@@ -1,0 +1,8 @@
+[package]
+name = "lava"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+ash = "0.38.0"
