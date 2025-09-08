@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ash::{khr, vk, Device, Instance};
 
-use crate::state::{Ctx, Functions};
+use crate::{state::{Ctx, Functions}, FRAMES_IN_FLIGHT};
 
 use super::{image::Image};
 
@@ -10,7 +10,7 @@ pub struct FrameResources {
     pub render_finished_semaphore: vk::Semaphore,
 }
 
-pub struct Swapchain<const FRAMES_IN_FLIGHT: usize> {
+pub struct Swapchain {
     pub handle: vk::SwapchainKHR,
     pub format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
@@ -19,7 +19,7 @@ pub struct Swapchain<const FRAMES_IN_FLIGHT: usize> {
     pub frame_resources: [FrameResources; FRAMES_IN_FLIGHT],
 }
 
-impl<const FRAMES_IN_FLIGHT: usize> Swapchain<FRAMES_IN_FLIGHT> {
+impl Swapchain {
     pub fn new() -> Result<Self> {
         let format = {
             let formats = Ctx::surface().formats;
@@ -47,32 +47,24 @@ impl<const FRAMES_IN_FLIGHT: usize> Swapchain<FRAMES_IN_FLIGHT> {
             }
         };
 
-        let capabilities = unsafe {
-            
-        };
-
         let extent = {
-            if capabilities.current_extent.width != std::u32::MAX {
-                capabilities.current_extent
+            if Ctx::surface().capabilities.current_extent.width != std::u32::MAX {
+                Ctx::surface().capabilities.current_extent
             } else {
-                let min = capabilities.min_image_extent;
-                let max = capabilities.max_image_extent;
-                let width = (WINDOW_SIZE.x as u32).min(max.width).max(min.width);
-                let height = (WINDOW_SIZE.y as u32).min(max.height).max(min.height);
-                vk::Extent2D { width, height }
+                vk::Extent2D { width: Ctx::surface().capabilities.min_image_extent, height: Ctx::surface().capabilities.min_image_extent }
             }
         };
 
-        let image_count = capabilities.min_image_count + 1;
+        let image_count = Ctx::surface().capabilities.min_image_count + 1;
 
         let families_indices = [
-            ctx.graphics_queue_family.index,
-            ctx.present_queue_family.index,
+            Ctx::queue().family_index,
+            Ctx::present_queue().family_index,
         ];
 
         let create_info = {
             let mut builder = vk::SwapchainCreateInfoKHR::default()
-                .surface(ctx.surface.vulkan)
+                .surface(Ctx::surface().handle)
                 .min_image_count(image_count)
                 .image_format(format.format)
                 .image_color_space(format.color_space)
@@ -84,7 +76,7 @@ impl<const FRAMES_IN_FLIGHT: usize> Swapchain<FRAMES_IN_FLIGHT> {
                         | vk::ImageUsageFlags::COLOR_ATTACHMENT,
                 );
 
-            builder = if ctx.graphics_queue_family.index != ctx.present_queue_family.index {
+            builder = if Ctx::queue().family_index != Ctx::present_queue().family_index {
                 builder
                     .image_sharing_mode(vk::SharingMode::CONCURRENT)
                     .queue_family_indices(&families_indices)
@@ -93,28 +85,27 @@ impl<const FRAMES_IN_FLIGHT: usize> Swapchain<FRAMES_IN_FLIGHT> {
             };
 
             builder
-                .pre_transform(capabilities.current_transform)
+                .pre_transform(Ctx::surface().current_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                 .present_mode(present_mode)
                 .clipped(true)
         };
 
         let handle = unsafe { Functions::swapchain().create_swapchain(&create_info, None).unwrap() };
-
         let images = unsafe { Functions::swapchain().get_swapchain_images(handle).unwrap() };
 
         let images = images
             .into_iter()
             .enumerate()
             .map(|(i, image)| {
-                ctx.set_debug_name(&format!("SwpachainImage{}", i), image);
+                Functions::set_debug_name(&format!("SwpachainImage{}", i), image);
 
                 Image {
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
                     image,
                     format: format.format,
                     extent,
-                    view: Image::view(&ctx.device, extent, image, format.format),
+                    view: Image::view(&Ctx::device(), extent, image, format.format),
                     allocation: None,
                 }
             })
@@ -126,9 +117,9 @@ impl<const FRAMES_IN_FLIGHT: usize> Swapchain<FRAMES_IN_FLIGHT> {
         for i in 0..FRAMES_IN_FLIGHT {
             let create_info = vk::SemaphoreCreateInfo::default();
             let image_availible_semaphore =
-                unsafe { ctx.device.create_semaphore(&create_info, None).unwrap() };
+                unsafe { Ctx::device().create_semaphore(&create_info, None).unwrap() };
             let render_finished_semaphore =
-                unsafe { ctx.device.create_semaphore(&create_info, None).unwrap() };
+                unsafe { Ctx::device().create_semaphore(&create_info, None).unwrap() };
             frame_resources[i] = FrameResources {
                 image_availible_semaphore,
                 render_finished_semaphore,
@@ -143,34 +134,5 @@ impl<const FRAMES_IN_FLIGHT: usize> Swapchain<FRAMES_IN_FLIGHT> {
             images,
             frame_resources,
         })
-    }
-
-    pub fn next_image(&self, frame_in_flight: usize) -> usize {
-        unsafe {
-            self.ash_swapchain
-                .acquire_next_image(
-                    self.handle,
-                    1000000000,
-                    self.frame_resources[frame_in_flight].image_availible_semaphore,
-                    vk::Fence::null(),
-                )
-                .unwrap()
-        }
-        .0 as usize
-    }
-
-    pub fn present(&self, frame_in_flight: usize, swapchain_image: usize) {
-        let binding = [self.frame_resources[frame_in_flight as usize].render_finished_semaphore];
-        let swapchains = [self.handle];
-        let image_indices = [swapchain_image as u32];
-        let present_info = vk::PresentInfoKHR::default()
-            .image_indices(&image_indices)
-            .swapchains(&swapchains)
-            .wait_semaphores(&binding);
-        unsafe {
-            Functions::swapchain()
-                .queue_present(Ctx::present_queue(), &present_info)
-                .unwrap()
-        };
     }
 }

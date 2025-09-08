@@ -1,22 +1,37 @@
-use std::{default, ffi::c_char, mem::MaybeUninit, sync::{Arc, Mutex, MutexGuard, OnceLock}};
+use std::{default, ffi::{c_char, c_void}, mem::MaybeUninit, sync::{atomic::{ AtomicU64}, Arc, Mutex, MutexGuard, OnceLock}};
 
 use anyhow::Result;
-use ash::{ext::debug_utils, vk, Device, Entry};
+use ash::{ext::debug_utils, vk::{self, Handle}, Device, Entry};
 use gpu_allocator::{vulkan::{Allocator, AllocatorCreateDesc}, AllocationSizes, AllocatorDebugSettings};
 use winit::raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle};
 use std::ffi::CStr;
 
-use crate::{vkobjects::{physical_device::PhysicalDevice, queue::Queue, surface::Surface}};
+use crate::{vkobjects::{physical_device::PhysicalDevice, queue::{CommandBuffer, Queue}, surface::Surface, swapchain::Swapchain}, FRAMES_IN_FLIGHT};
+
+
+pub struct Frame {
+    fence: vk::Fence,                          // fence-per-frame for CPU recycling
+    image_available: vk::Semaphore,            // binary, signaled by acquire
+    render_finished: vk::Semaphore,            // binary, waited by present
+    pool: vk::CommandPool,
+    cmd: CommandBuffer,
+    ticket: u64,                                // graphics timeline value signaled by this frame
+}
 
 #[derive(Default)]
 pub struct Ctx {
     device: Device,
     physical_device: PhysicalDevice,
     surface: Surface,
+    swapchain: Swapchain,
+    timeline: vk::Semaphore,
+    frames: [Frame; FRAMES_IN_FLIGHT],
     queue: Queue,
+    frame_in_flight: usize,
+    frame_counter: u64,
     transfer_queue: Option<Queue>,
     present_queue: Option<Queue>,
-    allocator: Mutex<Allocator>
+    allocator: Mutex<Allocator>,
 }
 
 impl Ctx {
@@ -42,6 +57,64 @@ impl Ctx {
     }
     pub fn surface() -> &'static Surface {
         &STATE.get().unwrap().surface
+    }
+
+    pub fn next_frame<'a, F: FnOnce(&'a vk::CommandBuffer) -> Result<()>>(func: F) -> Result<()> {
+        STATE.get_mut().unwrap().frame_in_flight = (STATE.get().unwrap().frame_in_flight + 1) % FRAMES_IN_FLIGHT;
+        let s = STATE.get().unwrap();
+        let f = &s.frames[s.frame_in_flight as usize];
+        unsafe {
+            Ctx::device().wait_for_fences(&[f.fence], true, u64::MAX)?;
+            Ctx::device().device.reset_fences(&[f.fence])?;
+            Ctx::device().device.reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())?;
+        }
+
+        let (image_index, _suboptimal) = unsafe {
+            Functions::acquire_next_image(s.swapchain.handle, u64::MAX, f.image_available, vk::Fence::null())
+        }?;
+
+        f.cmd.record(func)?;
+
+        STATE.get_mut().unwrap().frame_counter += 1;
+        let waits = [
+            vk::SemaphoreSubmitInfo {
+                semaphore: f.image_available,
+                stage_mask: vk::PipelineStageFlags2::NONE,
+                ..Default::default()
+            }
+        ];
+
+        let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(f.gcmd);
+        let sig_render_finished = vk::SemaphoreSubmitInfo {
+                semaphore: f.render_finished,
+                stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
+                ..Default::default()
+            };
+
+        let sig_graphics_timeline = vk::SemaphoreSubmitInfo {
+                semaphore: s.timeline,
+                value: s.frame_counter,
+                stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
+                ..Default::default()
+            };
+
+        let signals = [sig_render_finished, sig_graphics_timeline];
+
+        let submit = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&waits)
+            .command_buffer_infos(std::slice::from_ref(&cb_info))
+            .signal_semaphore_infos(&signals);
+
+        unsafe { Ctx::device().queue_submit2(Ctx::queue(), std::slice::from_ref(&submit), f.fence)?; }
+
+        let swapchains = [s.swapchain.handle];
+        let indices = [image_index];
+        let wait_sems = [f.render_finished];
+        let present = vk::PresentInfoKHR::default()
+            .wait_semaphores(&wait_sems)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+        unsafe { Functions::swapchain().queue_present(Ctx::present_queue(), &present)?; }
     }
 
     pub(super) fn init(display_handle: &dyn HasDisplayHandle, window_handle: &dyn HasWindowHandle) -> Result<()> {
@@ -164,6 +237,7 @@ impl Ctx {
         
         let state = STATE.get_mut().unwrap();
         state.surface = Surface::new(surface);
+        state.swapchain = Swapchain::new()?;
         state.queue = Queue::new(0);
         state.present_queue = Queue::new(1);
         state.transfer_queue = Queue::new(2);
@@ -318,6 +392,46 @@ impl Functions {
     pub fn mesh() -> Option<&'static ash::ext::mesh_shader::Device> { get().mesh.as_ref() }
     pub fn raytracing_pipeline() -> Option<&'static ash::khr::ray_tracing_pipeline::Device> { get().raytracing_pipeline.as_ref() }
     pub fn acceleration_structure() -> Option<&'static ash::khr::acceleration_structure::Device> { get().acceleration_structure.as_ref() }
+    
+    pub fn set_debug_name<T>(name: &str, object: T)
+    where
+        T: Handle,
+    {
+        if let Some(debug_utils) = Self::debug_utils() {
+            let name = format!("{}\0", name);
+            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+            let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
+                .object_handle(object)
+                .object_name(name);
+            unsafe { debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
+        }
+    }
+
+    pub fn cmd_start_label(&self, cmd: &vk::CommandBuffer, name: &str) {
+        if let Some(debug_utils) = Self::debug_utils() {
+            let name = format!("{}\0", name);
+            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+            let name_info = vk::DebugUtilsLabelEXT::default().label_name(name);
+            unsafe {
+                debug_utils
+                    .cmd_begin_debug_utils_label(*cmd, &name_info)
+            };
+        }
+    }
+    pub fn cmd_insert_label(&self, cmd: &vk::CommandBuffer, name: &str) {
+        if let Some(debug_utils) = Self::debug_utils() {
+            let name = format!("{}\0", name);
+            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+            let name_info = vk::DebugUtilsLabelEXT::default().label_name(name);
+            unsafe {
+                debug_utils
+                    .cmd_insert_debug_utils_label(*cmd, &name_info)
+            };
+        }
+    }
+    pub fn cmd_end_label(&self, cmd: &vk::CommandBuffer) {
+        unsafe { self.debug_utils.cmd_end_debug_utils_label(*cmd) };
+    }
 }
 fn get() -> &'static Functions {
     unsafe { FUNCTIONS.get().unwrap() }

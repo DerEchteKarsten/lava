@@ -1,4 +1,4 @@
-use std::{ffi::c_void, fmt::Debug, ptr::NonNull, sync::Mutex};
+use std::{ffi::c_void, fmt::Debug, ptr::NonNull, sync::{Mutex, Arc}};
 
 use anyhow::{Error, Result};
 use ash::vk;
@@ -17,124 +17,14 @@ use super::{
 };
 
 #[derive(Derivative)]
-#[derivative(Eq, PartialEq, Debug)]
+#[derivative(Eq, PartialEq, Debug, Clone, Copy)]
 pub struct Buffer {
     pub buffer: vk::Buffer,
     #[derivative(PartialEq = "ignore")]
-    pub allocation: Option<Mutex<Allocation>>,
+    pub allocation: Arc<Mutex<Allocation>>,
     pub address: vk::DeviceAddress,
     pub size: vk::DeviceSize,
     pub usage: vk::BufferUsageFlags,
-}
-
-impl Clone for Buffer {
-    fn clone(&self) -> Self {
-        Self {
-            buffer: self.buffer,
-            usage: self.usage,
-            address: self.address,
-            size: self.size,
-            allocation: None,
-        }
-    }
-}
-
-impl Buffer {
-    pub fn handle(&self) -> BufferHandle {
-        BufferHandle {
-            buffer: self.buffer,
-            address: self.address,
-            size: self.size,
-            usage: self.usage,
-        }
-    }
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct BufferHandle {
-    pub buffer: vk::Buffer,
-    pub address: vk::DeviceAddress,
-    pub size: vk::DeviceSize,
-    pub usage: vk::BufferUsageFlags,
-}
-
-impl BufferType for Buffer {
-    fn get_address(&self) -> vk::DeviceAddress {
-        self.address
-    }
-    fn get_size(&self) -> vk::DeviceSize {
-        self.size
-    }
-    fn get_usage(&self) -> vk::BufferUsageFlags {
-        self.usage
-    }
-    fn to_vk(&self) -> vk::Buffer {
-        self.buffer
-    }
-}
-impl BufferType for BufferHandle {
-    fn get_address(&self) -> vk::DeviceAddress {
-        self.address
-    }
-    fn get_size(&self) -> vk::DeviceSize {
-        self.size
-    }
-    fn get_usage(&self) -> vk::BufferUsageFlags {
-        self.usage
-    }
-    fn to_vk(&self) -> vk::Buffer {
-        self.buffer
-    }
-}
-
-pub trait BufferType {
-    fn get_address(&self) -> vk::DeviceAddress;
-    fn get_size(&self) -> vk::DeviceSize;
-    fn to_vk(&self) -> vk::Buffer;
-    fn get_usage(&self) -> vk::BufferUsageFlags;
-    fn copy_to_image(
-        &self,
-        cmd: &vk::CommandBuffer,
-        dst: &impl ImageType,
-        layout: vk::ImageLayout,
-        buffer_offset: u64,
-    ) {
-        let region = vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: get_aspects(dst.get_format()),
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(vk::Extent3D {
-                width: dst.get_extent().width,
-                height: dst.get_extent().height,
-                depth: 1,
-            })
-            .buffer_offset(buffer_offset);
-
-        unsafe {
-            Context::get().device.cmd_copy_buffer_to_image(
-                *cmd,
-                self.to_vk(),
-                dst.get_image(),
-                layout,
-                std::slice::from_ref(&region),
-            );
-        };
-    }
-
-    fn copy(&self, cmd: &vk::CommandBuffer, dst_buffer: &impl BufferType) {
-        unsafe {
-            let region = vk::BufferCopy::default().size(self.get_size());
-            Context::get().device.cmd_copy_buffer(
-                *cmd,
-                self.to_vk(),
-                dst_buffer.to_vk(),
-                std::slice::from_ref(&region),
-            )
-        };
-    }
 }
 
 impl Buffer {
@@ -335,21 +225,6 @@ pub struct DynamicBuffer {
     pub memory_location: MemoryLocation,
     pub override_alignment: Option<u64>,
     pub bindless_handle: DescriptorResourceHandle,
-}
-
-impl BufferType for DynamicBuffer {
-    fn get_address(&self) -> vk::DeviceAddress {
-        self.buffer.address
-    }
-    fn get_size(&self) -> vk::DeviceSize {
-        self.capacity
-    }
-    fn get_usage(&self) -> vk::BufferUsageFlags {
-        self.usage
-    }
-    fn to_vk(&self) -> vk::Buffer {
-        self.buffer.buffer
-    }
 }
 
 impl DynamicBuffer {

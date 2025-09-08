@@ -13,6 +13,8 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+const FRAMES_IN_FLIGHT: usize = 2;
+
 fn init(display_handle: &dyn HasDisplayHandle, window_handle: &dyn HasWindowHandle) -> Result<()> {
     Ctx::init(display_handle, window_handle)?;
     Ok(())
