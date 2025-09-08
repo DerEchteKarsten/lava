@@ -6,8 +6,6 @@ use std::{
 
 use anyhow::{Ok, Result};
 use ash::vk;
-use bevy_ecs::{resource::Resource, world::FromWorld};
-use glam::UVec2;
 
 use crate::raytracing::AccelerationStructure;
 

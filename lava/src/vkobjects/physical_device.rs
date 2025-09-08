@@ -3,6 +3,9 @@ use std::ffi::CStr;
 use anyhow::Result;
 use ash::vk;
 
+use crate::state::Features;
+use crate::state::Functions;
+
 #[derive(Clone, Debug)]
 pub struct QueueFamily {
     pub index: u32,
@@ -46,16 +49,16 @@ pub struct PhysicalDevice {
     pub supported_extensions: Vec<String>,
     pub supported_surface_formats: Vec<vk::SurfaceFormatKHR>,
     pub supported_present_modes: Vec<vk::PresentModeKHR>,
+    pub supported_features: Features,
+    pub bindless_supported: bool,
 }
 
 impl PhysicalDevice {
     pub fn new(
-        instance: &ash::Instance,
-        ash_surface: &ash::khr::surface::Instance,
-        vk_surface: &vk::SurfaceKHR,
+        surface: &vk::SurfaceKHR,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Self> {
-        let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let props = unsafe { Functions::instance().get_physical_device_properties(physical_device) };
 
         let name = unsafe {
             CStr::from_ptr(props.device_name.as_ptr())
@@ -67,17 +70,17 @@ impl PhysicalDevice {
         let limits = props.limits;
 
         let queue_family_properties =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+            unsafe { Functions::instance().get_physical_device_queue_family_properties(physical_device) };
         let queue_families = queue_family_properties
             .into_iter()
             .enumerate()
             .map(|(index, p)| {
                 let present_support = unsafe {
-                    ash_surface
+                    Functions::surface()
                         .get_physical_device_surface_support(
                             physical_device,
                             index as _,
-                            *vk_surface,
+                            *surface,
                         )
                         .unwrap()
                 };
@@ -91,7 +94,7 @@ impl PhysicalDevice {
             .collect::<Vec<_>>();
 
         let extension_properties =
-            unsafe { instance.enumerate_device_extension_properties(physical_device)? };
+            unsafe { Functions::instance().enumerate_device_extension_properties(physical_device)? };
         let supported_extensions = extension_properties
             .into_iter()
             .map(|p| {
@@ -101,42 +104,29 @@ impl PhysicalDevice {
             .collect();
 
         let supported_surface_formats = unsafe {
-            ash_surface.get_physical_device_surface_formats(physical_device, *vk_surface)?
+            Functions::surface().get_physical_device_surface_formats(physical_device, *surface)?
         };
 
         let supported_present_modes = unsafe {
-            ash_surface.get_physical_device_surface_present_modes(physical_device, *vk_surface)?
+            Functions::surface().get_physical_device_surface_present_modes(physical_device, *surface)?
         };
         let mut ray_tracing_feature = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
-        let mut acceleration_struct_feature =
-            vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
-        let mut atomics = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
-            .shader_buffer_float32_atomics(true)
-            .shader_buffer_float64_atomic_add(true)
-            .shader_buffer_float32_atomic_add(true);
-        let mut atomics2 = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
-            .shader_buffer_float32_atomics(true)
-            .shader_buffer_float32_atomic_add(true);
-        let features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
-        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .runtime_descriptor_array(true)
-            .buffer_device_address(true)
-            .shader_buffer_int64_atomics(true);
-        let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
-            .task_shader(true)
-            .mesh_shader(true);
+        let mut acceleration_struct_feature = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
 
-        let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
-            .features(features)
-            .push_next(&mut atomics)
             .push_next(&mut features12)
             .push_next(&mut ray_tracing_feature)
             .push_next(&mut acceleration_struct_feature)
-            .push_next(&mut features13)
-            .push_next(&mut atomics2)
             .push_next(&mut mesh_shading);
-        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+        unsafe { Functions::instance().get_physical_device_features2(physical_device, &mut features2) };
+
+        let features = Features {
+            debug_utils: true,
+            mesh: mesh_shading.mesh_shader == vk::TRUE,
+            raytracing: ray_tracing_feature.ray_tracing_pipeline == vk::TRUE && acceleration_struct_feature.acceleration_structure == vk::TRUE,
+        };
 
         Ok(Self {
             handel: physical_device,
@@ -147,6 +137,8 @@ impl PhysicalDevice {
             supported_extensions,
             supported_surface_formats,
             supported_present_modes,
+            bindless_supported: features12.runtime_descriptor_array == vk::TRUE && features12.descriptor_binding_partially_bound == vk::TRUE && features12.descriptor_binding_variable_descriptor_count == vk::TRUE,
+            supported_features: features,
         })
     }
 
@@ -157,5 +149,69 @@ impl PhysicalDevice {
             .map(String::as_str)
             .collect::<Vec<_>>();
         extensions.iter().all(|e| supported_extensions.contains(e))
+    }
+
+
+    pub fn enumerate_physical_devices(surface: vk::SurfaceKHR) -> Result<Vec<PhysicalDevice>> {
+        let physical_devices = unsafe { Functions::instance().enumerate_physical_devices()? };
+
+        let mut physical_devices = physical_devices
+            .into_iter()
+            .map(|pd| PhysicalDevice::new(surface, pd))
+            .collect::<Result<Vec<PhysicalDevice>>>()?;
+
+        physical_devices.sort_by_key(|pd| match pd.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+            _ => 2,
+        });
+        Ok(physical_devices)
+    }
+
+
+    pub fn select_suitable_physical_device(devices: &[PhysicalDevice]) -> Result<(PhysicalDevice, QueueFamily, Option<QueueFamily>, Option<QueueFamily>)> {
+        let mut graphics = None;
+        let mut present = None;
+        let mut transfer_queue = None;
+
+        let device = devices
+            .iter()
+            .find(|device| {
+                for family in device.queue_families.iter().filter(|f| f.has_queues()) {
+                    if family.supports_graphics()
+                        && family.supports_compute()
+                        && family.supports_timestamp_queries()
+                        && graphics.is_none()
+                    {
+                        graphics = Some(family.clone());
+                    } else if family.supports_present() && present.is_none(){
+                        present = Some(family.clone());
+                    } else if family.supports_transfer() && transfer_queue.is_none() {
+                        transfer_queue = Some(family.clone());
+                    }
+
+                    if graphics.is_some() && present.is_some() {
+                        break;
+                    }
+                }
+
+                graphics.is_some()
+                    && present.is_some()
+                    && !device.supported_surface_formats.is_empty()
+                    && !device.supported_present_modes.is_empty()
+                    && (device.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                        || device.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Could not find a suitable device"))?;
+        assert!(device.supports_extensions(&device.supported_features.extensions()), "device does not support required extensions");
+        log::info!("Using device: {}", device.name);
+        log::info!("Device type: {:?}", device.device_type);
+        log::info!("Features are: {:?}", device.supported_features);
+        Ok((
+            device.clone(),
+            graphics.unwrap(),
+            present,
+            transfer_queue,
+        ))
     }
 }

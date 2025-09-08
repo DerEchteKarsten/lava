@@ -1,16 +1,19 @@
+use anyhow::Result;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+use crate::state::Ctx;
+
 mod bindless;
 mod vulkan;
 mod pipeline_cache;
-mod extensions;
 mod shader_cache;
-mod properties;
 mod vkobjects;
+mod state;
 
 #[cfg(test)]
 mod tests;
 
-pub const FRAMES_IN_FLIGHT: usize = 3;
-
-pub struct Lava {
-    device: Device,
+fn init(display_handle: &dyn HasDisplayHandle, window_handle: &dyn HasWindowHandle) -> Result<()> {
+    Ctx::init(display_handle, window_handle)?;
+    Ok(())
 }

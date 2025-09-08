@@ -26,11 +26,6 @@ use winit::{dpi::PhysicalSize, event_loop::EventLoop, window::WindowAttributes};
 
 use crate::WINDOW_SIZE;
 
-pub struct Surface {
-    pub ash: ash::khr::surface::Instance,
-    pub vulkan: vk::SurfaceKHR,
-}
-
 pub static CTX: OnceLock<Context> = OnceLock::new();
 
 pub struct Context {
@@ -52,28 +47,6 @@ pub struct Context {
 }
 
 impl Context {
-    unsafe extern "system" fn vulkan_debug_callback(
-        flag: vk::DebugUtilsMessageSeverityFlagsEXT,
-        typ: vk::DebugUtilsMessageTypeFlagsEXT,
-        p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-        _: *mut c_void,
-    ) -> vk::Bool32 {
-        use vk::DebugUtilsMessageSeverityFlagsEXT as Flag;
-        if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
-            let message = CStr::from_ptr((*p_callback_data).p_message);
-            match flag {
-                // Flag::VERBOSE => log::info!("{:?} - {:?}", typ, message),
-                // Flag::INFO => {
-                //     let message = message.to_str().unwrap_or("");
-                //     log::info!("{:?} - {:?}", typ, message.to_owned())
-                // }
-                Flag::WARNING => log::warn!("{:?}", message),
-                Flag::ERROR => log::error!("{:?}", message),
-                _ => {}
-            }
-        }
-        vk::FALSE
-    }
 
     pub fn get() -> &'static Self {
         CTX.get().unwrap()
@@ -200,7 +173,7 @@ impl Context {
         })?;
 
         let command_pool_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(transfer_queue_family.index);
+            vk::CommandPoolCreateInfo::default().queue_family_index(graphics_queue_family.index);
         let command_pool = unsafe { device.create_command_pool(&command_pool_info, None)? };
 
         let debug_utils = debug_utils::Device::new(&instance, &device);

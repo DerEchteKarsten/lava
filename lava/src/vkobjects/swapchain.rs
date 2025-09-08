@@ -1,14 +1,16 @@
 use anyhow::Result;
 use ash::{khr, vk, Device, Instance};
 
-use super::{image::Image, Context};
+use crate::state::{Ctx, Functions};
+
+use super::{image::Image};
 
 pub struct FrameResources {
     pub image_availible_semaphore: vk::Semaphore,
     pub render_finished_semaphore: vk::Semaphore,
 }
 
-pub struct Swapchain {
+pub struct Swapchain<const FRAMES_IN_FLIGHT: usize> {
     pub handle: vk::SwapchainKHR,
     pub format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
@@ -17,15 +19,10 @@ pub struct Swapchain {
     pub frame_resources: [FrameResources; FRAMES_IN_FLIGHT],
 }
 
-impl Swapchain {
-    pub fn new(ctx: &Context) -> Result<Self> {
+impl<const FRAMES_IN_FLIGHT: usize> Swapchain<FRAMES_IN_FLIGHT> {
+    pub fn new() -> Result<Self> {
         let format = {
-            let formats = unsafe {
-                ctx.surface.ash.get_physical_device_surface_formats(
-                    ctx.physical_device.handel,
-                    ctx.surface.vulkan,
-                )?
-            };
+            let formats = Ctx::surface().formats;
             if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
                 vk::SurfaceFormatKHR {
                     format: vk::Format::B8G8R8A8_UNORM,
@@ -43,13 +40,7 @@ impl Swapchain {
         };
 
         let present_mode = {
-            let present_modes = unsafe {
-                ctx.surface.ash.get_physical_device_surface_present_modes(
-                    ctx.physical_device.handel,
-                    ctx.surface.vulkan,
-                )?
-            };
-            if present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+            if Ctx::surface().present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
                 vk::PresentModeKHR::IMMEDIATE
             } else {
                 vk::PresentModeKHR::MAILBOX
@@ -57,10 +48,7 @@ impl Swapchain {
         };
 
         let capabilities = unsafe {
-            ctx.surface.ash.get_physical_device_surface_capabilities(
-                ctx.physical_device.handel,
-                ctx.surface.vulkan,
-            )?
+            
         };
 
         let extent = {
@@ -111,9 +99,9 @@ impl Swapchain {
                 .clipped(true)
         };
 
-        let handle = unsafe { ash_swapchain.create_swapchain(&create_info, None).unwrap() };
+        let handle = unsafe { Functions::swapchain().create_swapchain(&create_info, None).unwrap() };
 
-        let images = unsafe { ash_swapchain.get_swapchain_images(handle).unwrap() };
+        let images = unsafe { Functions::swapchain().get_swapchain_images(handle).unwrap() };
 
         let images = images
             .into_iter()
@@ -172,7 +160,6 @@ impl Swapchain {
     }
 
     pub fn present(&self, frame_in_flight: usize, swapchain_image: usize) {
-        let ctx = Context::get();
         let binding = [self.frame_resources[frame_in_flight as usize].render_finished_semaphore];
         let swapchains = [self.handle];
         let image_indices = [swapchain_image as u32];
@@ -181,8 +168,8 @@ impl Swapchain {
             .swapchains(&swapchains)
             .wait_semaphores(&binding);
         unsafe {
-            self.ash_swapchain
-                .queue_present(ctx.graphics_queue, &present_info)
+            Functions::swapchain()
+                .queue_present(Ctx::present_queue(), &present_info)
                 .unwrap()
         };
     }

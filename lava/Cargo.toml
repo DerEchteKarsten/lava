@@ -6,3 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.99"
 ash = "0.38.0"
+ash-window = "0.13.0"
+derivative = "2.2.0"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+log = "0.4.28"
+winit = "0.30.12"
+
