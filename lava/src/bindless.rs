@@ -7,14 +7,7 @@ use std::{
 use anyhow::{Ok, Result};
 use ash::vk;
 
-use crate::raytracing::AccelerationStructure;
-
-use super::vulkan::{
-    buffer::{BufferHandle, BufferType},
-    image::{ImageHandle, ImageType},
-    raytracing::RayTracingContext,
-    Context,
-};
+use crate::{state::{Ctx, Features, Functions}, vkobjects::{acceleration_structure::AccelerationStructure, buffer::{Buffer, DynamicBuffer}, image::ImageType, queue::CommandBuffer}};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -39,7 +32,7 @@ impl ImmutableSampler {
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
-pub struct DescriptorResourceHandle(pub u32);
+pub struct DescriptorHandle(pub u32);
 
 enum AccessType {
     ReadOnly,
@@ -66,7 +59,31 @@ impl RenderResourceTag {
     }
 }
 
-impl DescriptorResourceHandle {
+trait ToBufferHandle {
+    fn to_vk(&self) -> vk::Buffer;
+    fn get_size(&self) -> u64;
+}
+
+impl ToBufferHandle for Buffer {
+    fn to_vk(&self) -> vk::Buffer {
+        self.buffer
+    }
+    fn get_size(&self) -> u64 {
+        self.size
+    }
+}
+
+
+impl ToBufferHandle for DynamicBuffer {
+    fn to_vk(&self) -> vk::Buffer {
+        self.buffer.buffer
+    }
+    fn get_size(&self) -> u64 {
+        self.capacity
+    }
+}
+
+impl DescriptorHandle {
     pub fn new(tag: RenderResourceTag, index: u32) -> Self {
         Self(((tag as u32) << 30) | index)
     }
@@ -78,8 +95,9 @@ impl DescriptorResourceHandle {
     }
 }
 
+#[derive(Debug)]
 pub struct BindlessDescriptorHeap {
-    available_recycled_descriptors: Mutex<VecDeque<DescriptorResourceHandle>>,
+    available_recycled_descriptors: Mutex<VecDeque<DescriptorHandle>>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_index: [std::sync::atomic::AtomicU32; 4],
     set_layouts: [vk::DescriptorSetLayout; 4],
@@ -125,23 +143,21 @@ impl BindlessTableType {
     }
 
     fn table_size(&self) -> u32 {
-        let ctx = Context::get();
-        let raytracing_ctx = RayTracingContext::get();
         match self {
             BindlessTableType::Buffers => {
-                ctx.physical_device
+                Ctx::physical_device()
                     .limits
                     .max_descriptor_set_storage_buffers
             }
             BindlessTableType::Images => {
-                ctx.physical_device.limits.max_descriptor_set_storage_images
+                Ctx::physical_device().limits.max_descriptor_set_storage_images
             }
             BindlessTableType::Textures => {
-                ctx.physical_device.limits.max_descriptor_set_sampled_images
+                Ctx::physical_device().limits.max_descriptor_set_sampled_images
             }
             BindlessTableType::AccelerationStructures => {
-                if let Some(r) = raytracing_ctx {
-                    r.acceleration_structure_properties
+                if let Some(r) = Ctx::physical_device().acceleration_structure_properties {
+                    r
                         .max_descriptor_set_acceleration_structures
                 } else {
                     0
@@ -152,11 +168,10 @@ impl BindlessTableType {
     }
 
     pub fn descriptor_pool_sizes(immutable_sampler_count: u32) -> Vec<vk::DescriptorPoolSize> {
-        let raytracing_ctx = RayTracingContext::get();
         Self::all_tables()
             .iter()
             .filter_map(|table| {
-                if raytracing_ctx.is_some()
+                if Functions::acceleration_structure().is_some()
                     || table.to_vk() != vk::DescriptorType::ACCELERATION_STRUCTURE_KHR
                 {
                     Some(vk::DescriptorPoolSize {
@@ -182,7 +197,7 @@ impl BindlessDescriptorHeap {
         BINDLESS.get().unwrap()
     }
 
-    pub fn retire_handle(&self, handle: DescriptorResourceHandle) {
+    pub fn retire_handle(&self, handle: DescriptorHandle) {
         self.available_recycled_descriptors
             .lock()
             .unwrap()
@@ -193,18 +208,18 @@ impl BindlessDescriptorHeap {
         self.descriptor_index[table.set_index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn fetch_available_descriptor(&self, tag: RenderResourceTag) -> DescriptorResourceHandle {
+    fn fetch_available_descriptor(&self, tag: RenderResourceTag) -> DescriptorHandle {
         self.available_recycled_descriptors
             .lock()
             .unwrap()
             .pop_front()
             .map_or_else(
-                || DescriptorResourceHandle::new(tag, self.increment_descriptor(tag.table())),
+                || DescriptorHandle::new(tag, self.increment_descriptor(tag.table())),
                 |recycled_handle| recycled_handle.bump_version_and_update_tag(tag),
             )
     }
 
-    pub fn allocate_buffer_handle(&self, buffer: &impl BufferType) -> DescriptorResourceHandle {
+    pub fn allocate_buffer_handle(&self, buffer: &impl ToBufferHandle) -> DescriptorHandle {
         let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Buffer);
 
         let buffer_info = [vk::DescriptorBufferInfo {
@@ -223,13 +238,13 @@ impl BindlessDescriptorHeap {
         }
         .buffer_info(&buffer_info)];
         unsafe {
-            Context::get().device.update_descriptor_sets(&write, &[]);
+            Ctx::device().update_descriptor_sets(&write, &[]);
         };
 
         handle
     }
 
-    pub fn update_buffer_handle(&self, buffer: &impl BufferType, handle: DescriptorResourceHandle) {
+    pub fn update_buffer_handle(&self, buffer: &impl ToBufferHandle, handle: DescriptorHandle) {
         let buffer_info = [vk::DescriptorBufferInfo {
             buffer: buffer.to_vk(),
             offset: 0,
@@ -246,11 +261,11 @@ impl BindlessDescriptorHeap {
         }
         .buffer_info(&buffer_info)];
         unsafe {
-            Context::get().device.update_descriptor_sets(&write, &[]);
+            Ctx::device().update_descriptor_sets(&write, &[]);
         };
     }
 
-    pub fn allocate_image_handle(&self, image: &impl ImageType) -> DescriptorResourceHandle {
+    pub fn allocate_image_handle(&self, image: &impl ImageType) -> DescriptorHandle {
         let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Image);
 
         let image_info = vk::DescriptorImageInfo {
@@ -269,13 +284,13 @@ impl BindlessDescriptorHeap {
             ..Default::default()
         }];
         unsafe {
-            Context::get().device.update_descriptor_sets(&write, &[]);
+            Ctx::device().update_descriptor_sets(&write, &[]);
         };
 
         handle
     }
 
-    pub fn allocate_texture_handle(&self, image: &impl ImageType) -> DescriptorResourceHandle {
+    pub fn allocate_texture_handle(&self, image: &impl ImageType) -> DescriptorHandle {
         let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Texture);
 
         let image_info = vk::DescriptorImageInfo {
@@ -294,7 +309,7 @@ impl BindlessDescriptorHeap {
             ..Default::default()
         }];
         unsafe {
-            Context::get().device.update_descriptor_sets(&write, &[]);
+            Ctx::device().update_descriptor_sets(&write, &[]);
         };
 
         handle
@@ -303,7 +318,7 @@ impl BindlessDescriptorHeap {
     pub fn allocate_acceleration_structure_handle(
         &self,
         tlas: &AccelerationStructure,
-    ) -> DescriptorResourceHandle {
+    ) -> DescriptorHandle {
         let handle =
             Self::fetch_available_descriptor(self, RenderResourceTag::AccelerationStructure);
 
@@ -318,13 +333,13 @@ impl BindlessDescriptorHeap {
             .push_next(&mut write_set_as);
         write.descriptor_count = 1;
         unsafe {
-            Context::get().device.update_descriptor_sets(&[write], &[]);
+            Ctx::device().update_descriptor_sets(&[write], &[]);
         };
 
         handle
     }
 
-    pub fn new() -> Self {
+    pub fn init() -> Result<()> {
         let immutable_samplers: [vk::Sampler; 4] = (0..4)
             .into_iter()
             .map(|i: i32| {
@@ -342,8 +357,7 @@ impl BindlessDescriptorHeap {
                     ..Default::default()
                 };
                 unsafe {
-                    Context::get()
-                        .device
+                    Ctx::device()
                         .create_sampler(&create_info, None)
                         .unwrap()
                 }
@@ -361,20 +375,18 @@ impl BindlessDescriptorHeap {
             .max_sets(4);
 
         let descriptor_pool = unsafe {
-            Context::get()
-                .device
+            Ctx::device()
                 .create_descriptor_pool(&descriptor_pool_info, None)
                 .unwrap()
         };
-        Context::get().set_debug_name("BindlessDescriptorPool", descriptor_pool);
+        Functions::set_debug_name("BindlessDescriptorPool", descriptor_pool);
         let (set_layouts, layout) = Self::create_bindless_layout(&immutable_samplers);
-        Context::get().set_debug_name("BindlessLayout", layout);
-        let raytracing_ctx = RayTracingContext::get();
+        Functions::set_debug_name("BindlessLayout", layout);
         for i in 0..set_layouts.len() {
-            if raytracing_ctx.is_none() && i == 3 {
+            if Functions::acceleration_structure().is_none() && i == 3 {
                 continue;
             }
-            Context::get().set_debug_name(
+            Functions::set_debug_name(
                 &format!(
                     "BindlessDescriptorSetLayout_{}",
                     match i {
@@ -392,7 +404,7 @@ impl BindlessDescriptorHeap {
         let descriptor_counts = BindlessTableType::all_tables()
             .iter()
             .filter_map(|table| {
-                if raytracing_ctx.is_some() || *table != BindlessTableType::AccelerationStructures {
+                if Functions::acceleration_structure().is_some() || *table != BindlessTableType::AccelerationStructures {
                     Some(table.table_size())
                 } else {
                     None
@@ -404,7 +416,7 @@ impl BindlessDescriptorHeap {
 
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(if raytracing_ctx.is_none() {
+            .set_layouts(if Functions::acceleration_structure().is_none() {
                 &set_layouts[0..3]
             } else {
                 &set_layouts
@@ -412,12 +424,11 @@ impl BindlessDescriptorHeap {
             .push_next(&mut set_counts);
 
         let sets = unsafe {
-            Context::get()
-                .device
+            Ctx::device()
                 .allocate_descriptor_sets(&allocate_info)
                 .unwrap()
         };
-        let sets: [vk::DescriptorSet; 4] = if raytracing_ctx.is_none() {
+        let sets: [vk::DescriptorSet; 4] = if Functions::acceleration_structure().is_none() {
             let mut res = [vk::DescriptorSet::default(); 4];
             res[0..3].copy_from_slice(sets.as_slice());
             res
@@ -426,10 +437,10 @@ impl BindlessDescriptorHeap {
         };
 
         for i in 0..sets.len() {
-            if raytracing_ctx.is_none() && i == 3 {
+            if Functions::acceleration_structure().is_none() && i == 3 {
                 continue;
             }
-            Context::get().set_debug_name(
+            Functions::set_debug_name(
                 &format!(
                     "BindlessDescriptorSet_{}",
                     match i {
@@ -444,7 +455,7 @@ impl BindlessDescriptorHeap {
             );
         }
 
-        Self {
+        BINDLESS.set(Self {
             descriptor_pool,
             available_recycled_descriptors: Mutex::new(VecDeque::new()),
             descriptor_index: [
@@ -456,13 +467,13 @@ impl BindlessDescriptorHeap {
             set_layouts,
             sets,
             layout,
-        }
+        }).unwrap();
+        Ok(())
     }
 
     pub(super) fn create_bindless_layout(
         immutable_samplers: &[vk::Sampler],
     ) -> ([vk::DescriptorSetLayout; 4], vk::PipelineLayout) {
-        let raytracing_ctx = RayTracingContext::get();
         let mut descriptor_layouts = [vk::DescriptorSetLayout::default(); 4];
         BindlessTableType::all_tables()
             .iter()
@@ -502,9 +513,8 @@ impl BindlessDescriptorHeap {
 
                 let mut ext_flags = vk::DescriptorSetLayoutBindingFlagsCreateInfoEXT::default()
                     .binding_flags(&descriptor_binding_flags);
-                if raytracing_ctx.is_some() || *table != BindlessTableType::AccelerationStructures {
-                    descriptor_layouts[set_idx] = Context::get()
-                        .device
+                if Functions::acceleration_structure().is_some() || *table != BindlessTableType::AccelerationStructures {
+                    descriptor_layouts[set_idx] = Ctx::device()
                         .create_descriptor_set_layout(
                             &vk::DescriptorSetLayoutCreateInfo::default()
                                 .bindings(&set)
@@ -528,7 +538,7 @@ impl BindlessDescriptorHeap {
         let push_constant_ranges = [push_constant_range];
 
         let layout_create_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(if raytracing_ctx.is_none() {
+            .set_layouts(if Functions::acceleration_structure().is_none() {
                 &descriptor_layouts[0..3]
             } else {
                 &descriptor_layouts
@@ -536,8 +546,7 @@ impl BindlessDescriptorHeap {
             .push_constant_ranges(&push_constant_ranges);
 
         let pipeline_layout = unsafe {
-            Context::get()
-                .device
+            Ctx::device()
                 .create_pipeline_layout(&layout_create_info, None)
         }
         .expect("Failed creating pipeline layout.");
@@ -546,14 +555,13 @@ impl BindlessDescriptorHeap {
     }
 
     pub fn bind(&self, raytracing: bool, cmd: &vk::CommandBuffer) -> Result<()> {
-        let ctx = Context::get();
         let sets = if raytracing {
             &self.sets
         } else {
             &self.sets[0..3]
         };
         unsafe {
-            ctx.device.cmd_bind_descriptor_sets(
+            Ctx::device().cmd_bind_descriptor_sets(
                 *cmd,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.layout,
@@ -564,7 +572,7 @@ impl BindlessDescriptorHeap {
         };
         if raytracing {
             unsafe {
-                ctx.device.cmd_bind_descriptor_sets(
+                Ctx::device().cmd_bind_descriptor_sets(
                     *cmd,
                     vk::PipelineBindPoint::RAY_TRACING_KHR,
                     self.layout,
@@ -575,7 +583,7 @@ impl BindlessDescriptorHeap {
             };
         }
         unsafe {
-            ctx.device.cmd_bind_descriptor_sets(
+            Ctx::device().cmd_bind_descriptor_sets(
                 *cmd,
                 vk::PipelineBindPoint::COMPUTE,
                 self.layout,

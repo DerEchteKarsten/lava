@@ -1,4 +1,5 @@
 use std::ffi::CStr;
+use std::ffi::CString;
 
 use anyhow::Result;
 use ash::vk;
@@ -51,14 +52,18 @@ pub struct PhysicalDevice {
     pub supported_present_modes: Vec<vk::PresentModeKHR>,
     pub supported_features: Features,
     pub bindless_supported: bool,
+    pub ray_tracing_pipeline_properties: Option<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>>,
+    pub acceleration_structure_properties: Option<vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>>,
 }
 
 impl PhysicalDevice {
     pub fn new(
-        surface: &vk::SurfaceKHR,
+        surface: Option<&vk::SurfaceKHR>,
+        surface_fn: Option<&ash::khr::surface::Instance>,
+        instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Self> {
-        let props = unsafe { Functions::instance().get_physical_device_properties(physical_device) };
+        let props = unsafe { instance.get_physical_device_properties(physical_device) };
 
         let name = unsafe {
             CStr::from_ptr(props.device_name.as_ptr())
@@ -70,19 +75,22 @@ impl PhysicalDevice {
         let limits = props.limits;
 
         let queue_family_properties =
-            unsafe { Functions::instance().get_physical_device_queue_family_properties(physical_device) };
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let queue_families = queue_family_properties
             .into_iter()
             .enumerate()
             .map(|(index, p)| {
-                let present_support = unsafe {
-                    Functions::surface()
+                let present_support = if let Some(surface) = surface {
+                    unsafe {
+                    surface_fn.unwrap()
                         .get_physical_device_surface_support(
                             physical_device,
                             index as _,
                             *surface,
                         )
                         .unwrap()
+                }} else {
+                    false
                 };
 
                 QueueFamily {
@@ -94,36 +102,51 @@ impl PhysicalDevice {
             .collect::<Vec<_>>();
 
         let extension_properties =
-            unsafe { Functions::instance().enumerate_device_extension_properties(physical_device)? };
+            unsafe { instance.enumerate_device_extension_properties(physical_device)? };
         let supported_extensions = extension_properties
             .into_iter()
             .map(|p| {
                 let name = unsafe { CStr::from_ptr(p.extension_name.as_ptr()) };
                 name.to_str().unwrap().to_owned()
             })
-            .collect();
+            .collect::<Vec<String>>();
 
-        let supported_surface_formats = unsafe {
-            Functions::surface().get_physical_device_surface_formats(physical_device, *surface)?
+        let supported_surface_formats = if let Some(surface) = surface {
+            unsafe {
+            surface_fn.unwrap().get_physical_device_surface_formats(physical_device, *surface)?
+        }}else {
+            vec![]
         };
 
-        let supported_present_modes = unsafe {
-            Functions::surface().get_physical_device_surface_present_modes(physical_device, *surface)?
+        let supported_present_modes = if let Some(surface) = surface {
+            unsafe {
+            surface_fn.unwrap().get_physical_device_surface_present_modes(physical_device, *surface)?
+        }}else {
+            vec![]
         };
         let mut ray_tracing_feature = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
         let mut acceleration_struct_feature = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut rt_pipeline_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+        let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut features12)
             .push_next(&mut ray_tracing_feature)
             .push_next(&mut acceleration_struct_feature)
             .push_next(&mut mesh_shading);
-        unsafe { Functions::instance().get_physical_device_features2(physical_device, &mut features2) };
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+
+        let mut properties2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut rt_pipeline_properties)
+            .push_next(&mut acc_properties);
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
 
         let features = Features {
+            present: surface.is_some(),
             debug_utils: true,
+            device_debug_utils: supported_extensions.contains(&ash::ext::debug_utils::NAME.to_str().unwrap().to_owned()),
             mesh: mesh_shading.mesh_shader == vk::TRUE,
             raytracing: ray_tracing_feature.ray_tracing_pipeline == vk::TRUE && acceleration_struct_feature.acceleration_structure == vk::TRUE,
         };
@@ -137,27 +160,27 @@ impl PhysicalDevice {
             supported_extensions,
             supported_surface_formats,
             supported_present_modes,
+            
+            acceleration_structure_properties: if features.raytracing {Some(acc_properties)} else {None},
+            ray_tracing_pipeline_properties: if features.raytracing {Some(rt_pipeline_properties)} else {None},
+
             bindless_supported: features12.runtime_descriptor_array == vk::TRUE && features12.descriptor_binding_partially_bound == vk::TRUE && features12.descriptor_binding_variable_descriptor_count == vk::TRUE,
             supported_features: features,
         })
     }
 
-    pub fn supports_extensions(&self, extensions: &[&str]) -> bool {
-        let supported_extensions = self
-            .supported_extensions
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        extensions.iter().all(|e| supported_extensions.contains(e))
+
+    pub fn unsupports_extensions(&self, extensions: &[&CStr]) -> Vec<String> {
+        extensions.iter().map(|e| e.to_str().unwrap().to_owned()).filter(|e| self.supported_extensions.iter().find(|i| *i == e).is_none()).collect::<Vec<String>>()
     }
 
 
-    pub fn enumerate_physical_devices(surface: vk::SurfaceKHR) -> Result<Vec<PhysicalDevice>> {
-        let physical_devices = unsafe { Functions::instance().enumerate_physical_devices()? };
+    pub fn enumerate_physical_devices(surface: Option<&vk::SurfaceKHR>, instance: &ash::Instance, surface_fn: Option<&ash::khr::surface::Instance>) -> Result<Vec<PhysicalDevice>> {
+        let physical_devices = unsafe { instance.enumerate_physical_devices()? };
 
         let mut physical_devices = physical_devices
             .into_iter()
-            .map(|pd| PhysicalDevice::new(surface, pd))
+            .map(|pd| PhysicalDevice::new(surface, surface_fn, instance, pd))
             .collect::<Result<Vec<PhysicalDevice>>>()?;
 
         physical_devices.sort_by_key(|pd| match pd.device_type {
@@ -169,7 +192,7 @@ impl PhysicalDevice {
     }
 
 
-    pub fn select_suitable_physical_device(devices: &[PhysicalDevice]) -> Result<(PhysicalDevice, QueueFamily, Option<QueueFamily>, Option<QueueFamily>)> {
+    pub fn select_suitable_physical_device(devices: &[PhysicalDevice], features: &mut Features) -> Result<(PhysicalDevice, QueueFamily, Option<QueueFamily>, Option<QueueFamily>)> {
         let mut graphics = None;
         let mut present = None;
         let mut transfer_queue = None;
@@ -196,17 +219,24 @@ impl PhysicalDevice {
                 }
 
                 graphics.is_some()
-                    && present.is_some()
-                    && !device.supported_surface_formats.is_empty()
-                    && !device.supported_present_modes.is_empty()
+                    && (!device.supported_surface_formats.is_empty() || !features.present)
+                    && (!device.supported_present_modes.is_empty() || !features.present)
                     && (device.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
                         || device.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU)
             })
             .ok_or_else(|| anyhow::anyhow!("Could not find a suitable device"))?;
-        assert!(device.supports_extensions(&device.supported_features.extensions()), "device does not support required extensions");
-        log::info!("Using device: {}", device.name);
-        log::info!("Device type: {:?}", device.device_type);
-        log::info!("Features are: {:?}", device.supported_features);
+        println!("Using device: {}", device.name);
+        println!("Device type: {:?}", device.device_type);
+        println!("Features are: {:?}", device.supported_features);
+        println!("Extentions: {:#?}", device.supported_features.extensions());
+        let unsuported_ext = device.unsupports_extensions(&device.supported_features.extensions());
+        if !unsuported_ext.is_empty() {
+            println!("Unsuported Extensions: {:#?}", unsuported_ext);
+        }
+        assert!(unsuported_ext.is_empty(), "device does not support required extensions");
+        features.device_debug_utils = device.supported_features.device_debug_utils && features.debug_utils;
+        features.mesh = device.supported_features.mesh;
+        features.raytracing = device.supported_features.raytracing;
         Ok((
             device.clone(),
             graphics.unwrap(),

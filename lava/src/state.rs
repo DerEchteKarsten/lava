@@ -1,14 +1,15 @@
-use std::{default, ffi::{c_char, c_void}, mem::MaybeUninit, sync::{atomic::{ AtomicU64}, Arc, Mutex, MutexGuard, OnceLock}};
+use std::{cell::LazyCell, default, ffi::{c_char, c_void}, fmt::{write, Debug}, mem::MaybeUninit, sync::{atomic::{AtomicU32, AtomicU64}, Arc, LazyLock, Mutex, MutexGuard, OnceLock}};
 
-use anyhow::Result;
+use anyhow::{anyhow, Error, Result};
 use ash::{ext::debug_utils, vk::{self, Handle}, Device, Entry};
-use gpu_allocator::{vulkan::{Allocator, AllocatorCreateDesc}, AllocationSizes, AllocatorDebugSettings};
+use gpu_allocator::{vulkan::{self, Allocator, AllocatorCreateDesc}, AllocationSizes, AllocatorDebugSettings};
 use winit::raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle};
 use std::ffi::CStr;
 
 use crate::{vkobjects::{physical_device::PhysicalDevice, queue::{CommandBuffer, Queue}, surface::Surface, swapchain::Swapchain}, FRAMES_IN_FLIGHT};
 
 
+#[derive(Debug)]
 pub struct Frame {
     fence: vk::Fence,                          // fence-per-frame for CPU recycling
     image_available: vk::Semaphore,            // binary, signaled by acquire
@@ -18,64 +19,94 @@ pub struct Frame {
     ticket: u64,                                // graphics timeline value signaled by this frame
 }
 
-#[derive(Default)]
 pub struct Ctx {
     device: Device,
     physical_device: PhysicalDevice,
-    surface: Surface,
-    swapchain: Swapchain,
-    timeline: vk::Semaphore,
-    frames: [Frame; FRAMES_IN_FLIGHT],
+    present: Option<Present>,
     queue: Queue,
-    frame_in_flight: usize,
-    frame_counter: u64,
     transfer_queue: Option<Queue>,
     present_queue: Option<Queue>,
     allocator: Mutex<Allocator>,
 }
 
+impl Debug for Ctx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write(f, format_args!("device: there, physical_device: {:?}, present: {:?}, queue: {:?}, transfer_queue: {:?}, present_queue: {:?}, allocator: {:?}", self.physical_device, self.present, self.queue, self.transfer_queue, self.present_queue, self.allocator))
+    }
+}
+
+#[derive(Debug)]
+pub struct Present {
+    frame_counter: AtomicU64,
+    surface: Surface,
+    swapchain: Swapchain,
+    timeline: vk::Semaphore,
+    frames: [Frame; FRAMES_IN_FLIGHT],
+}
+
 impl Ctx {
     pub fn device() -> &'static Device {
-        &STATE.get().unwrap().device
+        &STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().device
     }
-    pub fn physical_device() -> &'static Device {
-        &STATE.get().unwrap().physical_device
+    pub fn physical_device() -> &'static PhysicalDevice {
+        &STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().physical_device
     }
     pub fn queue() -> &'static Queue {
-        STATE.get().unwrap().queue
+        &STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().queue
     }
     pub fn transfer_queue() -> &'static Queue {
-        let state = STATE.get().unwrap();
-        &state.transfer_queue.unwrap_or(state.queue)
+        let state = STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap();
+        state.transfer_queue.as_ref().unwrap_or(&state.queue)
     }
     pub fn present_queue() -> &'static Queue {
-        let state = STATE.get().unwrap();
-        &state.present_queue.unwrap_or(state.queue)
+        let state = STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap();
+        state.present_queue.as_ref().unwrap_or(&state.queue)
     }
     pub fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        STATE.get().unwrap().allocator.lock().unwrap()
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().allocator.lock().unwrap()
     }
-    pub fn surface() -> &'static Surface {
-        &STATE.get().unwrap().surface
+    pub fn surface() -> Option< &'static Surface> {
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| &p.surface)
+    }
+    pub fn swapchain() -> Option< &'static Swapchain> {
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| &p.swapchain)
+    }
+    pub fn window_width() -> Option<u32> {
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.size[0])
+    }
+    pub fn window_height() -> Option<u32> {
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.size[1])
     }
 
-    pub fn next_frame<'a, F: FnOnce(&'a vk::CommandBuffer) -> Result<()>>(func: F) -> Result<()> {
-        STATE.get_mut().unwrap().frame_in_flight = (STATE.get().unwrap().frame_in_flight + 1) % FRAMES_IN_FLIGHT;
-        let s = STATE.get().unwrap();
-        let f = &s.frames[s.frame_in_flight as usize];
+    pub fn current_frame() -> u64 {
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.frame_counter.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0)
+    }
+
+
+    pub fn next_frame<'a, F: FnMut(&'a vk::CommandBuffer, usize) -> Result<()>>(func: &mut F) -> Result<()> {
+        let s = STATE.get().unwrap().present.as_ref().ok_or(anyhow!("No Present Context")).unwrap();
+        let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let frame_in_flight = (frame +1) % FRAMES_IN_FLIGHT as u64;
+        let f = &s.frames[frame_in_flight as usize];
         unsafe {
             Ctx::device().wait_for_fences(&[f.fence], true, u64::MAX)?;
-            Ctx::device().device.reset_fences(&[f.fence])?;
-            Ctx::device().device.reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())?;
+            Ctx::device().reset_fences(&[f.fence])?;
+            Ctx::device().reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())?;
         }
 
         let (image_index, _suboptimal) = unsafe {
-            Functions::acquire_next_image(s.swapchain.handle, u64::MAX, f.image_available, vk::Fence::null())
+            Functions::swapchain().unwrap().acquire_next_image(s.swapchain.handle, u64::MAX, f.image_available, vk::Fence::null())
         }?;
 
-        f.cmd.record(func)?;
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { Ctx::device()
+                    .begin_command_buffer(f.cmd.handle, &begin_info) }?;
+        let result = func(&f.cmd.handle, image_index as usize);
+        unsafe { Ctx::device().end_command_buffer(f.cmd.handle)? };
 
-        STATE.get_mut().unwrap().frame_counter += 1;
+        s.frame_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
         let waits = [
             vk::SemaphoreSubmitInfo {
                 semaphore: f.image_available,
@@ -84,7 +115,7 @@ impl Ctx {
             }
         ];
 
-        let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(f.gcmd);
+        let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(f.cmd.handle);
         let sig_render_finished = vk::SemaphoreSubmitInfo {
                 semaphore: f.render_finished,
                 stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -93,7 +124,7 @@ impl Ctx {
 
         let sig_graphics_timeline = vk::SemaphoreSubmitInfo {
                 semaphore: s.timeline,
-                value: s.frame_counter,
+                value: frame as u64,
                 stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
                 ..Default::default()
             };
@@ -105,7 +136,7 @@ impl Ctx {
             .command_buffer_infos(std::slice::from_ref(&cb_info))
             .signal_semaphore_infos(&signals);
 
-        unsafe { Ctx::device().queue_submit2(Ctx::queue(), std::slice::from_ref(&submit), f.fence)?; }
+        unsafe { Ctx::device().queue_submit2(Ctx::queue().handle, std::slice::from_ref(&submit), f.fence)?; }
 
         let swapchains = [s.swapchain.handle];
         let indices = [image_index];
@@ -114,12 +145,15 @@ impl Ctx {
             .wait_semaphores(&wait_sems)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        unsafe { Functions::swapchain().queue_present(Ctx::present_queue(), &present)?; }
+        unsafe { Functions::swapchain().unwrap().queue_present(Ctx::present_queue().handle, &present)?; }
+        Ok(())
     }
 
-    pub(super) fn init(display_handle: &dyn HasDisplayHandle, window_handle: &dyn HasWindowHandle) -> Result<()> {
-        FUNCTIONS.set(Functions::default())?;
-        FUNCTIONS.get_mut()?.entry = unsafe { Entry::load()? };
+    pub(super) fn init<T: HasWindowHandle+ HasDisplayHandle>(window: Option<&T>, enable_validation: bool) -> Result<()> {
+        if STATE.get().is_some() {
+            return Ok(())
+        }
+        let entry = unsafe { Entry::load()? };
 
         let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let layer_names = unsafe {
@@ -132,35 +166,39 @@ impl Ctx {
             .map(|raw_name| raw_name.as_ptr())
             .collect();
 
-        let mut instance_extensions = ash_window::enumerate_required_extensions(
-            display_handle.display_handle().unwrap().into(),
-        )
-        .unwrap()
-        .to_vec();
-
-        let mut instance_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_extension_names(&instance_extensions);
+        let mut instance_extensions = if let Some(window) = window {
+            ash_window::enumerate_required_extensions(window.display_handle().unwrap().into())
+            .unwrap()
+            .to_vec()
+        }else{
+            vec![]
+        };
 
         let mut features = Features::default();
+        features.present = window.is_some();
+        features.debug_utils = false;
         #[cfg(debug_assertions)]
         {
-            features.debug_utils = true;
+            features.debug_utils = enable_validation;
         }
-
+        let mut validation_features;
+        let mut instance_info = vk::InstanceCreateInfo::default();
         if features.debug_utils {
             instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
-            let mut validation_features = vk::ValidationFeaturesEXT::default()
+            validation_features = vk::ValidationFeaturesEXT::default()
                 .enabled_validation_features(&[vk::ValidationFeatureEnableEXT::DEBUG_PRINTF]);
             instance_info = instance_info
                 .enabled_layer_names(&layers_names_raw)
                 .push_next(&mut validation_features);
         }
+        instance_info = instance_info
+            .application_info(&app_info)
+            .enabled_extension_names(&instance_extensions);
         
-        FUNCTIONS.get_mut()?.instance = unsafe { Functions::entry().create_instance(&instance_info, None)? };
-        
+        let instance = unsafe { entry.create_instance(&instance_info, None)? };
+        let mut instance_debug_utils = None;
         if features.debug_utils {
-            FUNCTIONS.get_mut()?.debug_utils_loader = debug_utils::Instance::new(&Functions::entry(), Functions::instance());
+            instance_debug_utils = Some(debug_utils::Instance::new(&entry, &instance));
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
                     vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -174,47 +212,62 @@ impl Ctx {
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
                         | vk::DebugUtilsMessageTypeFlagsEXT::DEVICE_ADDRESS_BINDING,
                 )
-                .pfn_user_callback(Some(Self::vulkan_debug_callback));
+                .pfn_user_callback(Some(vulkan_debug_callback));
             unsafe {
-                Functions::debug_utils()
+                instance_debug_utils
+                    .as_ref()
+                    .unwrap()
                     .create_debug_utils_messenger(&debug_info, None)
                     .unwrap()
             };
         }
 
-        let surface = unsafe {
+        let surface = if let Some(window) = window {
+            Some(unsafe {
             ash_window::create_surface(
-                Functions::entry(),
-                Functions::instance(),
-                display_handle.display_handle().unwrap().into(),
-                window_handle.window_handle().unwrap().into(),
+                &entry,
+                &instance,
+                window.display_handle().unwrap().into(),
+                window.window_handle().unwrap().into(),
                 None,
             )
         }
-        .unwrap();
+        .unwrap())}
+        else {
+            None
+        };
     
-        FUNCTIONS.get_mut()?.surface = ash::khr::surface::Instance::new(&Functions::entry(), &Functions::instance());
+        let surface_fn = if window.is_some() {
+            Some(ash::khr::surface::Instance::new(&entry, &instance))
+        }else {
+            None
+        };
         
-        let physical_devices = PhysicalDevice::enumerate_physical_devices(&surface)?;
+        let physical_devices = PhysicalDevice::enumerate_physical_devices(surface.as_ref(), &instance, surface_fn.as_ref())?;
         let (physical_device, graphics_queue_family, present_queue_family, transfer_queue_family) =
-            PhysicalDevice::select_suitable_physical_device(physical_devices.as_slice())?;
+            PhysicalDevice::select_suitable_physical_device(physical_devices.as_slice(), &mut features)?;
 
         let mut queue_families = vec![graphics_queue_family.index];
-        if let Some(present_queue_family) = present_queue_family {
+        if let Some(present_queue_family) = &present_queue_family {
             queue_families.push(present_queue_family.index);
         }
-        if let Some(transfer_queue_family) = transfer_queue_family {
+        if let Some(transfer_queue_family) = &transfer_queue_family {
             queue_families.push(transfer_queue_family.index);
         }
 
         let device = create_device(
-            &queue_families,
-            &features,
+            queue_families,
             &physical_device,
+            &features,
+            &instance,
         )?;
-
+        let mut debug_utils = None;
+        if features.device_debug_utils {
+            debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
+        }
+        
         let allocator = Allocator::new(&AllocatorCreateDesc {
-            instance: Functions::instance().clone(),
+            instance: instance.clone(),
             device: device.clone(),
             physical_device: physical_device.handel,
             debug_settings: AllocatorDebugSettings {
@@ -228,25 +281,89 @@ impl Ctx {
             allocation_sizes: AllocationSizes::new(64, 64),
         })?;
 
-        STATE.set(Self {
-            allocator,
-            device,
-            physical_device,
-            ..Default::default()
-        })?;
-        
-        let state = STATE.get_mut().unwrap();
-        state.surface = Surface::new(surface);
-        state.swapchain = Swapchain::new()?;
-        state.queue = Queue::new(0);
-        state.present_queue = Queue::new(1);
-        state.transfer_queue = Queue::new(2);
+        let mut frames: [Frame; FRAMES_IN_FLIGHT] = unsafe {MaybeUninit::zeroed().assume_init()};
+        for i in 0..FRAMES_IN_FLIGHT {
+            let create_info = vk::SemaphoreCreateInfo::default();
+            let image_availible_semaphore =
+                unsafe { device.create_semaphore(&create_info, None).unwrap() };
+            let render_finished_semaphore =
+                unsafe { device.create_semaphore(&create_info, None).unwrap() };
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)? };
+            let pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo {
+                queue_family_index: graphics_queue_family.index,
+                ..Default::default()
+            }, None)? };
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .command_buffer_count(1)
+                .level(vk::CommandBufferLevel::PRIMARY);
+            let cmd = unsafe { device.allocate_command_buffers(&allocate_info) }.unwrap()[0];
+            frames[i] = Frame {
+                image_available: image_availible_semaphore,
+                render_finished: render_finished_semaphore,
+                fence,
+                pool,
+                cmd: CommandBuffer { handle: cmd },
+                ticket: 0,
+            }
+        }
 
+        let surface = if let Some(surface) = surface {
+            Some(Surface::new(surface, &physical_device, &surface_fn.as_ref().unwrap()))
+        }else {
+            None
+        };
+        let mut info = vk::SemaphoreTypeCreateInfo {
+            semaphore_type: vk::SemaphoreType::TIMELINE,
+            initial_value: 0,
+            ..Default::default()
+        };
+        let swapchain_fn = if window.is_some() {
+            Some(ash::khr::swapchain::Device::new(&instance, &device))
+        }else {
+            None
+        };
+
+        let present = if window.is_some() {
+            Some(Present {
+                swapchain: Swapchain::new(&surface.as_ref().unwrap(), &device, graphics_queue_family.index, present_queue_family.as_ref().map(|e| e.index).unwrap_or(graphics_queue_family.index), &swapchain_fn.as_ref().unwrap(), debug_utils.as_ref())?,
+                frame_counter: AtomicU64::new(0),
+                timeline: unsafe {
+                    device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut info), None)?
+                },
+                surface: surface.unwrap(),
+                frames,
+            })
+        } else {
+            None
+        };
+
+        let ctx = Self {
+            allocator: Mutex::new(allocator),
+            queue: Queue::new(&device, graphics_queue_family.index)?,
+            present_queue: if let Some(present) = present_queue_family {Some(Queue::new(&device, present.index).unwrap())}else{None},
+            transfer_queue: if let Some(transfer) = transfer_queue_family {Some(Queue::new(&device, transfer.index).unwrap())}else{None},
+            physical_device: physical_device,
+            device,
+            present,
+        };
+        STATE.set(ctx).unwrap();
+        FUNCTIONS.set(Functions {
+            mesh: if features.mesh {Some(ash::ext::mesh_shader::Device::new(&instance, &Self::device()))} else {None},
+            raytracing_pipeline: if features.raytracing {Some(ash::khr::ray_tracing_pipeline::Device::new(&instance, &Self::device()))} else {None},
+            acceleration_structure: if features.raytracing {Some(ash::khr::acceleration_structure::Device::new(&instance, &Self::device()))} else {None},
+            instance,
+            entry,
+            surface: surface_fn,
+            swapchain: swapchain_fn,
+            debug_utils: instance_debug_utils,
+            device_debug_utils: debug_utils,
+        });
         Ok(())
     }
 }
 
-static STATE: OnceLock<Ctx> = OnceLock::new();
+static STATE: OnceLock<Ctx> = OnceLock::new(); 
 
 unsafe extern "system" fn vulkan_debug_callback(
     flag: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -271,44 +388,46 @@ unsafe extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Features {
+    pub present: bool,
+    pub device_debug_utils: bool,
     pub debug_utils: bool,
     pub mesh: bool,
     pub raytracing: bool,
 }
 impl Features {
-    pub fn extensions(&self) -> Vec<&'static str> {
+    pub fn extensions(&self) -> Vec<&CStr> {
         let mut extensions = vec![
-            ash::khr::swapchain::NAME,
             ash::khr::get_memory_requirements2::NAME,
-            ash::khr::shader_float_controls::NAME,
             ash::khr::synchronization2::NAME,
             ash::ext::descriptor_indexing::NAME,
             ash::ext::extended_dynamic_state3::NAME,
             ash::ext::scalar_block_layout::NAME,
         ];
+        if self.present {
+            extensions.push(ash::khr::swapchain::NAME);
+        }
         if self.debug_utils {
-            extensions.push(ash::ext::debug_utils::NAME);
             extensions.push(ash::khr::shader_non_semantic_info::NAME)
+        }
+        if self.device_debug_utils {
+            extensions.push(ash::ext::debug_utils::NAME);
         }
         if self.mesh {
             extensions.push(ash::ext::mesh_shader::NAME);
         }
         if self.raytracing {
             extensions.push(ash::khr::ray_tracing_pipeline::NAME);
+            extensions.push(ash::khr::shader_float_controls::NAME);
+            extensions.push(ash::khr::deferred_host_operations::NAME);
             extensions.push(ash::khr::acceleration_structure::NAME);
         }
         extensions
     }
 
-    fn features(&self) -> vk::PhysicalDeviceFeatures {
-
-        let mut acceleration_struct_feature: vk::PhysicalDeviceAccelerationStructureFeaturesKHR;
-        let mut ray_tracing_feature: vk::PhysicalDeviceRayTracingPipelineFeaturesKHR;
-        let mut mesh_shading: vk::PhysicalDeviceMeshShaderFeaturesEXT;
-
-        let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default()
+    fn features<'a>(&self, vk12: &'a mut vk::PhysicalDeviceVulkan12Features, vk13: &'a mut vk::PhysicalDeviceVulkan13Features, dn3: &'a mut vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT, dy2: &'a mut vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT, mesh: &'a mut vk::PhysicalDeviceMeshShaderFeaturesEXT, ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR, acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR) -> vk::PhysicalDeviceFeatures2<'a> {
+        *vk12 = vk12
             .runtime_descriptor_array(true)
             .buffer_device_address(true)
             .descriptor_indexing(true)
@@ -322,7 +441,7 @@ impl Features {
             .timeline_semaphore(true)
             .scalar_block_layout(true)
             .shader_int8(true);
-        let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default()
+        *vk13 = vk13
             .dynamic_rendering(true)
             .maintenance4(true)
             .synchronization2(true);
@@ -332,63 +451,65 @@ impl Features {
             .shader_int16(true)
             .vertex_pipeline_stores_and_atomics(true);
 
-        let mut dynamic_state = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default()
+        *dn3 = dn3
             .extended_dynamic_state3_depth_clamp_enable(true)
             .extended_dynamic_state3_polygon_mode(true)
             .extended_dynamic_state3_logic_op_enable(true)
             .extended_dynamic_state3_color_blend_equation(true)
             .extended_dynamic_state3_color_write_mask(true)
             .extended_dynamic_state3_color_blend_enable(true);
-        let mut dynamic_state2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default()
+        *dy2 = dy2
             .extended_dynamic_state2_logic_op(true);
 
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(phfeatures)
-            .push_next(&mut vulkan_12_features)
-            .push_next(&mut vulkan_13_features)
-            .push_next(&mut dynamic_state)
-            .push_next(&mut dynamic_state2);
+            .push_next(vk12)
+            .push_next(vk13)
+            .push_next(dy2)
+            .push_next(dn3);
 
         if self.mesh {
-            mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+            *mesh = mesh
                 .task_shader(true)
                 .mesh_shader(true);
-            features = features.push_next(&mut mesh_shading);
+            features = features.push_next(mesh);
         }
         if self.raytracing {
-            ray_tracing_feature = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
+            *ray = ray
                     .ray_tracing_pipeline(true);
-            acceleration_struct_feature = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+            *acc = acc
                     .acceleration_structure(true)
                     .descriptor_binding_acceleration_structure_update_after_bind(true);
-            features = features.push_next(&mut ray_tracing_feature)
-                    .push_next(&mut acceleration_struct_feature);
+            features = features.push_next(ray)
+                    .push_next(acc);
         }
         features
     }
 }
 
 
-#[derive(Debug, Default)]
 pub struct Functions {
     instance: ash::Instance,
     entry: ash::Entry,
-    surface: ash::khr::surface::Instance,
-    swapchain: ash::khr::swapchain::Device,
-    debug_utils: Option<ash::ext::debug_utils::Device>,
+    surface: Option<ash::khr::surface::Instance>,
+    swapchain: Option<ash::khr::swapchain::Device>,
+    debug_utils: Option<ash::ext::debug_utils::Instance>,
+    device_debug_utils: Option<ash::ext::debug_utils::Device>,
     mesh: Option<ash::ext::mesh_shader::Device>,
     raytracing_pipeline: Option<ash::khr::ray_tracing_pipeline::Device>,
     acceleration_structure: Option<ash::khr::acceleration_structure::Device>,
 }
 
+
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 
 impl Functions {
-    pub fn surface() -> &'static ash::khr::surface::Instance { &get().surface }
+    pub fn surface() -> Option<&'static ash::khr::surface::Instance> { get().surface.as_ref() }
     pub fn instance() -> &'static ash::Instance { &get().instance }
     pub fn entry() -> &'static ash::Entry { &get().entry }
-    pub fn swapchain() -> &'static ash::khr::swapchain::Device { get().swapchain.as_ref() }
-    pub fn debug_utils() -> Option<&'static ash::ext::debug_utils::Instance> { get().debug_utils.as_ref() }
+    pub fn swapchain() -> Option<&'static ash::khr::swapchain::Device> { get().swapchain.as_ref() }
+    pub fn debug_utils() -> Option<&'static ash::ext::debug_utils::Device> { get().device_debug_utils.as_ref() }
+    pub fn instance_debug_utils() -> Option<&'static ash::ext::debug_utils::Instance> { get().debug_utils.as_ref() }
     pub fn mesh() -> Option<&'static ash::ext::mesh_shader::Device> { get().mesh.as_ref() }
     pub fn raytracing_pipeline() -> Option<&'static ash::khr::ray_tracing_pipeline::Device> { get().raytracing_pipeline.as_ref() }
     pub fn acceleration_structure() -> Option<&'static ash::khr::acceleration_structure::Device> { get().acceleration_structure.as_ref() }
@@ -407,7 +528,7 @@ impl Functions {
         }
     }
 
-    pub fn cmd_start_label(&self, cmd: &vk::CommandBuffer, name: &str) {
+    pub fn cmd_start_label(cmd: &vk::CommandBuffer, name: &str) {
         if let Some(debug_utils) = Self::debug_utils() {
             let name = format!("{}\0", name);
             let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
@@ -418,7 +539,7 @@ impl Functions {
             };
         }
     }
-    pub fn cmd_insert_label(&self, cmd: &vk::CommandBuffer, name: &str) {
+    pub fn cmd_insert_label(cmd: &vk::CommandBuffer, name: &str) {
         if let Some(debug_utils) = Self::debug_utils() {
             let name = format!("{}\0", name);
             let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
@@ -429,12 +550,14 @@ impl Functions {
             };
         }
     }
-    pub fn cmd_end_label(&self, cmd: &vk::CommandBuffer) {
-        unsafe { self.debug_utils.cmd_end_debug_utils_label(*cmd) };
+    pub fn cmd_end_label(cmd: &vk::CommandBuffer) {
+        if let Some(debug_utils) = Self::debug_utils() {
+            unsafe { debug_utils.cmd_end_debug_utils_label(*cmd) };
+        }
     }
 }
 fn get() -> &'static Functions {
-    unsafe { FUNCTIONS.get().unwrap() }
+    FUNCTIONS.get().unwrap()
 }
 
 
@@ -442,6 +565,7 @@ pub(super) fn create_device(
     mut queue_families: Vec<u32>,
     physical_device: &PhysicalDevice,
     features: &Features,
+    instance: &ash::Instance,
 ) -> Result<ash::Device> {
     let queue_priorities = [1.0f32];
     let queue_create_infos = {
@@ -462,14 +586,15 @@ pub(super) fn create_device(
         .map(|e| e.as_ptr() as *const i8)
         .collect::<Vec<_>>();
 
-    let mut features = features.features();
+    let (mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) = Default::default();
+    let mut features = features.features(&mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc);
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
         .enabled_extension_names(device_extensions_as_ptr.as_slice())
         .push_next(&mut features);
 
     let device = unsafe {
-        Functions::instance()
+        instance
             .create_device(physical_device.handel, &device_create_info, None)
             .unwrap()
     };

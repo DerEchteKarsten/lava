@@ -1,4 +1,4 @@
-use std::{ffi::c_void, fmt::Debug, ptr::NonNull, sync::{Mutex, Arc}};
+use std::{ffi::c_void, fmt::Debug, mem::MaybeUninit, ops::DerefMut, ptr::NonNull, sync::{Arc, Mutex}};
 
 use anyhow::{Error, Result};
 use ash::vk;
@@ -7,21 +7,30 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc},
     MemoryLocation,
 };
-use image::{DynamicImage, GenericImageView};
 
-use crate::renderer::bindless::{BindlessDescriptorHeap, DescriptorResourceHandle};
+use crate::{bindless::{BindlessDescriptorHeap, DescriptorHandle}, state::Ctx};
 
 use super::{
     image::{get_aspects, Image, ImageType},
-    Context,
 };
 
+
+#[derive(Debug)]
+struct MAllocation(Allocation);
+
+impl Drop for MAllocation {
+    fn drop(&mut self) {
+        let mut allocator = Ctx::allocator();
+        (*allocator).free(std::mem::replace(&mut self.0, unsafe { std::mem::zeroed() })).unwrap();
+    }
+}
+
 #[derive(Derivative)]
-#[derivative(Eq, PartialEq, Debug, Clone, Copy)]
+#[derivative(Eq, PartialEq, Debug, Clone)]
 pub struct Buffer {
     pub buffer: vk::Buffer,
     #[derivative(PartialEq = "ignore")]
-    pub allocation: Arc<Mutex<Allocation>>,
+    pub allocation: Arc<Mutex<MAllocation>>,
     pub address: vk::DeviceAddress,
     pub size: vk::DeviceSize,
     pub usage: vk::BufferUsageFlags,
@@ -34,18 +43,17 @@ impl Buffer {
         size: vk::DeviceSize,
         alignment: Option<u64>,
     ) -> Result<Self> {
-        let ctx = Context::get();
         let create_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS);
-        let buffer = unsafe { ctx.device.create_buffer(&create_info, None)? };
-        let mut requirements = unsafe { ctx.device.get_buffer_memory_requirements(buffer) };
+        let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
+        let mut requirements = unsafe { Ctx::device().get_buffer_memory_requirements(buffer) };
         if let Some(a) = alignment {
             requirements.alignment = a;
         }
 
         let allocation = {
-            let mut allocator = ctx.allocator.lock().unwrap();
+            let mut allocator = Ctx::allocator();
             (*allocator).allocate(&AllocationCreateDesc {
                 name: "buffer",
                 requirements,
@@ -56,15 +64,14 @@ impl Buffer {
         }?;
 
         unsafe {
-            ctx.device
-                .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?
+            Ctx::device().bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?
         };
         let addr_info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
 
         Ok(Self {
             buffer,
-            allocation: Some(Mutex::new(allocation)),
-            address: unsafe { ctx.device.get_buffer_device_address(&addr_info) },
+            allocation: Arc::new(Mutex::new(MAllocation(allocation))),
+            address: unsafe { Ctx::device().get_buffer_device_address(&addr_info) },
             size,
             usage,
         })
@@ -81,12 +88,10 @@ impl Buffer {
     pub fn copy_data_to_buffer<T: Copy>(&self, data: &[T]) -> Result<()> {
         let mut allocation = self
             .allocation
-            .as_ref()
-            .ok_or(Error::msg("Buffer not Owned"))?
             .lock()
             .unwrap();
 
-        presser::copy_from_slice_to_offset(data, &mut (*allocation), 0)?;
+        presser::copy_from_slice_to_offset(data, &mut (*allocation).0, 0)?;
 
         Ok(())
     }
@@ -94,11 +99,9 @@ impl Buffer {
     pub fn copy_data_to_buffer_offset<T: Copy>(&self, data: &[T], offset: u64) -> Result<()> {
         let mut allocation = self
             .allocation
-            .as_ref()
-            .ok_or(Error::msg("Buffer not Owned"))?
             .lock()
             .unwrap();
-        presser::copy_from_slice_to_offset(data, &mut (*allocation), offset as usize)?;
+        presser::copy_from_slice_to_offset(data, &mut (*allocation).0, offset as usize)?;
 
         Ok(())
     }
@@ -106,11 +109,9 @@ impl Buffer {
     pub fn copy_value_to_buffer_offset<T: Copy>(&self, data: &T, offset: u64) -> Result<()> {
         let mut allocation = self
             .allocation
-            .as_ref()
-            .ok_or(Error::msg("Buffer not Owned"))?
             .lock()
             .unwrap();
-        presser::copy_to_offset(data, &mut (*allocation), offset as usize)?;
+        presser::copy_to_offset(data, &mut (*allocation).0, offset as usize)?;
 
         Ok(())
     }
@@ -118,13 +119,11 @@ impl Buffer {
     pub fn copy_data_to_aligned_buffer<T: Copy>(&self, data: &[T], alignment: u32) -> Result<()> {
         let mut allocation = self
             .allocation
-            .as_ref()
-            .ok_or(Error::msg("Buffer not Owned"))?
             .lock()
             .unwrap();
         presser::copy_from_slice_to_offset_with_align(
             data,
-            &mut (*allocation),
+            &mut (*allocation).0,
             0,
             alignment as usize,
         )?;
@@ -132,88 +131,30 @@ impl Buffer {
         Ok(())
     }
 
-    pub fn destroy(&mut self) -> Result<()> {
-        let ctx = Context::get();
-        unsafe { ctx.device.destroy_buffer(self.buffer, None) };
-        let mut allocator = ctx.allocator.lock().unwrap();
-        let allocation = self
-            .allocation
-            .take()
-            .ok_or(Error::msg("Buffer not Owned"))?;
-
-        (*allocator).free(allocation.into_inner()?).unwrap();
-        Ok(())
-    }
+    // pub fn destroy(&mut self) -> Result<()> {
+    //     unsafe { Ctx::device().destroy_buffer(self.buffer, None) };
+    //     let mut allocator = Ctx::allocator();
+        
+    //     (*allocator).free((*self.allocation).into_inner().unwrap())?;
+    //     Ok(())
+    // }
 
     pub fn read<T: Clone>(&self, num_elements: usize) -> Result<Vec<T>> {
-        let allocation = self
-            .allocation
-            .as_ref()
-            .ok_or(Error::msg("Buffer not Owned"))?;
-        let allocation = allocation.lock().unwrap();
-        let slice = allocation.mapped_slice().unwrap();
+        let allocation = self.allocation.lock().unwrap();
+        let slice = (*allocation).0.mapped_slice().unwrap();
         let mut vec = Vec::new();
         vec.extend_from_slice(
             &unsafe { std::mem::transmute::<&[u8], &[T]>(slice) }[0..num_elements],
         );
         Ok(vec)
     }
-
-    // pub fn from_data_with_size<T: Copy>(
-    //     ctx: &mut Context,
-    //     usage: vk::BufferUsageFlags,
-    //     data: &[T],
-    //     size: u64,
-    // ) -> Result<Buffer> {
-    //     let staging_buffer = Self::new(
-    //         ctx,
-    //         vk::BufferUsageFlags::TRANSFER_SRC,
-    //         MemoryLocation::CpuToGpu,
-    //         size,
-    //     )?;
-    //     staging_buffer.copy_data_to_buffer(data)?;
-
-    //     let buffer = Self::new(
-    //         ctx,
-    //         usage | vk::BufferUsageFlags::TRANSFER_DST,
-    //         MemoryLocation::GpuOnly,
-    //         size,
-    //     )?;
-
-    //     ctx.execute_one_time_commands(|cmd_buffer| {
-    //         staging_buffer.copy(&ctx, cmd_buffer, &buffer);
-    //     })?;
-
-    //     staging_buffer.destroy(ctx);
-
-    //     Ok(buffer)
-    // }
-
-    // pub fn from_data<T: Copy>(
-    //     ctx: &mut Context,
-    //     usage: vk::BufferUsageFlags,
-    //     data: &[T],
-    // ) -> Result<Buffer> {
-    //     let size = size_of_val(data) as _;
-    //     Self::from_data_with_size(ctx, usage, data, size)
-    // }
 }
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct RawDynamicBuffer {
     pub buffer: vk::Buffer,
-    address: vk::DeviceAddress,
-    allocation: Option<Allocation>,
-}
-
-impl Clone for RawDynamicBuffer {
-    fn clone(&self) -> Self {
-        Self {
-            buffer: self.buffer,
-            address: self.address,
-            allocation: None,
-        }
-    }
+    pub address: vk::DeviceAddress,
+    allocation: Arc<Mutex<MAllocation>>,
 }
 
 #[derive(Clone)]
@@ -224,7 +165,30 @@ pub struct DynamicBuffer {
     pub size: u64,
     pub memory_location: MemoryLocation,
     pub override_alignment: Option<u64>,
-    pub bindless_handle: DescriptorResourceHandle,
+    pub bindless_handle: DescriptorHandle,
+}
+
+pub trait CopySrc {
+    fn to_vk(&self) -> vk::Buffer;
+    fn size(&self) -> u64;
+}
+
+impl CopySrc for Buffer {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn to_vk(&self) -> vk::Buffer {
+        self.buffer
+    }
+}
+
+impl CopySrc for DynamicBuffer {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn to_vk(&self) -> vk::Buffer {
+        self.buffer.buffer
+    }
 }
 
 impl DynamicBuffer {
@@ -236,7 +200,7 @@ impl DynamicBuffer {
     ) -> Result<Self> {
         let mut s = Self {
             memory_location,
-            buffer: RawDynamicBuffer::default(),
+            buffer: Self::create_buffer(capacity, usage, override_alignment)?,
             capacity,
             size: 0,
             usage: usage
@@ -244,27 +208,24 @@ impl DynamicBuffer {
                 | vk::BufferUsageFlags::TRANSFER_DST
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             override_alignment,
-            bindless_handle: DescriptorResourceHandle(0),
+            bindless_handle: DescriptorHandle(0),
         };
-        let buffer = s.create_buffer()?;
-        s.buffer = buffer;
         s.bindless_handle = BindlessDescriptorHeap::get().allocate_buffer_handle(&s);
         Ok(s)
     }
 
-    fn create_buffer(&mut self) -> Result<RawDynamicBuffer> {
-        let ctx = Context::get();
+    fn create_buffer(capacity: u64, usage: vk::BufferUsageFlags, override_alignment: Option<u64>) -> Result<RawDynamicBuffer> {
         let create_info = vk::BufferCreateInfo::default()
-            .size(self.capacity)
-            .usage(self.usage);
-        let buffer = unsafe { ctx.device.create_buffer(&create_info, None)? };
-        let mut requirements = unsafe { ctx.device.get_buffer_memory_requirements(buffer) };
-        if let Some(a) = self.override_alignment {
+            .size(capacity)
+            .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS);
+        let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
+        let mut requirements = unsafe { Ctx::device().get_buffer_memory_requirements(buffer) };
+        if let Some(a) = override_alignment {
             requirements.alignment = a;
         }
 
         let allocation = {
-            let mut allocator = ctx.allocator.lock().unwrap();
+            let mut allocator = Ctx::allocator();
             (*allocator).allocate(&AllocationCreateDesc {
                 name: "buffer",
                 requirements,
@@ -275,14 +236,14 @@ impl DynamicBuffer {
         }?;
 
         unsafe {
-            ctx.device
+            Ctx::device()
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?
         };
         let addr_info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
-        let address = unsafe { ctx.device.get_buffer_device_address(&addr_info) };
+        let address = unsafe { Ctx::device().get_buffer_device_address(&addr_info) };
         Ok(RawDynamicBuffer {
             address,
-            allocation: Some(allocation),
+            allocation: Arc::new(Mutex::new(MAllocation(allocation))),
             buffer,
         })
     }
@@ -291,14 +252,13 @@ impl DynamicBuffer {
         let old_size = self.size;
         self.size = size;
         if size > self.capacity {
-            let ctx = Context::get();
             self.capacity = self.size.next_power_of_two();
 
-            let buffer = self.create_buffer()?;
+            let buffer = Self::create_buffer(self.capacity, self.usage, self.override_alignment)?;
             if old_size != 0 {
-                ctx.execute_one_time_commands(|cmd| {
+                Ctx::transfer_queue().execute_command_wait(|cmd| {
                     unsafe {
-                        ctx.device.cmd_copy_buffer(
+                        Ctx::device().cmd_copy_buffer(
                             *cmd,
                             self.buffer.buffer,
                             buffer.buffer,
@@ -311,56 +271,7 @@ impl DynamicBuffer {
                     };
                 })?;
             }
-            unsafe { ctx.device.destroy_buffer(self.buffer.buffer, None) };
-            {
-                let mut allocator = ctx.allocator.lock().unwrap();
-                (*allocator)
-                    .free(
-                        self.buffer
-                            .allocation
-                            .take()
-                            .ok_or(Error::msg("Buffer not Owned"))?,
-                    )
-                    .unwrap();
-            }
-            self.buffer = buffer;
-            BindlessDescriptorHeap::get().update_buffer_handle(self, self.bindless_handle);
-        }
-        Ok(())
-    }
-
-    pub fn cmd_grow_to_size(&mut self, size: u64, cmd: &vk::CommandBuffer) -> Result<()> {
-        let old_size = self.size;
-        self.size = size;
-        if size > self.capacity {
-            let ctx = Context::get();
-            self.capacity = self.size.next_power_of_two();
-
-            let buffer = self.create_buffer()?;
-            unsafe {
-                ctx.device.cmd_copy_buffer(
-                    *cmd,
-                    self.buffer.buffer,
-                    buffer.buffer,
-                    &[vk::BufferCopy {
-                        size: old_size,
-                        src_offset: 0,
-                        dst_offset: 0,
-                    }],
-                )
-            };
-            unsafe { ctx.device.destroy_buffer(self.buffer.buffer, None) };
-            {
-                let mut allocator = ctx.allocator.lock().unwrap();
-                (*allocator)
-                    .free(
-                        self.buffer
-                            .allocation
-                            .take()
-                            .ok_or(Error::msg("Buffer not Owned"))?,
-                    )
-                    .unwrap();
-            }
+            unsafe { Ctx::device().destroy_buffer(self.buffer.buffer, None) };
             self.buffer = buffer;
             BindlessDescriptorHeap::get().update_buffer_handle(self, self.bindless_handle);
         }
@@ -369,16 +280,16 @@ impl DynamicBuffer {
 
     pub fn copy_from(
         &mut self,
-        src_buffer: &impl BufferType,
+        src_buffer: &impl CopySrc,
         offset: u64,
         size: u64,
-    ) -> Result<()> {
+    ) {
         if self.size < size + offset {
-            self.grow_to_size(size + offset)?;
+            self.grow_to_size(size + offset);
         }
-        Context::get().execute_one_time_commands(|cmd| {
+        Ctx::transfer_queue().execute_command_wait(|cmd| {
             unsafe {
-                Context::get().device.cmd_copy_buffer(
+                Ctx::device().cmd_copy_buffer(
                     *cmd,
                     src_buffer.to_vk(),
                     self.buffer.buffer,
@@ -389,11 +300,11 @@ impl DynamicBuffer {
                     }],
                 )
             };
-        })
+        }).unwrap();
     }
     pub fn copy_from_cmd(
         &mut self,
-        src_buffer: &impl BufferType,
+        src_buffer: &impl CopySrc,
         cmd: &vk::CommandBuffer,
         offset: u64,
         size: u64,
@@ -402,7 +313,7 @@ impl DynamicBuffer {
             self.grow_to_size(size + offset)?;
         }
         unsafe {
-            Context::get().device.cmd_copy_buffer(
+            Ctx::device().cmd_copy_buffer(
                 *cmd,
                 src_buffer.to_vk(),
                 self.buffer.buffer,
@@ -439,8 +350,7 @@ impl DynamicBuffer {
                 staging_buffer,
                 offset + i as u64 * staging_buffer.size as u64,
                 (staging_buffer.size as u64).min(size as u64),
-            )
-            .unwrap();
+            );
         }
     }
 }

@@ -6,13 +6,10 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc},
     MemoryLocation,
 };
-use image::{DynamicImage, GenericImageView};
 
-use super::{
-    buffer::{Buffer, BufferType},
-    Context,
-};
 use derivative::Derivative;
+
+use crate::state::Ctx;
 
 #[derive(Derivative)]
 #[derivative(Eq, PartialEq, Debug)]
@@ -85,14 +82,13 @@ pub trait ImageType {
     fn get_view(&self) -> vk::ImageView;
     fn copy(
         &self,
-        ctx: &Context,
         cmd: &vk::CommandBuffer,
         other: &impl ImageType,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
         unsafe {
-            ctx.device.cmd_copy_image(
+            Ctx::device().cmd_copy_image(
                 *cmd,
                 self.get_image(),
                 src_layout,
@@ -124,14 +120,13 @@ pub trait ImageType {
 
     fn blit(
         &self,
-        ctx: &Context,
         cmd: &vk::CommandBuffer,
         other: &impl ImageType,
         src_layout: vk::ImageLayout,
         dst_layout: vk::ImageLayout,
     ) {
         unsafe {
-            ctx.device.cmd_blit_image(
+            Ctx::device().cmd_blit_image(
                 *cmd,
                 self.get_image(),
                 src_layout,
@@ -414,7 +409,6 @@ impl Image {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        let ctx = Context::get();
         let extent = vk::Extent3D {
             width,
             height,
@@ -432,13 +426,10 @@ impl Image {
             .usage(usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
-        let image = unsafe { ctx.device.create_image(&image_info, None)? };
-        let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
+        let image = unsafe { Ctx::device().create_image(&image_info, None)? };
+        let requirements = unsafe { Ctx::device().get_image_memory_requirements(image) };
 
-        let allocation = ctx
-            .allocator
-            .lock()
-            .unwrap()
+        let allocation = Ctx::allocator()
             .allocate(&AllocationCreateDesc {
                 name: "image",
                 requirements,
@@ -448,14 +439,14 @@ impl Image {
             })?;
 
         unsafe {
-            ctx.device
+            Ctx::device()
                 .bind_image_memory(image, allocation.memory(), allocation.offset())?
         };
         let extent = vk::Extent2D {
             height: extent.height,
             width: extent.width,
         };
-        let view = Self::view(&ctx.device, extent, image, format);
+        let view = Self::view(&Ctx::device(), extent, image, format);
 
         Ok(Self {
             usage,
