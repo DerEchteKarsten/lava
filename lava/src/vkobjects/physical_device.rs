@@ -225,13 +225,13 @@ impl PhysicalDevice {
                         || device.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU)
             })
             .ok_or_else(|| anyhow::anyhow!("Could not find a suitable device"))?;
-        println!("Using device: {}", device.name);
-        println!("Device type: {:?}", device.device_type);
-        println!("Features are: {:?}", device.supported_features);
-        println!("Extentions: {:#?}", device.supported_features.extensions());
+        log::info!("Using device: {}", device.name);
+        log::info!("Device type: {:?}", device.device_type);
+        log::info!("Features are: {:?}", device.supported_features);
+        log::info!("Extentions: {:#?}", device.supported_features.extensions());
         let unsuported_ext = device.unsupports_extensions(&device.supported_features.extensions());
         if !unsuported_ext.is_empty() {
-            println!("Unsuported Extensions: {:#?}", unsuported_ext);
+            log::info!("Unsuported Extensions: {:#?}", unsuported_ext);
         }
         assert!(unsuported_ext.is_empty(), "device does not support required extensions");
         features.device_debug_utils = device.supported_features.device_debug_utils && features.debug_utils;

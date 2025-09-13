@@ -8,12 +8,6 @@ use crate::{state::{Ctx, Functions}, vkobjects::{queue::Queue, surface::Surface}
 use super::{image::Image};
 
 #[derive(Debug)]
-pub struct FrameResources {
-    pub image_availible_semaphore: vk::Semaphore,
-    pub render_finished_semaphore: vk::Semaphore,
-}
-
-#[derive(Debug)]
 pub struct Swapchain {
     pub size: [u32; 2],
     pub handle: vk::SwapchainKHR,
@@ -21,11 +15,10 @@ pub struct Swapchain {
     pub color_space: vk::ColorSpaceKHR,
     pub present_mode: vk::PresentModeKHR,
     pub images: Vec<Image>,
-    pub frame_resources: [FrameResources; FRAMES_IN_FLIGHT],
 }
 
 impl Swapchain {
-    pub fn new(surface: &Surface, device: &Device, graphics_queue: u32, present_queue: u32, swapchain_fn: &ash::khr::swapchain::Device, debug_utils: Option<&ash::ext::debug_utils::Device>) -> Result<Self> {
+    pub fn new(surface: &Surface, device: &Device, graphics_queue: u32, present_queue: u32, swapchain_fn: &ash::khr::swapchain::Device, debug_utils: Option<&ash::ext::debug_utils::Device>, old: Option<vk::SwapchainKHR>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = {
             let formats = &surface.formats;
             if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
@@ -53,7 +46,12 @@ impl Swapchain {
         };
 
         let extent = {
-            if surface.capabilities.current_extent.width != std::u32::MAX {
+            if let Some(size) = size {
+                vk::Extent2D {
+                    height: size[0],
+                    width: size[1]
+                }
+            }else if surface.capabilities.current_extent.width != std::u32::MAX {
                 surface.capabilities.current_extent
             } else {
                surface.capabilities.min_image_extent
@@ -89,6 +87,10 @@ impl Swapchain {
                 builder.image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             };
 
+            if let Some(old) = old {
+                builder = builder.old_swapchain(old);
+            }
+
             builder
                 .pre_transform(surface.capabilities.current_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -122,28 +124,12 @@ impl Swapchain {
             })
             .collect::<Vec<_>>();
 
-        let mut frame_resources: [FrameResources; FRAMES_IN_FLIGHT] =
-            unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-
-        for i in 0..FRAMES_IN_FLIGHT {
-            let create_info = vk::SemaphoreCreateInfo::default();
-            let image_availible_semaphore =
-                unsafe { device.create_semaphore(&create_info, None).unwrap() };
-            let render_finished_semaphore =
-                unsafe { device.create_semaphore(&create_info, None).unwrap() };
-            frame_resources[i] = FrameResources {
-                image_availible_semaphore,
-                render_finished_semaphore,
-            }
-        }
-
         Ok(Self {
             handle,
             format: format.format,
             color_space: format.color_space,
             present_mode,
             images,
-            frame_resources,
             size: [extent.width, extent.height],
         })
     }

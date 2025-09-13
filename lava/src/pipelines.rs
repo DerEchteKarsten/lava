@@ -168,7 +168,7 @@ impl RasterPipelineHandle {
                 .image_view(depth_attachment.view)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 0.0,
+                        depth: 1.0,
                         stencil: 0,
                     },
                 })
@@ -182,7 +182,7 @@ impl RasterPipelineHandle {
                 .image_view(stencil_attachment.view)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 0.0,
+                        depth: 1.0,
                         stencil: 0,
                     },
                 })
@@ -501,8 +501,8 @@ impl PipelineCache {
                 let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
                     .depth_bounds_test_enable(false)
                     .depth_compare_op(vk::CompareOp::GREATER)
-                    .depth_test_enable(true)
-                    .depth_write_enable(true)
+                    .depth_test_enable(false)
+                    .depth_write_enable(false)
                     .min_depth_bounds(1.0)
                     .max_depth_bounds(0.0)
                     .stencil_test_enable(false);

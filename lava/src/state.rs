@@ -20,6 +20,7 @@ pub struct Frame {
 }
 
 pub struct Ctx {
+    features: Features,
     device: Device,
     physical_device: PhysicalDevice,
     present: Option<Present>,
@@ -39,7 +40,7 @@ impl Debug for Ctx {
 pub struct Present {
     frame_counter: AtomicU64,
     surface: Surface,
-    swapchain: Swapchain,
+    swapchain: Mutex<Swapchain>,
     timeline: vk::Semaphore,
     frames: [Frame; FRAMES_IN_FLIGHT],
 }
@@ -68,14 +69,18 @@ impl Ctx {
     pub fn surface() -> Option< &'static Surface> {
         STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| &p.surface)
     }
-    pub fn swapchain() -> Option< &'static Swapchain> {
-        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| &p.swapchain)
-    }
+    // pub fn swapchain() -> Option< &'static Swapchain> {
+    //     STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| &p.swapchain)
+    // }
     pub fn window_width() -> Option<u32> {
-        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.size[0])
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.lock().unwrap().size[0])
     }
     pub fn window_height() -> Option<u32> {
-        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.size[1])
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.lock().unwrap().size[1])
+    }
+
+    pub fn features() -> Features {
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().features.clone()
     }
 
     pub fn current_frame() -> u64 {
@@ -95,7 +100,7 @@ impl Ctx {
         }
 
         let (image_index, _suboptimal) = unsafe {
-            Functions::swapchain().unwrap().acquire_next_image(s.swapchain.handle, u64::MAX, f.image_available, vk::Fence::null())
+            Functions::swapchain().unwrap().acquire_next_image(s.swapchain.lock().unwrap().handle, u64::MAX, f.image_available, vk::Fence::null())
         }?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
@@ -138,14 +143,22 @@ impl Ctx {
 
         unsafe { Ctx::device().queue_submit2(Ctx::queue().handle, std::slice::from_ref(&submit), f.fence)?; }
 
-        let swapchains = [s.swapchain.handle];
+        let swapchains = [s.swapchain.lock().unwrap().handle];
         let indices = [image_index];
         let wait_sems = [f.render_finished];
         let present = vk::PresentInfoKHR::default()
             .wait_semaphores(&wait_sems)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        unsafe { Functions::swapchain().unwrap().queue_present(Ctx::present_queue().handle, &present)?; }
+        
+        match unsafe { Functions::swapchain().unwrap().queue_present(Ctx::present_queue().handle, &present) } {
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                let old_swapchain = s.swapchain.lock();
+                
+            }
+            Ok(_) => {}
+            Err(e) => return Err(anyhow!("present failed: {e:?}")),
+        }
         Ok(())
     }
 
@@ -247,6 +260,12 @@ impl Ctx {
         let (physical_device, graphics_queue_family, present_queue_family, transfer_queue_family) =
             PhysicalDevice::select_suitable_physical_device(physical_devices.as_slice(), &mut features)?;
 
+
+        features.raytracing = false;
+        features.device_debug_utils = false;
+        features.mesh = false;
+
+
         let mut queue_families = vec![graphics_queue_family.index];
         if let Some(present_queue_family) = &present_queue_family {
             queue_families.push(present_queue_family.index);
@@ -326,7 +345,7 @@ impl Ctx {
 
         let present = if window.is_some() {
             Some(Present {
-                swapchain: Swapchain::new(&surface.as_ref().unwrap(), &device, graphics_queue_family.index, present_queue_family.as_ref().map(|e| e.index).unwrap_or(graphics_queue_family.index), &swapchain_fn.as_ref().unwrap(), debug_utils.as_ref())?,
+                swapchain: Swapchain::new(&surface.as_ref().unwrap(), &device, graphics_queue_family.index, present_queue_family.as_ref().map(|e| e.index).unwrap_or(graphics_queue_family.index), &swapchain_fn.as_ref().unwrap(), debug_utils.as_ref(), None, None)?,
                 frame_counter: AtomicU64::new(0),
                 timeline: unsafe {
                     device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut info), None)?
@@ -346,6 +365,7 @@ impl Ctx {
             physical_device: physical_device,
             device,
             present,
+            features: features.clone(),
         };
         STATE.set(ctx).unwrap();
         FUNCTIONS.set(Functions {
