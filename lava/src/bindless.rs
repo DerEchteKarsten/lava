@@ -1,13 +1,21 @@
 use std::{
     collections::VecDeque,
     mem::MaybeUninit,
-    sync::{atomic::AtomicU32, Mutex, OnceLock},
+    sync::{Mutex, OnceLock, atomic::AtomicU32},
 };
 
 use anyhow::{Ok, Result};
 use ash::vk;
 
-use crate::{state::{Ctx, Features, Functions}, vkobjects::{acceleration_structure::AccelerationStructure, buffer::{Buffer, DynamicBuffer}, image::ImageType, queue::CommandBuffer}};
+use crate::{
+    state::{Ctx, Features, Functions},
+    vkobjects::{
+        acceleration_structure::AccelerationStructure,
+        buffer::{Buffer, DynamicBuffer},
+        image::ImageType,
+        queue::CommandBuffer,
+    },
+};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -72,7 +80,6 @@ impl ToBufferHandle for Buffer {
         self.size
     }
 }
-
 
 impl ToBufferHandle for DynamicBuffer {
     fn to_vk(&self) -> vk::Buffer {
@@ -150,15 +157,18 @@ impl BindlessTableType {
                     .max_descriptor_set_storage_buffers
             }
             BindlessTableType::Images => {
-                Ctx::physical_device().limits.max_descriptor_set_storage_images
+                Ctx::physical_device()
+                    .limits
+                    .max_descriptor_set_storage_images
             }
             BindlessTableType::Textures => {
-                Ctx::physical_device().limits.max_descriptor_set_sampled_images
+                Ctx::physical_device()
+                    .limits
+                    .max_descriptor_set_sampled_images
             }
             BindlessTableType::AccelerationStructures => {
                 if let Some(r) = Ctx::physical_device().acceleration_structure_properties {
-                    r
-                        .max_descriptor_set_acceleration_structures
+                    r.max_descriptor_set_acceleration_structures
                 } else {
                     0
                 }
@@ -265,6 +275,27 @@ impl BindlessDescriptorHeap {
         };
     }
 
+    pub fn update_image_handle(&self, image: &impl ImageType, handle: DescriptorHandle) {
+        let image_info = vk::DescriptorImageInfo {
+            image_layout: vk::ImageLayout::GENERAL,
+            image_view: image.get_view(),
+            sampler: vk::Sampler::null()
+        };
+
+       let write = [vk::WriteDescriptorSet {
+            dst_set: self.sets[BindlessTableType::Images.set_index()],
+            dst_binding: 0,
+            descriptor_count: 1,
+            dst_array_element: handle.index(),
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            p_image_info: &image_info,
+            ..Default::default()
+        }];
+        unsafe {
+            Ctx::device().update_descriptor_sets(&write, &[]);
+        };
+    }
+
     pub fn allocate_image_handle(&self, image: &impl ImageType) -> DescriptorHandle {
         let handle = Self::fetch_available_descriptor(self, RenderResourceTag::Image);
 
@@ -356,11 +387,7 @@ impl BindlessDescriptorHeap {
                     },
                     ..Default::default()
                 };
-                unsafe {
-                    Ctx::device()
-                        .create_sampler(&create_info, None)
-                        .unwrap()
-                }
+                unsafe { Ctx::device().create_sampler(&create_info, None).unwrap() }
             })
             .collect::<Vec<vk::Sampler>>()
             .try_into()
@@ -387,16 +414,13 @@ impl BindlessDescriptorHeap {
                 continue;
             }
             Functions::set_debug_name(
-                &format!(
-                    "BindlessDescriptorSetLayout_{}",
-                    match i {
-                        0 => "Buffers",
-                        1 => "Images",
-                        2 => "Tectures",
-                        3 => "Tlas",
-                        _ => unreachable!(),
-                    }
-                ),
+                &format!("BindlessDescriptorSetLayout_{}", match i {
+                    0 => "Buffers",
+                    1 => "Images",
+                    2 => "Tectures",
+                    3 => "Tlas",
+                    _ => unreachable!(),
+                }),
                 set_layouts[i],
             );
         }
@@ -404,7 +428,9 @@ impl BindlessDescriptorHeap {
         let descriptor_counts = BindlessTableType::all_tables()
             .iter()
             .filter_map(|table| {
-                if Functions::acceleration_structure().is_some() || *table != BindlessTableType::AccelerationStructures {
+                if Functions::acceleration_structure().is_some()
+                    || *table != BindlessTableType::AccelerationStructures
+                {
                     Some(table.table_size())
                 } else {
                     None
@@ -441,33 +467,32 @@ impl BindlessDescriptorHeap {
                 continue;
             }
             Functions::set_debug_name(
-                &format!(
-                    "BindlessDescriptorSet_{}",
-                    match i {
-                        0 => "Buffers",
-                        1 => "Images",
-                        2 => "Textures",
-                        3 => "Tlas",
-                        _ => unreachable!(),
-                    }
-                ),
+                &format!("BindlessDescriptorSet_{}", match i {
+                    0 => "Buffers",
+                    1 => "Images",
+                    2 => "Textures",
+                    3 => "Tlas",
+                    _ => unreachable!(),
+                }),
                 sets[i],
             );
         }
 
-        BINDLESS.set(Self {
-            descriptor_pool,
-            available_recycled_descriptors: Mutex::new(VecDeque::new()),
-            descriptor_index: [
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-                AtomicU32::new(0),
-            ],
-            set_layouts,
-            sets,
-            layout,
-        }).unwrap();
+        BINDLESS
+            .set(Self {
+                descriptor_pool,
+                available_recycled_descriptors: Mutex::new(VecDeque::new()),
+                descriptor_index: [
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                ],
+                set_layouts,
+                sets,
+                layout,
+            })
+            .unwrap();
         Ok(())
     }
 
@@ -513,7 +538,9 @@ impl BindlessDescriptorHeap {
 
                 let mut ext_flags = vk::DescriptorSetLayoutBindingFlagsCreateInfoEXT::default()
                     .binding_flags(&descriptor_binding_flags);
-                if Functions::acceleration_structure().is_some() || *table != BindlessTableType::AccelerationStructures {
+                if Functions::acceleration_structure().is_some()
+                    || *table != BindlessTableType::AccelerationStructures
+                {
                     descriptor_layouts[set_idx] = Ctx::device()
                         .create_descriptor_set_layout(
                             &vk::DescriptorSetLayoutCreateInfo::default()
@@ -545,11 +572,9 @@ impl BindlessDescriptorHeap {
             })
             .push_constant_ranges(&push_constant_ranges);
 
-        let pipeline_layout = unsafe {
-            Ctx::device()
-                .create_pipeline_layout(&layout_create_info, None)
-        }
-        .expect("Failed creating pipeline layout.");
+        let pipeline_layout =
+            unsafe { Ctx::device().create_pipeline_layout(&layout_create_info, None) }
+                .expect("Failed creating pipeline layout.");
 
         (descriptor_layouts, pipeline_layout)
     }

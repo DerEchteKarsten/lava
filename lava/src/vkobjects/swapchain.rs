@@ -1,11 +1,18 @@
 use std::ffi::CStr;
 
 use anyhow::Result;
-use ash::{khr, vk::{self}, Device, Instance};
+use ash::{
+    Device, Instance, khr,
+    vk::{self},
+};
 
-use crate::{state::{Ctx, Functions}, vkobjects::{image::ImageSize, queue::Queue, surface::Surface}, FRAMES_IN_FLIGHT};
+use crate::{
+    FRAMES_IN_FLIGHT,
+    state::{Ctx, Functions},
+    vkobjects::{image::ImageSize, queue::Queue, surface::Surface},
+};
 
-use super::{image::Image};
+use super::image::Image;
 
 #[derive(Debug)]
 pub struct Swapchain {
@@ -19,7 +26,16 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn new(surface: &Surface, device: &Device, graphics_queue: u32, present_queue: u32, swapchain_fn: &ash::khr::swapchain::Device, debug_utils: Option<&ash::ext::debug_utils::Device>, old: Option<vk::SwapchainKHR>, size: Option<[u32; 2]>) -> Result<Self> {
+    pub fn new(
+        surface: &Surface,
+        device: &Device,
+        graphics_queue: u32,
+        present_queue: u32,
+        swapchain_fn: &ash::khr::swapchain::Device,
+        debug_utils: Option<&ash::ext::debug_utils::Device>,
+        old: Option<vk::SwapchainKHR>,
+        size: Option<[u32; 2]>,
+    ) -> Result<Self> {
         let format = {
             let formats = &surface.formats;
             if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
@@ -39,7 +55,10 @@ impl Swapchain {
         };
 
         let present_mode = {
-            if surface.present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+            if surface
+                .present_modes
+                .contains(&vk::PresentModeKHR::IMMEDIATE)
+            {
                 vk::PresentModeKHR::IMMEDIATE
             } else {
                 vk::PresentModeKHR::MAILBOX
@@ -50,21 +69,18 @@ impl Swapchain {
             if let Some(size) = size {
                 vk::Extent2D {
                     width: size[0],
-                    height: size[1]
+                    height: size[1],
                 }
-            }else if surface.capabilities.current_extent.width != std::u32::MAX {
+            } else if surface.capabilities.current_extent.width != std::u32::MAX {
                 surface.capabilities.current_extent
             } else {
-               surface.capabilities.min_image_extent
+                surface.capabilities.min_image_extent
             }
         };
 
-        let image_count = surface.capabilities.min_image_count + 1;
+        let image_count = surface.capabilities.min_image_count;
 
-        let families_indices = [
-            graphics_queue as u32,
-            present_queue as u32,
-        ];
+        let families_indices = [graphics_queue as u32, present_queue as u32];
 
         let create_info = {
             let mut builder = vk::SwapchainCreateInfoKHR::default()

@@ -1,11 +1,25 @@
 use std::{
-    cell::LazyCell, collections::HashMap, ffi::CStr, mem::MaybeUninit, sync::{LazyLock, Mutex, MutexGuard, Once, OnceLock}
+    cell::LazyCell,
+    collections::HashMap,
+    ffi::CStr,
+    mem::MaybeUninit,
+    sync::{LazyLock, Mutex, MutexGuard, Once, OnceLock},
 };
 
 use anyhow::Result;
 use ash::vk;
 
-use crate::{bindless::BindlessDescriptorHeap, state::{Ctx, Functions}, vkobjects::{image::ImageHandle, rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline, ShaderBindingTable}}};
+use crate::{
+    bindless::BindlessDescriptorHeap,
+    state::{Ctx, Functions},
+    vkobjects::{
+        image::ImageHandle,
+        rt_pipeline::{
+            RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
+            ShaderBindingTable,
+        },
+    },
+};
 
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 pub struct ComputePipelineHandle {
@@ -16,8 +30,7 @@ impl ComputePipelineHandle {
     pub fn dispatch(&self, cmd: &vk::CommandBuffer, x: u32, y: u32, z: u32) {
         let pipeline = PipelineCache::get().get_compute_pipeline(self);
         unsafe {
-            Ctx::device()
-                .cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            Ctx::device().cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             Ctx::device().cmd_dispatch(*cmd, x, y, z);
         }
     }
@@ -40,15 +53,15 @@ impl RayTracingPipelineHandle {
             );
             let call_region = vk::StridedDeviceAddressRegionKHR::default();
             Functions::raytracing_pipeline().unwrap().cmd_trace_rays(
-                    *cmd,
-                    &pipeline.sbt.raygen_region,
-                    &pipeline.sbt.miss_region,
-                    &pipeline.sbt.hit_region,
-                    &call_region,
-                    x,
-                    y,
-                    1,
-                );
+                *cmd,
+                &pipeline.sbt.raygen_region,
+                &pipeline.sbt.miss_region,
+                &pipeline.sbt.hit_region,
+                &call_region,
+                x,
+                y,
+                1,
+            );
         };
     }
 }
@@ -127,8 +140,7 @@ impl RasterPipelineHandle {
             .and_then(|d| Some(d.format))
             .unwrap_or(vk::Format::UNDEFINED);
 
-        let pipeline =
-            cache.get_raster_pipeline(self, color_formats, depth_format, stencil_format);
+        let pipeline = cache.get_raster_pipeline(self, color_formats, depth_format, stencil_format);
 
         let color_attachments = color_attachments
             .iter()
@@ -193,32 +205,23 @@ impl RasterPipelineHandle {
 
         unsafe {
             Ctx::device().cmd_begin_rendering(cmd, &rendering_info);
-            Ctx::device()
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            Ctx::device().cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
-            Ctx::device().cmd_set_viewport(
-                cmd,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: Ctx::window_width().unwrap_or(0) as f32,
-                    height: Ctx::window_height().unwrap_or(0) as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            Ctx::device().cmd_set_scissor(
-                cmd,
-                0,
-                &[vk::Rect2D {
-                    extent: vk::Extent2D {
-                        width: Ctx::window_width().unwrap_or(0),
-                        height: Ctx::window_height().unwrap_or(0),
-                    },
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                }],
-            );
+            Ctx::device().cmd_set_viewport(cmd, 0, &[vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: Ctx::window_width().unwrap_or(0) as f32,
+                height: Ctx::window_height().unwrap_or(0) as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }]);
+            Ctx::device().cmd_set_scissor(cmd, 0, &[vk::Rect2D {
+                extent: vk::Extent2D {
+                    width: Ctx::window_width().unwrap_or(0),
+                    height: Ctx::window_height().unwrap_or(0),
+                },
+                offset: vk::Offset2D { x: 0, y: 0 },
+            }]);
             match &self.model {
                 PipelineModel::Mesh { task, mesh } => {
                     Functions::mesh().unwrap().cmd_draw_mesh_tasks(cmd, x, y, z);
@@ -239,9 +242,8 @@ pub struct PipelineCache {
     shader_cache: HashMap<String, vk::ShaderModule>,
 }
 
-pub static CACHE: LazyLock<Mutex<PipelineCache>> = LazyLock::new(|| {
-    Mutex::new(PipelineCache::new())
-});
+pub static CACHE: LazyLock<Mutex<PipelineCache>> =
+    LazyLock::new(|| Mutex::new(PipelineCache::new()));
 
 impl PipelineCache {
     pub fn get<'a>() -> MutexGuard<'a, PipelineCache> {
@@ -256,10 +258,7 @@ impl PipelineCache {
                 let decoded_code = ash::util::read_spv(&mut code)?;
                 let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
 
-                let module = unsafe {
-                    Ctx::device()
-                        .create_shader_module(&create_info, None)?
-                };
+                let module = unsafe { Ctx::device().create_shader_module(&create_info, None)? };
                 self.shader_cache.insert(code_path.to_string(), module);
                 Ok(module)
             }
@@ -302,7 +301,7 @@ impl PipelineCache {
                             .unwrap(),
                     );
                 let pipeline = unsafe {
-                        Ctx::device()
+                    Ctx::device()
                         .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
                         .unwrap()
                 }[0];
@@ -327,35 +326,31 @@ impl PipelineCache {
             let entry = format!("{}\0", handle.path.entry);
             let path = format!("./shaders/bin/{}.slang.spv", handle.path.path,);
 
-            let pipeline = RaytracingPipeline::new(
-                    BindlessDescriptorHeap::get().layout,
-                    &[
-                        RayTracingShaderCreateInfo {
-                            group: RayTracingShaderGroup::RayGen,
-                            source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
-                        },
-                        RayTracingShaderCreateInfo {
-                            group: RayTracingShaderGroup::Hit,
-                            source: &[(
-                                "shaders/bin/default_hit",
-                                "main\0",
-                                vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                            )],
-                        },
-                        RayTracingShaderCreateInfo {
-                            group: RayTracingShaderGroup::Miss,
-                            source: &[(
-                                "shaders/bin/default_miss",
-                                "main\0",
-                                vk::ShaderStageFlags::MISS_KHR,
-                            )],
-                        },
-                    ],
-                )
-                .unwrap();
+            let pipeline = RaytracingPipeline::new(BindlessDescriptorHeap::get().layout, &[
+                RayTracingShaderCreateInfo {
+                    group: RayTracingShaderGroup::RayGen,
+                    source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
+                },
+                RayTracingShaderCreateInfo {
+                    group: RayTracingShaderGroup::Hit,
+                    source: &[(
+                        "shaders/bin/default_hit",
+                        "main\0",
+                        vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    )],
+                },
+                RayTracingShaderCreateInfo {
+                    group: RayTracingShaderGroup::Miss,
+                    source: &[(
+                        "shaders/bin/default_miss",
+                        "main\0",
+                        vk::ShaderStageFlags::MISS_KHR,
+                    )],
+                },
+            ])
+            .unwrap();
             Functions::set_debug_name(&handle.path.path, pipeline.pipeline);
-            self.raytracing_pipelines
-                .insert(handle.clone(), pipeline);
+            self.raytracing_pipelines.insert(handle.clone(), pipeline);
             self.raytracing_pipelines.get(handle).unwrap()
         }
     }
@@ -383,7 +378,8 @@ impl PipelineCache {
                 } else {
                     None
                 };
-                let amplicfication_entry = if let PipelineModel::Mesh { task, mesh } = &handle.model {
+                let amplicfication_entry = if let PipelineModel::Mesh { task, mesh } = &handle.model
+                {
                     task.as_ref().map(|task| format!("{}\0", task.entry))
                 } else {
                     None
@@ -400,14 +396,16 @@ impl PipelineCache {
                     .view_mask(0);
 
                 let fragment_entry = format!("{}\0", handle.fragment.entry);
-                let fragment_path = format!("./core/shaders/bin/{}.slang.spv", handle.fragment.path);
-                let mut stages = vec![self
-                    .create_shader_stage(
+                let fragment_path =
+                    format!("./core/shaders/bin/{}.slang.spv", handle.fragment.path);
+                let mut stages = vec![
+                    self.create_shader_stage(
                         &fragment_path,
                         &fragment_entry,
                         vk::ShaderStageFlags::FRAGMENT,
                     )
-                    .unwrap()];
+                    .unwrap(),
+                ];
                 let vertex_input_state;
                 let input_assembly;
                 match &handle.model {
@@ -450,7 +448,8 @@ impl PipelineCache {
 
                         input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
                             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-                        create_info = create_info.vertex_input_state(&vertex_input_state)
+                        create_info = create_info
+                            .vertex_input_state(&vertex_input_state)
                             .input_assembly_state(&input_assembly);
                     }
                 }
@@ -495,7 +494,11 @@ impl PipelineCache {
                     .rasterizer_discard_enable(false)
                     .line_width(1.0)
                     .polygon_mode(vk::PolygonMode::FILL)
-                    .cull_mode(if handle.backface_culling{vk::CullModeFlags::BACK}else{vk::CullModeFlags::NONE})
+                    .cull_mode(if handle.backface_culling {
+                        vk::CullModeFlags::BACK
+                    } else {
+                        vk::CullModeFlags::NONE
+                    })
                     .front_face(vk::FrontFace::CLOCKWISE)
                     .depth_bias_enable(true);
                 let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -521,7 +524,8 @@ impl PipelineCache {
                     .push_next(&mut rendering);
 
                 let pipeline = unsafe {
-                        Ctx::device().create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                    Ctx::device()
+                        .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
                         .unwrap()
                 }[0];
 

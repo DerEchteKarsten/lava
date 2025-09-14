@@ -2,13 +2,17 @@ use std::{ffi::CString, mem::MaybeUninit, sync::OnceLock};
 
 use anyhow::Result;
 use ash::{
+    Instance,
     khr::{acceleration_structure, ray_tracing_pipeline},
-    vk, Instance,
+    vk,
 };
 use gpu_allocator::MemoryLocation;
 
-use crate::{pipelines::PipelineCache, state::{Ctx, Functions}, vkobjects::buffer::Buffer};
-
+use crate::{
+    pipelines::PipelineCache,
+    state::{Ctx, Functions},
+    vkobjects::buffer::Buffer,
+};
 
 pub fn alinged_size(size: u32, alignment: u32) -> u32 {
     (size + (alignment - 1)) & !(alignment - 1)
@@ -49,15 +53,15 @@ impl RaytracingPipeline {
             group_count: shaders_create_info.len() as u32,
             ..Default::default()
         };
-    
+
         let mut modules = vec![];
         let mut stages = vec![];
         let mut groups = vec![];
-    
+
         for shader in shaders_create_info.iter() {
             let mut this_modules = vec![];
             let mut this_stages = vec![];
-    
+
             shader.source.into_iter().for_each(|s| {
                 let module = PipelineCache::get().create_shader_module(s.0).unwrap();
                 let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -67,15 +71,15 @@ impl RaytracingPipeline {
                 this_modules.push(module);
                 this_stages.push(stage);
             });
-    
+
             match shader.group {
                 RayTracingShaderGroup::RayGen => shader_group_info.raygen_shader_count += 1,
                 RayTracingShaderGroup::Miss => shader_group_info.miss_shader_count += 1,
                 RayTracingShaderGroup::Hit => shader_group_info.hit_shader_count += 1,
             };
-    
+
             let shader_index = stages.len();
-    
+
             let mut group = vk::RayTracingShaderGroupCreateInfoKHR::default()
                 .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
                 .general_shader(vk::SHADER_UNUSED_KHR)
@@ -101,35 +105,39 @@ impl RaytracingPipeline {
                             .any_hit_shader((shader_index as u32) + 1)
                             .intersection_shader((shader_index as u32) + 2);
                     }
-    
+
                     group
                 }
             };
-    
+
             modules.append(&mut this_modules);
             stages.append(&mut this_stages);
             groups.push(group);
         }
-    
+
         let pipe_info = vk::RayTracingPipelineCreateInfoKHR::default()
             .layout(pipeline_layout)
             .stages(&stages)
             .groups(&groups)
             .max_pipeline_ray_recursion_depth(1);
-    
+
         let pipeline = unsafe {
-            Functions::raytracing_pipeline().unwrap().create_ray_tracing_pipelines(
-                vk::DeferredOperationKHR::null(),
-                vk::PipelineCache::null(),
-                std::slice::from_ref(&pipe_info),
-                None,
-            )
+            Functions::raytracing_pipeline()
+                .unwrap()
+                .create_ray_tracing_pipelines(
+                    vk::DeferredOperationKHR::null(),
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&pipe_info),
+                    None,
+                )
         }
         .unwrap();
         let sbt = ShaderBindingTable::new(&pipeline[0], &shader_group_info)?;
-        Ok(RaytracingPipeline { pipeline: pipeline[0], sbt })
+        Ok(RaytracingPipeline {
+            pipeline: pipeline[0],
+            sbt,
+        })
     }
-
 }
 
 pub struct ShaderBindingTable {
@@ -143,13 +151,21 @@ impl ShaderBindingTable {
     pub fn new(pipeline: &vk::Pipeline, shaders: &RayTracingShaderGroupInfo) -> Result<Self> {
         let desc = shaders;
 
-        let handle_size = Ctx::physical_device().ray_tracing_pipeline_properties.unwrap().shader_group_handle_size;
-        let handle_alignment = Ctx::physical_device().ray_tracing_pipeline_properties.unwrap()
+        let handle_size = Ctx::physical_device()
+            .ray_tracing_pipeline_properties
+            .unwrap()
+            .shader_group_handle_size;
+        let handle_alignment = Ctx::physical_device()
+            .ray_tracing_pipeline_properties
+            .unwrap()
             .shader_group_handle_alignment;
         let aligned_handle_size = alinged_size(handle_size, handle_alignment);
         let handle_pad = aligned_handle_size - handle_size;
 
-        let group_alignment = Ctx::physical_device().ray_tracing_pipeline_properties.unwrap().shader_group_base_alignment;
+        let group_alignment = Ctx::physical_device()
+            .ray_tracing_pipeline_properties
+            .unwrap()
+            .shader_group_base_alignment;
 
         let data_size = desc.group_count * handle_size;
         let handles = unsafe {
@@ -191,7 +207,12 @@ impl ShaderBindingTable {
             buffer_usage,
             memory_location,
             buffer_size as _,
-            Some(Ctx::physical_device().ray_tracing_pipeline_properties.unwrap().shader_group_base_alignment as u64),
+            Some(
+                Ctx::physical_device()
+                    .ray_tracing_pipeline_properties
+                    .unwrap()
+                    .shader_group_base_alignment as u64,
+            ),
         )?;
 
         let mut offset = 0;

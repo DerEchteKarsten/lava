@@ -4,14 +4,13 @@ use anyhow::Result;
 use ash::vk;
 use glam::UVec2;
 use gpu_allocator::{
-    vulkan::{Allocation, AllocationCreateDesc},
     MemoryLocation,
+    vulkan::{Allocation, AllocationCreateDesc},
 };
 
 use derivative::Derivative;
 
 use crate::{state::Ctx, vkobjects::buffer::MAllocation};
-
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Default)]
 pub enum ImageSize {
@@ -24,7 +23,9 @@ pub enum ImageSize {
 impl ImageSize {
     pub fn size(self) -> UVec2 {
         match self {
-            Self::FullScreen => UVec2::new(Ctx::window_width().unwrap(), Ctx::window_height().unwrap()),
+            Self::FullScreen => {
+                UVec2::new(Ctx::window_width().unwrap(), Ctx::window_height().unwrap())
+            }
             Self::FractionalFullScreen(dx, dy) => UVec2::new(
                 (Ctx::window_width().unwrap()).div_ceil(dx),
                 (Ctx::window_height().unwrap()).div_ceil(dy),
@@ -33,7 +34,6 @@ impl ImageSize {
         }
     }
 }
-
 
 #[derive(Derivative)]
 #[derivative(Eq, PartialEq, Debug)]
@@ -157,22 +157,16 @@ pub trait ImageType {
                 other.get_image(),
                 dst_layout,
                 &[vk::ImageBlit::default()
-                    .src_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: self.get_extent().width as _,
-                            y: self.get_extent().height as _,
-                            z: 1,
-                        },
-                    ])
-                    .dst_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: other.get_extent().width as _,
-                            y: other.get_extent().height as _,
-                            z: 1,
-                        },
-                    ])
+                    .src_offsets([vk::Offset3D::default(), vk::Offset3D {
+                        x: self.get_extent().width as _,
+                        y: self.get_extent().height as _,
+                        z: 1,
+                    }])
+                    .dst_offsets([vk::Offset3D::default(), vk::Offset3D {
+                        x: other.get_extent().width as _,
+                        y: other.get_extent().height as _,
+                        z: 1,
+                    }])
                     .src_subresource(vk::ImageSubresourceLayers {
                         aspect_mask: get_aspects(self.get_format()),
                         mip_level: 0,
@@ -435,7 +429,7 @@ impl Image {
         usage: vk::ImageUsageFlags,
         memory_location: MemoryLocation,
         format: vk::Format,
-        size: ImageSize
+        size: ImageSize,
     ) -> Result<Self> {
         let extent = vk::Extent3D {
             width: size.size().x,
@@ -457,18 +451,16 @@ impl Image {
         let image = unsafe { Ctx::device().create_image(&image_info, None)? };
         let requirements = unsafe { Ctx::device().get_image_memory_requirements(image) };
 
-        let allocation = Ctx::allocator()
-            .allocate(&AllocationCreateDesc {
-                name: "image",
-                requirements,
-                location: memory_location,
-                linear: false,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-            })?;
+        let allocation = Ctx::allocator().allocate(&AllocationCreateDesc {
+            name: "image",
+            requirements,
+            location: memory_location,
+            linear: false,
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+        })?;
 
         unsafe {
-            Ctx::device()
-                .bind_image_memory(image, allocation.memory(), allocation.offset())?
+            Ctx::device().bind_image_memory(image, allocation.memory(), allocation.offset())?
         };
         let extent = vk::Extent2D {
             height: extent.height,
@@ -486,7 +478,7 @@ impl Image {
         })
     }
 
-    pub fn destroy(&mut self){
+    pub fn destroy(&self) {
         unsafe {
             Ctx::device().destroy_image_view(self.view, None);
             Ctx::device().destroy_image(self.image, None);
