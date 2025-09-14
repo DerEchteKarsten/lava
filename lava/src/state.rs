@@ -69,9 +69,9 @@ impl Ctx {
     pub fn surface() -> Option< &'static Surface> {
         STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| &p.surface)
     }
-    // pub fn swapchain() -> Option< &'static Swapchain> {
-    //     STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| &p.swapchain)
-    // }
+    pub fn swapchain<'a>() -> Option<MutexGuard<'a, Swapchain>> {
+        STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.lock().unwrap())
+    }
     pub fn window_width() -> Option<u32> {
         STATE.get().ok_or(anyhow!("Vulkan Context was not Initilized")).unwrap().present.as_ref().map(|p| p.swapchain.lock().unwrap().size[0])
     }
@@ -150,11 +150,17 @@ impl Ctx {
             .wait_semaphores(&wait_sems)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        
+        Ctx::swapchain().unwrap().resized = false;
         match unsafe { Functions::swapchain().unwrap().queue_present(Ctx::present_queue().handle, &present) } {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                let old_swapchain = s.swapchain.lock();
-                
+                log::info!("resized Swapchain");
+                let old_swapchain = s.swapchain.lock().unwrap().handle;
+                let size = unsafe { Functions::surface().unwrap().get_physical_device_surface_capabilities(Ctx::physical_device().handel, Ctx::surface().unwrap().handle) }.unwrap().current_extent;
+                let mut swapchain =
+                    Swapchain::new(Ctx::surface().unwrap(), Ctx::device(), Ctx::queue().family_index, Ctx::present_queue().family_index, Functions::swapchain().unwrap(), Functions::debug_utils(), Some(old_swapchain), Some([size.width, size.height])).unwrap();
+                swapchain.resized = true;
+                unsafe { Functions::swapchain().unwrap().destroy_swapchain(s.swapchain.lock().unwrap().handle, None) };
+                s.swapchain.set(swapchain).unwrap();
             }
             Ok(_) => {}
             Err(e) => return Err(anyhow!("present failed: {e:?}")),
@@ -290,8 +296,8 @@ impl Ctx {
             device: device.clone(),
             physical_device: physical_device.handel,
             debug_settings: AllocatorDebugSettings {
-                log_allocations: false,
-                log_frees: false,
+                log_allocations: true,
+                log_frees: true,
                 log_leaks_on_shutdown: false,
                 log_memory_information: false,
                 ..Default::default()
@@ -345,7 +351,7 @@ impl Ctx {
 
         let present = if window.is_some() {
             Some(Present {
-                swapchain: Swapchain::new(&surface.as_ref().unwrap(), &device, graphics_queue_family.index, present_queue_family.as_ref().map(|e| e.index).unwrap_or(graphics_queue_family.index), &swapchain_fn.as_ref().unwrap(), debug_utils.as_ref(), None, None)?,
+                swapchain: Mutex::new(Swapchain::new(&surface.as_ref().unwrap(), &device, graphics_queue_family.index, present_queue_family.as_ref().map(|e| e.index).unwrap_or(graphics_queue_family.index), &swapchain_fn.as_ref().unwrap(), debug_utils.as_ref(), None, None)?),
                 frame_counter: AtomicU64::new(0),
                 timeline: unsafe {
                     device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut info), None)?

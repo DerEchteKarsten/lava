@@ -16,7 +16,7 @@ use super::{
 
 
 #[derive(Debug)]
-struct MAllocation(Allocation);
+pub struct MAllocation(pub Allocation);
 
 impl Drop for MAllocation {
     fn drop(&mut self) {

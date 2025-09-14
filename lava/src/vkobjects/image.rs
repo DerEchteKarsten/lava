@@ -1,7 +1,8 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use ash::vk;
+use glam::UVec2;
 use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc},
     MemoryLocation,
@@ -9,7 +10,30 @@ use gpu_allocator::{
 
 use derivative::Derivative;
 
-use crate::state::Ctx;
+use crate::{state::Ctx, vkobjects::buffer::MAllocation};
+
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Default)]
+pub enum ImageSize {
+    #[default]
+    FullScreen,
+    FractionalFullScreen(u32, u32),
+    XY(u32, u32),
+}
+
+impl ImageSize {
+    pub fn size(self) -> UVec2 {
+        match self {
+            Self::FullScreen => UVec2::new(Ctx::window_width().unwrap(), Ctx::window_height().unwrap()),
+            Self::FractionalFullScreen(dx, dy) => UVec2::new(
+                (Ctx::window_width().unwrap()).div_ceil(dx),
+                (Ctx::window_height().unwrap()).div_ceil(dy),
+            ),
+            Self::XY(x, y) => UVec2::new(x, y),
+        }
+    }
+}
+
 
 #[derive(Derivative)]
 #[derivative(Eq, PartialEq, Debug)]
@@ -17,8 +41,8 @@ pub struct Image {
     pub image: vk::Image,
     pub view: vk::ImageView,
     #[derivative(PartialEq = "ignore")]
-    pub allocation: Option<Mutex<Allocation>>,
-    pub extent: vk::Extent2D,
+    pub allocation: Option<Arc<Mutex<MAllocation>>>,
+    pub size: ImageSize,
     pub format: vk::Format,
     pub usage: vk::ImageUsageFlags,
 }
@@ -26,12 +50,12 @@ pub struct Image {
 impl Clone for Image {
     fn clone(&self) -> Self {
         Self {
-            extent: self.extent,
+            size: self.size,
             format: self.format,
             image: self.image,
             usage: self.usage,
             view: self.view,
-            allocation: None,
+            allocation: self.allocation.clone(),
         }
     }
 }
@@ -41,7 +65,7 @@ impl Image {
         ImageHandle {
             image: self.image,
             view: self.view,
-            extent: self.extent,
+            size: self.size,
             format: self.format,
             usage: self.usage,
         }
@@ -52,7 +76,7 @@ impl Image {
 pub struct ImageHandle {
     pub image: vk::Image,
     pub view: vk::ImageView,
-    pub extent: vk::Extent2D,
+    pub size: ImageSize,
     pub format: vk::Format,
     pub usage: vk::ImageUsageFlags,
 }
@@ -265,7 +289,10 @@ pub trait ImageType {
 
 impl ImageType for Image {
     fn get_extent(&self) -> vk::Extent2D {
-        self.extent
+        vk::Extent2D {
+            width: self.size.size().x,
+            height: self.size.size().y,
+        }
     }
     fn get_format(&self) -> vk::Format {
         self.format
@@ -283,7 +310,10 @@ impl ImageType for Image {
 
 impl ImageType for ImageHandle {
     fn get_extent(&self) -> vk::Extent2D {
-        self.extent
+        vk::Extent2D {
+            width: self.size.size().x,
+            height: self.size.size().y,
+        }
     }
     fn get_format(&self) -> vk::Format {
         self.format
@@ -377,7 +407,6 @@ impl Image {
 
     pub(super) fn view(
         device: &ash::Device,
-        extent: vk::Extent2D,
         image: vk::Image,
         format: vk::Format,
     ) -> vk::ImageView {
@@ -406,12 +435,11 @@ impl Image {
         usage: vk::ImageUsageFlags,
         memory_location: MemoryLocation,
         format: vk::Format,
-        width: u32,
-        height: u32,
+        size: ImageSize
     ) -> Result<Self> {
         let extent = vk::Extent3D {
-            width,
-            height,
+            width: size.size().x,
+            height: size.size().y,
             depth: 1,
         };
 
@@ -446,15 +474,22 @@ impl Image {
             height: extent.height,
             width: extent.width,
         };
-        let view = Self::view(&Ctx::device(), extent, image, format);
+        let view = Self::view(&Ctx::device(), image, format);
 
         Ok(Self {
             usage,
             image,
-            allocation: Some(Mutex::new(allocation)),
+            allocation: Some(Arc::new(Mutex::new(MAllocation(allocation)))),
             format,
-            extent,
+            size,
             view,
         })
+    }
+
+    pub fn destroy(&mut self){
+        unsafe {
+            Ctx::device().destroy_image_view(self.view, None);
+            Ctx::device().destroy_image(self.image, None);
+        }
     }
 }

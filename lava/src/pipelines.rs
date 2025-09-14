@@ -293,7 +293,7 @@ impl PipelineCache {
             Some(pipeline) => pipeline.clone(),
             None => {
                 let entry = format!("{}\0", handle.path.entry);
-                let path = format!("./shaders/bin/{}.slang.spv", handle.path.path);
+                let path = format!("./core/shaders/bin/{}.slang.spv", handle.path.path);
 
                 let create_info = vk::ComputePipelineCreateInfo::default()
                     .layout(BindlessDescriptorHeap::get().layout)

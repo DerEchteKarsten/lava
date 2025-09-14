@@ -3,12 +3,13 @@ use std::ffi::CStr;
 use anyhow::Result;
 use ash::{khr, vk::{self}, Device, Instance};
 
-use crate::{state::{Ctx, Functions}, vkobjects::{queue::Queue, surface::Surface}, FRAMES_IN_FLIGHT};
+use crate::{state::{Ctx, Functions}, vkobjects::{image::ImageSize, queue::Queue, surface::Surface}, FRAMES_IN_FLIGHT};
 
 use super::{image::Image};
 
 #[derive(Debug)]
 pub struct Swapchain {
+    pub resized: bool,
     pub size: [u32; 2],
     pub handle: vk::SwapchainKHR,
     pub format: vk::Format,
@@ -48,8 +49,8 @@ impl Swapchain {
         let extent = {
             if let Some(size) = size {
                 vk::Extent2D {
-                    height: size[0],
-                    width: size[1]
+                    width: size[0],
+                    height: size[1]
                 }
             }else if surface.capabilities.current_extent.width != std::u32::MAX {
                 surface.capabilities.current_extent
@@ -117,14 +118,15 @@ impl Swapchain {
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
                     image,
                     format: format.format,
-                    extent,
-                    view: Image::view(&device, extent, image, format.format),
+                    size: ImageSize::FullScreen,
+                    view: Image::view(&device, image, format.format),
                     allocation: None,
                 }
             })
             .collect::<Vec<_>>();
 
         Ok(Self {
+            resized: true,
             handle,
             format: format.format,
             color_space: format.color_space,

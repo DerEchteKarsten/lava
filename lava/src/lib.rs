@@ -1,5 +1,6 @@
 #![feature(int_roundings)]
 #![feature(f16)]
+#![feature(lock_value_accessors)]
 use std::{time::Instant};
 
 use anyhow::{Ok, Result};
