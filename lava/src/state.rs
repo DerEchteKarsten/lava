@@ -284,11 +284,10 @@ impl Ctx {
         } {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 needs_recreation = true;
-            }    
+            }
             Ok(_) => {}
             Err(e) => return Err(anyhow!("present failed: {e:?}")),
         }
-
 
         if needs_recreation {
             log::info!("resized swapchain");
@@ -311,11 +310,12 @@ impl Ctx {
             swapchain.resized = true;
 
             unsafe {
+                Ctx::device().device_wait_idle().unwrap();
                 Functions::swapchain()
                     .unwrap()
                     .destroy_swapchain(Ctx::swapchain().unwrap().handle, None);
             };
-            
+
             s.swapchain.set(swapchain).unwrap();
             s.swpachain_needs_resizing.set(None).unwrap();
         }

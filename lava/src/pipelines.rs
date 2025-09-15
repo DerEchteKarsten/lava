@@ -207,21 +207,29 @@ impl RasterPipelineHandle {
             Ctx::device().cmd_begin_rendering(cmd, &rendering_info);
             Ctx::device().cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
-            Ctx::device().cmd_set_viewport(cmd, 0, &[vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: Ctx::window_width().unwrap_or(0) as f32,
-                height: Ctx::window_height().unwrap_or(0) as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }]);
-            Ctx::device().cmd_set_scissor(cmd, 0, &[vk::Rect2D {
-                extent: vk::Extent2D {
-                    width: Ctx::window_width().unwrap_or(0),
-                    height: Ctx::window_height().unwrap_or(0),
-                },
-                offset: vk::Offset2D { x: 0, y: 0 },
-            }]);
+            Ctx::device().cmd_set_viewport(
+                cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: Ctx::window_width().unwrap_or(0) as f32,
+                    height: Ctx::window_height().unwrap_or(0) as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            Ctx::device().cmd_set_scissor(
+                cmd,
+                0,
+                &[vk::Rect2D {
+                    extent: vk::Extent2D {
+                        width: Ctx::window_width().unwrap_or(0),
+                        height: Ctx::window_height().unwrap_or(0),
+                    },
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                }],
+            );
             match &self.model {
                 PipelineModel::Mesh { task, mesh } => {
                     Functions::mesh().unwrap().cmd_draw_mesh_tasks(cmd, x, y, z);
@@ -326,28 +334,31 @@ impl PipelineCache {
             let entry = format!("{}\0", handle.path.entry);
             let path = format!("./shaders/bin/{}.slang.spv", handle.path.path,);
 
-            let pipeline = RaytracingPipeline::new(BindlessDescriptorHeap::get().layout, &[
-                RayTracingShaderCreateInfo {
-                    group: RayTracingShaderGroup::RayGen,
-                    source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
-                },
-                RayTracingShaderCreateInfo {
-                    group: RayTracingShaderGroup::Hit,
-                    source: &[(
-                        "shaders/bin/default_hit",
-                        "main\0",
-                        vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                    )],
-                },
-                RayTracingShaderCreateInfo {
-                    group: RayTracingShaderGroup::Miss,
-                    source: &[(
-                        "shaders/bin/default_miss",
-                        "main\0",
-                        vk::ShaderStageFlags::MISS_KHR,
-                    )],
-                },
-            ])
+            let pipeline = RaytracingPipeline::new(
+                BindlessDescriptorHeap::get().layout,
+                &[
+                    RayTracingShaderCreateInfo {
+                        group: RayTracingShaderGroup::RayGen,
+                        source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
+                    },
+                    RayTracingShaderCreateInfo {
+                        group: RayTracingShaderGroup::Hit,
+                        source: &[(
+                            "shaders/bin/default_hit",
+                            "main\0",
+                            vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                        )],
+                    },
+                    RayTracingShaderCreateInfo {
+                        group: RayTracingShaderGroup::Miss,
+                        source: &[(
+                            "shaders/bin/default_miss",
+                            "main\0",
+                            vk::ShaderStageFlags::MISS_KHR,
+                        )],
+                    },
+                ],
+            )
             .unwrap();
             Functions::set_debug_name(&handle.path.path, pipeline.pipeline);
             self.raytracing_pipelines.insert(handle.clone(), pipeline);

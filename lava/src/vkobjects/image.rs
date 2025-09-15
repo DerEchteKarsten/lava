@@ -157,16 +157,22 @@ pub trait ImageType {
                 other.get_image(),
                 dst_layout,
                 &[vk::ImageBlit::default()
-                    .src_offsets([vk::Offset3D::default(), vk::Offset3D {
-                        x: self.get_extent().width as _,
-                        y: self.get_extent().height as _,
-                        z: 1,
-                    }])
-                    .dst_offsets([vk::Offset3D::default(), vk::Offset3D {
-                        x: other.get_extent().width as _,
-                        y: other.get_extent().height as _,
-                        z: 1,
-                    }])
+                    .src_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: self.get_extent().width as _,
+                            y: self.get_extent().height as _,
+                            z: 1,
+                        },
+                    ])
+                    .dst_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: other.get_extent().width as _,
+                            y: other.get_extent().height as _,
+                            z: 1,
+                        },
+                    ])
                     .src_subresource(vk::ImageSubresourceLayers {
                         aspect_mask: get_aspects(self.get_format()),
                         mip_level: 0,

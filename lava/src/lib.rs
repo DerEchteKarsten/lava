@@ -173,9 +173,12 @@ fn buffers() {
         .execute_command_wait(|cmd_buf| {
             let copy_region = vk::BufferCopy::default().size(1024);
             unsafe {
-                Ctx::device().cmd_copy_buffer(*cmd_buf, staging_buffer.buffer, buffer.buffer, &[
-                    copy_region,
-                ]);
+                Ctx::device().cmd_copy_buffer(
+                    *cmd_buf,
+                    staging_buffer.buffer,
+                    buffer.buffer,
+                    &[copy_region],
+                );
             }
         })
         .unwrap();
@@ -184,9 +187,12 @@ fn buffers() {
         .execute_command_wait(|cmd_buf| {
             let copy_region = vk::BufferCopy::default().size(1024);
             unsafe {
-                Ctx::device().cmd_copy_buffer(*cmd_buf, buffer.buffer, staging_buffer.buffer, &[
-                    copy_region,
-                ]);
+                Ctx::device().cmd_copy_buffer(
+                    *cmd_buf,
+                    buffer.buffer,
+                    staging_buffer.buffer,
+                    &[copy_region],
+                );
             }
         })
         .unwrap();

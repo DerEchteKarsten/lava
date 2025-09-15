@@ -192,10 +192,19 @@ impl BindlessTableType {
                     None
                 }
             })
-            .chain(std::iter::once(vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: immutable_sampler_count,
-            }))
+            .chain(
+                [
+                    vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::SAMPLER,
+                        descriptor_count: immutable_sampler_count,
+                    },
+                    vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 1,
+                    },
+                ]
+                .into_iter(),
+            )
             .collect::<Vec<_>>()
     }
 }
@@ -240,7 +249,7 @@ impl BindlessDescriptorHeap {
 
         let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Buffers.set_index()],
-            dst_binding: 0,
+            dst_binding: 1,
             descriptor_count: 1,
             dst_array_element: handle.index(),
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
@@ -263,7 +272,7 @@ impl BindlessDescriptorHeap {
 
         let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Buffers.set_index()],
-            dst_binding: 0,
+            dst_binding: 1,
             descriptor_count: 1,
             dst_array_element: handle.index(),
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
@@ -279,10 +288,10 @@ impl BindlessDescriptorHeap {
         let image_info = vk::DescriptorImageInfo {
             image_layout: vk::ImageLayout::GENERAL,
             image_view: image.get_view(),
-            sampler: vk::Sampler::null()
+            sampler: vk::Sampler::null(),
         };
 
-       let write = [vk::WriteDescriptorSet {
+        let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Images.set_index()],
             dst_binding: 0,
             descriptor_count: 1,
@@ -414,13 +423,16 @@ impl BindlessDescriptorHeap {
                 continue;
             }
             Functions::set_debug_name(
-                &format!("BindlessDescriptorSetLayout_{}", match i {
-                    0 => "Buffers",
-                    1 => "Images",
-                    2 => "Tectures",
-                    3 => "Tlas",
-                    _ => unreachable!(),
-                }),
+                &format!(
+                    "BindlessDescriptorSetLayout_{}",
+                    match i {
+                        0 => "Buffers",
+                        1 => "Images",
+                        2 => "Tectures",
+                        3 => "Tlas",
+                        _ => unreachable!(),
+                    }
+                ),
                 set_layouts[i],
             );
         }
@@ -467,13 +479,16 @@ impl BindlessDescriptorHeap {
                 continue;
             }
             Functions::set_debug_name(
-                &format!("BindlessDescriptorSet_{}", match i {
-                    0 => "Buffers",
-                    1 => "Images",
-                    2 => "Textures",
-                    3 => "Tlas",
-                    _ => unreachable!(),
-                }),
+                &format!(
+                    "BindlessDescriptorSet_{}",
+                    match i {
+                        0 => "Buffers",
+                        1 => "Images",
+                        2 => "Textures",
+                        3 => "Tlas",
+                        _ => unreachable!(),
+                    }
+                ),
                 sets[i],
             );
         }
@@ -521,10 +536,19 @@ impl BindlessDescriptorHeap {
                     ..Default::default()
                 }];
 
+                if *table == BindlessTableType::Buffers {
+                    descriptor_binding_flags.push(vk::DescriptorBindingFlags::empty());
+                    set[0].binding = 1;
+                    set.push(vk::DescriptorSetLayoutBinding {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 1,
+                        stage_flags: vk::ShaderStageFlags::ALL,
+                        ..Default::default()
+                    });
+                }
                 if *table == BindlessTableType::Textures {
                     descriptor_binding_flags.push(vk::DescriptorBindingFlags::empty());
-
-                    // Set texture binding start at the end of the immutable samplers.
                     set[0].binding = immutable_samplers.len() as u32;
                     set.push(vk::DescriptorSetLayoutBinding {
                         binding: 0,

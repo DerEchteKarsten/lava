@@ -22,7 +22,8 @@ struct RenderResourceHandle {
 
 [[vk::push_constant]] ConstantBuffer<Offsets> g_offsets;
 
-[vk::binding(0, 0)] RWByteAddressBuffer bufferHandles[];
+[vk::binding(0, 0)] ByteAddressBuffer unifrom_buffer[];
+[vk::binding(1, 0)] RWByteAddressBuffer bufferHandles[];
 [vk::binding(0, 1)] RWTexture2D<float4> imageHandlesf4[];
 [vk::binding(0, 1)] RWTexture2D<float2> imageHandlesf2[];
 [vk::binding(0, 1)] RWTexture2D<float> imageHandlesf1[];

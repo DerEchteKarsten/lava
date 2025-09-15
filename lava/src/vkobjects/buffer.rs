@@ -260,13 +260,16 @@ impl DynamicBuffer {
             if old_size != 0 {
                 Ctx::transfer_queue().execute_command_wait(|cmd| {
                     unsafe {
-                        Ctx::device().cmd_copy_buffer(*cmd, self.buffer.buffer, buffer.buffer, &[
-                            vk::BufferCopy {
+                        Ctx::device().cmd_copy_buffer(
+                            *cmd,
+                            self.buffer.buffer,
+                            buffer.buffer,
+                            &[vk::BufferCopy {
                                 size: old_size,
                                 src_offset: 0,
                                 dst_offset: 0,
-                            },
-                        ])
+                            }],
+                        )
                     };
                 })?;
             }
@@ -284,13 +287,16 @@ impl DynamicBuffer {
         Ctx::transfer_queue()
             .execute_command_wait(|cmd| {
                 unsafe {
-                    Ctx::device().cmd_copy_buffer(*cmd, src_buffer.to_vk(), self.buffer.buffer, &[
-                        vk::BufferCopy {
+                    Ctx::device().cmd_copy_buffer(
+                        *cmd,
+                        src_buffer.to_vk(),
+                        self.buffer.buffer,
+                        &[vk::BufferCopy {
                             src_offset: 0,
                             size,
                             dst_offset: offset,
-                        },
-                    ])
+                        }],
+                    )
                 };
             })
             .unwrap();
@@ -306,13 +312,16 @@ impl DynamicBuffer {
             self.grow_to_size(size + offset)?;
         }
         unsafe {
-            Ctx::device().cmd_copy_buffer(*cmd, src_buffer.to_vk(), self.buffer.buffer, &[
-                vk::BufferCopy {
+            Ctx::device().cmd_copy_buffer(
+                *cmd,
+                src_buffer.to_vk(),
+                self.buffer.buffer,
+                &[vk::BufferCopy {
                     src_offset: 0,
                     size: size,
                     dst_offset: offset,
-                },
-            ])
+                }],
+            )
         };
         Ok(())
     }
