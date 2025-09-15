@@ -198,10 +198,6 @@ impl BindlessTableType {
                         ty: vk::DescriptorType::SAMPLER,
                         descriptor_count: immutable_sampler_count,
                     },
-                    vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::UNIFORM_BUFFER,
-                        descriptor_count: 1,
-                    },
                 ]
                 .into_iter(),
             )
@@ -249,7 +245,7 @@ impl BindlessDescriptorHeap {
 
         let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Buffers.set_index()],
-            dst_binding: 1,
+            dst_binding: 0,
             descriptor_count: 1,
             dst_array_element: handle.index(),
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
@@ -272,7 +268,7 @@ impl BindlessDescriptorHeap {
 
         let write = [vk::WriteDescriptorSet {
             dst_set: self.sets[BindlessTableType::Buffers.set_index()],
-            dst_binding: 1,
+            dst_binding: 0,
             descriptor_count: 1,
             dst_array_element: handle.index(),
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
@@ -536,17 +532,7 @@ impl BindlessDescriptorHeap {
                     ..Default::default()
                 }];
 
-                if *table == BindlessTableType::Buffers {
-                    descriptor_binding_flags.push(vk::DescriptorBindingFlags::empty());
-                    set[0].binding = 1;
-                    set.push(vk::DescriptorSetLayoutBinding {
-                        binding: 0,
-                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                        descriptor_count: 1,
-                        stage_flags: vk::ShaderStageFlags::ALL,
-                        ..Default::default()
-                    });
-                }
+
                 if *table == BindlessTableType::Textures {
                     descriptor_binding_flags.push(vk::DescriptorBindingFlags::empty());
                     set[0].binding = immutable_samplers.len() as u32;
@@ -577,7 +563,7 @@ impl BindlessDescriptorHeap {
                 }
             });
 
-        let num_push_constants = 4;
+        let num_push_constants = 2;
         let num_push_constants_sized = std::mem::size_of::<u32>() as u32 * num_push_constants;
 
         let push_constant_range = vk::PushConstantRange {

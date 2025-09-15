@@ -4,8 +4,6 @@
 struct Offsets {
     uint32_t constants;
     uint32_t bindings;
-    RenderResourceHandle bindings_buffer;
-    RenderResourceHandle constants_buffer;
 }
 
 struct RenderResourceHandle {
@@ -22,8 +20,7 @@ struct RenderResourceHandle {
 
 [[vk::push_constant]] ConstantBuffer<Offsets> g_offsets;
 
-[vk::binding(0, 0)] ByteAddressBuffer unifrom_buffer[];
-[vk::binding(1, 0)] RWByteAddressBuffer bufferHandles[];
+[vk::binding(0, 0)] RWByteAddressBuffer bufferHandles[];
 [vk::binding(0, 1)] RWTexture2D<float4> imageHandlesf4[];
 [vk::binding(0, 1)] RWTexture2D<float2> imageHandlesf2[];
 [vk::binding(0, 1)] RWTexture2D<float> imageHandlesf1[];
@@ -40,21 +37,14 @@ enum RenderResourceTag {
     AccelerationStructure = 3,
 }
 
-//TODO Validation
 T loadBindings<T>() {
-    // #ifdef DEBUG
-    //     if(g_offsets.bindings_buffer.tag() != RenderResourceTag::Buffer) {
-    //         printf("Bindings Buffer is not a Buffer! is %i insted", g_offsets.bindings_buffer.tag());
-    //         T t;
-    //         return t;
-    //     }
-    // #endif
-    return bufferHandles[g_offsets.bindings_buffer.index()].Load<T>(g_offsets.bindings);
+    return bufferHandles[0].Load<T>(g_offsets.bindings);
 }
 
 T loadConstants<T>() {
-    return bufferHandles[g_offsets.constants_buffer.index()].Load<T>(g_offsets.constants);
+    return bufferHandles[1].Load<T>(g_offsets.constants);
 }
+
 
 
 
