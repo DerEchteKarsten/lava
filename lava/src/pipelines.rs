@@ -10,15 +10,12 @@ use anyhow::Result;
 use ash::vk;
 
 use crate::{
-    bindless::BindlessDescriptorHeap,
-    state::{Ctx, Functions},
-    vkobjects::{
-        image::ImageHandle,
-        rt_pipeline::{
+    bindless::Bindless, state::{Ctx, Functions}, vkobjects::{
+        image::Image, rt_pipeline::{
             RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
             ShaderBindingTable,
-        },
-    },
+        }
+    }
 };
 
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
@@ -119,9 +116,9 @@ impl RasterPipelineHandle {
     pub fn dispatch(
         &self,
         cmd: vk::CommandBuffer,
-        color_attachments: &[(ImageHandle, Option<[f32; 4]>)],
-        depth_attachment: &Option<ImageHandle>,
-        stencil_attachment: &Option<ImageHandle>,
+        color_attachments: &[(Image, Option<[f32; 4]>)],
+        depth_attachment: Option<&Image>,
+        stencil_attachment: Option<&Image>,
         width: u32,
         height: u32,
         x: u32,
@@ -303,7 +300,7 @@ impl PipelineCache {
                 let path = format!("./core/shaders/bin/{}.slang.spv", handle.path.path);
 
                 let create_info = vk::ComputePipelineCreateInfo::default()
-                    .layout(BindlessDescriptorHeap::get().layout)
+                    .layout(Bindless::layout())
                     .stage(
                         self.create_shader_stage(&path, &entry, vk::ShaderStageFlags::COMPUTE)
                             .unwrap(),
@@ -335,7 +332,7 @@ impl PipelineCache {
             let path = format!("./shaders/bin/{}.slang.spv", handle.path.path,);
 
             let pipeline = RaytracingPipeline::new(
-                BindlessDescriptorHeap::get().layout,
+                Bindless::layout(),
                 &[
                     RayTracingShaderCreateInfo {
                         group: RayTracingShaderGroup::RayGen,
@@ -523,7 +520,7 @@ impl PipelineCache {
 
                 create_info = create_info
                     .stages(&stages)
-                    .layout(BindlessDescriptorHeap::get().layout)
+                    .layout(Bindless::layout())
                     .dynamic_state(&dynamic_state)
                     .multisample_state(&multisampling)
                     .color_blend_state(&color_blend_state)

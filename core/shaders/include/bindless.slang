@@ -1,133 +1,75 @@
-#pragma once
-#define DEBUG
-#define NUM_STATIC_SAMPLERS 4
-struct Offsets {
-    uint32_t constants;
-    uint32_t bindings;
-}
 
-struct RenderResourceHandle {
-    uint handle;
-    
-    uint index() {
-        return handle & 0xfffffff;
+[vk::binding(0, 0)] __DynamicResource TextureHeap[];
+[vk::binding(1, 0)] __DynamicResource RWTextureHeap[];
+
+interface IImageDescriptor {
+    static const bool isWriteable;
+};
+
+__generic<E : ITexelElement, Shape : __ITextureShape, int isArray, int isMS, int sampleCount, int access, int isShadow, int format>
+    extension _Texture<E, Shape, isArray, isMS, sampleCount, access, isShadow, 0, format> : IImageDescriptor {
+    static const bool isWriteable = access == 1;
+};
+
+public struct ImageHandle<T : IImageDescriptor & __IDynamicResourceCastable> {
+    uint DescriptorIndex;
+
+    public property bool IsNull { get { return DescriptorIndex == ~0; } }
+
+    public property T Instance {
+        [ForceInline]
+        get { return (T.isWriteable ? RWTextureHeap : TextureHeap)[DescriptorIndex].as<T>(); }
     }
-
-    uint tag() {
-        return handle >> 30;
-    }
-}
-
-[[vk::push_constant]] ConstantBuffer<Offsets> g_offsets;
-
-[vk::binding(0, 0)] RWByteAddressBuffer bufferHandles[];
-[vk::binding(0, 1)] RWTexture2D<float4> imageHandlesf4[];
-[vk::binding(0, 1)] RWTexture2D<float2> imageHandlesf2[];
-[vk::binding(0, 1)] RWTexture2D<float> imageHandlesf1[];
-[vk::binding(NUM_STATIC_SAMPLERS, 2)] Texture2D<float4> textureHandles4[];
-[vk::binding(NUM_STATIC_SAMPLERS, 2)] Texture2D<float3> textureHandles3[];
-[vk::binding(NUM_STATIC_SAMPLERS, 2)] Texture2D<float> textureHandles1[];
-[vk::binding(0, 2)] SamplerState samplerHandles[];
-[vk::binding(0, 3)] RaytracingAccelerationStructure tlasHandles[];
-
-enum RenderResourceTag {
-    Buffer = 0,
-    Image = 1,
-    Texture = 2,
-    AccelerationStructure = 3,
-}
-
-T loadBindings<T>() {
-    return bufferHandles[0].Load<T>(g_offsets.bindings);
-}
-
-T loadConstants<T>() {
-    return bufferHandles[1].Load<T>(g_offsets.constants);
-}
-
-
-
-
-struct Buffer<T> {
-    RenderResourceHandle handle;
-
-    __subscript(uint i) -> T
-    {
-        get { return bufferHandles[NonUniformResourceIndex(handle.index())].Load<T>(sizeof(T) * int(i)); }
-        set { bufferHandles[handle.index()].Store<T>(sizeof(T) * i, newValue); }
-    }
-
-    RWByteAddressBuffer raw() {
-        return bufferHandles[NonUniformResourceIndex(handle.index())];
+    public property T NonUniformInstance {
+        [ForceInline]
+        get { return (T.isWriteable ? RWTextureHeap : TextureHeap)[NonUniformResourceIndex(DescriptorIndex)].as<T>(); }
     }
 }
 
-struct Image4 {
-    RenderResourceHandle handle;
+__generic<E : ITexelElement, Shape : __ITextureShape, let format : int>
+public extension ImageHandle<_Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>> {
+    typealias TextureType = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
 
-    __subscript(vector<uint, 2> i) -> vector<float, 4>
-    {
-        get { return imageHandlesf4[handle.index()][i]; }
-        set { imageHandlesf4[handle.index()][i] = newValue; }
+    [ForceInline]
+    public E Load(vector<uint, Shape.dimensions> pos) {
+        return Instance[pos];
+    }
+    [ForceInline]
+    public void Store(vector<uint, Shape.dimensions> pos, E value) {
+        Instance[pos] = value;
     }
 }
 
-struct Image2 {
-    RenderResourceHandle handle;
+public typealias TextureHandle2D<F: ITexelElement = float4> = ImageHandle<Texture2D<F>>;
+public typealias TextureHandle3D<F: ITexelElement = float4> = ImageHandle<Texture3D<F>>;
+public typealias ImageHandle2D<F: ITexelElement = float4> = ImageHandle<RWTexture2D<F>>;
+public typealias ImageHandle3D<F: ITexelElement = float4> = ImageHandle<RWTexture3D<F>>;
 
-    __subscript(int2 i) -> vector<float, 2>
-    {
-        get { return imageHandlesf2[handle.index()][i]; }
-        set { imageHandlesf2[handle.index()][i] = newValue; }
-    }
-}
+public typealias RWTextureCube<F: ITexelElement = float4> = _Texture<F, __ShapeCube, 0, 0, 0, 1, 0, 0, 0>;
 
-struct Image1 {
-    RenderResourceHandle handle;
+public typealias TextureHandleCube<F: ITexelElement = float4> = ImageHandle<TextureCube<F>>;
+public typealias ImageHandleCube<F: ITexelElement = float4> = ImageHandle<RWTextureCube<F>>;
 
-    __subscript(int2 i) -> float
-    {
-        get { return imageHandlesf1[handle.index()][i]; }
-        set { imageHandlesf1[handle.index()][i] = newValue; }
-    }
-}
+public typealias ImageHandleArray2D<F: ITexelElement = float4> = ImageHandle<RWTexture2DArray<F>>;
 
+#define DESTRUCT_VEC1(var) var.x
+#define DESTRUCT_VEC2(var) var.x, var.y
+#define DESTRUCT_VEC3(var) var.x, var.y, var.z
 
-struct Texture4 {
-    RenderResourceHandle handle;
-
-    __subscript(int2 i) -> vector<float, 4>
-    {
-        get { return textureHandles4[handle.index()][i]; }
-    }
-    
-    float4 sampleLevel2D(SamplerState s, float2 uv, float mip) {
-        return textureHandles4[handle.index()].SampleLevel(s, uv, mip);
-    }
-}
-
-struct Texture3 {
-    RenderResourceHandle handle;
-
-    __subscript(int2 i) -> vector<float, 3>
-    {
-        get { return textureHandles3[handle.index()][i]; }
+#define DEF_TEXTURE_SIZE_EXT(shape, isArray, dim) \
+    __generic<T: ITexelElement, let access : int, let isShadow : int, let isCombined : int, let format : int> \
+    public extension _Texture<T, shape, isArray, 0, 0, access, isShadow, isCombined, format> { \
+        public property uint##dim Size { \
+            get { \
+                uint##dim res; \
+                GetDimensions(DESTRUCT_VEC##dim(res)); \
+                return res; \
+            } \
+        } \
     }
 
-    float3 sampleLevel2D(SamplerState s, float2 uv, float mip) {
-        return textureHandles3[handle.index()].SampleLevel(s, uv, mip);
-    }
-}
+DEF_TEXTURE_SIZE_EXT(__Shape2D, 0, 2);
+DEF_TEXTURE_SIZE_EXT(__Shape2D, 1, 3);
+DEF_TEXTURE_SIZE_EXT(__Shape3D, 0, 3);
 
-struct Texture1 {
-    RenderResourceHandle handle;
-
-    __subscript(int2 i) -> float
-    {
-        get { return textureHandles1[handle.index()][i]; }
-    }
-
-    float3 sampleLevel2D(SamplerState s, float2 uv, float mip) {
-        return textureHandles1[handle.index()].SampleLevel(s, uv, mip);
-    }
-}
+DEF_TEXTURE_SIZE_EXT(__ShapeCube, 0, 2);

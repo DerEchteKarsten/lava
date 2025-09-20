@@ -10,7 +10,7 @@ use gpu_allocator::{
 
 use derivative::Derivative;
 
-use crate::{state::Ctx, vkobjects::buffer::MAllocation};
+use crate::{bindless::{Bindless, BindlessHandle}, state::Ctx, vkobjects::buffer::MAllocation};
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Default)]
 pub enum ImageSize {
@@ -38,6 +38,7 @@ impl ImageSize {
 #[derive(Derivative)]
 #[derivative(Eq, PartialEq, Debug)]
 pub struct Image {
+    pub bindless_handle: BindlessHandle,
     pub image: vk::Image,
     pub view: vk::ImageView,
     #[derivative(PartialEq = "ignore")]
@@ -56,29 +57,9 @@ impl Clone for Image {
             usage: self.usage,
             view: self.view,
             allocation: self.allocation.clone(),
+            bindless_handle: self.bindless_handle,
         }
     }
-}
-
-impl Image {
-    pub fn handle(&self) -> ImageHandle {
-        ImageHandle {
-            image: self.image,
-            view: self.view,
-            size: self.size,
-            format: self.format,
-            usage: self.usage,
-        }
-    }
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct ImageHandle {
-    pub image: vk::Image,
-    pub view: vk::ImageView,
-    pub size: ImageSize,
-    pub format: vk::Format,
-    pub usage: vk::ImageUsageFlags,
 }
 
 pub(super) fn get_aspects(format: vk::Format) -> vk::ImageAspectFlags {
@@ -308,27 +289,6 @@ impl ImageType for Image {
     }
 }
 
-impl ImageType for ImageHandle {
-    fn get_extent(&self) -> vk::Extent2D {
-        vk::Extent2D {
-            width: self.size.size().x,
-            height: self.size.size().y,
-        }
-    }
-    fn get_format(&self) -> vk::Format {
-        self.format
-    }
-    fn get_image(&self) -> vk::Image {
-        self.image
-    }
-    fn get_usage(&self) -> vk::ImageUsageFlags {
-        self.usage
-    }
-    fn get_view(&self) -> vk::ImageView {
-        self.view
-    }
-}
-
 impl Image {
     // pub fn new_from_data(
     //     ctx: &mut Context,
@@ -474,14 +434,19 @@ impl Image {
         };
         let view = Self::view(&Ctx::device(), image, format);
 
-        Ok(Self {
+        let mut s = Self {
             usage,
             image,
             allocation: Some(Arc::new(Mutex::new(MAllocation(allocation)))),
             format,
             size,
             view,
-        })
+            bindless_handle: 0,
+        };
+
+        let handle = Bindless::push_image(&s);
+        s.bindless_handle = handle;
+        Ok(s)
     }
 
     pub fn destroy(&self) {

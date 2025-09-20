@@ -7,9 +7,7 @@ use ash::{
 };
 
 use crate::{
-    FRAMES_IN_FLIGHT,
-    state::{Ctx, Functions},
-    vkobjects::{image::ImageSize, queue::Queue, surface::Surface},
+    bindless::Bindless, state::{Ctx, Functions}, vkobjects::{image::ImageSize, queue::Queue, surface::Surface}, FRAMES_IN_FLIGHT
 };
 
 use super::image::Image;
@@ -137,6 +135,7 @@ impl Swapchain {
                     size: ImageSize::FullScreen,
                     view: Image::view(&device, image, format.format),
                     allocation: None,
+                    bindless_handle: 0
                 }
             })
             .collect::<Vec<_>>();

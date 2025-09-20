@@ -16,7 +16,6 @@ use gpu_allocator::{
 };
 
 use crate::{
-    bindless::{BindlessDescriptorHeap, DescriptorHandle},
     state::Ctx,
 };
 
@@ -164,7 +163,6 @@ pub struct DynamicBuffer {
     pub size: u64,
     pub memory_location: MemoryLocation,
     pub override_alignment: Option<u64>,
-    pub bindless_handle: DescriptorHandle,
 }
 
 pub trait CopySrc {
@@ -197,7 +195,7 @@ impl DynamicBuffer {
         capacity: u64,
         override_alignment: Option<u64>,
     ) -> Result<Self> {
-        let mut s = Self {
+        Ok(Self {
             memory_location,
             buffer: Self::create_buffer(capacity, usage, override_alignment)?,
             capacity,
@@ -207,10 +205,7 @@ impl DynamicBuffer {
                 | vk::BufferUsageFlags::TRANSFER_DST
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             override_alignment,
-            bindless_handle: DescriptorHandle(0),
-        };
-        s.bindless_handle = BindlessDescriptorHeap::get().allocate_buffer_handle(&s);
-        Ok(s)
+        })
     }
 
     fn create_buffer(
@@ -275,7 +270,6 @@ impl DynamicBuffer {
             }
             unsafe { Ctx::device().destroy_buffer(self.buffer.buffer, None) };
             self.buffer = buffer;
-            BindlessDescriptorHeap::get().update_buffer_handle(self, self.bindless_handle);
         }
         Ok(())
     }
@@ -351,5 +345,9 @@ impl DynamicBuffer {
                 (staging_buffer.size as u64).min(size as u64),
             );
         }
+    }
+    
+    pub fn ptr(&self) -> u64 {
+        self.buffer.address
     }
 }

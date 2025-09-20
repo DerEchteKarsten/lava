@@ -2,19 +2,14 @@
 #![feature(f16)]
 #![feature(lock_value_accessors)]
 #![feature(let_chains)]
+#![feature(const_trait_impl)]
 use std::time::Instant;
 
 use crate::{
-    bindless::BindlessDescriptorHeap,
-    pipelines::{RasterPipelineHandle, ShaderPath},
-    state::Ctx,
-    vkobjects::{
-        buffer::{Buffer, DynamicBuffer},
-        queue::CommandBuffer,
-    },
+    bindless::{Bindless, BindlessHandle}, command_buffer::CommandBuffer, pipelines::{RasterPipelineHandle, ShaderPath}, state::Ctx, vkobjects::{buffer::{Buffer, DynamicBuffer}, image::Image}
 };
 use anyhow::{Ok, Result};
-use ash::vk;
+use ash::vk::{self};
 use gpu_allocator::MemoryLocation;
 use winit::{
     application::ApplicationHandler,
@@ -30,6 +25,7 @@ pub mod bindless;
 pub mod pipelines;
 pub mod state;
 pub mod vkobjects;
+pub mod command_buffer;
 
 pub const FRAMES_IN_FLIGHT: usize = 3;
 
@@ -38,18 +34,23 @@ pub fn init<T: HasDisplayHandle + HasWindowHandle>(
     enable_validation: bool,
 ) -> Result<()> {
     Ctx::init(window, enable_validation)?;
-    BindlessDescriptorHeap::init()?;
+    Bindless::init()?;
+
+    for i in &mut Ctx::swapchain().unwrap().images {
+        let handle = Bindless::push_image(i);
+        i.bindless_handle = handle;
+    }
     Ok(())
 }
 
-struct App<F: Fn(&vk::CommandBuffer, usize) -> Result<()>, Y: Fn() -> Result<()>> {
+struct App<F: Fn(CommandBuffer, Image) -> Result<()>, Y: Fn() -> Result<()>> {
     window: Option<Window>,
     start_time: Instant,
     test_func: F,
     after_init: Y,
 }
 
-impl<F: Fn(&vk::CommandBuffer, usize) -> Result<()>, Y: Fn() -> Result<()>> ApplicationHandler
+impl<F: Fn(CommandBuffer, Image) -> Result<()>, Y: Fn() -> Result<()>> ApplicationHandler
     for App<F, Y>
 {
     fn window_event(
@@ -122,7 +123,7 @@ fn test_init() {
     let mut app = App {
         window: None,
         start_time: Instant::now(),
-        test_func: |cmd: &vk::CommandBuffer, _| Ok(()),
+        test_func: |cmd: CommandBuffer, _| Ok(()),
         after_init: || Ok(()),
     };
     event_loop.run_app(&mut app).unwrap();
@@ -142,7 +143,7 @@ fn pipelines() {
     let mut app = App {
         window: None,
         start_time: Instant::now(),
-        test_func: |cmd: &vk::CommandBuffer, _| Ok(()),
+        test_func: |CommandBuffer, _| Ok(()),
         after_init: || Ok(()),
     };
     event_loop.run_app(&mut app).unwrap();

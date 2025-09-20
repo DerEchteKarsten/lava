@@ -10,22 +10,6 @@ pub struct Queue {
     pub percistent_command_pool: vk::CommandPool,
 }
 
-#[derive(Debug)]
-pub struct CommandBuffer {
-    pub handle: vk::CommandBuffer,
-}
-
-impl CommandBuffer {
-    pub fn record<'a, R, F: Fn(&'a vk::CommandBuffer) -> R>(&'a self, f: &F) -> Result<R> {
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info) }?;
-        let result = f(&self.handle);
-        unsafe { Ctx::device().end_command_buffer(self.handle)? };
-        Ok(result)
-    }
-}
-
 impl Queue {
     pub fn new(device: &ash::Device, family_index: u32) -> Result<Self> {
         let handle = unsafe { device.get_device_queue(family_index, 0) };
@@ -44,21 +28,6 @@ impl Queue {
             family_index,
             percistent_command_pool,
         })
-    }
-
-    pub fn cmd(&self) -> CommandBuffer {
-        CommandBuffer {
-            handle: unsafe {
-                Ctx::device()
-                    .allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_buffer_count(1)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_pool(self.percistent_command_pool),
-                    )
-                    .unwrap()
-            }[0],
-        }
     }
 
     pub fn execute_command_wait<R, F: FnOnce(&vk::CommandBuffer) -> R>(

@@ -1,13 +1,7 @@
 use std::{
-    cell::LazyCell,
-    default,
-    ffi::{c_char, c_void},
-    fmt::{Debug, write},
-    mem::MaybeUninit,
-    sync::{
-        Arc, LazyLock, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicU32, AtomicU64},
-    },
+    cell::LazyCell, collections::HashMap, default, ffi::{c_char, c_void}, fmt::{write, Debug}, mem::MaybeUninit, sync::{
+        atomic::{AtomicU32, AtomicU64}, Arc, LazyLock, Mutex, MutexGuard, OnceLock
+    }
 };
 
 use anyhow::{Error, Result, anyhow};
@@ -26,13 +20,9 @@ use winit::raw_window_handle::{
 };
 
 use crate::{
-    FRAMES_IN_FLIGHT,
-    vkobjects::{
-        physical_device::PhysicalDevice,
-        queue::{CommandBuffer, Queue},
-        surface::Surface,
-        swapchain::Swapchain,
-    },
+    bindless::{Bindless, BindlessHandle}, command_buffer::CommandBuffer, vkobjects::{
+        image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface, swapchain::Swapchain
+    }, FRAMES_IN_FLIGHT
 };
 
 #[derive(Debug)]
@@ -41,7 +31,7 @@ pub struct Frame {
     image_available: vk::Semaphore, // binary, signaled by acquire
     render_finished: vk::Semaphore, // binary, waited by present
     pool: vk::CommandPool,
-    cmd: CommandBuffer,
+    cmd: vk::CommandBuffer,
 }
 
 pub struct Ctx {
@@ -196,7 +186,7 @@ impl Ctx {
             .unwrap_or(0)
     }
 
-    pub fn next_frame<'a, F: FnMut(&'a vk::CommandBuffer, usize) -> Result<()>>(
+    pub fn next_frame<'a, F: FnMut(CommandBuffer, Image) -> Result<()>>(
         func: &mut F,
     ) -> Result<()> {
         let s = STATE
@@ -226,9 +216,14 @@ impl Ctx {
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { Ctx::device().begin_command_buffer(f.cmd.handle, &begin_info) }?;
-        let result = func(&f.cmd.handle, image_index as usize);
-        unsafe { Ctx::device().end_command_buffer(f.cmd.handle)? };
+        unsafe { Ctx::device().begin_command_buffer(f.cmd, &begin_info) }?;
+        let cmd = CommandBuffer {
+            commands: Vec::new(),
+            handle: f.cmd,
+            resource_hashes: HashMap::new(),
+        };
+        let result = func(cmd, Ctx::swapchain().unwrap().images[image_index as usize].clone());
+        unsafe { Ctx::device().end_command_buffer(f.cmd)? };
 
         s.frame_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -239,7 +234,7 @@ impl Ctx {
             ..Default::default()
         }];
 
-        let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(f.cmd.handle);
+        let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(f.cmd);
         let sig_render_finished = vk::SemaphoreSubmitInfo {
             semaphore: f.render_finished,
             stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -315,6 +310,10 @@ impl Ctx {
                     .unwrap()
                     .destroy_swapchain(Ctx::swapchain().unwrap().handle, None);
             };
+
+            for (i, image) in swapchain.images.iter().enumerate() {
+                Bindless::write_image(image, Ctx::swapchain().unwrap().images[i].bindless_handle);
+            }
 
             s.swapchain.set(swapchain).unwrap();
             s.swpachain_needs_resizing.set(None).unwrap();
@@ -498,7 +497,7 @@ impl Ctx {
                 render_finished: render_finished_semaphore,
                 fence,
                 pool,
-                cmd: CommandBuffer { handle: cmd },
+                cmd,
             }
         }
 
