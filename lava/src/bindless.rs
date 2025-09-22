@@ -100,7 +100,7 @@ impl Bindless {
 
         let pool_sizes = [
             vk::DescriptorPoolSize {
-                descriptor_count: Ctx::physical_device().limits.max_descriptor_set_sampled_images,
+                descriptor_count: Ctx::physical_device().limits.max_descriptor_set_sampled_images.min(1000),
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
             },
             vk::DescriptorPoolSize {
@@ -108,7 +108,7 @@ impl Bindless {
                 ty: vk::DescriptorType::SAMPLER,
             },
             vk::DescriptorPoolSize {
-                descriptor_count: Ctx::physical_device().limits.max_descriptor_set_storage_images,
+                descriptor_count: Ctx::physical_device().limits.max_descriptor_set_storage_images.min(1000),
                 ty: vk::DescriptorType::STORAGE_IMAGE,
             }
         ];
@@ -120,8 +120,8 @@ impl Bindless {
         let pool = unsafe { Ctx::device().create_descriptor_pool(&pool_info, None) }.unwrap();
 
         let desc_counts = [
-            Ctx::physical_device().limits.max_descriptor_set_sampled_images,
-            Ctx::physical_device().limits.max_descriptor_set_storage_images,
+            Ctx::physical_device().limits.max_descriptor_set_sampled_images.min(1000),
+            Ctx::physical_device().limits.max_descriptor_set_storage_images.min(1000),
         ];
         let mut alloc_info = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
             .descriptor_counts(&desc_counts);
