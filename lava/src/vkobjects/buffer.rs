@@ -333,10 +333,10 @@ impl DynamicBuffer {
         for i in 0..size.div_ceil(staging_buffer.size as usize) {
             staging_buffer
                 .copy_data_to_buffer(
-                    &data[i * staging_buffer.size as usize / size_of::<T>()
+                    &data[i * (staging_buffer.size as usize / size_of::<T>())
                         ..data
                             .len()
-                            .min((i + 1) * staging_buffer.size as usize / size_of::<T>())],
+                            .min((i + 1) * (staging_buffer.size as usize / size_of::<T>()))],
                 )
                 .unwrap();
             self.copy_from(

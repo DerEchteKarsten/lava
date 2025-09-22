@@ -1,6 +1,6 @@
-
-[vk::binding(0, 0)] __DynamicResource TextureHeap[];
-[vk::binding(1, 0)] __DynamicResource RWTextureHeap[];
+#define NUM_SAMPLERS 1
+[vk::binding(NUM_SAMPLERS, 0)] __DynamicResource TextureHeap[];
+[vk::binding(0, 1)] __DynamicResource RWTextureHeap[];
 
 interface IImageDescriptor {
     static const bool isWriteable;
@@ -12,7 +12,7 @@ __generic<E : ITexelElement, Shape : __ITextureShape, int isArray, int isMS, int
 };
 
 public struct ImageHandle<T : IImageDescriptor & __IDynamicResourceCastable> {
-    uint DescriptorIndex;
+    uint64_t DescriptorIndex;
 
     public property bool IsNull { get { return DescriptorIndex == ~0; } }
 

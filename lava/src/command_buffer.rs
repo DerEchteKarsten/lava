@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use ash::vk;
+use glam::Mat4;
 
-use crate::{bindless::Bindless, pipelines::{ComputePipelineHandle, PipelineModel, RasterPipelineHandle, RayTracingPipelineHandle, ShaderPath}, state::Ctx, vkobjects::{buffer::{Buffer, DynamicBuffer}, image::Image}};
+use crate::{bindless::Bindless, pipelines::{ComputePipelineHandle, PipelineModel, RasterPipelineHandle, RayTracingPipelineHandle, ShaderPath}, state::Ctx, vkobjects::{buffer::{Buffer, DynamicBuffer}, image::Image, rt_pipeline::alinged_size}};
 
 
 enum Command {
@@ -12,21 +13,25 @@ enum Command {
     Present,
 }
 
-enum PushConstant {
-    BindlessImage(u32),
+#[derive(Debug)]
+pub enum PushConstant {
+    BindlessImage(u64),
     BufferPointer(u64),
     Constants(Vec<u8>),
 }
 
+#[derive(Clone, Hash, PartialEq, Eq)]
 pub enum ResourceHandle {
     Buffer(vk::Buffer),
-    Image(vk::ImageView),
+    Image((vk::ImageView, vk::Image)),
 }
 
+#[derive(Clone, Copy)]
 pub struct ResourceState {
-    pipeline_barrier_src_stages: vk::PipelineStageFlags2,
-    last_access: vk::AccessFlags2,
+    stages: vk::PipelineStageFlags2,
+    access: vk::AccessFlags2,
     layout: vk::ImageLayout,
+    aspect: vk::ImageAspectFlags,
 }
 
 pub struct Action {
@@ -35,7 +40,7 @@ pub struct Action {
     push_constants: Option<Vec<PushConstant>>,
     color_attachments: Option<Vec<(Image, Option<[f32; 4]>)>>,
     depth_attachments: Option<Image>,
-    shader_resources: Option<Vec<(ResourceHandle, vk::AccessFlags2)>>,
+    resources: Vec<(ResourceHandle, ResourceState)>,
 }
 
 pub struct CommandBuffer {
@@ -52,9 +57,10 @@ struct RasterBuilder {
     dispatch: [u32; 5],
 }
 
-trait IntoShaderResourceHandle {
+pub trait IntoShaderResourceHandle {
     fn to(&self) -> PushConstant;
     fn vk(&self) -> Option<ResourceHandle>;
+    fn preferd_default_layout(&self) -> Option<vk::ImageLayout>;
 }
 
 impl IntoShaderResourceHandle for Buffer {
@@ -63,6 +69,9 @@ impl IntoShaderResourceHandle for Buffer {
     }
     fn vk(&self) -> Option<ResourceHandle> {
         Some(ResourceHandle::Buffer(self.buffer))
+    }
+    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
+        None
     }
 }
 
@@ -73,14 +82,24 @@ impl IntoShaderResourceHandle for DynamicBuffer {
     fn vk(&self) -> Option<ResourceHandle> {
         Some(ResourceHandle::Buffer(self.buffer.buffer))
     }
+    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
+        None
+    }
 }
 
 impl IntoShaderResourceHandle for Image {
     fn to(&self) -> PushConstant {
-        PushConstant::BindlessImage(self.bindless_handle)
+        PushConstant::BindlessImage(self.bindless_handle as u64)
     }
     fn vk(&self) -> Option<ResourceHandle> {
-        Some(ResourceHandle::Image(self.view))
+        Some(ResourceHandle::Image((self.view, self.image)))
+    }
+    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
+        if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            Some(vk::ImageLayout::GENERAL)
+        }else {
+            None
+        }
     }
 }
 
@@ -91,38 +110,51 @@ impl IntoShaderResourceHandle for u64 {
     fn vk(&self) -> Option<ResourceHandle> {
         None
     }
+    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
+        None
+    }
 }
 
 
 
 pub struct CommandBuilder<'a, T: Default> {
     push_constants: Vec<PushConstant>,
-    resources: Vec<(ResourceHandle, vk::AccessFlags2)>,
+    resources: Vec<(ResourceHandle, ResourceState)>,
     sub_builder: T,
     cmd_buffer: &'a mut CommandBuffer,
 }
 
 impl<'a, T: Default> CommandBuilder<'a, T> {
-    pub fn resource_access(mut self, value: &impl IntoShaderResourceHandle, access: vk::AccessFlags2) -> Self {
+    pub fn resource_access(mut self, value: &impl IntoShaderResourceHandle, access: vk::AccessFlags2, layout: vk::ImageLayout) -> Self {
         self.push_constants.push(value.to());
         if let Some(v) = value.vk() {
-            self.resources.push((v, access));
+            let mut stages = vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER;
+            if Ctx::features().raytracing {
+                stages |= vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
+            }
+            self.resources.push((v, ResourceState {
+                access,
+                layout,
+                stages,
+                aspect: vk::ImageAspectFlags::COLOR,
+            }));
         }
         self
     }
     pub fn read(self, read: &impl IntoShaderResourceHandle) -> Self {
-        self.resource_access(read, vk::AccessFlags2::SHADER_READ)
+        self.resource_access(read, vk::AccessFlags2::SHADER_READ, read.preferd_default_layout().unwrap_or(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL))
     }
     pub fn readwrite(self, read: &impl IntoShaderResourceHandle) -> Self {
-        self.resource_access(read, vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
+        self.resource_access(read, vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE, vk::ImageLayout::GENERAL)
     }
     pub fn write(self, read: &impl IntoShaderResourceHandle) -> Self {
-        self.resource_access(read, vk::AccessFlags2::SHADER_WRITE)
+        self.resource_access(read, vk::AccessFlags2::SHADER_WRITE, vk::ImageLayout::GENERAL)
     }
     pub fn constant<A: Clone>(mut self, value: &A) -> Self {
         let mut slice = [value.clone()];
-        let byte_slice = unsafe { Vec::from_raw_parts(slice.as_mut_ptr() as *mut u8, size_of::<A>(), size_of::<A>()) };
-        self.push_constants.push(PushConstant::Constants(byte_slice));
+        let mut vec = Vec::new();
+        unsafe { vec.extend_from_slice(std::slice::from_raw_parts(slice.as_mut_ptr() as *mut u8, size_of::<A>())) };
+        self.push_constants.push(PushConstant::Constants(vec));
         self
     }
 }
@@ -166,14 +198,24 @@ impl<'a> CommandBuilder<'a, RasterBuilder> {
 
     pub fn color_attachment(mut self, image: &Image, clear: Option<[f32; 4]>) -> Self {
         self.sub_builder.color_attachments.push((image.clone(), clear));
-        self.resources.push((ResourceHandle::Image(image.view), vk::AccessFlags2::COLOR_ATTACHMENT_WRITE));
+        self.resources.push((ResourceHandle::Image((image.view, image.image)), ResourceState {
+            access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            stages: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            aspect: vk::ImageAspectFlags::COLOR,
+        }));
         self
     } 
 
     pub fn depth_attachment(mut self, image: &Image) -> Self {
         assert!(self.sub_builder.depth_attachments.is_none());
         self.sub_builder.depth_attachments = Some(image.clone());
-        self.resources.push((ResourceHandle::Image(image.view), vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE_KHR | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ_KHR));
+        self.resources.push((ResourceHandle::Image((image.view, image.image)), ResourceState {
+            access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+            layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            stages: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS,
+            aspect: vk::ImageAspectFlags::DEPTH
+        }));
         self
     } 
 
@@ -184,7 +226,7 @@ impl<'a> CommandBuilder<'a, RasterBuilder> {
             dispatch,
             command: Command::Raster(self.sub_builder.pipeline_handle),
             push_constants: Some(self.push_constants),
-            shader_resources: Some(self.resources),
+            resources: self.resources,
         });
     }
 
@@ -223,7 +265,7 @@ impl<'a> CommandBuilder<'a, ComputeBuilder> {
             command: Command::Compute(self.sub_builder.pipeline_handle),
             dispatch,
             push_constants: Some(self.push_constants),
-            shader_resources: Some(self.resources)
+            resources: self.resources
         });
     }
 
@@ -261,7 +303,7 @@ impl<'a> CommandBuilder<'a, RayTracingBuilder> {
             command: Command::Raytracing(self.sub_builder.pipeline_handle),
             dispatch,
             push_constants: Some(self.push_constants),
-            shader_resources: Some(self.resources)
+            resources: self.resources
         });
     }
 
@@ -302,11 +344,30 @@ impl CommandBuffer {
         }
     }
 
+    pub fn present(&mut self, swapchain_image: Image) {
+        self.commands.push(Action {
+            color_attachments: None,
+            depth_attachments: None,
+            push_constants: None,
+            dispatch: [0;5],
+            command: Command::Present,
+            resources: vec![(
+                ResourceHandle::Image((swapchain_image.view, swapchain_image.image)),
+                ResourceState {
+                    access: vk::AccessFlags2::empty(),
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                    stages: vk::PipelineStageFlags2::NONE,
+                }
+            )],
+        });
+    }
+
     pub fn record(&mut self) {
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info) }.unwrap();
         Bindless::bind(&self.handle);
-        
+
         for (i, aktion) in self.commands.iter().enumerate() {
             let mut data = vec![0; Ctx::physical_device().limits.max_push_constants_size as usize];
             let mut index = 0;
@@ -318,12 +379,78 @@ impl CommandBuffer {
                         PushConstant::BufferPointer(n) => bytes.extend_from_slice(&n.to_ne_bytes()),
                         PushConstant::Constants(con) => bytes.extend(con),
                     };
-                    data[index..bytes.len()].copy_from_slice(&bytes);
+                    data[index..(index +bytes.len())].copy_from_slice(&bytes);
                     index += bytes.len();
                 }
             }
 
             unsafe { Ctx::device().cmd_push_constants(self.handle, Bindless::layout(), vk::ShaderStageFlags::ALL, 0, &data) };
+
+            let mut image_barriers = Vec::new();
+            let mut buffer_barriers = Vec::new();
+            for (resource, new) in &aktion.resources {
+                let prev = self.resource_hashes.get(&resource).copied().unwrap_or(ResourceState { 
+                    stages: vk::PipelineStageFlags2::empty(), 
+                    access: vk::AccessFlags2::empty(), 
+                    layout: vk::ImageLayout::UNDEFINED,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                });
+                // fast path: same layout/access/queue and no write->read hazard => no barrier
+                let read_to_read = prev.access.contains(vk::AccessFlags2::SHADER_READ) && !prev.access.intersects(vk::AccessFlags2::SHADER_WRITE)
+                                && new.access.contains(vk::AccessFlags2::SHADER_READ) && !new.access.intersects(vk::AccessFlags2::SHADER_WRITE);
+                let same_layout   = prev.layout == new.layout;
+
+                let need_barrier = !read_to_read || !same_layout;
+
+                if need_barrier {
+                    // src/dst stages & access: from prev -> next
+                    let src_stage_mask = if prev.stages.is_empty() { vk::PipelineStageFlags2::TOP_OF_PIPE } else { prev.stages };
+                    let dst_stage_mask = if new.stages.is_empty() { vk::PipelineStageFlags2::BOTTOM_OF_PIPE } else { new.stages };
+
+                    match resource {
+                        ResourceHandle::Buffer(buffer) => buffer_barriers.push(vk::BufferMemoryBarrier2 {
+                            src_access_mask: prev.access,
+                            dst_access_mask: new.access,
+                            src_stage_mask,
+                            dst_stage_mask,
+                            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                            buffer: *buffer,
+                            offset: 0,
+                            size: vk::WHOLE_SIZE,
+                            ..Default::default()
+                        }),
+                        ResourceHandle::Image((view, image)) => image_barriers.push(vk::ImageMemoryBarrier2 {
+                            src_access_mask: prev.access,
+                            dst_access_mask: new.access,
+                            src_stage_mask,
+                            dst_stage_mask,
+                            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                            image: *image,
+                            old_layout: prev.layout,
+                            new_layout: new.layout,
+                            subresource_range: vk::ImageSubresourceRange {
+                                aspect_mask: new.aspect,
+                                base_array_layer: 0,
+                                base_mip_level: 0,
+                                layer_count: 1,
+                                level_count: 1,
+                            },
+                            ..Default::default()
+                        }),
+                    };
+                }
+
+                self.resource_hashes.insert(resource.clone(), new.clone());
+            }
+            if !image_barriers.is_empty() || !buffer_barriers.is_empty() {
+                let dependency_info = vk::DependencyInfo::default()
+                    .buffer_memory_barriers(&buffer_barriers)
+                    .image_memory_barriers(&image_barriers)
+                    .dependency_flags(vk::DependencyFlags::BY_REGION);
+                unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
+            }
 
             match &aktion.command {
                 Command::Compute(pipeline) => {
@@ -338,5 +465,7 @@ impl CommandBuffer {
                 Command::Present => {}
             }
         }
+
+        unsafe { Ctx::device().end_command_buffer(self.handle) }.unwrap();
     }
 }

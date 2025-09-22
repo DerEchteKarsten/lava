@@ -186,16 +186,16 @@ impl Ctx {
             .unwrap_or(0)
     }
 
-    pub fn next_frame<'a, F: FnMut(CommandBuffer, Image) -> Result<()>>(
+    pub fn next_frame<'a, F: FnMut(&mut CommandBuffer, Image) -> Result<()>>(
         func: &mut F,
     ) -> Result<()> {
-        let s = STATE
-            .get()
-            .unwrap()
-            .present
-            .as_ref()
-            .ok_or(anyhow!("No Present Context"))
-            .unwrap();
+    let s = STATE
+        .get()
+        .unwrap()
+        .present
+        .as_ref()
+        .ok_or(anyhow!("No Present Context"))
+        .unwrap();
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
         let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
@@ -214,17 +214,15 @@ impl Ctx {
             )
         }?;
 
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { Ctx::device().begin_command_buffer(f.cmd, &begin_info) }?;
-        let cmd = CommandBuffer {
+        let mut cmd = CommandBuffer {
             commands: Vec::new(),
             handle: f.cmd,
             resource_hashes: HashMap::new(),
         };
-        let result = func(cmd, Ctx::swapchain().unwrap().images[image_index as usize].clone());
-        unsafe { Ctx::device().end_command_buffer(f.cmd)? };
-
+        let img = Ctx::swapchain().unwrap().images[image_index as usize].clone();
+        let result = func(&mut cmd, img);
+        cmd.record();
+        
         s.frame_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
@@ -311,8 +309,9 @@ impl Ctx {
                     .destroy_swapchain(Ctx::swapchain().unwrap().handle, None);
             };
 
-            for (i, image) in swapchain.images.iter().enumerate() {
-                Bindless::write_image(image, Ctx::swapchain().unwrap().images[i].bindless_handle);
+            for (i, image) in swapchain.images.iter_mut().enumerate() {
+                Bindless::write_image(image, i as u32);
+                image.bindless_handle = i as u32;
             }
 
             s.swapchain.set(swapchain).unwrap();

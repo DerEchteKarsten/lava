@@ -28,12 +28,15 @@ impl Bindless {
     }
     pub fn init() -> Result<()> {
         let mut layouts = [vk::DescriptorSetLayout::default(); 2];
-        let samplers = [];
+        let sci = vk::SamplerCreateInfo::default();
+        let samplers = [
+            unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap()
+        ];
         let mut descriptor_binding_flags = [
                     vk::DescriptorBindingFlags::empty(),
-                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                        | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                    vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
+                        | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT_EXT
+                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT,
                 ];
         let bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -44,7 +47,7 @@ impl Bindless {
                 ..Default::default()
             }.immutable_samplers(&samplers),
             vk::DescriptorSetLayoutBinding {
-                binding: 1,
+                binding: samplers.len() as u32,
                 descriptor_count: Ctx::physical_device().limits.max_descriptor_set_sampled_images,
                 descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                 stage_flags: vk::ShaderStageFlags::ALL,
@@ -55,14 +58,14 @@ impl Bindless {
                 .binding_flags(&descriptor_binding_flags);
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
-            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)  
+            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL_EXT)  
             .push_next(&mut ext_flags);
         layouts[0] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
         let mut descriptor_binding_flags = [
-                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                        | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                    vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
+                        | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT_EXT
+                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT,
                 ];
 
         let bindings = [
@@ -78,7 +81,7 @@ impl Bindless {
                 .binding_flags(&descriptor_binding_flags);
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
-            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL_EXT)
             .push_next(&mut ext_flags);
         layouts[1] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
         
@@ -97,11 +100,15 @@ impl Bindless {
 
         let pool_sizes = [
             vk::DescriptorPoolSize {
-                descriptor_count: 1,
+                descriptor_count: Ctx::physical_device().limits.max_descriptor_set_sampled_images,
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
             },
             vk::DescriptorPoolSize {
-                descriptor_count: 1,
+                descriptor_count: samplers.len() as u32,
+                ty: vk::DescriptorType::SAMPLER,
+            },
+            vk::DescriptorPoolSize {
+                descriptor_count: Ctx::physical_device().limits.max_descriptor_set_storage_images,
                 ty: vk::DescriptorType::STORAGE_IMAGE,
             }
         ];
@@ -112,9 +119,16 @@ impl Bindless {
             .pool_sizes(&pool_sizes);
         let pool = unsafe { Ctx::device().create_descriptor_pool(&pool_info, None) }.unwrap();
 
+        let desc_counts = [
+            Ctx::physical_device().limits.max_descriptor_set_sampled_images,
+            Ctx::physical_device().limits.max_descriptor_set_storage_images,
+        ];
+        let mut alloc_info = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
+            .descriptor_counts(&desc_counts);
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
-            .set_layouts(&layouts);
+            .set_layouts(&layouts)
+            .push_next(&mut alloc_info);
         let sets = unsafe { Ctx::device().allocate_descriptor_sets(&allocate_info) }?.try_into().unwrap();
 
         BINDLESS.set(Self { num_images: AtomicU32::new(0), num_textures: AtomicU32::new(0), layout, layouts, sets, pool }).unwrap();
@@ -146,7 +160,7 @@ impl Bindless {
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .dst_array_element(handle)
             .dst_binding(0)
-            .dst_set(Self::get().sets[0])
+            .dst_set(Self::get().sets[1])
             .image_info(&image_info);
         unsafe { Ctx::device().update_descriptor_sets(std::slice::from_ref(&write), &[]) };
     }
@@ -164,7 +178,7 @@ impl Bindless {
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
             .dst_array_element(handle)
             .dst_binding(1)
-            .dst_set(Self::get().sets[1])
+            .dst_set(Self::get().sets[0])
             .image_info(&image_info);
         unsafe { Ctx::device().update_descriptor_sets(std::slice::from_ref(&write), &[]) };
     }
