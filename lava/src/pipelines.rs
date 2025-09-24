@@ -10,12 +10,15 @@ use anyhow::Result;
 use ash::vk;
 
 use crate::{
-    bindless::Bindless, state::{Ctx, Functions}, vkobjects::{
-        image::Image, rt_pipeline::{
+    bindless::Bindless,
+    state::{Ctx, Functions},
+    vkobjects::{
+        image::Image,
+        rt_pipeline::{
             RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
             ShaderBindingTable,
-        }
-    }
+        },
+    },
 };
 
 #[derive(Clone, Hash, PartialEq, Eq, Default)]

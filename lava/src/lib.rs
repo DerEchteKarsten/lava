@@ -6,7 +6,14 @@
 use std::time::Instant;
 
 use crate::{
-    bindless::{Bindless, BindlessHandle}, command_buffer::CommandBuffer, pipelines::{RasterPipelineHandle, ShaderPath}, state::Ctx, vkobjects::{buffer::{Buffer, DynamicBuffer}, image::Image}
+    bindless::{Bindless, BindlessHandle},
+    command_buffer::CommandBuffer,
+    pipelines::{RasterPipelineHandle, ShaderPath},
+    state::Ctx,
+    vkobjects::{
+        buffer::{Buffer, DynamicBuffer},
+        image::Image,
+    },
 };
 use anyhow::{Ok, Result};
 use ash::vk::{self};
@@ -22,10 +29,10 @@ use winit::{
 };
 
 pub mod bindless;
+pub mod command_buffer;
 pub mod pipelines;
 pub mod state;
 pub mod vkobjects;
-pub mod command_buffer;
 
 pub const FRAMES_IN_FLIGHT: usize = 3;
 

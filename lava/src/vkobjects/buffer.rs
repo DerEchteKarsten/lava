@@ -15,9 +15,7 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc},
 };
 
-use crate::{
-    state::Ctx,
-};
+use crate::state::Ctx;
 
 use super::image::{Image, ImageType, get_aspects};
 
@@ -346,7 +344,7 @@ impl DynamicBuffer {
             );
         }
     }
-    
+
     pub fn ptr(&self) -> u64 {
         self.buffer.address
     }

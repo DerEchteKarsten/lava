@@ -10,7 +10,11 @@ use gpu_allocator::{
 
 use derivative::Derivative;
 
-use crate::{bindless::{Bindless, BindlessHandle}, state::Ctx, vkobjects::buffer::MAllocation};
+use crate::{
+    bindless::{Bindless, BindlessHandle},
+    state::Ctx,
+    vkobjects::buffer::MAllocation,
+};
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Default)]
 pub enum ImageSize {

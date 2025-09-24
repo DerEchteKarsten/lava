@@ -1,7 +1,14 @@
 use std::{
-    cell::LazyCell, collections::HashMap, default, ffi::{c_char, c_void}, fmt::{write, Debug}, mem::MaybeUninit, sync::{
-        atomic::{AtomicU32, AtomicU64}, Arc, LazyLock, Mutex, MutexGuard, OnceLock
-    }
+    cell::LazyCell,
+    collections::HashMap,
+    default,
+    ffi::{c_char, c_void},
+    fmt::{Debug, write},
+    mem::MaybeUninit,
+    sync::{
+        Arc, LazyLock, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicU32, AtomicU64},
+    },
 };
 
 use anyhow::{Error, Result, anyhow};
@@ -20,9 +27,13 @@ use winit::raw_window_handle::{
 };
 
 use crate::{
-    bindless::{Bindless, BindlessHandle}, command_buffer::CommandBuffer, vkobjects::{
-        image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface, swapchain::Swapchain
-    }, FRAMES_IN_FLIGHT
+    FRAMES_IN_FLIGHT,
+    bindless::{Bindless, BindlessHandle},
+    command_buffer::CommandBuffer,
+    vkobjects::{
+        image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface,
+        swapchain::Swapchain,
+    },
 };
 
 #[derive(Debug)]
@@ -189,13 +200,13 @@ impl Ctx {
     pub fn next_frame<'a, F: FnMut(&mut CommandBuffer, Image) -> Result<()>>(
         func: &mut F,
     ) -> Result<()> {
-    let s = STATE
-        .get()
-        .unwrap()
-        .present
-        .as_ref()
-        .ok_or(anyhow!("No Present Context"))
-        .unwrap();
+        let s = STATE
+            .get()
+            .unwrap()
+            .present
+            .as_ref()
+            .ok_or(anyhow!("No Present Context"))
+            .unwrap();
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
         let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
@@ -222,7 +233,7 @@ impl Ctx {
         let img = Ctx::swapchain().unwrap().images[image_index as usize].clone();
         let result = func(&mut cmd, img);
         cmd.record();
-        
+
         s.frame_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
