@@ -45,7 +45,7 @@ pub fn init<T: HasDisplayHandle + HasWindowHandle>(
 
     for i in &mut Ctx::swapchain().unwrap().images {
         let handle = Bindless::push_image(i);
-        i.bindless_handle = handle;
+        i.bindless_handle = Some(handle);
     }
     Ok(())
 }

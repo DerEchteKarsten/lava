@@ -61,16 +61,16 @@ pub struct CommandBuffer {
 }
 
 #[derive(Default)]
-struct RasterBuilder {
+pub struct RasterBuilder {
     pipeline_handle: RasterPipelineHandle,
     color_attachments: Vec<(Image, Option<[f32; 4]>)>,
     depth_attachments: Option<Image>,
-    dispatch: [u32; 5],
 }
 
 pub trait IntoShaderResourceHandle {
     fn to(&self) -> PushConstant;
     fn vk(&self) -> Option<ResourceHandle>;
+    fn aspect(&self) -> vk::ImageAspectFlags;
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout>;
 }
 
@@ -84,23 +84,29 @@ impl IntoShaderResourceHandle for Buffer {
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
         None
     }
+    fn aspect(&self) -> vk::ImageAspectFlags {
+        vk::ImageAspectFlags::NONE
+    }
 }
 
-impl IntoShaderResourceHandle for DynamicBuffer {
+impl<T: Copy> IntoShaderResourceHandle for DynamicBuffer<T> {
     fn to(&self) -> PushConstant {
         PushConstant::BufferPointer(self.ptr())
     }
     fn vk(&self) -> Option<ResourceHandle> {
-        Some(ResourceHandle::Buffer(self.buffer.buffer))
+        self.buffer.as_ref().map(|b| ResourceHandle::Buffer(b.buffer))
     }
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
         None
+    }
+    fn aspect(&self) -> vk::ImageAspectFlags {
+        vk::ImageAspectFlags::NONE
     }
 }
 
 impl IntoShaderResourceHandle for Image {
     fn to(&self) -> PushConstant {
-        PushConstant::BindlessImage(self.bindless_handle as u64)
+        PushConstant::BindlessImage(self.bindless_handle.expect("Image is neither a texture nor a storage image, consider adding either vk::Sampled or vk::StorageImage to your image usage flags.") as u64)
     }
     fn vk(&self) -> Option<ResourceHandle> {
         Some(ResourceHandle::Image((self.view, self.image)))
@@ -110,6 +116,13 @@ impl IntoShaderResourceHandle for Image {
             Some(vk::ImageLayout::GENERAL)
         } else {
             None
+        }
+    }
+    fn aspect(&self) -> vk::ImageAspectFlags {
+        if self.format == vk::Format::D32_SFLOAT || self.format == vk::Format::D16_UNORM || self.format == vk::Format::D16_UNORM_S8_UINT || self.format == vk::Format::D24_UNORM_S8_UINT || self.format == vk::Format::D32_SFLOAT_S8_UINT {
+            vk::ImageAspectFlags::DEPTH
+        }else {
+            vk::ImageAspectFlags::COLOR
         }
     }
 }
@@ -123,6 +136,9 @@ impl IntoShaderResourceHandle for u64 {
     }
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
         None
+    }
+    fn aspect(&self) -> vk::ImageAspectFlags {
+        vk::ImageAspectFlags::NONE
     }
 }
 
@@ -153,7 +169,7 @@ impl<'a, T: Default> CommandBuilder<'a, T> {
                     access,
                     layout,
                     stages,
-                    aspect: vk::ImageAspectFlags::COLOR,
+                    aspect: value.aspect(),
                 },
             ));
         }
@@ -228,12 +244,16 @@ impl<'a> CommandBuilder<'a, RasterBuilder> {
         if let PipelineModel::Mesh { task, mesh } = &mut self.sub_builder.pipeline_handle.model {
             mesh.entry = entry;
             mesh.path = path;
+        }else {
+            self.sub_builder.pipeline_handle.model = PipelineModel::Mesh { task: None, mesh: ShaderPath { path, entry } }
         }
         self
     }
     pub fn task(mut self, path: &'static str, entry: &'static str) -> Self {
         if let PipelineModel::Mesh { task, mesh } = &mut self.sub_builder.pipeline_handle.model {
             *task = Some(ShaderPath { entry, path })
+        }else {
+            self.sub_builder.pipeline_handle.model = PipelineModel::Mesh { task: Some(ShaderPath { path, entry }), mesh: ShaderPath {path: "", entry: ""} }
         }
         self
     }

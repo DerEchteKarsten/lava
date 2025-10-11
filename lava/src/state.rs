@@ -322,7 +322,7 @@ impl Ctx {
 
             for (i, image) in swapchain.images.iter_mut().enumerate() {
                 Bindless::write_image(image, i as u32);
-                image.bindless_handle = i as u32;
+                image.bindless_handle = Some(i as u32);
             }
 
             s.swapchain.set(swapchain).unwrap();
@@ -441,10 +441,6 @@ impl Ctx {
                 physical_devices.as_slice(),
                 &mut features,
             )?;
-
-        features.raytracing = false;
-        features.device_debug_utils = false;
-        features.mesh = false;
 
         let mut queue_families = vec![graphics_queue_family.index];
         if let Some(present_queue_family) = &present_queue_family {

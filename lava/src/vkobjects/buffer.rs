@@ -1,10 +1,5 @@
 use std::{
-    ffi::c_void,
-    fmt::Debug,
-    mem::MaybeUninit,
-    ops::DerefMut,
-    ptr::NonNull,
-    sync::{Arc, Mutex},
+    ffi::c_void, fmt::Debug, marker::PhantomData, mem::MaybeUninit, ops::DerefMut, ptr::NonNull, sync::{Arc, Mutex}
 };
 
 use anyhow::{Error, Result};
@@ -154,13 +149,14 @@ pub struct RawDynamicBuffer {
 }
 
 #[derive(Clone)]
-pub struct DynamicBuffer {
-    pub buffer: RawDynamicBuffer,
+pub struct DynamicBuffer<T: Copy> {
+    pub buffer: Option<RawDynamicBuffer>,
     pub capacity: u64,
     pub usage: vk::BufferUsageFlags,
     pub size: u64,
     pub memory_location: MemoryLocation,
     pub override_alignment: Option<u64>,
+    pub _marker: PhantomData<T>,
 }
 
 pub trait CopySrc {
@@ -177,17 +173,28 @@ impl CopySrc for Buffer {
     }
 }
 
-impl CopySrc for DynamicBuffer {
+impl<T: Copy> CopySrc for DynamicBuffer<T> {
     fn size(&self) -> u64 {
         self.size
     }
     fn to_vk(&self) -> vk::Buffer {
-        self.buffer.buffer
+        self.buffer.as_ref().unwrap().buffer
     }
 }
 
-impl DynamicBuffer {
+impl<T: Copy> DynamicBuffer<T> {
+    pub fn new_storage() -> Result<Self> {
+        Self::new(vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, None)
+    }
     pub fn new(
+        usage: vk::BufferUsageFlags,
+        memory_location: MemoryLocation,
+        override_alignment: Option<u64>,
+    ) -> Result<Self> {
+        Self::with_capacity(usage, memory_location, 0, override_alignment)
+    }
+
+    pub fn with_capacity(
         usage: vk::BufferUsageFlags,
         memory_location: MemoryLocation,
         capacity: u64,
@@ -195,7 +202,7 @@ impl DynamicBuffer {
     ) -> Result<Self> {
         Ok(Self {
             memory_location,
-            buffer: Self::create_buffer(capacity, usage, override_alignment)?,
+            buffer: if capacity == 0 {None} else {Some(Self::create_buffer(capacity, usage, override_alignment)?)},
             capacity,
             size: 0,
             usage: usage
@@ -203,6 +210,7 @@ impl DynamicBuffer {
                 | vk::BufferUsageFlags::TRANSFER_DST
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             override_alignment,
+            _marker: PhantomData
         })
     }
 
@@ -255,7 +263,7 @@ impl DynamicBuffer {
                     unsafe {
                         Ctx::device().cmd_copy_buffer(
                             *cmd,
-                            self.buffer.buffer,
+                            self.buffer.as_ref().unwrap().buffer,
                             buffer.buffer,
                             &[vk::BufferCopy {
                                 size: old_size,
@@ -265,9 +273,9 @@ impl DynamicBuffer {
                         )
                     };
                 })?;
+                unsafe { Ctx::device().destroy_buffer(self.buffer.as_ref().unwrap().buffer, None) };
             }
-            unsafe { Ctx::device().destroy_buffer(self.buffer.buffer, None) };
-            self.buffer = buffer;
+            self.buffer = Some(buffer);
         }
         Ok(())
     }
@@ -282,7 +290,7 @@ impl DynamicBuffer {
                     Ctx::device().cmd_copy_buffer(
                         *cmd,
                         src_buffer.to_vk(),
-                        self.buffer.buffer,
+                        self.buffer.as_ref().unwrap().buffer,
                         &[vk::BufferCopy {
                             src_offset: 0,
                             size,
@@ -307,7 +315,7 @@ impl DynamicBuffer {
             Ctx::device().cmd_copy_buffer(
                 *cmd,
                 src_buffer.to_vk(),
-                self.buffer.buffer,
+                self.buffer.as_ref().unwrap().buffer,
                 &[vk::BufferCopy {
                     src_offset: 0,
                     size: size,
@@ -318,7 +326,7 @@ impl DynamicBuffer {
         Ok(())
     }
 
-    pub fn push<T: Copy>(&mut self, staging_buffer: &Buffer, data: &[T]) {
+    pub fn push(&mut self, staging_buffer: &Buffer, data: &[T]) {
         let offset = self.size;
         let size = data.len() * size_of::<T>();
 
@@ -346,6 +354,10 @@ impl DynamicBuffer {
     }
 
     pub fn ptr(&self) -> u64 {
-        self.buffer.address
+        if let Some(buffer) = &self.buffer {
+            buffer.address
+        }else {
+            0
+        }
     }
 }

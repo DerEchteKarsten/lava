@@ -42,7 +42,7 @@ impl ImageSize {
 #[derive(Derivative)]
 #[derivative(Eq, PartialEq, Debug)]
 pub struct Image {
-    pub bindless_handle: BindlessHandle,
+    pub bindless_handle: Option<BindlessHandle>,
     pub image: vk::Image,
     pub view: vk::ImageView,
     #[derivative(PartialEq = "ignore")]
@@ -445,10 +445,16 @@ impl Image {
             format,
             size,
             view,
-            bindless_handle: 0,
+            bindless_handle: None,
         };
 
-        let handle = Bindless::push_image(&s);
+        let handle = if usage.contains(vk::ImageUsageFlags::STORAGE) {
+            Some(Bindless::push_image(&s))
+        } else if usage.contains(vk::ImageUsageFlags::SAMPLED) {
+            Some(Bindless::push_texture(&s))
+        } else {
+            None
+        };
         s.bindless_handle = handle;
         Ok(s)
     }

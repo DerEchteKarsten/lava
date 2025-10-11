@@ -180,7 +180,7 @@ impl RasterPipelineHandle {
                 .image_view(depth_attachment.view)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
+                        depth: 0.0,
                         stencil: 0,
                     },
                 })
@@ -194,7 +194,7 @@ impl RasterPipelineHandle {
                 .image_view(stencil_attachment.view)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
+                        depth: 0.0,
                         stencil: 0,
                     },
                 })
@@ -432,7 +432,7 @@ impl PipelineCache {
                         );
                         if let Some(task) = task {
                             let amplicfication_path =
-                                format!("./shaders/bin/{}.slang.spv", task.path);
+                                format!("./core/shaders/bin/{}.slang.spv", task.path);
                             stages.push(
                                 self.create_shader_stage(
                                     &amplicfication_path,
@@ -445,6 +445,7 @@ impl PipelineCache {
                     }
                     PipelineModel::Vertex { vertex } => {
                         let vertex_path = format!("./core/shaders/bin/{}.slang.spv", vertex.path);
+                        log::info!("{}", vertex_path);
                         stages.push(
                             self.create_shader_stage(
                                 &vertex_path,
@@ -515,8 +516,8 @@ impl PipelineCache {
                 let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
                     .depth_bounds_test_enable(false)
                     .depth_compare_op(vk::CompareOp::GREATER)
-                    .depth_test_enable(false)
-                    .depth_write_enable(false)
+                    .depth_test_enable(true)
+                    .depth_write_enable(true)
                     .min_depth_bounds(1.0)
                     .max_depth_bounds(0.0)
                     .stencil_test_enable(false);

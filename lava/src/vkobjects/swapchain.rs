@@ -138,7 +138,7 @@ impl Swapchain {
                     size: ImageSize::FullScreen,
                     view: Image::view(&device, image, format.format),
                     allocation: None,
-                    bindless_handle: 0,
+                    bindless_handle: None,
                 }
             })
             .collect::<Vec<_>>();
