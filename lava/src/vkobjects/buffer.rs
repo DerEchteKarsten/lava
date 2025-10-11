@@ -159,6 +159,12 @@ pub struct DynamicBuffer<T: Copy> {
     pub _marker: PhantomData<T>,
 }
 
+impl<T: Copy> Default for DynamicBuffer<T> {
+    fn default() -> Self {
+        Self::new_storage().unwrap()
+    }
+}
+
 pub trait CopySrc {
     fn to_vk(&self) -> vk::Buffer;
     fn size(&self) -> u64;
@@ -183,6 +189,9 @@ impl<T: Copy> CopySrc for DynamicBuffer<T> {
 }
 
 impl<T: Copy> DynamicBuffer<T> {
+    pub fn len(&self) -> usize {
+        self.size as usize / size_of::<T>()
+    }
     pub fn new_storage() -> Result<Self> {
         Self::new(vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, None)
     }
@@ -327,6 +336,9 @@ impl<T: Copy> DynamicBuffer<T> {
     }
 
     pub fn push(&mut self, staging_buffer: &Buffer, data: &[T]) {
+        if data.len() == 0 {
+            return;
+        }
         let offset = self.size;
         let size = data.len() * size_of::<T>();
 

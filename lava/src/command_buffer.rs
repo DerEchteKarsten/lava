@@ -190,9 +190,9 @@ impl<'a, T: Default> CommandBuilder<'a, T> {
             vk::ImageLayout::GENERAL,
         )
     }
-    pub fn write(self, read: &impl IntoShaderResourceHandle) -> Self {
+    pub fn write(self, write: &impl IntoShaderResourceHandle) -> Self {
         self.resource_access(
-            read,
+            write,
             vk::AccessFlags2::SHADER_WRITE,
             vk::ImageLayout::GENERAL,
         )
