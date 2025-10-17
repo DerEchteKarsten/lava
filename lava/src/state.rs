@@ -677,6 +677,7 @@ impl Features {
 
     fn features<'a>(
         &self,
+        vk11: &'a mut vk::PhysicalDeviceVulkan11Features,
         vk12: &'a mut vk::PhysicalDeviceVulkan12Features,
         vk13: &'a mut vk::PhysicalDeviceVulkan13Features,
         dn3: &'a mut vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
@@ -685,6 +686,7 @@ impl Features {
         ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
     ) -> vk::PhysicalDeviceFeatures2<'a> {
+        *vk11 = vk11.shader_draw_parameters(true);
         *vk12 = vk12
             .runtime_descriptor_array(true)
             .buffer_device_address(true)
@@ -698,10 +700,12 @@ impl Features {
             .descriptor_binding_sampled_image_update_after_bind(true)
             .timeline_semaphore(true)
             .scalar_block_layout(true)
+            .storage_push_constant8(true)
             .shader_int8(true);
         *vk13 = vk13
             .dynamic_rendering(true)
             .maintenance4(true)
+            
             .synchronization2(true);
         let phfeatures = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
@@ -720,6 +724,7 @@ impl Features {
 
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(phfeatures)
+            .push_next(vk11)
             .push_next(vk12)
             .push_next(vk13)
             .push_next(dy2)
@@ -848,9 +853,9 @@ pub(super) fn create_device(
         .map(|e| e.as_ptr() as *const i8)
         .collect::<Vec<_>>();
 
-    let (mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) = Default::default();
+    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) = Default::default();
     let mut features = features.features(
-        &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
+        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)

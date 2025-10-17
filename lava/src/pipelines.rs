@@ -8,16 +8,16 @@ use std::{
 
 use anyhow::Result;
 use ash::vk;
-
+use glam::{Vec2, Vec3};
+use bytemuck::{Pod, Zeroable};
 use crate::{
     bindless::Bindless,
     state::{Ctx, Functions},
     vkobjects::{
-        image::Image,
-        rt_pipeline::{
+        buffer::{self, Buffer, Location}, image::Image, rt_pipeline::{
             RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
             ShaderBindingTable,
-        },
+        }
     },
 };
 
@@ -32,6 +32,13 @@ impl ComputePipelineHandle {
         unsafe {
             Ctx::device().cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             Ctx::device().cmd_dispatch(*cmd, x, y, z);
+        }
+    }
+    pub fn dispatch_indirect(&self, cmd: &vk::CommandBuffer, buffer: vk::Buffer) {
+        let pipeline = PipelineCache::get().get_compute_pipeline(self);
+        unsafe {
+            Ctx::device().cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            Ctx::device().cmd_dispatch_indirect(*cmd, buffer, 0);
         }
     }
 }
@@ -115,6 +122,57 @@ struct RasterPipelineHash {
     stencil_format: vk::Format,
 }
 
+#[derive(Clone, Copy)]
+pub enum RasterDispatch {
+    LaunchMesh { x: u32, y: u32, z: u32 },
+    Draw { vertex_count: u32, instance_count: u32 },
+    DrawIndexed { triangle_count: u32, instance_count: u32 },
+    DrawIndirect { buffer: vk::Buffer, offset: u32, count: u32 },
+    DrawIndexedIndirect { buffer: vk::Buffer, offset: u32, count: u32 },
+    DrawIndirectCount { buffer: vk::Buffer, offset: u32, count_buffer: vk::Buffer, count_offset: u32 },
+    DrawIndexedIndirectCount { buffer: vk::Buffer, offset: u32, count_buffer: vk::Buffer, count_offset: u32 },
+}
+
+impl RasterDispatch {
+    pub fn launch_mesh(x: u32, y: u32, z: u32) -> Self {
+        Self::LaunchMesh { x, y, z }
+    }
+    pub fn draw(vertex_count: u32, instance_count: u32) -> Self {
+        Self::Draw {
+            vertex_count,
+            instance_count,
+        }
+    }
+    pub fn indexed(triangle_count: u32, instance_count: u32) -> Self {
+        Self::DrawIndexed {
+            triangle_count,
+            instance_count,
+        }
+    }
+    pub fn indirect<L: Location>(buffer: &Buffer<vk::DrawIndirectCommand, L>, offset: u32, count: u32) -> Self {
+        Self::DrawIndirect { buffer: buffer.vk(), offset, count }
+    }
+    pub fn indexed_indirect<L: Location>(buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>, offset: u32, count: u32) -> Self {
+        Self::DrawIndexedIndirect { buffer: buffer.vk(), offset, count }
+    }
+    pub fn indirect_count<L: Location>(buffer: &Buffer<vk::DrawIndirectCommand, L>, offset: u32, count_buffer: vk::Buffer, count_offset: u32) -> Self {
+        Self::DrawIndirectCount { buffer: buffer.vk(), offset, count_buffer, count_offset }
+    }
+    pub fn indexed_indirect_count<L: Location>(buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>, offset: u32, count_buffer: vk::Buffer, count_offset: u32) -> Self {
+        Self::DrawIndexedIndirectCount { buffer: buffer.vk(), offset, count_buffer, count_offset }
+    }
+}
+
+
+#[derive(Debug ,Copy, Clone, Pod, Zeroable)]
+#[repr(C)]
+pub struct Vertex {
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub uv: Vec2,
+}
+
+
 impl RasterPipelineHandle {
     pub fn dispatch(
         &self,
@@ -122,11 +180,10 @@ impl RasterPipelineHandle {
         color_attachments: &[(Image, Option<[f32; 4]>)],
         depth_attachment: Option<&Image>,
         stencil_attachment: Option<&Image>,
+        vertex_buffer: Option<&vk::Buffer>,
         width: u32,
         height: u32,
-        x: u32,
-        y: u32,
-        z: u32,
+        dispatch: RasterDispatch,
     ) {
         let mut cache = PipelineCache::get();
         let color_formats = color_attachments
@@ -232,10 +289,28 @@ impl RasterPipelineHandle {
             );
             match &self.model {
                 PipelineModel::Mesh { task, mesh } => {
-                    Functions::mesh().unwrap().cmd_draw_mesh_tasks(cmd, x, y, z);
+                    match dispatch {
+                        RasterDispatch::LaunchMesh { x, y, z } => {
+                            Functions::mesh().unwrap().cmd_draw_mesh_tasks(cmd, x, y, z);
+                        }
+                        _ => panic!("Invalid dispatch for mesh pipeline"),
+                    }
                 }
                 PipelineModel::Vertex { vertex } => {
-                    Ctx::device().cmd_draw(cmd, x, y, 0, 0);
+                    if let Some(vertex_buffer) = vertex_buffer {
+                        Ctx::device().cmd_bind_vertex_buffers(cmd, 0, &[*vertex_buffer], &[0]);
+                    }
+                    match dispatch {
+                        RasterDispatch::Draw { vertex_count, instance_count } => Ctx::device().cmd_draw(cmd, vertex_count, instance_count, 0, 0),
+                        RasterDispatch::DrawIndexed { triangle_count, instance_count } => Ctx::device().cmd_draw_indexed(cmd, triangle_count * 3, instance_count, 0, 0, 0),
+                        RasterDispatch::DrawIndirect { buffer, offset, count } => Ctx::device().cmd_draw_indirect(cmd, buffer, offset as u64, count, size_of::<vk::DrawIndirectCommand>() as u32),
+                        RasterDispatch::DrawIndexedIndirect { buffer, offset, count } => Ctx::device().cmd_draw_indexed_indirect(cmd, buffer, offset as u64, count, size_of::<vk::DrawIndexedIndirectCommand>() as u32),
+                        RasterDispatch::DrawIndirectCount { buffer, offset, count_buffer, count_offset } => Ctx::device().cmd_draw_indirect_count(cmd, buffer, offset as u64, count_buffer, count_offset as u64, u32::MAX, size_of::<vk::DrawIndirectCommand>() as u32),
+                        RasterDispatch::DrawIndexedIndirectCount { buffer, offset, count_buffer, count_offset } => Ctx::device().cmd_draw_indexed_indirect_count(cmd, buffer, offset as u64, count_buffer, count_offset as u64, u32::MAX, size_of::<vk::DrawIndirectCommand>() as u32),
+                        RasterDispatch::LaunchMesh { x, y, z } => {
+                            panic!("Invalid dispatch for vertex pipeline")
+                        }
+                    }
                 }
             }
             Ctx::device().cmd_end_rendering(cmd);
@@ -419,6 +494,8 @@ impl PipelineCache {
                 ];
                 let vertex_input_state;
                 let input_assembly;
+                let vertex_bindings;
+                let vertex_attribute_descriptions;
                 match &handle.model {
                     PipelineModel::Mesh { task, mesh } => {
                         let mesh_path = format!("./core/shaders/bin/{}.slang.spv", mesh.path);
@@ -445,7 +522,6 @@ impl PipelineCache {
                     }
                     PipelineModel::Vertex { vertex } => {
                         let vertex_path = format!("./core/shaders/bin/{}.slang.spv", vertex.path);
-                        log::info!("{}", vertex_path);
                         stages.push(
                             self.create_shader_stage(
                                 &vertex_path,
@@ -454,12 +530,38 @@ impl PipelineCache {
                             )
                             .unwrap(),
                         );
+                        vertex_bindings = [
+                            vk::VertexInputBindingDescription::default()
+                                .binding(0)
+                                .stride(size_of::<Vertex>() as u32)
+                                .input_rate(vk::VertexInputRate::VERTEX),
+                        ];
+
+                        vertex_attribute_descriptions = [
+                            vk::VertexInputAttributeDescription::default()
+                                .binding(0)
+                                .location(0)
+                                .format(vk::Format::R32G32B32_SFLOAT)
+                                .offset(0),
+                            vk::VertexInputAttributeDescription::default()
+                                .binding(0)
+                                .location(1)
+                                .format(vk::Format::R32G32B32_SFLOAT)
+                                .offset(12),
+                            vk::VertexInputAttributeDescription::default()
+                                .binding(0)
+                                .location(2)
+                                .format(vk::Format::R32G32_SFLOAT)
+                                .offset(24),
+                        ];
+
                         vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
-                            .vertex_binding_descriptions(&[])
-                            .vertex_attribute_descriptions(&[]);
+                            .vertex_binding_descriptions(&vertex_bindings)
+                            .vertex_attribute_descriptions(&vertex_attribute_descriptions);
 
                         input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-                            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+                            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+                            .primitive_restart_enable(false);
                         create_info = create_info
                             .vertex_input_state(&vertex_input_state)
                             .input_assembly_state(&input_assembly);

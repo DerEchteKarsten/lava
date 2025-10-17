@@ -11,7 +11,7 @@ use gpu_allocator::MemoryLocation;
 use crate::{
     pipelines::PipelineCache,
     state::{Ctx, Functions},
-    vkobjects::buffer::Buffer,
+    vkobjects::buffer::{Buffer, CpuBuffer, GpuBuffer},
 };
 
 pub fn alinged_size(size: u32, alignment: u32) -> u32 {
@@ -141,7 +141,7 @@ impl RaytracingPipeline {
 }
 
 pub struct ShaderBindingTable {
-    pub _buffer: Buffer,
+    pub _buffer: Buffer<u8, CpuBuffer>,
     pub raygen_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
@@ -201,11 +201,10 @@ impl ShaderBindingTable {
 
         let buffer_usage = vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-        let memory_location = MemoryLocation::CpuToGpu;
 
-        let buffer = Buffer::new_aligned(
+        let mut buffer = Buffer::with_alignment(
             buffer_usage,
-            memory_location,
+            buffer_size as _,
             buffer_size as _,
             Some(
                 Ctx::physical_device()
@@ -237,20 +236,20 @@ impl ShaderBindingTable {
             }
         }
 
-        buffer.copy_data_to_buffer(&stb_data)?;
+        buffer.copy_from_slice(&stb_data)?;
 
         let raygen_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(buffer.address)
+            .device_address(buffer.ptr())
             .size(raygen_region_size as _)
             .stride(raygen_region_size as _); //REMINDER
 
         let miss_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(buffer.address + raygen_region.size)
+            .device_address(buffer.ptr() + raygen_region.size)
             .size(miss_region_size as _)
             .stride(aligned_handle_size as _);
 
         let hit_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(buffer.address + raygen_region.size + miss_region.size)
+            .device_address(buffer.ptr() + raygen_region.size + miss_region.size)
             .size(hit_region_size as _)
             .stride(aligned_handle_size as _);
 

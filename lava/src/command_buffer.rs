@@ -6,21 +6,31 @@ use glam::Mat4;
 use crate::{
     bindless::Bindless,
     pipelines::{
-        ComputePipelineHandle, PipelineModel, RasterPipelineHandle, RayTracingPipelineHandle,
-        ShaderPath,
+        ComputePipelineHandle, PipelineModel, RasterDispatch, RasterPipelineHandle, RayTracingPipelineHandle, ShaderPath, Vertex
     },
     state::Ctx,
     vkobjects::{
-        buffer::{Buffer, DynamicBuffer},
+        buffer::{Buffer, Location},
         image::Image,
         rt_pipeline::alinged_size,
     },
 };
 
 enum Command {
-    Raster(RasterPipelineHandle),
-    Raytracing(RayTracingPipelineHandle),
-    Compute(ComputePipelineHandle),
+    Raster {
+        pipeline: RasterPipelineHandle,
+        dispatch: RasterDispatch,
+        width: u32,
+        height: u32,
+    },
+    Raytracing {
+        pipeline: RayTracingPipelineHandle,
+        dispatch: [u32; 2],
+    },
+    Compute {
+        pipeline: ComputePipelineHandle,
+        dispatch: [u32; 3],
+    },
     Present,
 }
 
@@ -46,11 +56,12 @@ pub struct ResourceState {
 }
 
 pub struct Action {
-    dispatch: [u32; 5],
     command: Command,
     push_constants: Option<Vec<PushConstant>>,
     color_attachments: Option<Vec<(Image, Option<[f32; 4]>)>>,
     depth_attachments: Option<Image>,
+    vertex_buffer: Option<vk::Buffer>,
+    index_buffer: Option<vk::Buffer>,
     resources: Vec<(ResourceHandle, ResourceState)>,
 }
 
@@ -65,35 +76,22 @@ pub struct RasterBuilder {
     pipeline_handle: RasterPipelineHandle,
     color_attachments: Vec<(Image, Option<[f32; 4]>)>,
     depth_attachments: Option<Image>,
+    vertex_buffer: Option<vk::Buffer>,
+    index_buffer: Option<vk::Buffer>,
 }
 
 pub trait IntoShaderResourceHandle {
-    fn to(&self) -> PushConstant;
-    fn vk(&self) -> Option<ResourceHandle>;
+    fn push_constant(&self) -> PushConstant;
+    fn resource_handle(&self) -> Option<ResourceHandle>;
     fn aspect(&self) -> vk::ImageAspectFlags;
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout>;
 }
 
-impl IntoShaderResourceHandle for Buffer {
-    fn to(&self) -> PushConstant {
-        PushConstant::BufferPointer(self.address)
-    }
-    fn vk(&self) -> Option<ResourceHandle> {
-        Some(ResourceHandle::Buffer(self.buffer))
-    }
-    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
-        None
-    }
-    fn aspect(&self) -> vk::ImageAspectFlags {
-        vk::ImageAspectFlags::NONE
-    }
-}
-
-impl<T: Copy> IntoShaderResourceHandle for DynamicBuffer<T> {
-    fn to(&self) -> PushConstant {
+impl<T: Copy> IntoShaderResourceHandle for Buffer<T> {
+    fn push_constant(&self) -> PushConstant {
         PushConstant::BufferPointer(self.ptr())
     }
-    fn vk(&self) -> Option<ResourceHandle> {
+    fn resource_handle(&self) -> Option<ResourceHandle> {
         self.buffer.as_ref().map(|b| ResourceHandle::Buffer(b.buffer))
     }
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
@@ -105,10 +103,10 @@ impl<T: Copy> IntoShaderResourceHandle for DynamicBuffer<T> {
 }
 
 impl IntoShaderResourceHandle for Image {
-    fn to(&self) -> PushConstant {
+    fn push_constant(&self) -> PushConstant {
         PushConstant::BindlessImage(self.bindless_handle.expect("Image is neither a texture nor a storage image, consider adding either vk::Sampled or vk::StorageImage to your image usage flags.") as u64)
     }
-    fn vk(&self) -> Option<ResourceHandle> {
+    fn resource_handle(&self) -> Option<ResourceHandle> {
         Some(ResourceHandle::Image((self.view, self.image)))
     }
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
@@ -128,10 +126,10 @@ impl IntoShaderResourceHandle for Image {
 }
 
 impl IntoShaderResourceHandle for u64 {
-    fn to(&self) -> PushConstant {
+    fn push_constant(&self) -> PushConstant {
         PushConstant::BufferPointer(*self)
     }
-    fn vk(&self) -> Option<ResourceHandle> {
+    fn resource_handle(&self) -> Option<ResourceHandle> {
         None
     }
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
@@ -156,8 +154,8 @@ impl<'a, T: Default> CommandBuilder<'a, T> {
         access: vk::AccessFlags2,
         layout: vk::ImageLayout,
     ) -> Self {
-        self.push_constants.push(value.to());
-        if let Some(v) = value.vk() {
+        self.push_constants.push(value.push_constant());
+        if let Some(v) = value.resource_handle() {
             let mut stages =
                 vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER;
             if Ctx::features().raytracing {
@@ -290,39 +288,80 @@ impl<'a> CommandBuilder<'a, RasterBuilder> {
         self
     }
 
-    fn build(self, dispatch: [u32; 5]) {
+    pub fn vertex_buffer(mut self, buffer: &Buffer<Vertex>) -> Self {
+        assert!(self.sub_builder.vertex_buffer.is_none());
+        let buffer = buffer.buffer.as_ref().map(|e| e.buffer).unwrap();
+        self.sub_builder.vertex_buffer = Some(buffer);
+        self.resources.push((
+            ResourceHandle::Buffer(buffer),
+            ResourceState {
+                access: vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+                layout: vk::ImageLayout::UNDEFINED,
+                stages: vk::PipelineStageFlags2::VERTEX_INPUT,
+                aspect: vk::ImageAspectFlags::NONE,
+            },
+        ));
+        self
+    }
+
+    pub fn index_buffer(mut self, buffer: &Buffer<u32>) -> Self {
+        assert!(self.sub_builder.index_buffer.is_none());
+        let buffer = buffer.buffer.as_ref().map(|e| e.buffer).unwrap();
+        self.sub_builder.index_buffer = Some(buffer);
+        self.resources.push((
+            ResourceHandle::Buffer(buffer),
+            ResourceState {
+                access: vk::AccessFlags2::INDEX_READ,
+                layout: vk::ImageLayout::UNDEFINED,
+                stages: vk::PipelineStageFlags2::INDEX_INPUT,
+                aspect: vk::ImageAspectFlags::NONE,
+            },
+        ));
+        self
+    }
+
+
+    pub fn draw(mut self, dispatch: RasterDispatch, width: u32, height: u32) {
+        let buffers = match &dispatch {
+            RasterDispatch::DrawIndexedIndirect { buffer, offset, count } => vec![buffer],
+            RasterDispatch::DrawIndexedIndirectCount { buffer, offset, count_buffer, count_offset } => vec![buffer, count_buffer],
+            RasterDispatch::DrawIndirect { buffer, offset, count } => vec![buffer],
+            RasterDispatch::DrawIndirectCount { buffer, offset, count_buffer, count_offset } => vec![buffer, count_buffer],
+            _ => vec![],
+        };
+        for buffer in buffers {
+            self.resources.push((
+                ResourceHandle::Buffer(*buffer),
+                ResourceState {
+                    access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                    layout: vk::ImageLayout::UNDEFINED,
+                    stages: vk::PipelineStageFlags2::DRAW_INDIRECT,
+                    aspect: vk::ImageAspectFlags::NONE,
+                },
+            ));
+        }
         self.cmd_buffer.commands.push(Action {
             color_attachments: Some(self.sub_builder.color_attachments),
             depth_attachments: self.sub_builder.depth_attachments,
-            dispatch,
-            command: Command::Raster(self.sub_builder.pipeline_handle),
+            command: Command::Raster{
+                pipeline:  self.sub_builder.pipeline_handle,
+                dispatch,
+                width,
+                height,
+            },
+            vertex_buffer: self.sub_builder.vertex_buffer,
             push_constants: Some(self.push_constants),
             resources: self.resources,
+            index_buffer: self.sub_builder.index_buffer,
         });
     }
 
-    pub fn draw(self, x: u32, y: u32, z: u32, width: u32, height: u32) {
-        self.build([x, y, z, width, height]);
-    }
-
-    pub fn draw_fullscreen(self, x: u32, y: u32, z: u32) {
-        self.build([
-            x,
-            y,
-            z,
+    pub fn draw_fullscreen(self, dispatch: RasterDispatch) {
+        self.draw(
+            dispatch,
             Ctx::window_width().unwrap(),
             Ctx::window_height().unwrap(),
-        ]);
-    }
-
-    pub fn draw_instances_fullscreen(self, vertex_count: u32, instance_count: u32) {
-        self.build([
-            vertex_count,
-            instance_count,
-            0,
-            Ctx::window_width().unwrap(),
-            Ctx::window_height().unwrap(),
-        ]);
+        );
     }
 }
 
@@ -344,27 +383,29 @@ impl<'a> CommandBuilder<'a, ComputeBuilder> {
         self
     }
 
-    fn build(self, dispatch: [u32; 5]) {
+    fn build(self, dispatch: [u32; 3]) {
         self.cmd_buffer.commands.push(Action {
             color_attachments: None,
             depth_attachments: None,
-            command: Command::Compute(self.sub_builder.pipeline_handle),
-            dispatch,
+            command: Command::Compute{
+                pipeline: self.sub_builder.pipeline_handle,
+                dispatch,
+            },
             push_constants: Some(self.push_constants),
             resources: self.resources,
+            vertex_buffer: None,
+            index_buffer: None,
         });
     }
 
     pub fn dispatch(self, x: u32, y: u32, z: u32) {
-        self.build([x, y, z, 0, 0]);
+        self.build([x, y, z]);
     }
     pub fn dispatch_fullscreen(self) {
         self.build([
             Ctx::window_width().unwrap().div_ceil(8),
             Ctx::window_height().unwrap().div_ceil(8),
             1,
-            0,
-            0,
         ]);
     }
     pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
@@ -372,8 +413,6 @@ impl<'a> CommandBuilder<'a, ComputeBuilder> {
             Ctx::window_width().unwrap().div_ceil(x),
             Ctx::window_height().unwrap().div_ceil(y),
             1,
-            0,
-            0,
         ]);
     }
 }
@@ -396,36 +435,34 @@ impl<'a> CommandBuilder<'a, RayTracingBuilder> {
         self
     }
 
-    fn build(self, dispatch: [u32; 5]) {
+    fn build(self, dispatch: [u32; 2]) {
         self.cmd_buffer.commands.push(Action {
             color_attachments: None,
             depth_attachments: None,
-            command: Command::Raytracing(self.sub_builder.pipeline_handle),
-            dispatch,
+            command: Command::Raytracing {
+                pipeline: self.sub_builder.pipeline_handle,
+                dispatch,
+            },
             push_constants: Some(self.push_constants),
             resources: self.resources,
+            vertex_buffer: None,
+            index_buffer: None,
         });
     }
 
     pub fn dispatch(self, x: u32, y: u32) {
-        self.build([x, y, 0, 0, 0]);
+        self.build([x, y]);
     }
     pub fn dispatch_fullscreen(self) {
         self.build([
             Ctx::window_width().unwrap(),
             Ctx::window_height().unwrap(),
-            1,
-            0,
-            0,
         ]);
     }
     pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
         self.build([
             Ctx::window_width().unwrap().div_ceil(x),
             Ctx::window_height().unwrap().div_ceil(y),
-            1,
-            0,
-            0,
         ]);
     }
 }
@@ -461,7 +498,6 @@ impl CommandBuffer {
             color_attachments: None,
             depth_attachments: None,
             push_constants: None,
-            dispatch: [0; 5],
             command: Command::Present,
             resources: vec![(
                 ResourceHandle::Image((swapchain_image.view, swapchain_image.image)),
@@ -472,6 +508,8 @@ impl CommandBuffer {
                     stages: vk::PipelineStageFlags2::NONE,
                 },
             )],
+            vertex_buffer: None,
+            index_buffer: None,
         });
     }
 
@@ -591,29 +629,25 @@ impl CommandBuffer {
             }
 
             match &aktion.command {
-                Command::Compute(pipeline) => {
-                    pipeline.dispatch(
-                        &self.handle,
-                        aktion.dispatch[0],
-                        aktion.dispatch[1],
-                        aktion.dispatch[2],
-                    );
-                }
-                Command::Raster(pipeline) => {
+                Command::Compute { pipeline, dispatch: [x,y,z] } => pipeline.dispatch(&self.handle, *x, *y, *z),
+                Command::Raster { pipeline, dispatch, width, height} => {
+                    if let Some(index_buffer) = aktion.index_buffer {
+                        unsafe { Ctx::device().cmd_bind_index_buffer(self.handle, index_buffer, 0, vk::IndexType::UINT32) };
+                    }
                     pipeline.dispatch(
                         self.handle,
                         aktion.color_attachments.as_ref().unwrap(),
                         aktion.depth_attachments.as_ref(),
                         None,
-                        aktion.dispatch[3],
-                        aktion.dispatch[4],
-                        aktion.dispatch[0],
-                        aktion.dispatch[1],
-                        aktion.dispatch[2],
-                    );
-                }
-                Command::Raytracing(pipeline) => {
-                    pipeline.launch(&self.handle, aktion.dispatch[0], aktion.dispatch[1]);
+                        aktion.vertex_buffer.as_ref(),
+                            *width,
+                            *height,
+                            
+                            *dispatch
+                    )
+                },
+                Command::Raytracing { pipeline, dispatch } => {
+                    pipeline.launch(&self.handle, dispatch[0], dispatch[1])
                 }
                 Command::Present => {}
             }

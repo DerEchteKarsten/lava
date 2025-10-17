@@ -11,7 +11,7 @@ use crate::{
     pipelines::{RasterPipelineHandle, ShaderPath},
     state::Ctx,
     vkobjects::{
-        buffer::{Buffer, DynamicBuffer},
+        buffer::{Buffer},
         image::Image,
     },
 };

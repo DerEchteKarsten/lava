@@ -3,7 +3,7 @@ use ash::vk;
 
 use crate::{
     state::Functions,
-    vkobjects::buffer::{Buffer, DynamicBuffer},
+    vkobjects::buffer::{Buffer},
 };
 
 pub struct AccelerationStructure {
@@ -18,9 +18,9 @@ impl AccelerationStructure {
         as_geometry: &[vk::AccelerationStructureGeometryKHR],
         as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
         max_primitive_counts: &[u32],
-        buffer: &mut DynamicBuffer<u8>,
+        buffer: &mut Buffer<u8>,
         offset: u64,
-        scratch_buffer: &mut DynamicBuffer<u8>,
+        scratch_buffer: &mut Buffer<u8>,
         cmd: &vk::CommandBuffer,
     ) -> Result<AccelerationStructure> {
         let build_geo_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()

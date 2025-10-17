@@ -397,7 +397,6 @@ impl Image {
 
     pub fn new_2d(
         usage: vk::ImageUsageFlags,
-        memory_location: MemoryLocation,
         format: vk::Format,
         size: ImageSize,
     ) -> Result<Self> {
@@ -424,7 +423,7 @@ impl Image {
         let allocation = Ctx::allocator().allocate(&AllocationCreateDesc {
             name: "image",
             requirements,
-            location: memory_location,
+            location: MemoryLocation::GpuOnly,
             linear: false,
             allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
         })?;
