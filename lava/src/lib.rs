@@ -10,10 +10,7 @@ use crate::{
     command_buffer::CommandBuffer,
     pipelines::{RasterPipelineHandle, ShaderPath},
     state::Ctx,
-    vkobjects::{
-        buffer::{Buffer},
-        image::Image,
-    },
+    vkobjects::{buffer::Buffer, image::Image},
 };
 use anyhow::{Ok, Result};
 use ash::vk::{self};

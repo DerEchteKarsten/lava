@@ -11,6 +11,21 @@ __generic<E : ITexelElement, Shape : __ITextureShape, int isArray, int isMS, int
     static const bool isWriteable = access == 1;
 };
 
+public struct TextureHandle<T : IImageDescriptor & __IDynamicResourceCastable> {
+    uint64_t DescriptorIndex;
+
+    public property bool IsNull { get { return DescriptorIndex == ~0; } }
+
+    public property T Instance {
+        [ForceInline]
+        get { return TextureHeap[DescriptorIndex].as<T>(); }
+    }
+    public property T NonUniformInstance {
+        [ForceInline]
+        get { return TextureHeap[NonUniformResourceIndex(DescriptorIndex)].as<T>(); }
+    }
+}
+
 public struct ImageHandle<T : IImageDescriptor & __IDynamicResourceCastable> {
     uint64_t DescriptorIndex;
 
@@ -18,11 +33,21 @@ public struct ImageHandle<T : IImageDescriptor & __IDynamicResourceCastable> {
 
     public property T Instance {
         [ForceInline]
-        get { return (T.isWriteable ? RWTextureHeap : TextureHeap)[DescriptorIndex].as<T>(); }
+        get { return RWTextureHeap[DescriptorIndex].as<T>(); }
     }
     public property T NonUniformInstance {
         [ForceInline]
-        get { return (T.isWriteable ? RWTextureHeap : TextureHeap)[NonUniformResourceIndex(DescriptorIndex)].as<T>(); }
+        get { return RWTextureHeap[NonUniformResourceIndex(DescriptorIndex)].as<T>(); }
+    }
+}
+
+__generic<E : ITexelElement, Shape : __ITextureShape, let format : int>
+public extension TextureHandle<_Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>> {
+    typealias TextureType = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>;
+
+    [ForceInline]
+    public E Load(vector<uint, Shape.dimensions> pos) {
+        return Instance[pos];
     }
 }
 
@@ -40,32 +65,36 @@ public extension ImageHandle<_Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>> {
     }
 }
 
-public typealias TextureHandle2D<F: ITexelElement = float4> = ImageHandle<Texture2D<F>>;
-public typealias TextureHandle3D<F: ITexelElement = float4> = ImageHandle<Texture3D<F>>;
-public typealias ImageHandle2D<F: ITexelElement = float4> = ImageHandle<RWTexture2D<F>>;
-public typealias ImageHandle3D<F: ITexelElement = float4> = ImageHandle<RWTexture3D<F>>;
+public typealias TextureHandle2D<F : ITexelElement = float4> = TextureHandle<Texture2D<F>>;
+public typealias TextureHandle3D<F : ITexelElement = float4> = TextureHandle<Texture3D<F>>;
 
-public typealias RWTextureCube<F: ITexelElement = float4> = _Texture<F, __ShapeCube, 0, 0, 0, 1, 0, 0, 0>;
+public typealias ImageHandle2D<F : ITexelElement = float4> = ImageHandle<RWTexture2D<F>>;
+public typealias ImageHandle3D<F : ITexelElement = float4> = ImageHandle<RWTexture3D<F>>;
 
-public typealias TextureHandleCube<F: ITexelElement = float4> = ImageHandle<TextureCube<F>>;
-public typealias ImageHandleCube<F: ITexelElement = float4> = ImageHandle<RWTextureCube<F>>;
+public typealias RWTextureCube<F : ITexelElement = float4> = _Texture<F, __ShapeCube, 0, 0, 0, 1, 0, 0, 0>;
 
-public typealias ImageHandleArray2D<F: ITexelElement = float4> = ImageHandle<RWTexture2DArray<F>>;
+public typealias TextureHandleCube<F : ITexelElement = float4> = TextureHandle<TextureCube<F>>;
+public typealias ImageHandleCube<F : ITexelElement = float4> = ImageHandle<RWTextureCube<F>>;
 
+public typealias ImageHandleArray2D<F : ITexelElement = float4> = ImageHandle<RWTexture2DArray<F>>;
+
+// -----------------------------
+// Your existing size macros (unchanged)
+// -----------------------------
 #define DESTRUCT_VEC1(var) var.x
 #define DESTRUCT_VEC2(var) var.x, var.y
 #define DESTRUCT_VEC3(var) var.x, var.y, var.z
 
-#define DEF_TEXTURE_SIZE_EXT(shape, isArray, dim) \
-    __generic<T: ITexelElement, let access : int, let isShadow : int, let isCombined : int, let format : int> \
-    public extension _Texture<T, shape, isArray, 0, 0, access, isShadow, isCombined, format> { \
-        public property uint##dim Size { \
-            get { \
-                uint##dim res; \
-                GetDimensions(DESTRUCT_VEC##dim(res)); \
-                return res; \
-            } \
-        } \
+#define DEF_TEXTURE_SIZE_EXT(shape, isArray, dim)                                                                                                                                                       \
+    __generic<T : ITexelElement, let access : int, let isShadow : int, let isCombined : int, let format : int> \
+    public extension _Texture<T, shape, isArray, 0, 0, access, isShadow, isCombined, format> {                                                                                                                                                                                                   \
+        public property uint##dim Size {                                                                                                                                                                                               \
+            get {                                                                                                                                                                                       \
+                uint##dim res;                                                                                                                                                                          \
+                GetDimensions(DESTRUCT_VEC##dim(res));                                                                                                                                                  \
+                return res;                                                                                                                                                                             \
+            }                                                                                                                                                                                           \
+        }                                                                                                                                                                                               \
     }
 
 DEF_TEXTURE_SIZE_EXT(__Shape2D, 0, 2);

@@ -1,10 +1,7 @@
 use anyhow::Result;
 use ash::vk;
 
-use crate::{
-    state::Functions,
-    vkobjects::buffer::{Buffer},
-};
+use crate::{state::Functions, vkobjects::buffer::Buffer};
 
 pub struct AccelerationStructure {
     pub ty: vk::AccelerationStructureTypeKHR,

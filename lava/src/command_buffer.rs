@@ -1,21 +1,28 @@
-use std::collections::HashMap;
+use std::{
+    cell::LazyCell,
+    collections::HashMap,
+    sync::{LazyLock, Mutex},
+};
 
 use ash::vk;
 use glam::Mat4;
+use json::JsonValue;
 
 use crate::{
     bindless::Bindless,
     pipelines::{
-        ComputePipelineHandle, PipelineModel, RasterDispatch, RasterPipelineHandle, RayTracingPipelineHandle, ShaderPath, Vertex
+        ComputePipelineHandle, PipelineCache, PipelineModel, RasterDispatch, RasterPipelineHandle,
+        RayTracingPipelineHandle, ShaderPath, Vertex,
     },
     state::Ctx,
     vkobjects::{
-        buffer::{Buffer, Location},
+        buffer::{Buffer, CpuBuffer, Location},
         image::Image,
         rt_pipeline::alinged_size,
     },
 };
 
+#[derive(Default)]
 enum Command {
     Raster {
         pipeline: RasterPipelineHandle,
@@ -31,6 +38,19 @@ enum Command {
         pipeline: ComputePipelineHandle,
         dispatch: [u32; 3],
     },
+    FillBuffer {
+        buffer: vk::Buffer,
+        data: u32,
+        offset: u32,
+    },
+    CopyBuffer {
+        src: vk::Buffer,
+        dst: vk::Buffer,
+        src_offset: u32,
+        dst_offset: u32,
+        num_bytes: u32,
+    },
+    #[default]
     Present,
 }
 
@@ -41,13 +61,13 @@ pub enum PushConstant {
     Constants(Vec<u8>),
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub enum ResourceHandle {
     Buffer(vk::Buffer),
     Image((vk::ImageView, vk::Image)),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct ResourceState {
     stages: vk::PipelineStageFlags2,
     access: vk::AccessFlags2,
@@ -55,9 +75,18 @@ pub struct ResourceState {
     aspect: vk::ImageAspectFlags,
 }
 
+#[derive(Debug)]
+enum LayoutBlock {
+    Constant { size: u32 },
+    Type { name: String },
+}
+
+#[derive(Default)]
 pub struct Action {
     command: Command,
     push_constants: Option<Vec<PushConstant>>,
+    #[cfg(debug_assertions)]
+    layout_validation: Vec<LayoutBlock>,
     color_attachments: Option<Vec<(Image, Option<[f32; 4]>)>>,
     depth_attachments: Option<Image>,
     vertex_buffer: Option<vk::Buffer>,
@@ -65,10 +94,10 @@ pub struct Action {
     resources: Vec<(ResourceHandle, ResourceState)>,
 }
 
-pub struct CommandBuffer {
+pub struct CommandBuffer<'a> {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) commands: Vec<Action>,
-    pub(crate) resource_hashes: HashMap<ResourceHandle, ResourceState>,
+    pub(crate) resource_hashes: &'a mut HashMap<ResourceHandle, ResourceState>,
 }
 
 #[derive(Default)]
@@ -85,6 +114,7 @@ pub trait IntoShaderResourceHandle {
     fn resource_handle(&self) -> Option<ResourceHandle>;
     fn aspect(&self) -> vk::ImageAspectFlags;
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout>;
+    fn type_name(&self) -> String;
 }
 
 impl<T: Copy> IntoShaderResourceHandle for Buffer<T> {
@@ -92,13 +122,37 @@ impl<T: Copy> IntoShaderResourceHandle for Buffer<T> {
         PushConstant::BufferPointer(self.ptr())
     }
     fn resource_handle(&self) -> Option<ResourceHandle> {
-        self.buffer.as_ref().map(|b| ResourceHandle::Buffer(b.buffer))
+        self.buffer
+            .as_ref()
+            .map(|b| ResourceHandle::Buffer(b.buffer))
     }
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
         None
     }
     fn aspect(&self) -> vk::ImageAspectFlags {
         vk::ImageAspectFlags::NONE
+    }
+    fn type_name(&self) -> String {
+        let type_name = std::any::type_name::<T>()
+            .rsplit("::")
+            .next()
+            .unwrap()
+            .to_string();
+
+        match type_name.as_str() {
+            "u8" => "uint8_t",
+            "u32" => "uint",
+            "i32" => "int",
+            "f32" => "float",
+            "f64" => "double",
+            "Vec2" => "vector",
+            "Vec3" => "vector",
+            "Vec4" => "vector",
+            "Mat3" => "matrix",
+            "Mat4" => "matrix",
+            _ => type_name.as_str(),
+        }
+        .to_string()
     }
 }
 
@@ -117,10 +171,25 @@ impl IntoShaderResourceHandle for Image {
         }
     }
     fn aspect(&self) -> vk::ImageAspectFlags {
-        if self.format == vk::Format::D32_SFLOAT || self.format == vk::Format::D16_UNORM || self.format == vk::Format::D16_UNORM_S8_UINT || self.format == vk::Format::D24_UNORM_S8_UINT || self.format == vk::Format::D32_SFLOAT_S8_UINT {
+        if self.format == vk::Format::D32_SFLOAT
+            || self.format == vk::Format::D16_UNORM
+            || self.format == vk::Format::D16_UNORM_S8_UINT
+            || self.format == vk::Format::D24_UNORM_S8_UINT
+            || self.format == vk::Format::D32_SFLOAT_S8_UINT
+        {
             vk::ImageAspectFlags::DEPTH
-        }else {
+        } else {
             vk::ImageAspectFlags::COLOR
+        }
+    }
+    fn type_name(&self) -> String {
+        if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            "ImageHandle".to_string()
+        } else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+            "TextureHandle".to_string()
+        } else {
+            //Most likely storage Image
+            "ImageHandle".to_string()
         }
     }
 }
@@ -138,16 +207,21 @@ impl IntoShaderResourceHandle for u64 {
     fn aspect(&self) -> vk::ImageAspectFlags {
         vk::ImageAspectFlags::NONE
     }
+    fn type_name(&self) -> String {
+        "".to_string()
+    }
 }
 
-pub struct CommandBuilder<'a, T: Default> {
+pub struct CommandBuilder<'a, 'b, T: Default> {
     push_constants: Vec<PushConstant>,
     resources: Vec<(ResourceHandle, ResourceState)>,
     sub_builder: T,
-    cmd_buffer: &'a mut CommandBuffer,
+    cmd_buffer: &'a mut CommandBuffer<'b>,
+    #[cfg(debug_assertions)]
+    layout_validation: Vec<LayoutBlock>,
 }
 
-impl<'a, T: Default> CommandBuilder<'a, T> {
+impl<'a, 'b, T: Default> CommandBuilder<'a, 'b, T> {
     pub fn resource_access(
         mut self,
         value: &impl IntoShaderResourceHandle,
@@ -155,6 +229,11 @@ impl<'a, T: Default> CommandBuilder<'a, T> {
         layout: vk::ImageLayout,
     ) -> Self {
         self.push_constants.push(value.push_constant());
+        if cfg!(debug_assertions) {
+            self.layout_validation.push(LayoutBlock::Type {
+                name: value.type_name(),
+            });
+        }
         if let Some(v) = value.resource_handle() {
             let mut stages =
                 vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER;
@@ -205,11 +284,14 @@ impl<'a, T: Default> CommandBuilder<'a, T> {
             ))
         };
         self.push_constants.push(PushConstant::Constants(vec));
+        self.layout_validation.push(LayoutBlock::Constant {
+            size: size_of::<A>() as u32,
+        });
         self
     }
 }
 
-impl<'a> CommandBuilder<'a, RasterBuilder> {
+impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
     pub fn fragment(mut self, path: &'static str, entry: &'static str) -> Self {
         self.sub_builder.pipeline_handle.fragment = crate::pipelines::ShaderPath { path, entry };
         self
@@ -238,20 +320,34 @@ impl<'a> CommandBuilder<'a, RasterBuilder> {
         self
     }
 
+    pub fn backface_culling(mut self, backface_culling: bool) -> Self {
+        self.sub_builder.pipeline_handle.backface_culling = backface_culling;
+        self
+    }
+
     pub fn mesh(mut self, path: &'static str, entry: &'static str) -> Self {
         if let PipelineModel::Mesh { task, mesh } = &mut self.sub_builder.pipeline_handle.model {
             mesh.entry = entry;
             mesh.path = path;
-        }else {
-            self.sub_builder.pipeline_handle.model = PipelineModel::Mesh { task: None, mesh: ShaderPath { path, entry } }
+        } else {
+            self.sub_builder.pipeline_handle.model = PipelineModel::Mesh {
+                task: None,
+                mesh: ShaderPath { path, entry },
+            }
         }
         self
     }
     pub fn task(mut self, path: &'static str, entry: &'static str) -> Self {
         if let PipelineModel::Mesh { task, mesh } = &mut self.sub_builder.pipeline_handle.model {
             *task = Some(ShaderPath { entry, path })
-        }else {
-            self.sub_builder.pipeline_handle.model = PipelineModel::Mesh { task: Some(ShaderPath { path, entry }), mesh: ShaderPath {path: "", entry: ""} }
+        } else {
+            self.sub_builder.pipeline_handle.model = PipelineModel::Mesh {
+                task: Some(ShaderPath { path, entry }),
+                mesh: ShaderPath {
+                    path: "",
+                    entry: "",
+                },
+            }
         }
         self
     }
@@ -320,13 +416,30 @@ impl<'a> CommandBuilder<'a, RasterBuilder> {
         self
     }
 
-
     pub fn draw(mut self, dispatch: RasterDispatch, width: u32, height: u32) {
         let buffers = match &dispatch {
-            RasterDispatch::DrawIndexedIndirect { buffer, offset, count } => vec![buffer],
-            RasterDispatch::DrawIndexedIndirectCount { buffer, offset, count_buffer, count_offset } => vec![buffer, count_buffer],
-            RasterDispatch::DrawIndirect { buffer, offset, count } => vec![buffer],
-            RasterDispatch::DrawIndirectCount { buffer, offset, count_buffer, count_offset } => vec![buffer, count_buffer],
+            RasterDispatch::DrawIndexedIndirect {
+                buffer,
+                offset,
+                count,
+            } => vec![buffer],
+            RasterDispatch::DrawIndexedIndirectCount {
+                buffer,
+                offset,
+                count_buffer,
+                count_offset,
+            } => vec![buffer, count_buffer],
+            RasterDispatch::DrawIndirect {
+                buffer,
+                offset,
+                count,
+            } => vec![buffer],
+            RasterDispatch::DrawIndirectCount {
+                buffer,
+                offset,
+                count_buffer,
+                count_offset,
+            } => vec![buffer, count_buffer],
             _ => vec![],
         };
         for buffer in buffers {
@@ -341,10 +454,12 @@ impl<'a> CommandBuilder<'a, RasterBuilder> {
             ));
         }
         self.cmd_buffer.commands.push(Action {
+            #[cfg(debug_assertions)]
+            layout_validation: self.layout_validation,
             color_attachments: Some(self.sub_builder.color_attachments),
             depth_attachments: self.sub_builder.depth_attachments,
-            command: Command::Raster{
-                pipeline:  self.sub_builder.pipeline_handle,
+            command: Command::Raster {
+                pipeline: self.sub_builder.pipeline_handle,
                 dispatch,
                 width,
                 height,
@@ -370,7 +485,7 @@ pub struct ComputeBuilder {
     pipeline_handle: ComputePipelineHandle,
 }
 
-impl<'a> CommandBuilder<'a, ComputeBuilder> {
+impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
     pub fn shader(mut self, path: &'static str, entry: &'static str) -> Self {
         self.sub_builder.pipeline_handle.path = ShaderPath { path, entry };
         self
@@ -385,16 +500,15 @@ impl<'a> CommandBuilder<'a, ComputeBuilder> {
 
     fn build(self, dispatch: [u32; 3]) {
         self.cmd_buffer.commands.push(Action {
-            color_attachments: None,
-            depth_attachments: None,
-            command: Command::Compute{
+            #[cfg(debug_assertions)]
+            layout_validation: self.layout_validation,
+            command: Command::Compute {
                 pipeline: self.sub_builder.pipeline_handle,
                 dispatch,
             },
             push_constants: Some(self.push_constants),
             resources: self.resources,
-            vertex_buffer: None,
-            index_buffer: None,
+            ..Default::default()
         });
     }
 
@@ -418,11 +532,11 @@ impl<'a> CommandBuilder<'a, ComputeBuilder> {
 }
 
 #[derive(Default)]
-struct RayTracingBuilder {
+pub struct RayTracingBuilder {
     pipeline_handle: RayTracingPipelineHandle,
 }
 
-impl<'a> CommandBuilder<'a, RayTracingBuilder> {
+impl<'a, 'b> CommandBuilder<'a, 'b, RayTracingBuilder> {
     pub fn shader(mut self, path: &'static str, entry: &'static str) -> Self {
         self.sub_builder.pipeline_handle.path = ShaderPath { path, entry };
         self
@@ -437,16 +551,15 @@ impl<'a> CommandBuilder<'a, RayTracingBuilder> {
 
     fn build(self, dispatch: [u32; 2]) {
         self.cmd_buffer.commands.push(Action {
-            color_attachments: None,
-            depth_attachments: None,
+            #[cfg(debug_assertions)]
+            layout_validation: self.layout_validation,
             command: Command::Raytracing {
                 pipeline: self.sub_builder.pipeline_handle,
                 dispatch,
             },
             push_constants: Some(self.push_constants),
             resources: self.resources,
-            vertex_buffer: None,
-            index_buffer: None,
+            ..Default::default()
         });
     }
 
@@ -454,10 +567,7 @@ impl<'a> CommandBuilder<'a, RayTracingBuilder> {
         self.build([x, y]);
     }
     pub fn dispatch_fullscreen(self) {
-        self.build([
-            Ctx::window_width().unwrap(),
-            Ctx::window_height().unwrap(),
-        ]);
+        self.build([Ctx::window_width().unwrap(), Ctx::window_height().unwrap()]);
     }
     pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
         self.build([
@@ -467,37 +577,99 @@ impl<'a> CommandBuilder<'a, RayTracingBuilder> {
     }
 }
 
-impl CommandBuffer {
-    pub fn raster<'a>(&'a mut self) -> CommandBuilder<'a, RasterBuilder> {
+static JSON_CACHE: Mutex<LazyCell<HashMap<String, JsonValue>>> =
+    Mutex::new(LazyCell::new(|| HashMap::new()));
+
+impl<'b> CommandBuffer<'b> {
+    pub fn fill_buffer<T: Copy, L: Location>(
+        &mut self,
+        buffer: &Buffer<T, L>,
+        offset: u32,
+        data: u32,
+    ) {
+        if let Some(buffer) = &buffer.buffer {
+            self.commands.push(Action {
+                command: Command::FillBuffer {
+                    buffer: buffer.buffer,
+                    data,
+                    offset,
+                },
+                resources: vec![(
+                    ResourceHandle::Buffer(buffer.buffer),
+                    ResourceState {
+                        access: vk::AccessFlags2::TRANSFER_WRITE,
+                        stages: vk::PipelineStageFlags2::TRANSFER,
+                        ..Default::default()
+                    },
+                )],
+                ..Default::default()
+            });
+        }
+    }
+    pub fn copy_buffer_unsafe<T: Copy, L: Location, B: Location>(
+        &mut self,
+        src_buffer: &Buffer<T, L>,
+        dst_buffer: &Buffer<T, B>,
+        num_bytes: usize,
+        src_offset: u32,
+        dst_offset: u32,
+    ) {
+        if let Some(src) = &src_buffer.buffer
+            && let Some(dst) = &dst_buffer.buffer
+        {
+            self.commands.push(Action {
+                command: Command::CopyBuffer {
+                    src: src.buffer,
+                    dst: dst.buffer,
+                    offset: ,
+                    size: (),
+                },
+                resources: vec![(
+                    ResourceHandle::Buffer(buffer.buffer),
+                    ResourceState {
+                        access: vk::AccessFlags2::TRANSFER_WRITE,
+                        stages: vk::PipelineStageFlags2::TRANSFER,
+                        ..Default::default()
+                    },
+                )],
+                ..Default::default()
+            });
+        }
+    }
+
+    pub fn raster<'a>(&'a mut self) -> CommandBuilder<'a, 'b, RasterBuilder> {
         CommandBuilder {
             resources: Vec::new(),
             sub_builder: RasterBuilder::default(),
             cmd_buffer: self,
             push_constants: Vec::new(),
+            #[cfg(debug_assertions)]
+            layout_validation: Vec::new(),
         }
     }
-    pub fn compute<'a>(&'a mut self) -> CommandBuilder<'a, ComputeBuilder> {
+    pub fn compute<'a>(&'a mut self) -> CommandBuilder<'a, 'b, ComputeBuilder> {
         CommandBuilder {
             resources: Vec::new(),
             sub_builder: ComputeBuilder::default(),
             cmd_buffer: self,
             push_constants: Vec::new(),
+            #[cfg(debug_assertions)]
+            layout_validation: Vec::new(),
         }
     }
-    pub fn raytrace<'a>(&'a mut self) -> CommandBuilder<'a, RayTracingBuilder> {
+    pub fn raytrace<'a>(&'a mut self) -> CommandBuilder<'a, 'b, RayTracingBuilder> {
         CommandBuilder {
             resources: Vec::new(),
             sub_builder: RayTracingBuilder::default(),
             cmd_buffer: self,
             push_constants: Vec::new(),
+            #[cfg(debug_assertions)]
+            layout_validation: Vec::new(),
         }
     }
 
     pub fn present(&mut self, swapchain_image: Image) {
         self.commands.push(Action {
-            color_attachments: None,
-            depth_attachments: None,
-            push_constants: None,
             command: Command::Present,
             resources: vec![(
                 ResourceHandle::Image((swapchain_image.view, swapchain_image.image)),
@@ -508,8 +680,7 @@ impl CommandBuffer {
                     stages: vk::PipelineStageFlags2::NONE,
                 },
             )],
-            vertex_buffer: None,
-            index_buffer: None,
+            ..Default::default()
         });
     }
 
@@ -628,11 +799,143 @@ impl CommandBuffer {
                 unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
             }
 
+            if cfg!(debug_assertions) && aktion.push_constants.is_some() {
+                let shaders = match &aktion.command {
+                    Command::Compute { pipeline, dispatch } => vec![pipeline.path.clone()],
+                    Command::Raster {
+                        pipeline,
+                        dispatch,
+                        width,
+                        height,
+                    } => {
+                        let mut shaders = vec![pipeline.fragment.clone()];
+                        match &pipeline.model {
+                            PipelineModel::Mesh { task, mesh } => {
+                                if let Some(task) = task {
+                                    shaders.push(task.clone());
+                                }
+                                shaders.push(mesh.clone())
+                            }
+                            PipelineModel::Vertex { vertex } => shaders.push(vertex.clone()),
+                        }
+                        shaders
+                    }
+                    Command::Raytracing { pipeline, dispatch } => vec![pipeline.path.clone()],
+                    _ => vec![],
+                };
+
+                let mut cache = JSON_CACHE.lock().unwrap();
+                for shader_path in shaders {
+                    let path = format!("./core/shaders/bin/{}.slang.json", shader_path.path);
+                    let json = cache
+                        .entry(path.clone())
+                        .or_insert(json::parse(&std::fs::read_to_string(&path).unwrap()).unwrap());
+
+                    let binding = json["parameters"]
+                        .members()
+                        .find(|m| m["binding"]["kind"].as_str().unwrap() == "pushConstantBuffer")
+                        .expect(&format!(
+                            "No Push Constant block found in shader {}",
+                            shader_path.path
+                        ));
+
+                    let binding = &binding["type"]["elementVarLayout"]["type"];
+                    assert!(
+                        binding["kind"] == "struct",
+                        "Push Constant block must be a struct"
+                    );
+
+                    let members = binding["fields"].members().collect::<Vec<_>>();
+                    assert!(
+                        members.len() >= aktion.push_constants.as_ref().unwrap().len(),
+                        "Push constant struct must have at least as many members as are in push constants"
+                    );
+
+                    let mut offset = 0;
+                    let mut byte_offset = 0;
+                    for block in &aktion.layout_validation {
+                        match block {
+                            LayoutBlock::Constant { size } => {
+                                let constant_end = byte_offset + *size;
+                                let member = members[offset];
+                                while {
+                                    let member = members[offset];
+                                    let member_type = member["type"]["kind"].as_str().unwrap();
+                                    let member_name = member["type"]["name"].as_str().unwrap_or("");
+                                    member_type != "pointer"
+                                        && member_name != "ImageHandle"
+                                        && member_name != "TextureHandle"
+                                        && offset < members.len()
+                                } {
+                                    let member_size = member["binding"]["size"].as_u32().unwrap();
+                                    offset += 1;
+                                    byte_offset += member_size;
+                                    assert!(
+                                        byte_offset <= constant_end,
+                                        "Exspected Constants block to end at {} bytes, but it didnt!",
+                                        constant_end
+                                    );
+                                }
+                            }
+                            LayoutBlock::Type { name } => {
+                                let member = members[offset];
+                                let member_type = member["type"]["kind"].as_str().unwrap();
+                                let member_offset = member["binding"]["offset"].as_u32().unwrap();
+                                assert!(
+                                    member_offset == byte_offset,
+                                    "Expected member to be at offset {}, found it at offset {}",
+                                    byte_offset,
+                                    member_offset
+                                );
+                                let member_field_name = member["name"].as_str().unwrap();
+                                let member_name = if member_type == "pointer" {
+                                    member["type"]["valueType"].as_str().unwrap()
+                                } else if member_type == "struct" {
+                                    member["type"]["name"].as_str().unwrap()
+                                } else {
+                                    assert!(
+                                        false,
+                                        "Expected pointer or struct, found {}, at field {}",
+                                        member_type, member_field_name
+                                    );
+                                    ""
+                                };
+
+                                assert!(
+                                    member_name == *name,
+                                    "Expected typename {}, found {} for field {}",
+                                    name,
+                                    member_name,
+                                    member_field_name
+                                );
+                                offset += 1;
+                                byte_offset += 8;
+                            }
+                        }
+                    }
+                }
+            }
+
             match &aktion.command {
-                Command::Compute { pipeline, dispatch: [x,y,z] } => pipeline.dispatch(&self.handle, *x, *y, *z),
-                Command::Raster { pipeline, dispatch, width, height} => {
+                Command::Compute {
+                    pipeline,
+                    dispatch: [x, y, z],
+                } => pipeline.dispatch(&self.handle, *x, *y, *z),
+                Command::Raster {
+                    pipeline,
+                    dispatch,
+                    width,
+                    height,
+                } => {
                     if let Some(index_buffer) = aktion.index_buffer {
-                        unsafe { Ctx::device().cmd_bind_index_buffer(self.handle, index_buffer, 0, vk::IndexType::UINT32) };
+                        unsafe {
+                            Ctx::device().cmd_bind_index_buffer(
+                                self.handle,
+                                index_buffer,
+                                0,
+                                vk::IndexType::UINT32,
+                            )
+                        };
                     }
                     pipeline.dispatch(
                         self.handle,
@@ -640,15 +943,27 @@ impl CommandBuffer {
                         aktion.depth_attachments.as_ref(),
                         None,
                         aktion.vertex_buffer.as_ref(),
-                            *width,
-                            *height,
-                            
-                            *dispatch
+                        *width,
+                        *height,
+                        *dispatch,
                     )
-                },
+                }
                 Command::Raytracing { pipeline, dispatch } => {
                     pipeline.launch(&self.handle, dispatch[0], dispatch[1])
                 }
+                Command::FillBuffer {
+                    buffer,
+                    data,
+                    offset,
+                } => unsafe {
+                    Ctx::device().cmd_fill_buffer(
+                        self.handle,
+                        *buffer,
+                        *offset as u64,
+                        vk::WHOLE_SIZE,
+                        *data,
+                    );
+                },
                 Command::Present => {}
             }
         }

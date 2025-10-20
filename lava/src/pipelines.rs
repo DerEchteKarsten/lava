@@ -3,23 +3,25 @@ use std::{
     collections::HashMap,
     ffi::CStr,
     mem::MaybeUninit,
-    sync::{LazyLock, Mutex, MutexGuard, Once, OnceLock},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, Once, OnceLock},
 };
 
-use anyhow::Result;
-use ash::vk;
-use glam::{Vec2, Vec3};
-use bytemuck::{Pod, Zeroable};
 use crate::{
     bindless::Bindless,
     state::{Ctx, Functions},
     vkobjects::{
-        buffer::{self, Buffer, Location}, image::Image, rt_pipeline::{
+        buffer::{self, Buffer, Location},
+        image::Image,
+        rt_pipeline::{
             RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
             ShaderBindingTable,
-        }
+        },
     },
 };
+use anyhow::Result;
+use ash::vk;
+use bytemuck::{Pod, Zeroable};
+use glam::{Vec2, Vec3};
 
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 pub struct ComputePipelineHandle {
@@ -124,13 +126,41 @@ struct RasterPipelineHash {
 
 #[derive(Clone, Copy)]
 pub enum RasterDispatch {
-    LaunchMesh { x: u32, y: u32, z: u32 },
-    Draw { vertex_count: u32, instance_count: u32 },
-    DrawIndexed { triangle_count: u32, instance_count: u32 },
-    DrawIndirect { buffer: vk::Buffer, offset: u32, count: u32 },
-    DrawIndexedIndirect { buffer: vk::Buffer, offset: u32, count: u32 },
-    DrawIndirectCount { buffer: vk::Buffer, offset: u32, count_buffer: vk::Buffer, count_offset: u32 },
-    DrawIndexedIndirectCount { buffer: vk::Buffer, offset: u32, count_buffer: vk::Buffer, count_offset: u32 },
+    LaunchMesh {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    Draw {
+        vertex_count: u32,
+        instance_count: u32,
+    },
+    DrawIndexed {
+        triangle_count: u32,
+        instance_count: u32,
+    },
+    DrawIndirect {
+        buffer: vk::Buffer,
+        offset: u32,
+        count: u32,
+    },
+    DrawIndexedIndirect {
+        buffer: vk::Buffer,
+        offset: u32,
+        count: u32,
+    },
+    DrawIndirectCount {
+        buffer: vk::Buffer,
+        offset: u32,
+        count_buffer: vk::Buffer,
+        count_offset: u32,
+    },
+    DrawIndexedIndirectCount {
+        buffer: vk::Buffer,
+        offset: u32,
+        count_buffer: vk::Buffer,
+        count_offset: u32,
+    },
 }
 
 impl RasterDispatch {
@@ -149,29 +179,63 @@ impl RasterDispatch {
             instance_count,
         }
     }
-    pub fn indirect<L: Location>(buffer: &Buffer<vk::DrawIndirectCommand, L>, offset: u32, count: u32) -> Self {
-        Self::DrawIndirect { buffer: buffer.vk(), offset, count }
+    pub fn indirect<L: Location>(
+        buffer: &Buffer<vk::DrawIndirectCommand, L>,
+        offset: u32,
+        count: u32,
+    ) -> Self {
+        Self::DrawIndirect {
+            buffer: buffer.vk(),
+            offset,
+            count,
+        }
     }
-    pub fn indexed_indirect<L: Location>(buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>, offset: u32, count: u32) -> Self {
-        Self::DrawIndexedIndirect { buffer: buffer.vk(), offset, count }
+    pub fn indexed_indirect<L: Location>(
+        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
+        offset: u32,
+        count: u32,
+    ) -> Self {
+        Self::DrawIndexedIndirect {
+            buffer: buffer.vk(),
+            offset,
+            count,
+        }
     }
-    pub fn indirect_count<L: Location>(buffer: &Buffer<vk::DrawIndirectCommand, L>, offset: u32, count_buffer: vk::Buffer, count_offset: u32) -> Self {
-        Self::DrawIndirectCount { buffer: buffer.vk(), offset, count_buffer, count_offset }
+    pub fn indirect_count<L: Location>(
+        buffer: &Buffer<vk::DrawIndirectCommand, L>,
+        offset: u32,
+        count_buffer: vk::Buffer,
+        count_offset: u32,
+    ) -> Self {
+        Self::DrawIndirectCount {
+            buffer: buffer.vk(),
+            offset,
+            count_buffer,
+            count_offset,
+        }
     }
-    pub fn indexed_indirect_count<L: Location>(buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>, offset: u32, count_buffer: vk::Buffer, count_offset: u32) -> Self {
-        Self::DrawIndexedIndirectCount { buffer: buffer.vk(), offset, count_buffer, count_offset }
+    pub fn indexed_indirect_count<L: Location>(
+        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
+        offset: u32,
+        count_buffer: vk::Buffer,
+        count_offset: u32,
+    ) -> Self {
+        Self::DrawIndexedIndirectCount {
+            buffer: buffer.vk(),
+            offset,
+            count_buffer,
+            count_offset,
+        }
     }
 }
 
-
-#[derive(Debug ,Copy, Clone, Pod, Zeroable)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
 #[repr(C)]
 pub struct Vertex {
     pub position: Vec3,
     pub normal: Vec3,
     pub uv: Vec2,
 }
-
 
 impl RasterPipelineHandle {
     pub fn dispatch(
@@ -288,25 +352,82 @@ impl RasterPipelineHandle {
                 }],
             );
             match &self.model {
-                PipelineModel::Mesh { task, mesh } => {
-                    match dispatch {
-                        RasterDispatch::LaunchMesh { x, y, z } => {
-                            Functions::mesh().unwrap().cmd_draw_mesh_tasks(cmd, x, y, z);
-                        }
-                        _ => panic!("Invalid dispatch for mesh pipeline"),
+                PipelineModel::Mesh { task, mesh } => match dispatch {
+                    RasterDispatch::LaunchMesh { x, y, z } => {
+                        Functions::mesh().unwrap().cmd_draw_mesh_tasks(cmd, x, y, z);
                     }
-                }
+                    _ => panic!("Invalid dispatch for mesh pipeline"),
+                },
                 PipelineModel::Vertex { vertex } => {
                     if let Some(vertex_buffer) = vertex_buffer {
                         Ctx::device().cmd_bind_vertex_buffers(cmd, 0, &[*vertex_buffer], &[0]);
                     }
                     match dispatch {
-                        RasterDispatch::Draw { vertex_count, instance_count } => Ctx::device().cmd_draw(cmd, vertex_count, instance_count, 0, 0),
-                        RasterDispatch::DrawIndexed { triangle_count, instance_count } => Ctx::device().cmd_draw_indexed(cmd, triangle_count * 3, instance_count, 0, 0, 0),
-                        RasterDispatch::DrawIndirect { buffer, offset, count } => Ctx::device().cmd_draw_indirect(cmd, buffer, offset as u64, count, size_of::<vk::DrawIndirectCommand>() as u32),
-                        RasterDispatch::DrawIndexedIndirect { buffer, offset, count } => Ctx::device().cmd_draw_indexed_indirect(cmd, buffer, offset as u64, count, size_of::<vk::DrawIndexedIndirectCommand>() as u32),
-                        RasterDispatch::DrawIndirectCount { buffer, offset, count_buffer, count_offset } => Ctx::device().cmd_draw_indirect_count(cmd, buffer, offset as u64, count_buffer, count_offset as u64, u32::MAX, size_of::<vk::DrawIndirectCommand>() as u32),
-                        RasterDispatch::DrawIndexedIndirectCount { buffer, offset, count_buffer, count_offset } => Ctx::device().cmd_draw_indexed_indirect_count(cmd, buffer, offset as u64, count_buffer, count_offset as u64, u32::MAX, size_of::<vk::DrawIndirectCommand>() as u32),
+                        RasterDispatch::Draw {
+                            vertex_count,
+                            instance_count,
+                        } => Ctx::device().cmd_draw(cmd, vertex_count, instance_count, 0, 0),
+                        RasterDispatch::DrawIndexed {
+                            triangle_count,
+                            instance_count,
+                        } => Ctx::device().cmd_draw_indexed(
+                            cmd,
+                            triangle_count * 3,
+                            instance_count,
+                            0,
+                            0,
+                            0,
+                        ),
+                        RasterDispatch::DrawIndirect {
+                            buffer,
+                            offset,
+                            count,
+                        } => Ctx::device().cmd_draw_indirect(
+                            cmd,
+                            buffer,
+                            offset as u64,
+                            count,
+                            size_of::<vk::DrawIndirectCommand>() as u32,
+                        ),
+                        RasterDispatch::DrawIndexedIndirect {
+                            buffer,
+                            offset,
+                            count,
+                        } => Ctx::device().cmd_draw_indexed_indirect(
+                            cmd,
+                            buffer,
+                            offset as u64,
+                            count,
+                            size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                        ),
+                        RasterDispatch::DrawIndirectCount {
+                            buffer,
+                            offset,
+                            count_buffer,
+                            count_offset,
+                        } => Ctx::device().cmd_draw_indirect_count(
+                            cmd,
+                            buffer,
+                            offset as u64,
+                            count_buffer,
+                            count_offset as u64,
+                            u32::MAX,
+                            size_of::<vk::DrawIndirectCommand>() as u32,
+                        ),
+                        RasterDispatch::DrawIndexedIndirectCount {
+                            buffer,
+                            offset,
+                            count_buffer,
+                            count_offset,
+                        } => Ctx::device().cmd_draw_indexed_indirect_count(
+                            cmd,
+                            buffer,
+                            offset as u64,
+                            count_buffer,
+                            count_offset as u64,
+                            u32::MAX,
+                            size_of::<vk::DrawIndirectCommand>() as u32,
+                        ),
                         RasterDispatch::LaunchMesh { x, y, z } => {
                             panic!("Invalid dispatch for vertex pipeline")
                         }
@@ -328,6 +449,9 @@ pub struct PipelineCache {
 pub static CACHE: LazyLock<Mutex<PipelineCache>> =
     LazyLock::new(|| Mutex::new(PipelineCache::new()));
 
+use json::JsonValue;
+use std::io::Read;
+
 impl PipelineCache {
     pub fn get<'a>() -> MutexGuard<'a, PipelineCache> {
         CACHE.lock().unwrap()
@@ -335,14 +459,16 @@ impl PipelineCache {
 
     pub fn create_shader_module(&mut self, code_path: &str) -> Result<vk::ShaderModule> {
         match self.shader_cache.get(code_path) {
-            Some(module) => Ok(*module),
+            Some(module) => Ok(module.clone()),
             None => {
                 let mut code = std::fs::File::open(code_path)?;
                 let decoded_code = ash::util::read_spv(&mut code)?;
                 let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
 
                 let module = unsafe { Ctx::device().create_shader_module(&create_info, None)? };
-                self.shader_cache.insert(code_path.to_string(), module);
+
+                self.shader_cache
+                    .insert(code_path.to_string(), module.clone());
                 Ok(module)
             }
         }
@@ -530,12 +656,10 @@ impl PipelineCache {
                             )
                             .unwrap(),
                         );
-                        vertex_bindings = [
-                            vk::VertexInputBindingDescription::default()
-                                .binding(0)
-                                .stride(size_of::<Vertex>() as u32)
-                                .input_rate(vk::VertexInputRate::VERTEX),
-                        ];
+                        vertex_bindings = [vk::VertexInputBindingDescription::default()
+                            .binding(0)
+                            .stride(size_of::<Vertex>() as u32)
+                            .input_rate(vk::VertexInputRate::VERTEX)];
 
                         vertex_attribute_descriptions = [
                             vk::VertexInputAttributeDescription::default()

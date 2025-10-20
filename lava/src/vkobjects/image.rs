@@ -395,11 +395,7 @@ impl Image {
         unsafe { device.create_image_view(&image_view_info, None) }.unwrap()
     }
 
-    pub fn new_2d(
-        usage: vk::ImageUsageFlags,
-        format: vk::Format,
-        size: ImageSize,
-    ) -> Result<Self> {
+    pub fn new_2d(usage: vk::ImageUsageFlags, format: vk::Format, size: ImageSize) -> Result<Self> {
         let extent = vk::Extent3D {
             width: size.size().x,
             height: size.size().y,

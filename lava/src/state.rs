@@ -29,7 +29,7 @@ use winit::raw_window_handle::{
 use crate::{
     FRAMES_IN_FLIGHT,
     bindless::{Bindless, BindlessHandle},
-    command_buffer::CommandBuffer,
+    command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     vkobjects::{
         image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface,
         swapchain::Swapchain,
@@ -75,6 +75,7 @@ impl Debug for Ctx {
 
 #[derive(Debug)]
 pub struct Present {
+    resource_cache: Mutex<HashMap<ResourceHandle, ResourceState>>,
     frame_counter: AtomicU64,
     surface: Surface,
     swapchain: Mutex<Swapchain>,
@@ -228,7 +229,7 @@ impl Ctx {
         let mut cmd = CommandBuffer {
             commands: Vec::new(),
             handle: f.cmd,
-            resource_hashes: HashMap::new(),
+            resource_hashes: &mut s.resource_cache.lock().unwrap(),
         };
         let img = Ctx::swapchain().unwrap().images[image_index as usize].clone();
         let result = func(&mut cmd, img);
@@ -371,8 +372,14 @@ impl Ctx {
         let mut instance_info = vk::InstanceCreateInfo::default();
         if features.debug_utils {
             instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
-            validation_features = vk::ValidationFeaturesEXT::default()
-                .enabled_validation_features(&[vk::ValidationFeatureEnableEXT::DEBUG_PRINTF]);
+            validation_features =
+                vk::ValidationFeaturesEXT::default().enabled_validation_features(&[
+                    vk::ValidationFeatureEnableEXT::DEBUG_PRINTF,
+                    vk::ValidationFeatureEnableEXT::GPU_ASSISTED,
+                    vk::ValidationFeatureEnableEXT::BEST_PRACTICES,
+                    vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION,
+                ]);
+
             instance_info = instance_info
                 .enabled_layer_names(&layers_names_raw)
                 .push_next(&mut validation_features);
@@ -529,6 +536,7 @@ impl Ctx {
 
         let present = if window.is_some() {
             Some(Present {
+                resource_cache: Mutex::new(HashMap::new()),
                 swpachain_needs_resizing: Mutex::new(None),
                 swapchain: Mutex::new(Swapchain::new(
                     &surface.as_ref().unwrap(),
@@ -705,7 +713,6 @@ impl Features {
         *vk13 = vk13
             .dynamic_rendering(true)
             .maintenance4(true)
-            
             .synchronization2(true);
         let phfeatures = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
@@ -853,7 +860,8 @@ pub(super) fn create_device(
         .map(|e| e.as_ptr() as *const i8)
         .collect::<Vec<_>>();
 
-    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) = Default::default();
+    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) =
+        Default::default();
     let mut features = features.features(
         &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
     );
