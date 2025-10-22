@@ -10,7 +10,7 @@ use crate::{
     bindless::Bindless,
     state::{Ctx, Functions},
     vkobjects::{
-        buffer::{self, Buffer, Location},
+        buffer::{self, Buffer, Location, Size},
         image::Image,
         rt_pipeline::{
             RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
@@ -179,49 +179,49 @@ impl RasterDispatch {
             instance_count,
         }
     }
-    pub fn indirect<L: Location>(
-        buffer: &Buffer<vk::DrawIndirectCommand, L>,
+    pub fn indirect<L: Location, S: Size>(
+        buffer: &Buffer<vk::DrawIndirectCommand, S, L>,
         offset: u32,
         count: u32,
     ) -> Self {
         Self::DrawIndirect {
-            buffer: buffer.vk(),
+            buffer: buffer.buffer,
             offset,
             count,
         }
     }
-    pub fn indexed_indirect<L: Location>(
-        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
+    pub fn indexed_indirect<L: Location, S: Size>(
+        buffer: &Buffer<vk::DrawIndexedIndirectCommand, S, L>,
         offset: u32,
         count: u32,
     ) -> Self {
         Self::DrawIndexedIndirect {
-            buffer: buffer.vk(),
+            buffer: buffer.buffer,
             offset,
             count,
         }
     }
-    pub fn indirect_count<L: Location>(
-        buffer: &Buffer<vk::DrawIndirectCommand, L>,
+    pub fn indirect_count<L: Location, S: Size>(
+        buffer: &Buffer<vk::DrawIndirectCommand, S, L>,
         offset: u32,
         count_buffer: vk::Buffer,
         count_offset: u32,
     ) -> Self {
         Self::DrawIndirectCount {
-            buffer: buffer.vk(),
+            buffer: buffer.buffer,
             offset,
             count_buffer,
             count_offset,
         }
     }
-    pub fn indexed_indirect_count<L: Location>(
-        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
+    pub fn indexed_indirect_count<L: Location, S: Size>(
+        buffer: &Buffer<vk::DrawIndexedIndirectCommand, S, L>,
         offset: u32,
         count_buffer: vk::Buffer,
         count_offset: u32,
     ) -> Self {
         Self::DrawIndexedIndirectCount {
-            buffer: buffer.vk(),
+            buffer: buffer.buffer,
             offset,
             count_buffer,
             count_offset,

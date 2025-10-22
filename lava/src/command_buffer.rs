@@ -4,7 +4,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use ash::vk;
+use ash::vk::{self, Handle};
 use glam::Mat4;
 use json::JsonValue;
 
@@ -16,7 +16,7 @@ use crate::{
     },
     state::Ctx,
     vkobjects::{
-        buffer::{Buffer, CpuBuffer, Location},
+        buffer::{Buffer, CpuBuffer, Growable, Location, Size},
         image::Image,
         rt_pipeline::alinged_size,
     },
@@ -119,12 +119,14 @@ pub trait IntoShaderResourceHandle {
 
 impl<T: Copy> IntoShaderResourceHandle for Buffer<T> {
     fn push_constant(&self) -> PushConstant {
-        PushConstant::BufferPointer(self.ptr())
+        PushConstant::BufferPointer(self.ptr)
     }
     fn resource_handle(&self) -> Option<ResourceHandle> {
-        self.buffer
-            .as_ref()
-            .map(|b| ResourceHandle::Buffer(b.buffer))
+        if self.buffer.is_null() {
+            None
+        }else {
+            Some(ResourceHandle::Buffer(self.buffer))
+        }
     }
     fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
         None
@@ -384,12 +386,14 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
         self
     }
 
-    pub fn vertex_buffer(mut self, buffer: &Buffer<Vertex>) -> Self {
+    pub fn vertex_buffer<S: Size>(mut self, buffer: &Buffer<Vertex, S>) -> Self {
         assert!(self.sub_builder.vertex_buffer.is_none());
-        let buffer = buffer.buffer.as_ref().map(|e| e.buffer).unwrap();
-        self.sub_builder.vertex_buffer = Some(buffer);
+        if buffer.buffer.is_null() {
+            return self;
+        }
+        self.sub_builder.vertex_buffer = Some(buffer.buffer);
         self.resources.push((
-            ResourceHandle::Buffer(buffer),
+            ResourceHandle::Buffer(buffer.buffer),
             ResourceState {
                 access: vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
                 layout: vk::ImageLayout::UNDEFINED,
@@ -400,12 +404,14 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
         self
     }
 
-    pub fn index_buffer(mut self, buffer: &Buffer<u32>) -> Self {
+    pub fn index_buffer<S: Size>(mut self, buffer: &Buffer<u32, S>) -> Self {
         assert!(self.sub_builder.index_buffer.is_none());
-        let buffer = buffer.buffer.as_ref().map(|e| e.buffer).unwrap();
-        self.sub_builder.index_buffer = Some(buffer);
+        if buffer.buffer.is_null() {
+            return self;
+        }
+        self.sub_builder.index_buffer = Some(buffer.buffer);
         self.resources.push((
-            ResourceHandle::Buffer(buffer),
+            ResourceHandle::Buffer(buffer.buffer),
             ResourceState {
                 access: vk::AccessFlags2::INDEX_READ,
                 layout: vk::ImageLayout::UNDEFINED,
@@ -581,60 +587,85 @@ static JSON_CACHE: Mutex<LazyCell<HashMap<String, JsonValue>>> =
     Mutex::new(LazyCell::new(|| HashMap::new()));
 
 impl<'b> CommandBuffer<'b> {
-    pub fn fill_buffer<T: Copy, L: Location>(
+    pub fn fill_buffer<T: Copy, S: Size, L: Location>(
         &mut self,
-        buffer: &Buffer<T, L>,
+        buffer: &Buffer<T, S, L>,
         offset: u32,
         data: u32,
     ) {
-        if let Some(buffer) = &buffer.buffer {
-            self.commands.push(Action {
-                command: Command::FillBuffer {
-                    buffer: buffer.buffer,
-                    data,
-                    offset,
-                },
-                resources: vec![(
-                    ResourceHandle::Buffer(buffer.buffer),
-                    ResourceState {
-                        access: vk::AccessFlags2::TRANSFER_WRITE,
-                        stages: vk::PipelineStageFlags2::TRANSFER,
-                        ..Default::default()
-                    },
-                )],
-                ..Default::default()
-            });
+        if buffer.buffer.is_null() {
+            return;
         }
+
+        self.commands.push(Action {
+            command: Command::FillBuffer {
+                buffer: buffer.buffer,
+                data,
+                offset,
+            },
+            resources: vec![(
+                ResourceHandle::Buffer(buffer.buffer),
+                ResourceState {
+                    access: vk::AccessFlags2::TRANSFER_WRITE,
+                    stages: vk::PipelineStageFlags2::TRANSFER,
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        });
     }
-    pub fn copy_buffer_unsafe<T: Copy, L: Location, B: Location>(
+    pub fn copy_buffer<T: Copy, L: Location, S: Size, J: Size, B: Location>(
         &mut self,
-        src_buffer: &Buffer<T, L>,
-        dst_buffer: &Buffer<T, B>,
-        num_bytes: usize,
+        src: &Buffer<T, S, L>,
+        dst: &Buffer<T, J, B>,
+        num_elements: usize,
         src_offset: u32,
         dst_offset: u32,
     ) {
-        if let Some(src) = &src_buffer.buffer
-            && let Some(dst) = &dst_buffer.buffer
-        {
-            self.commands.push(Action {
-                command: Command::CopyBuffer {
-                    src: src.buffer,
-                    dst: dst.buffer,
-                    offset: ,
-                    size: (),
-                },
-                resources: vec![(
-                    ResourceHandle::Buffer(buffer.buffer),
-                    ResourceState {
-                        access: vk::AccessFlags2::TRANSFER_WRITE,
-                        stages: vk::PipelineStageFlags2::TRANSFER,
-                        ..Default::default()
-                    },
-                )],
-                ..Default::default()
-            });
+        let num_bytes = num_elements * size_of::<T>();
+        if src.buffer.is_null() || dst.buffer.is_null() || src.size < src_offset as u64 + num_bytes as u64 || dst.size < dst_offset as u64 + num_bytes as u64 {
+            return;
         }
+
+        self.commands.push(Action {
+            command: Command::CopyBuffer {
+                src: src.buffer,
+                dst: dst.buffer,
+                src_offset,
+                dst_offset,
+                num_bytes: num_bytes as u32,
+            },
+            resources: vec![(
+                ResourceHandle::Buffer(src.buffer),
+                ResourceState {
+                    access: vk::AccessFlags2::TRANSFER_READ,
+                    stages: vk::PipelineStageFlags2::TRANSFER,
+                    ..Default::default()
+                },
+            ),(
+                ResourceHandle::Buffer(src.buffer),
+                ResourceState {
+                    access: vk::AccessFlags2::TRANSFER_WRITE,
+                    stages: vk::PipelineStageFlags2::TRANSFER,
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        });
+        
+    }
+
+    pub fn copy_dyn_buffer<T: Copy, L: Location, S: Size + Growable, H: Size, B: Location>(
+        &mut self,
+        src: &Buffer<T, H, L>,
+        dst: &mut Buffer<T, S, B>,
+        num_elements: usize,
+        src_offset: u32,
+        dst_offset: u32,
+    ) {
+        let num_bytes = num_elements * size_of::<T>();
+        dst.grow_to_size(num_bytes as u64 + dst_offset as u64);
+        self.copy_buffer(src, dst, num_elements, src_offset, dst_offset);
     }
 
     pub fn raster<'a>(&'a mut self) -> CommandBuilder<'a, 'b, RasterBuilder> {
@@ -964,6 +995,13 @@ impl<'b> CommandBuffer<'b> {
                         *data,
                     );
                 },
+                Command::CopyBuffer { src, dst, src_offset, dst_offset, num_bytes } => unsafe {
+                    Ctx::device().cmd_copy_buffer(self.handle, *src, *dst, &[vk::BufferCopy{
+                        src_offset: *src_offset as u64,
+                        dst_offset: *dst_offset as u64,
+                        size: *num_bytes as u64,
+                    }]);
+                }
                 Command::Present => {}
             }
         }

@@ -3,6 +3,8 @@
 #![feature(lock_value_accessors)]
 #![feature(let_chains)]
 #![feature(const_trait_impl)]
+#![feature(specialization)]
+
 use std::time::Instant;
 
 use crate::{

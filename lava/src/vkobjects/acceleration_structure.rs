@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ash::vk;
 
-use crate::{state::Functions, vkobjects::buffer::Buffer};
+use crate::{state::Functions, vkobjects::buffer::{Buffer, FirstUse, GpuBuffer, Growable}};
 
 pub struct AccelerationStructure {
     pub ty: vk::AccelerationStructureTypeKHR,
@@ -15,9 +15,9 @@ impl AccelerationStructure {
         as_geometry: &[vk::AccelerationStructureGeometryKHR],
         as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
         max_primitive_counts: &[u32],
-        buffer: &mut Buffer<u8>,
+        buffer: &mut Buffer<u8, FirstUse, GpuBuffer>,
         offset: u64,
-        scratch_buffer: &mut Buffer<u8>,
+        scratch_buffer: &mut Buffer<u8, FirstUse, GpuBuffer>,
         cmd: &vk::CommandBuffer,
     ) -> Result<AccelerationStructure> {
         let build_geo_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
@@ -41,7 +41,7 @@ impl AccelerationStructure {
         scratch_buffer.grow_to_size(build_size.build_scratch_size);
         buffer.grow_to_size(build_size.acceleration_structure_size);
         let create_info = vk::AccelerationStructureCreateInfoKHR::default()
-            .buffer(buffer.buffer.as_ref().unwrap().buffer)
+            .buffer(buffer.buffer)
             .offset(offset)
             .size(build_size.acceleration_structure_size)
             .ty(level);
@@ -57,7 +57,7 @@ impl AccelerationStructure {
             .geometries(as_geometry)
             .dst_acceleration_structure(handle)
             .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: scratch_buffer.buffer.as_ref().unwrap().address,
+                device_address: scratch_buffer.ptr,
             });
 
         unsafe {
