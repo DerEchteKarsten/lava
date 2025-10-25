@@ -227,14 +227,13 @@ impl Ctx {
         }?;
 
         let mut cmd = CommandBuffer {
-            commands: Vec::new(),
             handle: f.cmd,
             resource_hashes: &mut s.resource_cache.lock().unwrap(),
         };
         let img = Ctx::swapchain().unwrap().images[image_index as usize].clone();
+        cmd.begin();
         let result = func(&mut cmd, img);
-        cmd.record();
-
+        cmd.end();
         s.frame_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
@@ -628,18 +627,19 @@ unsafe extern "system" fn vulkan_debug_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _: *mut c_void,
 ) -> vk::Bool32 {
-    use vk::DebugUtilsMessageSeverityFlagsEXT as Flag;
-    if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
-        let message = CStr::from_ptr((*p_callback_data).p_message);
-        match flag {
-            Flag::VERBOSE => log::info!("{:?} - {:?}", typ, message),
-            Flag::INFO => {
-                let message = message.to_str().unwrap_or("");
-                log::info!("{:?} - {:?}", typ, message.to_owned())
+    unsafe {
+        use vk::DebugUtilsMessageSeverityFlagsEXT as Flag;
+        if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
+            let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
+            match flag {
+                Flag::VERBOSE => log::info!("{:?} - {}", typ, message),
+                Flag::INFO => {
+                    log::info!("{:?} - {}", typ, message)
+                }
+                Flag::WARNING => log::warn!("{}", message),
+                Flag::ERROR => log::error!("{}", message),
+                _ => {}
             }
-            Flag::WARNING => log::warn!("{:?}", message),
-            Flag::ERROR => log::error!("{:?}", message),
-            _ => {}
         }
     }
     vk::FALSE

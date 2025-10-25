@@ -11,7 +11,7 @@ use gpu_allocator::MemoryLocation;
 use crate::{
     pipelines::PipelineCache,
     state::{Ctx, Functions},
-    vkobjects::buffer::{Buffer, BufferUsageFlags, CpuBuffer, GpuBuffer, Sized},
+    vkobjects::buffer::{Buffer, BufferUsageFlags, CpuBuffer, GpuBuffer},
 };
 
 pub fn alinged_size(size: u32, alignment: u32) -> u32 {
@@ -141,7 +141,7 @@ impl RaytracingPipeline {
 }
 
 pub struct ShaderBindingTable {
-    pub _buffer: Buffer<u8, Sized, CpuBuffer>,
+    pub _buffer: Buffer<u8, CpuBuffer>,
     pub raygen_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
@@ -201,7 +201,7 @@ impl ShaderBindingTable {
 
         let buffer_usage = BufferUsageFlags::SHADER_BINDING_TABLE;
 
-        let mut buffer = Buffer::<u8, Sized, CpuBuffer>::with_alignment(
+        let mut buffer = Buffer::with_alignment(
             buffer_usage,
             buffer_size as _,
             Some(
@@ -237,17 +237,17 @@ impl ShaderBindingTable {
         buffer.copy_from_slice(&stb_data)?;
 
         let raygen_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(buffer.ptr)
+            .device_address(buffer.address)
             .size(raygen_region_size as _)
             .stride(raygen_region_size as _);
 
         let miss_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(buffer.ptr + raygen_region.size)
+            .device_address(buffer.address + raygen_region.size)
             .size(miss_region_size as _)
             .stride(aligned_handle_size as _);
 
         let hit_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(buffer.ptr + raygen_region.size + miss_region.size)
+            .device_address(buffer.address + raygen_region.size + miss_region.size)
             .size(hit_region_size as _)
             .stride(aligned_handle_size as _);
 

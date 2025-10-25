@@ -10,7 +10,7 @@ use crate::{
     bindless::Bindless,
     state::{Ctx, Functions},
     vkobjects::{
-        buffer::{self, Buffer, Location, Size},
+        buffer::{self, Buffer, Location},
         image::Image,
         rt_pipeline::{
             RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
@@ -105,6 +105,7 @@ pub enum PipelineModel {
     },
     Vertex {
         vertex: ShaderPath,
+        vertex_buffer: bool,
     },
 }
 
@@ -112,6 +113,7 @@ impl Default for PipelineModel {
     fn default() -> Self {
         Self::Vertex {
             vertex: ShaderPath::default(),
+            vertex_buffer: false,
         }
     }
 }
@@ -179,49 +181,49 @@ impl RasterDispatch {
             instance_count,
         }
     }
-    pub fn indirect<L: Location, S: Size>(
-        buffer: &Buffer<vk::DrawIndirectCommand, S, L>,
+    pub fn indirect<L: Location>(
+        buffer: &Buffer<vk::DrawIndirectCommand, L>,
         offset: u32,
         count: u32,
     ) -> Self {
         Self::DrawIndirect {
-            buffer: buffer.buffer,
+            buffer: buffer.handle,
             offset,
             count,
         }
     }
-    pub fn indexed_indirect<L: Location, S: Size>(
-        buffer: &Buffer<vk::DrawIndexedIndirectCommand, S, L>,
+    pub fn indexed_indirect<L: Location>(
+        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
         offset: u32,
         count: u32,
     ) -> Self {
         Self::DrawIndexedIndirect {
-            buffer: buffer.buffer,
+            buffer: buffer.handle,
             offset,
             count,
         }
     }
-    pub fn indirect_count<L: Location, S: Size>(
-        buffer: &Buffer<vk::DrawIndirectCommand, S, L>,
+    pub fn indirect_count<L: Location>(
+        buffer: &Buffer<vk::DrawIndirectCommand, L>,
         offset: u32,
         count_buffer: vk::Buffer,
         count_offset: u32,
     ) -> Self {
         Self::DrawIndirectCount {
-            buffer: buffer.buffer,
+            buffer: buffer.handle,
             offset,
             count_buffer,
             count_offset,
         }
     }
-    pub fn indexed_indirect_count<L: Location, S: Size>(
-        buffer: &Buffer<vk::DrawIndexedIndirectCommand, S, L>,
+    pub fn indexed_indirect_count<L: Location>(
+        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
         offset: u32,
         count_buffer: vk::Buffer,
         count_offset: u32,
     ) -> Self {
         Self::DrawIndexedIndirectCount {
-            buffer: buffer.buffer,
+            buffer: buffer.handle,
             offset,
             count_buffer,
             count_offset,
@@ -358,7 +360,10 @@ impl RasterPipelineHandle {
                     }
                     _ => panic!("Invalid dispatch for mesh pipeline"),
                 },
-                PipelineModel::Vertex { vertex } => {
+                PipelineModel::Vertex {
+                    vertex,
+                    vertex_buffer: use_vertex_buffer,
+                } => {
                     if let Some(vertex_buffer) = vertex_buffer {
                         Ctx::device().cmd_bind_vertex_buffers(cmd, 0, &[*vertex_buffer], &[0]);
                     }
@@ -596,7 +601,11 @@ impl PipelineCache {
                 } else {
                     None
                 };
-                let vertex_entry = if let PipelineModel::Vertex { vertex } = &handle.model {
+                let vertex_entry = if let PipelineModel::Vertex {
+                    vertex,
+                    vertex_buffer,
+                } = &handle.model
+                {
                     Some(format!("{}\0", vertex.entry))
                 } else {
                     None
@@ -646,7 +655,10 @@ impl PipelineCache {
                             );
                         }
                     }
-                    PipelineModel::Vertex { vertex } => {
+                    PipelineModel::Vertex {
+                        vertex,
+                        vertex_buffer,
+                    } => {
                         let vertex_path = format!("./core/shaders/bin/{}.slang.spv", vertex.path);
                         stages.push(
                             self.create_shader_stage(
@@ -656,39 +668,41 @@ impl PipelineCache {
                             )
                             .unwrap(),
                         );
-                        vertex_bindings = [vk::VertexInputBindingDescription::default()
-                            .binding(0)
-                            .stride(size_of::<Vertex>() as u32)
-                            .input_rate(vk::VertexInputRate::VERTEX)];
-
-                        vertex_attribute_descriptions = [
-                            vk::VertexInputAttributeDescription::default()
+                        if *vertex_buffer {
+                            vertex_bindings = [vk::VertexInputBindingDescription::default()
                                 .binding(0)
-                                .location(0)
-                                .format(vk::Format::R32G32B32_SFLOAT)
-                                .offset(0),
-                            vk::VertexInputAttributeDescription::default()
-                                .binding(0)
-                                .location(1)
-                                .format(vk::Format::R32G32B32_SFLOAT)
-                                .offset(12),
-                            vk::VertexInputAttributeDescription::default()
-                                .binding(0)
-                                .location(2)
-                                .format(vk::Format::R32G32_SFLOAT)
-                                .offset(24),
-                        ];
+                                .stride(size_of::<Vertex>() as u32)
+                                .input_rate(vk::VertexInputRate::VERTEX)];
 
-                        vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
-                            .vertex_binding_descriptions(&vertex_bindings)
-                            .vertex_attribute_descriptions(&vertex_attribute_descriptions);
+                            vertex_attribute_descriptions = [
+                                vk::VertexInputAttributeDescription::default()
+                                    .binding(0)
+                                    .location(0)
+                                    .format(vk::Format::R32G32B32_SFLOAT)
+                                    .offset(0),
+                                vk::VertexInputAttributeDescription::default()
+                                    .binding(0)
+                                    .location(1)
+                                    .format(vk::Format::R32G32B32_SFLOAT)
+                                    .offset(12),
+                                vk::VertexInputAttributeDescription::default()
+                                    .binding(0)
+                                    .location(2)
+                                    .format(vk::Format::R32G32_SFLOAT)
+                                    .offset(24),
+                            ];
 
-                        input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-                            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-                            .primitive_restart_enable(false);
-                        create_info = create_info
-                            .vertex_input_state(&vertex_input_state)
-                            .input_assembly_state(&input_assembly);
+                            vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
+                                .vertex_binding_descriptions(&vertex_bindings)
+                                .vertex_attribute_descriptions(&vertex_attribute_descriptions);
+
+                            input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+                                .primitive_restart_enable(false);
+                            create_info = create_info
+                                .vertex_input_state(&vertex_input_state)
+                                .input_assembly_state(&input_assembly);
+                        }
                     }
                 }
 
