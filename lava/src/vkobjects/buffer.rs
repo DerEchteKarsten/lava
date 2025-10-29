@@ -142,12 +142,11 @@ impl<T: Copy> DerefMut for StorageBuffer<T> {
 impl<T: Copy, L: Location + 'static> Buffer<T, L> {
     pub fn with_alignment(
         usage: BufferUsageFlags,
-        size: usize,
+        num_bytes: u64,
         alignment: Option<u32>,
     ) -> Result<Self> {
-        let size = (size * size_of::<T>()) as u64;
         let usage = usage.to_vk();
-        let create_info = vk::BufferCreateInfo::default().size(size).usage(usage);
+        let create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(usage);
         let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
         let mut requirements = unsafe { Ctx::device().get_buffer_memory_requirements(buffer) };
         if let Some(a) = alignment {
@@ -181,12 +180,12 @@ impl<T: Copy, L: Location + 'static> Buffer<T, L> {
             alignment: None,
             allocation: Arc::new(Mutex::new(MAllocation(allocation))),
             handle: buffer,
-            size,
+            size: num_bytes as u64,
             usage,
         })
     }
     pub fn new(usage: BufferUsageFlags, size: usize) -> Result<Self> {
-        Self::with_alignment(usage, size, None)
+        Self::with_alignment(usage, (size * size_of::<T>()) as u64, None)
     }
     pub fn copy_from<J: Location>(
         &mut self,
@@ -239,18 +238,22 @@ impl<T: Copy> StorageBuffer<T> {
     }
     pub fn new(usage: BufferUsageFlags) -> Result<Self> {
         Ok(Self {
-            buffer: Buffer::new(usage, 1024)?,
+            buffer: Buffer::with_alignment(usage, 1024, None)?,
             size: 0,
         })
+    }
+    pub fn len(&self) -> usize {
+        (self.size / size_of::<T>() as u64) as usize
     }
     pub fn assert_size(&mut self, size: u64) -> Result<()> {
         if self.buffer.size < size {
             let capacity = size.next_power_of_two();
             let buffer = Buffer::with_alignment(
-                BufferUsageFlags::from_bits(self.buffer.usage.as_raw()).unwrap(),
-                capacity as usize / size_of::<T>(),
+                BufferUsageFlags::from_bits_retain(self.buffer.usage.as_raw()),
+                capacity,
                 self.buffer.alignment,
             )?;
+            log::info!("{:#?}", buffer.usage);
             if self.size != 0 {
                 Ctx::transfer_queue().execute_command_wait(|cmd| {
                     unsafe {
@@ -266,11 +269,11 @@ impl<T: Copy> StorageBuffer<T> {
                         )
                     };
                 })?;
-                unsafe { Ctx::device().destroy_buffer(self.buffer.handle, None) };
             }
+            unsafe { Ctx::device().destroy_buffer(self.buffer.handle, None) };
             self.buffer = buffer;
-            self.size = size;
         }
+        self.size = size;
         Ok(())
     }
 }

@@ -54,6 +54,8 @@ pub struct Ctx {
     transfer_queue: Option<Queue>,
     present_queue: Option<Queue>,
     allocator: Mutex<Allocator>,
+    #[cfg(debug_assertions)]
+    printf: Mutex<HashMap<String, usize>>,
 }
 
 impl Debug for Ctx {
@@ -271,6 +273,20 @@ impl Ctx {
                 f.fence,
             )?;
         }
+
+        {
+            let lock = STATE.get().unwrap().printf.lock().unwrap();
+            let mut messages = lock.iter().collect::<Vec<_>>();
+            if messages.len() > 0 {
+                log::info!("Printf output this frame:");
+                messages.sort_by(|(_, a), (_, b)| b.cmp(a));
+                for (message, value) in messages {
+                    log::info!("    {}x: {}", *value, *message);
+                }
+            }
+        }
+
+        STATE.get().unwrap().printf.lock().unwrap().drain();
 
         let mut needs_recreation = s.swpachain_needs_resizing.lock().unwrap().is_some();
         let swapchains = [s.swapchain.lock().unwrap().handle];
@@ -581,6 +597,8 @@ impl Ctx {
             device,
             present,
             features: features.clone(),
+            #[cfg(debug_assertions)]
+            printf: Mutex::new(HashMap::new())
         };
         STATE.set(ctx).unwrap();
         FUNCTIONS.set(Functions {
@@ -631,6 +649,15 @@ unsafe extern "system" fn vulkan_debug_callback(
         use vk::DebugUtilsMessageSeverityFlagsEXT as Flag;
         if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
             let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
+            let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
+            if let Some(s) = STATE.get() && !split.is_empty() {
+                let printf_message = split[1..].iter().map(|s| s.chars()).flatten().collect::<String>();
+                if printf_message.len() != 0 {
+                    *(s.printf.lock().unwrap().entry(printf_message).or_insert(0)) += 1;
+                }
+                return vk::FALSE;
+            }
+
             match flag {
                 Flag::VERBOSE => log::info!("{:?} - {}", typ, message),
                 Flag::INFO => {
@@ -666,7 +693,8 @@ impl Features {
             extensions.push(ash::khr::swapchain::NAME);
         }
         if self.debug_utils {
-            extensions.push(ash::khr::shader_non_semantic_info::NAME)
+            extensions.push(ash::khr::shader_non_semantic_info::NAME);
+            extensions.push(ash::ext::device_address_binding_report::NAME);
         }
         if self.device_debug_utils {
             extensions.push(ash::ext::debug_utils::NAME);
@@ -693,6 +721,7 @@ impl Features {
         mesh: &'a mut vk::PhysicalDeviceMeshShaderFeaturesEXT,
         ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+        dab: &'a mut vk::PhysicalDeviceAddressBindingReportFeaturesEXT,
     ) -> vk::PhysicalDeviceFeatures2<'a> {
         *vk11 = vk11.shader_draw_parameters(true);
         *vk12 = vk12
@@ -729,13 +758,16 @@ impl Features {
             .extended_dynamic_state3_color_blend_enable(true);
         *dy2 = dy2.extended_dynamic_state2_logic_op(true);
 
+        *dab = dab.report_address_binding(true);
+
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(phfeatures)
             .push_next(vk11)
             .push_next(vk12)
             .push_next(vk13)
             .push_next(dy2)
-            .push_next(dn3);
+            .push_next(dn3)
+            .push_next(dab);
 
         if self.mesh {
             *mesh = mesh.task_shader(true).mesh_shader(true);
@@ -860,10 +892,10 @@ pub(super) fn create_device(
         .map(|e| e.as_ptr() as *const i8)
         .collect::<Vec<_>>();
 
-    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) =
+    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc, mut dab) =
         Default::default();
     let mut features = features.features(
-        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
+        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc, &mut dab
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)

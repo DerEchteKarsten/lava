@@ -7,6 +7,7 @@ use std::{
 };
 
 use ash::vk::{self, Handle};
+use bytemuck::{Pod, bytes_of};
 use glam::Mat4;
 use json::JsonValue;
 
@@ -45,12 +46,24 @@ pub struct ResourceState {
     aspect: vk::ImageAspectFlags,
 }
 
+#[macro_export]
+macro_rules! c {
+    ($($val:expr),+ $(,)?) => {{
+        use bytemuck::bytes_of;
+        let mut vec = Vec::new();
+
+        $(
+            vec.extend_from_slice(bytes_of(&$val));
+        )+
+        vec
+    }};
+}
+
 #[derive(Debug)]
-enum LayoutBlock {
+pub enum LayoutBlock {
     Constant { size: u32 },
     Type { name: String },
 }
-
 pub struct CommandBuffer<'a> {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) resource_hashes: &'a mut HashMap<ResourceHandle, ResourceState>,
@@ -246,18 +259,11 @@ impl<'a, 'b, T: Default> CommandBuilder<'a, 'b, T> {
             vk::ImageLayout::GENERAL,
         )
     }
-    pub fn constant<A: Clone>(mut self, value: &A) -> Self {
-        let mut slice = [value.clone()];
-        let mut vec = Vec::new();
-        unsafe {
-            vec.extend_from_slice(std::slice::from_raw_parts(
-                slice.as_mut_ptr() as *mut u8,
-                size_of::<A>(),
-            ))
-        };
-        self.push_constants.push(PushConstant::Constants(vec));
+    pub fn constants(mut self, bytes: Vec<u8>) -> Self {
+        let size = bytes.len() as u32;
+        self.push_constants.push(PushConstant::Constants(bytes));
         self.layout_validation.push(LayoutBlock::Constant {
-            size: size_of::<A>() as u32,
+            size,
         });
         self
     }
@@ -477,7 +483,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
         self
     }
 
-    fn build(self, dispatch: [u32; 3]) {
+    fn build(self, dispatch: [u32; 3], indirect_buffer: Option<vk::Buffer>) {
         self.cmd_buffer.barriers(self.resources);
         self.cmd_buffer.push_constants(&self.push_constants);
         if cfg!(debug_assertions) {
@@ -487,30 +493,46 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
                 &self.layout_validation,
             );
         }
-        self.sub_builder.pipeline_handle.dispatch(
-            &self.cmd_buffer.handle,
-            dispatch[0],
-            dispatch[1],
-            dispatch[2],
-        );
+        if let Some(buffer) = indirect_buffer {
+            self.sub_builder.pipeline_handle.dispatch_indirect(&self.cmd_buffer.handle, buffer, 0);
+        }else {
+            self.sub_builder.pipeline_handle.dispatch(
+                &self.cmd_buffer.handle,
+                dispatch[0],
+                dispatch[1],
+                dispatch[2],
+            );
+        }
+    }
+
+    pub fn dispatch_indirect<L: Location>(mut self, buffer: &Buffer<vk::DispatchIndirectCommand, L>) {
+        self.resources.push((
+            ResourceHandle::Buffer(buffer.handle),
+            ResourceState {
+                access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                stages: vk::PipelineStageFlags2::COMPUTE_SHADER,
+                ..Default::default()
+            }
+        ));
+        self.build([0, 0, 0], Some(buffer.handle));
     }
 
     pub fn dispatch(self, x: u32, y: u32, z: u32) {
-        self.build([x, y, z]);
+        self.build([x, y, z], None);
     }
     pub fn dispatch_fullscreen(self) {
         self.build([
             Ctx::window_width().unwrap().div_ceil(8),
             Ctx::window_height().unwrap().div_ceil(8),
             1,
-        ]);
+        ], None);
     }
     pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
         self.build([
             Ctx::window_width().unwrap().div_ceil(x),
             Ctx::window_height().unwrap().div_ceil(y),
             1,
-        ]);
+        ], None);
     }
 }
 
@@ -631,13 +653,17 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn print_buffer<T: Copy + Debug>(
+    pub fn read_buffer<T: Copy + Debug>(
         &mut self,
         buffer: &Buffer<T, GpuBuffer>,
         staging: &Buffer<T, CpuBuffer>,
         num_elements: usize,
-    ) {
-        self.copy_buffer(buffer, staging, num_elements, 0, 0);
+        offset: usize,
+    ) -> Vec<T>{
+        if !cfg!(debug_assertions) {
+            log::warn!("Using read_buffer in release can cause performance problems!");
+        }
+        self.copy_buffer(buffer, staging, num_elements, offset as u32 * size_of::<T>() as u32, 0);
         self.barriers(vec![(
             ResourceHandle::Buffer(staging.handle),
             ResourceState {
@@ -646,8 +672,7 @@ impl<'b> CommandBuffer<'b> {
                 ..Default::default()
             },
         )]);
-        let data = staging.read_len(num_elements);
-        log::info!("{:#?}", data);
+        staging.read_len(num_elements)
     }
 
     pub fn raster<'a>(&'a mut self) -> CommandBuilder<'a, 'b, RasterBuilder> {
@@ -843,7 +868,6 @@ impl<'b> CommandBuffer<'b> {
                 match block {
                     LayoutBlock::Constant { size } => {
                         let constant_end = byte_offset + *size;
-                        let member = members[offset];
                         while {
                             let member = members[offset];
                             let member_type = member["type"]["kind"].as_str().unwrap();
@@ -853,6 +877,7 @@ impl<'b> CommandBuffer<'b> {
                                 && member_name != "TextureHandle"
                                 && offset < members.len()
                         } {
+                            let member = members[offset];
                             let member_size = member["binding"]["size"].as_u32().unwrap();
                             offset += 1;
                             byte_offset += member_size;
@@ -867,12 +892,6 @@ impl<'b> CommandBuffer<'b> {
                         let member = members[offset];
                         let member_type = member["type"]["kind"].as_str().unwrap();
                         let member_offset = member["binding"]["offset"].as_u32().unwrap();
-                        assert!(
-                            member_offset == byte_offset,
-                            "Expected member to be at offset {}, found it at offset {}",
-                            byte_offset,
-                            member_offset
-                        );
                         let member_field_name = member["name"].as_str().unwrap();
                         let member_name = if member_type == "pointer" {
                             member["type"]["valueType"].as_str().unwrap()
@@ -886,6 +905,13 @@ impl<'b> CommandBuffer<'b> {
                             );
                             ""
                         };
+                        assert!(
+                            member_offset == byte_offset,
+                            "Expected member {} to be at offset {}, found it at offset {}",
+                            member_field_name,
+                            byte_offset,
+                            member_offset
+                        );
 
                         assert!(
                             member_name == *name,

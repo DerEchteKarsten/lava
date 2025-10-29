@@ -36,11 +36,11 @@ impl ComputePipelineHandle {
             Ctx::device().cmd_dispatch(*cmd, x, y, z);
         }
     }
-    pub fn dispatch_indirect(&self, cmd: &vk::CommandBuffer, buffer: vk::Buffer) {
+    pub fn dispatch_indirect(&self, cmd: &vk::CommandBuffer, buffer: vk::Buffer, offset: u32) {
         let pipeline = PipelineCache::get().get_compute_pipeline(self);
         unsafe {
             Ctx::device().cmd_bind_pipeline(*cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            Ctx::device().cmd_dispatch_indirect(*cmd, buffer, 0);
+            Ctx::device().cmd_dispatch_indirect(*cmd, buffer, offset as u64);
         }
     }
 }
@@ -696,6 +696,16 @@ impl PipelineCache {
                                 .vertex_binding_descriptions(&vertex_bindings)
                                 .vertex_attribute_descriptions(&vertex_attribute_descriptions);
 
+                            input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+                                .primitive_restart_enable(false);
+                            create_info = create_info
+                                .vertex_input_state(&vertex_input_state)
+                                .input_assembly_state(&input_assembly);
+                        }else {
+                            vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
+                                    .vertex_attribute_descriptions(&[])
+                                    .vertex_binding_descriptions(&[]);
                             input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
                                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
                                 .primitive_restart_enable(false);
