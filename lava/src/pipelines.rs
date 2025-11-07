@@ -504,7 +504,7 @@ impl PipelineCache {
             Some(pipeline) => pipeline.clone(),
             None => {
                 let entry = format!("{}\0", handle.path.entry);
-                let path = format!("./core/shaders/bin/{}.slang.spv", handle.path.path);
+                let path = format!("./target/spirv-builder/spirv-unknown-vulkan1.4/release/deps/{}.spv", handle.path.path);
 
                 let create_info = vk::ComputePipelineCreateInfo::default()
                     .layout(Bindless::layout())

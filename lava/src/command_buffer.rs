@@ -1,9 +1,5 @@
 use std::{
-    any::TypeId,
-    cell::LazyCell,
-    collections::HashMap,
-    fmt::Debug,
-    sync::{LazyLock, Mutex},
+    any::TypeId, cell::LazyCell, collections::HashMap, fmt::Debug, ops::Deref, sync::{LazyLock, Mutex}
 };
 
 use ash::vk::{self, Handle};
