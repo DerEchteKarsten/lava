@@ -7,7 +7,7 @@ use std::{
 };
 
 use ash::vk::{self, Handle};
-use bytemuck::{Pod, bytes_of};
+use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::Mat4;
 use json::JsonValue;
 
@@ -86,7 +86,7 @@ pub trait IntoShaderResourceHandle {
     fn type_name(&self) -> String;
 }
 
-impl<T: Copy, L: Location> IntoShaderResourceHandle for Buffer<T, L> {
+impl<T: Copy + Pod, L: Location> IntoShaderResourceHandle for Buffer<T, L> {
     fn push_constant(&self) -> PushConstant {
         PushConstant::BufferPointer(self.address)
     }
@@ -123,7 +123,7 @@ impl<T: Copy, L: Location> IntoShaderResourceHandle for Buffer<T, L> {
     }
 }
 
-impl<T: Copy> IntoShaderResourceHandle for StorageBuffer<T> {
+impl<T: Copy + Pod> IntoShaderResourceHandle for StorageBuffer<T> {
     fn aspect(&self) -> vk::ImageAspectFlags {
         self.buffer.aspect()
     }
@@ -195,6 +195,35 @@ impl IntoShaderResourceHandle for u64 {
     fn type_name(&self) -> String {
         "".to_string()
     }
+}
+
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct DrawIndirectCommand {
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub first_vertex: u32,
+    pub first_instance: u32,
+}
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct DispatchIndirectCommand {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct DrawIndexedIndirectCommand {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub vertex_offset: i32,
+    pub first_instance: u32,
 }
 
 pub struct CommandBuilder<'a, 'b, T: Default> {
@@ -442,7 +471,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
             }
 
             self.cmd_buffer
-                .type_check(&self.push_constants, &shaders, &self.layout_validation);
+                .type_check(&self.push_constants, &shaders, &self.layout_validation).unwrap();
         }
         self.sub_builder.pipeline_handle.dispatch(
             self.cmd_buffer.handle,
@@ -483,7 +512,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
         self
     }
 
-    fn build(self, dispatch: [u32; 3], indirect_buffer: Option<vk::Buffer>) {
+    fn build(self, dispatch: [u32; 3], indirect_buffer: Option<(vk::Buffer, u32)>) {
         self.cmd_buffer.barriers(self.resources);
         self.cmd_buffer.push_constants(&self.push_constants);
         if cfg!(debug_assertions) {
@@ -491,10 +520,10 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
                 &self.push_constants,
                 &vec![self.sub_builder.pipeline_handle.path.clone()],
                 &self.layout_validation,
-            );
+            ).unwrap();
         }
         if let Some(buffer) = indirect_buffer {
-            self.sub_builder.pipeline_handle.dispatch_indirect(&self.cmd_buffer.handle, buffer, 0);
+            self.sub_builder.pipeline_handle.dispatch_indirect(&self.cmd_buffer.handle, buffer.0, buffer.1);
         }else {
             self.sub_builder.pipeline_handle.dispatch(
                 &self.cmd_buffer.handle,
@@ -505,7 +534,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
         }
     }
 
-    pub fn dispatch_indirect<L: Location>(mut self, buffer: &Buffer<vk::DispatchIndirectCommand, L>) {
+    pub fn dispatch_indirect<L: Location, T: Copy + Pod>(mut self, buffer: &Buffer<T, L>, offset: u32) {
         self.resources.push((
             ResourceHandle::Buffer(buffer.handle),
             ResourceState {
@@ -514,7 +543,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
                 ..Default::default()
             }
         ));
-        self.build([0, 0, 0], Some(buffer.handle));
+        self.build([0, 0, 0], Some((buffer.handle, offset as u32)));
     }
 
     pub fn dispatch(self, x: u32, y: u32, z: u32) {
@@ -562,7 +591,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RayTracingBuilder> {
                 &self.push_constants,
                 &vec![self.sub_builder.pipeline_handle.path.clone()],
                 &self.layout_validation,
-            );
+            ).unwrap();
         }
         self.sub_builder
             .pipeline_handle
@@ -586,8 +615,48 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RayTracingBuilder> {
 static JSON_CACHE: Mutex<LazyCell<HashMap<String, JsonValue>>> =
     Mutex::new(LazyCell::new(|| HashMap::new()));
 
+pub type LayoutResult = Result<(), LayoutError>;
+
+pub struct LayoutError {
+    file: String,
+    entry: String,
+    field: String,
+    _ty: LayoutErrorType,
+}
+
+pub enum LayoutErrorType {
+    ConstantsTooLarge{
+        expected_at: usize,
+    },
+    WrongType {
+        expected: String,
+        found: String,
+    },
+    WrongTypeName {
+        expected: String,
+        found: String,
+    },
+    WrongOffset {
+        expected: u32,
+        found: u32,
+    },
+}
+
+impl Debug for LayoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self._ty {
+            LayoutErrorType::ConstantsTooLarge { expected_at } => format!("expect constants block to end at {}, but it didnt", expected_at),
+            LayoutErrorType::WrongType { ref expected, ref found } => format!("expected field {} to be of type {}, found {}", self.field, expected, found),
+            LayoutErrorType::WrongTypeName { ref expected, ref found } => format!("expected field {} type name {}, found {}", self.field, expected, found),
+            LayoutErrorType::WrongOffset { expected, found } => format!("expected field {} to be at offset {}, found it at {}", self.field, expected, found),
+        };
+        write!(f, "Layout error in shader {} at entry point {}: {}", self.file, self.entry, msg)?;
+        Ok(())
+    }
+}
+
 impl<'b> CommandBuffer<'b> {
-    pub fn fill_buffer<T: Copy, L: Location>(
+    pub fn fill_buffer<T: Copy + Pod, L: Location>(
         &mut self,
         buffer: &Buffer<T, L>,
         offset: u32,
@@ -612,7 +681,31 @@ impl<'b> CommandBuffer<'b> {
             )
         };
     }
-    pub fn copy_buffer<T: Copy, L: Location, B: Location>(
+    pub fn update_buffer_element<T: Copy + Pod, L: Location>(
+        &mut self,
+        buffer: &Buffer<T, L>,
+        element: usize,
+        data: &T
+    ) {
+        self.barriers(vec![(
+            ResourceHandle::Buffer(buffer.handle),
+            ResourceState {
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                stages: vk::PipelineStageFlags2::TRANSFER,
+                ..Default::default()
+            },
+        )]);
+
+        unsafe {
+            Ctx::device().cmd_update_buffer(
+                self.handle,
+                buffer.handle,
+                (element * size_of::<T>()) as u64,
+                bytemuck::bytes_of(data),
+            )
+        };
+    }
+    pub fn copy_buffer<T: Copy + Pod, L: Location, B: Location>(
         &mut self,
         src: &Buffer<T, L>,
         dst: &Buffer<T, B>,
@@ -653,7 +746,7 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn read_buffer<T: Copy + Debug>(
+    pub fn read_buffer<T: Copy + Pod + Debug>(
         &mut self,
         buffer: &Buffer<T, GpuBuffer>,
         staging: &Buffer<T, CpuBuffer>,
@@ -834,7 +927,7 @@ impl<'b> CommandBuffer<'b> {
         push_constants: &Vec<PushConstant>,
         shaders: &Vec<ShaderPath>,
         layout_validation: &Vec<LayoutBlock>,
-    ) {
+    ) -> LayoutResult {
         let mut cache = JSON_CACHE.lock().unwrap();
         for shader_path in shaders {
             let path = format!("./core/shaders/bin/{}.slang.json", shader_path.path);
@@ -864,6 +957,12 @@ impl<'b> CommandBuffer<'b> {
 
             let mut offset = 0;
             let mut byte_offset = 0;
+            let mut error = LayoutError{
+                file: shader_path.path.to_string(),
+                entry: shader_path.entry.to_string(),
+                field: "".to_string(),
+                _ty: LayoutErrorType::ConstantsTooLarge { expected_at: 0 },   
+            };
             for block in layout_validation {
                 match block {
                     LayoutBlock::Constant { size } => {
@@ -881,11 +980,10 @@ impl<'b> CommandBuffer<'b> {
                             let member_size = member["binding"]["size"].as_u32().unwrap();
                             offset += 1;
                             byte_offset += member_size;
-                            assert!(
-                                byte_offset <= constant_end,
-                                "Exspected Constants block to end at {} bytes, but it didnt!",
-                                constant_end
-                            );
+                            if byte_offset > constant_end {
+                                error._ty = LayoutErrorType::ConstantsTooLarge { expected_at: constant_end as usize };
+                                return Err(error);
+                            }
                         }
                     }
                     LayoutBlock::Type { name } => {
@@ -893,39 +991,31 @@ impl<'b> CommandBuffer<'b> {
                         let member_type = member["type"]["kind"].as_str().unwrap();
                         let member_offset = member["binding"]["offset"].as_u32().unwrap();
                         let member_field_name = member["name"].as_str().unwrap();
+                        error.field = member_field_name.to_string();
                         let member_name = if member_type == "pointer" {
                             member["type"]["valueType"].as_str().unwrap()
                         } else if member_type == "struct" {
                             member["type"]["name"].as_str().unwrap()
                         } else {
-                            assert!(
-                                false,
-                                "Expected pointer or struct, found {}, at field {}",
-                                member_type, member_field_name
-                            );
+                            error._ty = LayoutErrorType::WrongType { expected: "Pointer or Struct".to_owned(), found: member_type.to_string() };
+                            return Err(error);
                             ""
                         };
-                        assert!(
-                            member_offset == byte_offset,
-                            "Expected member {} to be at offset {}, found it at offset {}",
-                            member_field_name,
-                            byte_offset,
-                            member_offset
-                        );
-
-                        assert!(
-                            member_name == *name,
-                            "Expected typename {}, found {} for field {}",
-                            name,
-                            member_name,
-                            member_field_name
-                        );
+                        if member_offset != byte_offset {
+                            error._ty = LayoutErrorType::WrongOffset { expected: byte_offset, found: member_offset };
+                            return Err(error);
+                        }
+                        if member_name != *name {
+                            error._ty = LayoutErrorType::WrongTypeName { expected: name.to_string(), found: member_name.to_string() };
+                            return Err(error);
+                        }
                         offset += 1;
                         byte_offset += 8;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     pub fn begin(&mut self) {

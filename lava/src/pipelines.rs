@@ -7,19 +7,17 @@ use std::{
 };
 
 use crate::{
-    bindless::Bindless,
-    state::{Ctx, Functions},
-    vkobjects::{
+    bindless::Bindless, command_buffer::{DrawIndexedIndirectCommand, DrawIndirectCommand}, state::{Ctx, Functions}, vkobjects::{
         buffer::{self, Buffer, Location},
         image::Image,
         rt_pipeline::{
             RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
             ShaderBindingTable,
         },
-    },
+    }
 };
 use anyhow::Result;
-use ash::vk;
+use ash::vk::{self};
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 
@@ -181,8 +179,8 @@ impl RasterDispatch {
             instance_count,
         }
     }
-    pub fn indirect<L: Location>(
-        buffer: &Buffer<vk::DrawIndirectCommand, L>,
+    pub fn indirect<T: Copy+Pod, L: Location>(
+        buffer: &Buffer<T, L>,
         offset: u32,
         count: u32,
     ) -> Self {
@@ -192,8 +190,8 @@ impl RasterDispatch {
             count,
         }
     }
-    pub fn indexed_indirect<L: Location>(
-        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
+    pub fn indexed_indirect<T: Copy+Pod, L: Location>(
+        buffer: &Buffer<T, L>,
         offset: u32,
         count: u32,
     ) -> Self {
@@ -203,8 +201,8 @@ impl RasterDispatch {
             count,
         }
     }
-    pub fn indirect_count<L: Location>(
-        buffer: &Buffer<vk::DrawIndirectCommand, L>,
+    pub fn indirect_count<T: Copy+Pod, L: Location>(
+        buffer: &Buffer<T, L>,
         offset: u32,
         count_buffer: vk::Buffer,
         count_offset: u32,
@@ -217,7 +215,7 @@ impl RasterDispatch {
         }
     }
     pub fn indexed_indirect_count<L: Location>(
-        buffer: &Buffer<vk::DrawIndexedIndirectCommand, L>,
+        buffer: &Buffer<DrawIndexedIndirectCommand, L>,
         offset: u32,
         count_buffer: vk::Buffer,
         count_offset: u32,

@@ -694,7 +694,6 @@ impl Features {
         }
         if self.debug_utils {
             extensions.push(ash::khr::shader_non_semantic_info::NAME);
-            extensions.push(ash::ext::device_address_binding_report::NAME);
         }
         if self.device_debug_utils {
             extensions.push(ash::ext::debug_utils::NAME);
@@ -721,7 +720,6 @@ impl Features {
         mesh: &'a mut vk::PhysicalDeviceMeshShaderFeaturesEXT,
         ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
-        dab: &'a mut vk::PhysicalDeviceAddressBindingReportFeaturesEXT,
     ) -> vk::PhysicalDeviceFeatures2<'a> {
         *vk11 = vk11.shader_draw_parameters(true);
         *vk12 = vk12
@@ -758,17 +756,13 @@ impl Features {
             .extended_dynamic_state3_color_blend_enable(true);
         *dy2 = dy2.extended_dynamic_state2_logic_op(true);
 
-        *dab = dab.report_address_binding(true);
-
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(phfeatures)
             .push_next(vk11)
             .push_next(vk12)
             .push_next(vk13)
             .push_next(dy2)
-            .push_next(dn3)
-            .push_next(dab);
-
+            .push_next(dn3);
         if self.mesh {
             *mesh = mesh.task_shader(true).mesh_shader(true);
             features = features.push_next(mesh);
@@ -892,10 +886,10 @@ pub(super) fn create_device(
         .map(|e| e.as_ptr() as *const i8)
         .collect::<Vec<_>>();
 
-    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc, mut dab) =
+    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) =
         Default::default();
     let mut features = features.features(
-        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc, &mut dab
+        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
