@@ -1,23 +1,19 @@
-use std::{
-    any::TypeId, cell::LazyCell, collections::HashMap, fmt::Debug, ops::Deref, sync::{LazyLock, Mutex}
-};
+use std::{cell::LazyCell, collections::HashMap, fmt::Debug, sync::Mutex};
 
-use ash::vk::{self, Handle};
-use bytemuck::{Pod, Zeroable, bytes_of};
-use glam::Mat4;
+use ash::vk::{self};
+use bytemuck::{Pod, Zeroable};
 use json::JsonValue;
 
 use crate::{
     bindless::Bindless,
     pipelines::{
-        ComputePipelineHandle, PipelineCache, PipelineModel, RasterDispatch, RasterPipelineHandle,
+        ComputePipelineHandle, PipelineModel, RasterDispatch, RasterPipelineHandle,
         RayTracingPipelineHandle, ShaderPath, Vertex,
     },
     state::Ctx,
     vkobjects::{
         buffer::{Buffer, CpuBuffer, GpuBuffer, Location, StorageBuffer},
         image::Image,
-        rt_pipeline::alinged_size,
     },
 };
 
@@ -193,7 +189,6 @@ impl IntoShaderResourceHandle for u64 {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct DrawIndirectCommand {
@@ -210,7 +205,6 @@ pub struct DispatchIndirectCommand {
     pub y: u32,
     pub z: u32,
 }
-
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -287,9 +281,7 @@ impl<'a, 'b, T: Default> CommandBuilder<'a, 'b, T> {
     pub fn constants(mut self, bytes: Vec<u8>) -> Self {
         let size = bytes.len() as u32;
         self.push_constants.push(PushConstant::Constants(bytes));
-        self.layout_validation.push(LayoutBlock::Constant {
-            size,
-        });
+        self.layout_validation.push(LayoutBlock::Constant { size });
         self
     }
 }
@@ -320,7 +312,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
     }
 
     pub fn mesh(mut self, path: &'static str, entry: &'static str) -> Self {
-        if let PipelineModel::Mesh { task, mesh } = &mut self.sub_builder.pipeline_handle.model {
+        if let PipelineModel::Mesh { task: _, mesh } = &mut self.sub_builder.pipeline_handle.model {
             mesh.entry = entry;
             mesh.path = path;
         } else {
@@ -332,7 +324,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
         self
     }
     pub fn task(mut self, path: &'static str, entry: &'static str) -> Self {
-        if let PipelineModel::Mesh { task, mesh } = &mut self.sub_builder.pipeline_handle.model {
+        if let PipelineModel::Mesh { task, mesh: _ } = &mut self.sub_builder.pipeline_handle.model {
             *task = Some(ShaderPath { entry, path })
         } else {
             self.sub_builder.pipeline_handle.model = PipelineModel::Mesh {
@@ -371,7 +363,8 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
                 access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
                     | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
                 layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                stages: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                stages: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                 aspect: vk::ImageAspectFlags::DEPTH,
             },
         ));
@@ -382,7 +375,7 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
         assert!(self.sub_builder.vertex_buffer.is_none());
         self.sub_builder.vertex_buffer = Some(buffer.handle);
         if let PipelineModel::Vertex {
-            vertex,
+            vertex: _,
             vertex_buffer,
         } = &mut self.sub_builder.pipeline_handle.model
         {
@@ -419,25 +412,25 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
         let buffers = match &dispatch {
             RasterDispatch::DrawIndexedIndirect {
                 buffer,
-                offset,
-                count,
+                offset: _,
+                count: _,
             } => vec![buffer],
             RasterDispatch::DrawIndexedIndirectCount {
                 buffer,
-                offset,
+                offset: _,
                 count_buffer,
-                count_offset,
+                count_offset: _,
             } => vec![buffer, count_buffer],
             RasterDispatch::DrawIndirect {
                 buffer,
-                offset,
-                count,
+                offset: _,
+                count: _,
             } => vec![buffer],
             RasterDispatch::DrawIndirectCount {
                 buffer,
-                offset,
+                offset: _,
                 count_buffer,
-                count_offset,
+                count_offset: _,
             } => vec![buffer, count_buffer],
             _ => vec![],
         };
@@ -463,11 +456,12 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
                     if let Some(task) = task {
                         shaders.push(task.clone());
                     }
-                },
+                }
             }
 
             self.cmd_buffer
-                .type_check(&self.push_constants, &shaders, &self.layout_validation).unwrap();
+                .type_check(&self.push_constants, &shaders, &self.layout_validation)
+                .unwrap();
         }
         self.sub_builder.pipeline_handle.dispatch(
             self.cmd_buffer.handle,
@@ -512,15 +506,21 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
         self.cmd_buffer.barriers(self.resources);
         self.cmd_buffer.push_constants(&self.push_constants);
         if cfg!(debug_assertions) {
-            self.cmd_buffer.type_check(
-                &self.push_constants,
-                &vec![self.sub_builder.pipeline_handle.path.clone()],
-                &self.layout_validation,
-            ).unwrap();
+            self.cmd_buffer
+                .type_check(
+                    &self.push_constants,
+                    &vec![self.sub_builder.pipeline_handle.path.clone()],
+                    &self.layout_validation,
+                )
+                .unwrap();
         }
         if let Some(buffer) = indirect_buffer {
-            self.sub_builder.pipeline_handle.dispatch_indirect(&self.cmd_buffer.handle, buffer.0, buffer.1);
-        }else {
+            self.sub_builder.pipeline_handle.dispatch_indirect(
+                &self.cmd_buffer.handle,
+                buffer.0,
+                buffer.1,
+            );
+        } else {
             self.sub_builder.pipeline_handle.dispatch(
                 &self.cmd_buffer.handle,
                 dispatch[0],
@@ -530,14 +530,18 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
         }
     }
 
-    pub fn dispatch_indirect<L: Location, T: Copy + Pod>(mut self, buffer: &Buffer<T, L>, offset: u32) {
+    pub fn dispatch_indirect<L: Location, T: Copy + Pod>(
+        mut self,
+        buffer: &Buffer<T, L>,
+        offset: u32,
+    ) {
         self.resources.push((
             ResourceHandle::Buffer(buffer.handle),
             ResourceState {
                 access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
                 stages: vk::PipelineStageFlags2::COMPUTE_SHADER,
                 ..Default::default()
-            }
+            },
         ));
         self.build([0, 0, 0], Some((buffer.handle, offset as u32)));
     }
@@ -546,18 +550,24 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
         self.build([x, y, z], None);
     }
     pub fn dispatch_fullscreen(self) {
-        self.build([
-            Ctx::window_width().unwrap().div_ceil(8),
-            Ctx::window_height().unwrap().div_ceil(8),
-            1,
-        ], None);
+        self.build(
+            [
+                Ctx::window_width().unwrap().div_ceil(8),
+                Ctx::window_height().unwrap().div_ceil(8),
+                1,
+            ],
+            None,
+        );
     }
     pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
-        self.build([
-            Ctx::window_width().unwrap().div_ceil(x),
-            Ctx::window_height().unwrap().div_ceil(y),
-            1,
-        ], None);
+        self.build(
+            [
+                Ctx::window_width().unwrap().div_ceil(x),
+                Ctx::window_height().unwrap().div_ceil(y),
+                1,
+            ],
+            None,
+        );
     }
 }
 
@@ -583,11 +593,13 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RayTracingBuilder> {
         self.cmd_buffer.barriers(self.resources);
         self.cmd_buffer.push_constants(&self.push_constants);
         if cfg!(debug_assertions) {
-            self.cmd_buffer.type_check(
-                &self.push_constants,
-                &vec![self.sub_builder.pipeline_handle.path.clone()],
-                &self.layout_validation,
-            ).unwrap();
+            self.cmd_buffer
+                .type_check(
+                    &self.push_constants,
+                    &vec![self.sub_builder.pipeline_handle.path.clone()],
+                    &self.layout_validation,
+                )
+                .unwrap();
         }
         self.sub_builder
             .pipeline_handle
@@ -621,32 +633,43 @@ pub struct LayoutError {
 }
 
 pub enum LayoutErrorType {
-    ConstantsTooLarge{
-        expected_at: usize,
-    },
-    WrongType {
-        expected: String,
-        found: String,
-    },
-    WrongTypeName {
-        expected: String,
-        found: String,
-    },
-    WrongOffset {
-        expected: u32,
-        found: u32,
-    },
+    ConstantsTooLarge { expected_at: usize },
+    WrongType { expected: String, found: String },
+    WrongTypeName { expected: String, found: String },
+    WrongOffset { expected: u32, found: u32 },
 }
 
 impl Debug for LayoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self._ty {
-            LayoutErrorType::ConstantsTooLarge { expected_at } => format!("expect constants block to end at {}, but it didnt", expected_at),
-            LayoutErrorType::WrongType { ref expected, ref found } => format!("expected field {} to be of type {}, found {}", self.field, expected, found),
-            LayoutErrorType::WrongTypeName { ref expected, ref found } => format!("expected field {} type name {}, found {}", self.field, expected, found),
-            LayoutErrorType::WrongOffset { expected, found } => format!("expected field {} to be at offset {}, found it at {}", self.field, expected, found),
+            LayoutErrorType::ConstantsTooLarge { expected_at } => format!(
+                "expect constants block to end at {}, but it didnt",
+                expected_at
+            ),
+            LayoutErrorType::WrongType {
+                ref expected,
+                ref found,
+            } => format!(
+                "expected field {} to be of type {}, found {}",
+                self.field, expected, found
+            ),
+            LayoutErrorType::WrongTypeName {
+                ref expected,
+                ref found,
+            } => format!(
+                "expected field {} type name {}, found {}",
+                self.field, expected, found
+            ),
+            LayoutErrorType::WrongOffset { expected, found } => format!(
+                "expected field {} to be at offset {}, found it at {}",
+                self.field, expected, found
+            ),
         };
-        write!(f, "Layout error in shader {} at entry point {}: {}", self.file, self.entry, msg)?;
+        write!(
+            f,
+            "Layout error in shader {} at entry point {}: {}",
+            self.file, self.entry, msg
+        )?;
         Ok(())
     }
 }
@@ -681,7 +704,7 @@ impl<'b> CommandBuffer<'b> {
         &mut self,
         buffer: &Buffer<T, L>,
         element: usize,
-        data: &T
+        data: &T,
     ) {
         self.barriers(vec![(
             ResourceHandle::Buffer(buffer.handle),
@@ -748,11 +771,17 @@ impl<'b> CommandBuffer<'b> {
         staging: &Buffer<T, CpuBuffer>,
         num_elements: usize,
         offset: usize,
-    ) -> Vec<T>{
+    ) -> Vec<T> {
         if !cfg!(debug_assertions) {
             log::warn!("Using read_buffer in release can cause performance problems!");
         }
-        self.copy_buffer(buffer, staging, num_elements, offset as u32 * size_of::<T>() as u32, 0);
+        self.copy_buffer(
+            buffer,
+            staging,
+            num_elements,
+            offset as u32 * size_of::<T>() as u32,
+            0,
+        );
         self.barriers(vec![(
             ResourceHandle::Buffer(staging.handle),
             ResourceState {
@@ -858,7 +887,7 @@ impl<'b> CommandBuffer<'b> {
                             ..Default::default()
                         })
                     }
-                    ResourceHandle::Image((view, image)) => {
+                    ResourceHandle::Image((_, image)) => {
                         image_barriers.push(vk::ImageMemoryBarrier2 {
                             src_access_mask: prev.access,
                             dst_access_mask: new.access,
@@ -953,11 +982,11 @@ impl<'b> CommandBuffer<'b> {
 
             let mut offset = 0;
             let mut byte_offset = 0;
-            let mut error = LayoutError{
+            let mut error = LayoutError {
                 file: shader_path.path.to_string(),
                 entry: shader_path.entry.to_string(),
                 field: "".to_string(),
-                _ty: LayoutErrorType::ConstantsTooLarge { expected_at: 0 },   
+                _ty: LayoutErrorType::ConstantsTooLarge { expected_at: 0 },
             };
             for block in layout_validation {
                 match block {
@@ -977,7 +1006,9 @@ impl<'b> CommandBuffer<'b> {
                             offset += 1;
                             byte_offset += member_size;
                             if byte_offset > constant_end {
-                                error._ty = LayoutErrorType::ConstantsTooLarge { expected_at: constant_end as usize };
+                                error._ty = LayoutErrorType::ConstantsTooLarge {
+                                    expected_at: constant_end as usize,
+                                };
                                 return Err(error);
                             }
                         }
@@ -993,16 +1024,24 @@ impl<'b> CommandBuffer<'b> {
                         } else if member_type == "struct" {
                             member["type"]["name"].as_str().unwrap()
                         } else {
-                            error._ty = LayoutErrorType::WrongType { expected: "Pointer or Struct".to_owned(), found: member_type.to_string() };
+                            error._ty = LayoutErrorType::WrongType {
+                                expected: "Pointer or Struct".to_owned(),
+                                found: member_type.to_string(),
+                            };
                             return Err(error);
-                            ""
                         };
                         if member_offset != byte_offset {
-                            error._ty = LayoutErrorType::WrongOffset { expected: byte_offset, found: member_offset };
+                            error._ty = LayoutErrorType::WrongOffset {
+                                expected: byte_offset,
+                                found: member_offset,
+                            };
                             return Err(error);
                         }
                         if member_name != *name {
-                            error._ty = LayoutErrorType::WrongTypeName { expected: name.to_string(), found: member_name.to_string() };
+                            error._ty = LayoutErrorType::WrongTypeName {
+                                expected: name.to_string(),
+                                found: member_name.to_string(),
+                            };
                             return Err(error);
                         }
                         offset += 1;

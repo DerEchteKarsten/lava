@@ -30,7 +30,7 @@ impl Bindless {
         let mut layouts = [vk::DescriptorSetLayout::default(); 2];
         let sci = vk::SamplerCreateInfo::default();
         let samplers = [unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap()];
-        let mut descriptor_binding_flags = [
+        let descriptor_binding_flags = [
             vk::DescriptorBindingFlags::empty(),
             vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
                 | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT_EXT
@@ -63,7 +63,7 @@ impl Bindless {
             .push_next(&mut ext_flags);
         layouts[0] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
-        let mut descriptor_binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
+        let descriptor_binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
             | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT_EXT
             | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT];
 
@@ -235,5 +235,17 @@ impl Bindless {
                 &[],
             )
         };
+    }
+
+    pub fn destroy() {
+        unsafe {
+            let s = Self::get();
+            Ctx::device().destroy_pipeline_layout(s.layout, None);
+            for i in s.layouts {
+                Ctx::device().destroy_descriptor_set_layout(i, None);
+            }
+            Ctx::device().free_descriptor_sets(s.pool, &s.sets).unwrap();
+            Ctx::device().destroy_descriptor_pool(s.pool, None);
+        }
     }
 }

@@ -1,28 +1,21 @@
 use std::{
     any::TypeId,
-    borrow::{Borrow, BorrowMut},
-    ffi::c_void,
     fmt::Debug,
     marker::PhantomData,
-    mem::MaybeUninit,
     ops::{Deref, DerefMut},
-    ptr::NonNull,
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Error, Result};
-use ash::vk::{self, Handle};
+use anyhow::Result;
+use ash::vk::{self};
 use bitflags::bitflags;
 use bytemuck::Pod;
-use derivative::Derivative;
 use gpu_allocator::{
     MemoryLocation,
     vulkan::{Allocation, AllocationCreateDesc},
 };
 
 use crate::state::Ctx;
-
-use super::image::{Image, ImageType, get_aspects};
 
 #[derive(Debug)]
 pub struct MAllocation(pub Allocation);

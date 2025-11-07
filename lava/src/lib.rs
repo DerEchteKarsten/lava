@@ -3,29 +3,10 @@
 #![feature(lock_value_accessors)]
 #![feature(let_chains)]
 #![feature(const_trait_impl)]
-#![feature(specialization)]
 
-use std::time::Instant;
-
-use crate::{
-    bindless::{Bindless, BindlessHandle},
-    command_buffer::CommandBuffer,
-    pipelines::{RasterPipelineHandle, ShaderPath},
-    state::Ctx,
-    vkobjects::{buffer::Buffer, image::Image},
-};
+use crate::{bindless::Bindless, state::Ctx};
 use anyhow::{Ok, Result};
-use ash::vk::{self};
-use gpu_allocator::MemoryLocation;
-use winit::{
-    application::ApplicationHandler,
-    dpi::{PhysicalSize, Size},
-    event::{self, Event, WindowEvent},
-    event_loop::{EventLoop, EventLoopBuilder},
-    platform::wayland::EventLoopBuilderExtWayland,
-    raw_window_handle::{HasDisplayHandle, HasWindowHandle},
-    window::{Window, WindowAttributes, WindowId},
-};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub mod bindless;
 pub mod command_buffer;
@@ -49,6 +30,9 @@ pub fn init<T: HasDisplayHandle + HasWindowHandle>(
     Ok(())
 }
 
+pub fn destroy() {
+    Bindless::destroy();
+}
 // struct App<F: Fn(CommandBuffer, Image) -> Result<()>, Y: Fn() -> Result<()>> {
 //     window: Option<Window>,
 //     start_time: Instant,

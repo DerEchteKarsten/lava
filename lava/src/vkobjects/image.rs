@@ -3,10 +3,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use ash::vk;
 use glam::UVec2;
-use gpu_allocator::{
-    MemoryLocation,
-    vulkan::{Allocation, AllocationCreateDesc},
-};
+use gpu_allocator::{MemoryLocation, vulkan::AllocationCreateDesc};
 
 use derivative::Derivative;
 
@@ -427,10 +424,7 @@ impl Image {
         unsafe {
             Ctx::device().bind_image_memory(image, allocation.memory(), allocation.offset())?
         };
-        let extent = vk::Extent2D {
-            height: extent.height,
-            width: extent.width,
-        };
+
         let view = Self::view(&Ctx::device(), image, format);
 
         let mut s = Self {

@@ -2,16 +2,11 @@ use std::ffi::CStr;
 
 use anyhow::Result;
 use ash::{
-    Device, Instance, khr,
+    Device,
     vk::{self},
 };
 
-use crate::{
-    FRAMES_IN_FLIGHT,
-    bindless::Bindless,
-    state::{Ctx, Functions},
-    vkobjects::{image::ImageSize, queue::Queue, surface::Surface},
-};
+use crate::vkobjects::{image::ImageSize, surface::Surface};
 
 use super::image::Image;
 

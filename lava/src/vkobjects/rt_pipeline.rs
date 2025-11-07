@@ -1,17 +1,10 @@
-use std::{ffi::CString, mem::MaybeUninit, sync::OnceLock};
-
 use anyhow::Result;
-use ash::{
-    Instance,
-    khr::{acceleration_structure, ray_tracing_pipeline},
-    vk,
-};
-use gpu_allocator::MemoryLocation;
+use ash::vk;
 
 use crate::{
     pipelines::PipelineCache,
     state::{Ctx, Functions},
-    vkobjects::buffer::{Buffer, BufferUsageFlags, CpuBuffer, GpuBuffer},
+    vkobjects::buffer::{Buffer, BufferUsageFlags, CpuBuffer},
 };
 
 pub fn alinged_size(size: u32, alignment: u32) -> u32 {

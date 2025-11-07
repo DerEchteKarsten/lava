@@ -1,9 +1,6 @@
 use ash::vk;
 
-use crate::{
-    state::{Ctx, Functions},
-    vkobjects::physical_device::PhysicalDevice,
-};
+use crate::vkobjects::physical_device::PhysicalDevice;
 
 #[derive(Debug)]
 pub struct Surface {

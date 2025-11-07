@@ -1,11 +1,9 @@
 use std::ffi::CStr;
-use std::ffi::CString;
 
 use anyhow::Result;
 use ash::vk;
 
 use crate::state::Features;
-use crate::state::Functions;
 
 #[derive(Clone, Debug)]
 pub struct QueueFamily {

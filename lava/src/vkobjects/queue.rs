@@ -35,14 +35,12 @@ impl Queue {
         executor: F,
     ) -> Result<R> {
         unsafe {
-            let command_buffer = unsafe {
-                Ctx::device().allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_buffer_count(1)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_pool(self.percistent_command_pool),
-                )?
-            }[0];
+            let command_buffer = Ctx::device().allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_buffer_count(1)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_pool(self.percistent_command_pool),
+            )?[0];
 
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);

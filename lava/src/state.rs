@@ -1,17 +1,12 @@
 use std::{
-    cell::LazyCell,
     collections::HashMap,
-    default,
     ffi::{c_char, c_void},
     fmt::{Debug, write},
     mem::MaybeUninit,
-    sync::{
-        Arc, LazyLock, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicU32, AtomicU64},
-    },
+    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU64},
 };
 
-use anyhow::{Error, Result, anyhow};
+use anyhow::{Result, anyhow};
 use ash::{
     Device, Entry,
     ext::debug_utils,
@@ -19,16 +14,14 @@ use ash::{
 };
 use gpu_allocator::{
     AllocationSizes, AllocatorDebugSettings,
-    vulkan::{self, Allocator, AllocatorCreateDesc},
+    vulkan::{Allocator, AllocatorCreateDesc},
 };
 use std::ffi::CStr;
-use winit::raw_window_handle::{
-    HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle,
-};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::{
     FRAMES_IN_FLIGHT,
-    bindless::{Bindless, BindlessHandle},
+    bindless::Bindless,
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     vkobjects::{
         image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface,
@@ -598,41 +591,43 @@ impl Ctx {
             present,
             features: features.clone(),
             #[cfg(debug_assertions)]
-            printf: Mutex::new(HashMap::new())
+            printf: Mutex::new(HashMap::new()),
         };
         STATE.set(ctx).unwrap();
-        FUNCTIONS.set(Functions {
-            mesh: if features.mesh {
-                Some(ash::ext::mesh_shader::Device::new(
-                    &instance,
-                    &Self::device(),
-                ))
-            } else {
-                None
-            },
-            raytracing_pipeline: if features.raytracing {
-                Some(ash::khr::ray_tracing_pipeline::Device::new(
-                    &instance,
-                    &Self::device(),
-                ))
-            } else {
-                None
-            },
-            acceleration_structure: if features.raytracing {
-                Some(ash::khr::acceleration_structure::Device::new(
-                    &instance,
-                    &Self::device(),
-                ))
-            } else {
-                None
-            },
-            instance,
-            entry,
-            surface: surface_fn,
-            swapchain: swapchain_fn,
-            debug_utils: instance_debug_utils,
-            device_debug_utils: debug_utils,
-        });
+        FUNCTIONS
+            .set(Functions {
+                mesh: if features.mesh {
+                    Some(ash::ext::mesh_shader::Device::new(
+                        &instance,
+                        &Self::device(),
+                    ))
+                } else {
+                    None
+                },
+                raytracing_pipeline: if features.raytracing {
+                    Some(ash::khr::ray_tracing_pipeline::Device::new(
+                        &instance,
+                        &Self::device(),
+                    ))
+                } else {
+                    None
+                },
+                acceleration_structure: if features.raytracing {
+                    Some(ash::khr::acceleration_structure::Device::new(
+                        &instance,
+                        &Self::device(),
+                    ))
+                } else {
+                    None
+                },
+                instance,
+                entry,
+                surface: surface_fn,
+                swapchain: swapchain_fn,
+                debug_utils: instance_debug_utils,
+                device_debug_utils: debug_utils,
+            })
+            .unwrap();
         Ok(())
     }
 }
@@ -650,8 +645,14 @@ unsafe extern "system" fn vulkan_debug_callback(
         if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
             let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
             let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-            if let Some(s) = STATE.get() && !split.is_empty() {
-                let printf_message = split[1..].iter().map(|s| s.chars()).flatten().collect::<String>();
+            if let Some(s) = STATE.get()
+                && !split.is_empty()
+            {
+                let printf_message = split[1..]
+                    .iter()
+                    .map(|s| s.chars())
+                    .flatten()
+                    .collect::<String>();
                 if printf_message.len() != 0 {
                     *(s.printf.lock().unwrap().entry(printf_message).or_insert(0)) += 1;
                 }
@@ -790,6 +791,12 @@ pub struct Functions {
     acceleration_structure: Option<ash::khr::acceleration_structure::Device>,
 }
 
+impl Debug for Functions {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 
 impl Functions {
@@ -889,7 +896,7 @@ pub(super) fn create_device(
     let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) =
         Default::default();
     let mut features = features.features(
-        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc
+        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)

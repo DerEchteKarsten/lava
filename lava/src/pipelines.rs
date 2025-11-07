@@ -1,20 +1,18 @@
 use std::{
-    cell::LazyCell,
     collections::HashMap,
     ffi::CStr,
-    mem::MaybeUninit,
-    sync::{Arc, LazyLock, Mutex, MutexGuard, Once, OnceLock},
+    sync::{LazyLock, Mutex, MutexGuard},
 };
 
 use crate::{
-    bindless::Bindless, command_buffer::{DrawIndexedIndirectCommand, DrawIndirectCommand}, state::{Ctx, Functions}, vkobjects::{
-        buffer::{self, Buffer, Location},
+    bindless::Bindless,
+    command_buffer::DrawIndexedIndirectCommand,
+    state::{Ctx, Functions},
+    vkobjects::{
+        buffer::{Buffer, Location},
         image::Image,
-        rt_pipeline::{
-            RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
-            ShaderBindingTable,
-        },
-    }
+        rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
+    },
 };
 use anyhow::Result;
 use ash::vk::{self};
@@ -179,7 +177,7 @@ impl RasterDispatch {
             instance_count,
         }
     }
-    pub fn indirect<T: Copy+Pod, L: Location>(
+    pub fn indirect<T: Copy + Pod, L: Location>(
         buffer: &Buffer<T, L>,
         offset: u32,
         count: u32,
@@ -190,7 +188,7 @@ impl RasterDispatch {
             count,
         }
     }
-    pub fn indexed_indirect<T: Copy+Pod, L: Location>(
+    pub fn indexed_indirect<T: Copy + Pod, L: Location>(
         buffer: &Buffer<T, L>,
         offset: u32,
         count: u32,
@@ -201,7 +199,7 @@ impl RasterDispatch {
             count,
         }
     }
-    pub fn indirect_count<T: Copy+Pod, L: Location>(
+    pub fn indirect_count<T: Copy + Pod, L: Location>(
         buffer: &Buffer<T, L>,
         offset: u32,
         count_buffer: vk::Buffer,
@@ -352,15 +350,15 @@ impl RasterPipelineHandle {
                 }],
             );
             match &self.model {
-                PipelineModel::Mesh { task, mesh } => match dispatch {
+                PipelineModel::Mesh { task: _, mesh: _ } => match dispatch {
                     RasterDispatch::LaunchMesh { x, y, z } => {
                         Functions::mesh().unwrap().cmd_draw_mesh_tasks(cmd, x, y, z);
                     }
                     _ => panic!("Invalid dispatch for mesh pipeline"),
                 },
                 PipelineModel::Vertex {
-                    vertex,
-                    vertex_buffer: use_vertex_buffer,
+                    vertex: _,
+                    vertex_buffer: _,
                 } => {
                     if let Some(vertex_buffer) = vertex_buffer {
                         Ctx::device().cmd_bind_vertex_buffers(cmd, 0, &[*vertex_buffer], &[0]);
@@ -431,7 +429,7 @@ impl RasterPipelineHandle {
                             u32::MAX,
                             size_of::<vk::DrawIndirectCommand>() as u32,
                         ),
-                        RasterDispatch::LaunchMesh { x, y, z } => {
+                        RasterDispatch::LaunchMesh { x: _, y: _, z: _ } => {
                             panic!("Invalid dispatch for vertex pipeline")
                         }
                     }
@@ -451,9 +449,6 @@ pub struct PipelineCache {
 
 pub static CACHE: LazyLock<Mutex<PipelineCache>> =
     LazyLock::new(|| Mutex::new(PipelineCache::new()));
-
-use json::JsonValue;
-use std::io::Read;
 
 impl PipelineCache {
     pub fn get<'a>() -> MutexGuard<'a, PipelineCache> {
@@ -504,7 +499,10 @@ impl PipelineCache {
             Some(pipeline) => pipeline.clone(),
             None => {
                 let entry = format!("{}\0", handle.path.entry);
-                let path = format!("./target/spirv-builder/spirv-unknown-vulkan1.4/release/deps/{}.spv", handle.path.path);
+                let path = format!(
+                    "./target/spirv-builder/spirv-unknown-vulkan1.4/release/deps/{}.spv",
+                    handle.path.path
+                );
 
                 let create_info = vk::ComputePipelineCreateInfo::default()
                     .layout(Bindless::layout())
@@ -588,20 +586,20 @@ impl PipelineCache {
             None => {
                 let mut create_info = vk::GraphicsPipelineCreateInfo::default();
 
-                let mesh_entry = if let PipelineModel::Mesh { task, mesh } = &handle.model {
+                let mesh_entry = if let PipelineModel::Mesh { task: _, mesh } = &handle.model {
                     Some(format!("{}\0", mesh.entry))
                 } else {
                     None
                 };
-                let amplicfication_entry = if let PipelineModel::Mesh { task, mesh } = &handle.model
-                {
-                    task.as_ref().map(|task| format!("{}\0", task.entry))
-                } else {
-                    None
-                };
+                let amplicfication_entry =
+                    if let PipelineModel::Mesh { task, mesh: _ } = &handle.model {
+                        task.as_ref().map(|task| format!("{}\0", task.entry))
+                    } else {
+                        None
+                    };
                 let vertex_entry = if let PipelineModel::Vertex {
                     vertex,
-                    vertex_buffer,
+                    vertex_buffer: _,
                 } = &handle.model
                 {
                     Some(format!("{}\0", vertex.entry))
@@ -700,10 +698,10 @@ impl PipelineCache {
                             create_info = create_info
                                 .vertex_input_state(&vertex_input_state)
                                 .input_assembly_state(&input_assembly);
-                        }else {
+                        } else {
                             vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
-                                    .vertex_attribute_descriptions(&[])
-                                    .vertex_binding_descriptions(&[]);
+                                .vertex_attribute_descriptions(&[])
+                                .vertex_binding_descriptions(&[]);
                             input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
                                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
                                 .primitive_restart_enable(false);
@@ -728,7 +726,7 @@ impl PipelineCache {
                 let color_blend_attachments = hash
                     .color_formats
                     .iter()
-                    .map(|e| {
+                    .map(|_| {
                         vk::PipelineColorBlendAttachmentState::default()
                             .blend_enable(false)
                             .color_write_mask(vk::ColorComponentFlags::RGBA)
