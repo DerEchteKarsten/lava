@@ -21,7 +21,7 @@ pub struct RayTracingShaderGroupInfo {
 
 #[derive(Debug, Clone)]
 pub struct RayTracingShaderCreateInfo<'a> {
-    pub source: &'a [(&'a str, &'a str, vk::ShaderStageFlags)],
+    pub stages: &'a [vk::PipelineShaderStageCreateInfo<'a>],
     pub group: RayTracingShaderGroup,
 }
 
@@ -47,24 +47,11 @@ impl RaytracingPipeline {
             ..Default::default()
         };
 
-        let mut modules = vec![];
         let mut stages = vec![];
         let mut groups = vec![];
 
         for shader in shaders_create_info.iter() {
-            let mut this_modules = vec![];
-            let mut this_stages = vec![];
-
-            shader.source.into_iter().for_each(|s| {
-                let module = PipelineCache::get().create_shader_module(s.0).unwrap();
-                let stage = vk::PipelineShaderStageCreateInfo::default()
-                    .stage(s.2)
-                    .module(module)
-                    .name(std::ffi::CStr::from_bytes_until_nul(s.1.as_bytes()).unwrap());
-                this_modules.push(module);
-                this_stages.push(stage);
-            });
-
+    
             match shader.group {
                 RayTracingShaderGroup::RayGen => shader_group_info.raygen_shader_count += 1,
                 RayTracingShaderGroup::Miss => shader_group_info.miss_shader_count += 1,
@@ -87,12 +74,12 @@ impl RaytracingPipeline {
                     group = group
                         .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
                         .closest_hit_shader(shader_index as _);
-                    if shader.source.len() >= 2 {
+                    if shader.stages.len() >= 2 {
                         group = group
                             .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
                             .any_hit_shader((shader_index as u32) + 1);
                     }
-                    if shader.source.len() >= 3 {
+                    if shader.stages.len() >= 3 {
                         group = group
                             .ty(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP)
                             .any_hit_shader((shader_index as u32) + 1)
@@ -103,8 +90,7 @@ impl RaytracingPipeline {
                 }
             };
 
-            modules.append(&mut this_modules);
-            stages.append(&mut this_stages);
+            stages.extend(shader.stages);
             groups.push(group);
         }
 

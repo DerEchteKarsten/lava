@@ -21,7 +21,7 @@ use glam::{Vec2, Vec3};
 
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 pub struct ComputePipelineHandle {
-    pub path: ShaderPath,
+    pub entry: &'static str,
 }
 
 impl ComputePipelineHandle {
@@ -43,7 +43,7 @@ impl ComputePipelineHandle {
 
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 pub struct RayTracingPipelineHandle {
-    pub path: ShaderPath,
+    pub entry: &'static str,
 }
 
 impl RayTracingPipelineHandle {
@@ -71,24 +71,9 @@ impl RayTracingPipelineHandle {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
-pub struct ShaderPath {
-    pub path: &'static str,
-    pub entry: &'static str,
-}
-
-impl Default for ShaderPath {
-    fn default() -> Self {
-        Self {
-            entry: "main",
-            path: "",
-        }
-    }
-}
-
 #[derive(Clone, Hash, PartialEq, Eq, Default)]
 pub struct RasterPipelineHandle {
-    pub fragment: ShaderPath,
+    pub fragment: &'static str,
     pub backface_culling: bool,
     pub model: PipelineModel,
 }
@@ -96,11 +81,11 @@ pub struct RasterPipelineHandle {
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub enum PipelineModel {
     Mesh {
-        task: Option<ShaderPath>,
-        mesh: ShaderPath,
+        task: Option<&'static str>,
+        mesh: &'static str,
     },
     Vertex {
-        vertex: ShaderPath,
+        vertex: &'static str,
         vertex_buffer: bool,
     },
 }
@@ -108,7 +93,7 @@ pub enum PipelineModel {
 impl Default for PipelineModel {
     fn default() -> Self {
         Self::Vertex {
-            vertex: ShaderPath::default(),
+            vertex: "",
             vertex_buffer: false,
         }
     }
@@ -444,7 +429,7 @@ pub struct PipelineCache {
     compute_pipelines: HashMap<ComputePipelineHandle, vk::Pipeline>,
     raster_pipelines: HashMap<RasterPipelineHash, vk::Pipeline>,
     raytracing_pipelines: HashMap<RayTracingPipelineHandle, RaytracingPipeline>,
-    shader_cache: HashMap<String, vk::ShaderModule>,
+    shader_code: vk::ShaderModule,
 }
 
 pub static CACHE: LazyLock<Mutex<PipelineCache>> =
@@ -455,40 +440,27 @@ impl PipelineCache {
         CACHE.lock().unwrap()
     }
 
-    pub fn create_shader_module(&mut self, code_path: &str) -> Result<vk::ShaderModule> {
-        match self.shader_cache.get(code_path) {
-            Some(module) => Ok(module.clone()),
-            None => {
-                let mut code = std::fs::File::open(code_path)?;
-                let decoded_code = ash::util::read_spv(&mut code)?;
-                let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
-
-                let module = unsafe { Ctx::device().create_shader_module(&create_info, None)? };
-
-                self.shader_cache
-                    .insert(code_path.to_string(), module.clone());
-                Ok(module)
-            }
-        }
-    }
-
     fn create_shader_stage<'a>(
-        &mut self,
-        code_path: &str,
+        &self,
         main: &'a str,
         stage: vk::ShaderStageFlags,
     ) -> Result<vk::PipelineShaderStageCreateInfo<'a>> {
-        let module = self.create_shader_module(code_path)?;
         Ok(vk::PipelineShaderStageCreateInfo::default()
             .stage(stage)
-            .module(module)
+            .module(self.shader_code)
             .name(CStr::from_bytes_with_nul(main.as_bytes())?))
     }
 
     pub fn new() -> Self {
+        let mut code = std::fs::File::open("./target/spirv-builder/spirv-unknown-vulkan1.4/release/deps/shaders.spv").unwrap();
+        let decoded_code = ash::util::read_spv(&mut code).unwrap();
+        let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
+
+        let module = unsafe { Ctx::device().create_shader_module(&create_info, None).unwrap() };
+
         Self {
             compute_pipelines: HashMap::new(),
-            shader_cache: HashMap::new(),
+            shader_code: module,
             raytracing_pipelines: HashMap::new(),
             raster_pipelines: HashMap::new(),
         }
@@ -498,16 +470,11 @@ impl PipelineCache {
         match self.compute_pipelines.get(handle) {
             Some(pipeline) => pipeline.clone(),
             None => {
-                let entry = format!("{}\0", handle.path.entry);
-                let path = format!(
-                    "./target/spirv-builder/spirv-unknown-vulkan1.4/release/deps/{}.spv",
-                    handle.path.path
-                );
-
+                let main = format!("{}\0", handle.entry);
                 let create_info = vk::ComputePipelineCreateInfo::default()
                     .layout(Bindless::layout())
                     .stage(
-                        self.create_shader_stage(&path, &entry, vk::ShaderStageFlags::COMPUTE)
+                        self.create_shader_stage(&main, vk::ShaderStageFlags::COMPUTE)
                             .unwrap(),
                     );
                 let pipeline = unsafe {
@@ -515,7 +482,7 @@ impl PipelineCache {
                         .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
                         .unwrap()
                 }[0];
-                Functions::set_debug_name(&handle.path.path, pipeline);
+                Functions::set_debug_name(&handle.entry, pipeline);
                 self.compute_pipelines
                     .insert(handle.clone(), pipeline.clone());
                 pipeline
@@ -533,36 +500,27 @@ impl PipelineCache {
         if self.raytracing_pipelines.contains_key(handle) {
             self.raytracing_pipelines.get(handle).unwrap()
         } else {
-            let entry = format!("{}\0", handle.path.entry);
-            let path = format!("./shaders/bin/{}.slang.spv", handle.path.path,);
+            let entry = format!("{}\0", handle.entry);
 
             let pipeline = RaytracingPipeline::new(
                 Bindless::layout(),
                 &[
                     RayTracingShaderCreateInfo {
                         group: RayTracingShaderGroup::RayGen,
-                        source: &[(&path, &entry, vk::ShaderStageFlags::RAYGEN_KHR)],
+                        stages: &[self.create_shader_stage(&entry, vk::ShaderStageFlags::RAYGEN_KHR).unwrap()]
                     },
                     RayTracingShaderCreateInfo {
                         group: RayTracingShaderGroup::Hit,
-                        source: &[(
-                            "shaders/bin/default_hit",
-                            "main\0",
-                            vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                        )],
+                        stages: &[self.create_shader_stage("default_hit\0", vk::ShaderStageFlags::ANY_HIT_KHR).unwrap()]
                     },
                     RayTracingShaderCreateInfo {
                         group: RayTracingShaderGroup::Miss,
-                        source: &[(
-                            "shaders/bin/default_miss",
-                            "main\0",
-                            vk::ShaderStageFlags::MISS_KHR,
-                        )],
+                        stages: &[self.create_shader_stage("default_miss\0", vk::ShaderStageFlags::MISS_KHR).unwrap()]
                     },
                 ],
             )
             .unwrap();
-            Functions::set_debug_name(&handle.path.path, pipeline.pipeline);
+            Functions::set_debug_name(&handle.entry, pipeline.pipeline);
             self.raytracing_pipelines.insert(handle.clone(), pipeline);
             self.raytracing_pipelines.get(handle).unwrap()
         }
@@ -585,66 +543,45 @@ impl PipelineCache {
             Some(pipeline) => pipeline.clone(),
             None => {
                 let mut create_info = vk::GraphicsPipelineCreateInfo::default();
-
-                let mesh_entry = if let PipelineModel::Mesh { task: _, mesh } = &handle.model {
-                    Some(format!("{}\0", mesh.entry))
-                } else {
-                    None
-                };
-                let amplicfication_entry =
-                    if let PipelineModel::Mesh { task, mesh: _ } = &handle.model {
-                        task.as_ref().map(|task| format!("{}\0", task.entry))
-                    } else {
-                        None
-                    };
-                let vertex_entry = if let PipelineModel::Vertex {
-                    vertex,
-                    vertex_buffer: _,
-                } = &handle.model
-                {
-                    Some(format!("{}\0", vertex.entry))
-                } else {
-                    None
-                };
                 let mut rendering = vk::PipelineRenderingCreateInfo::default()
                     .color_attachment_formats(&hash.color_formats)
                     .depth_attachment_format(depth_format)
                     .stencil_attachment_format(stencil_format)
                     .view_mask(0);
-
-                let fragment_entry = format!("{}\0", handle.fragment.entry);
-                let fragment_path =
-                    format!("./core/shaders/bin/{}.slang.spv", handle.fragment.path);
+    
+                let fragment_entry;
                 let mut stages = vec![
-                    self.create_shader_stage(
-                        &fragment_path,
-                        &fragment_entry,
-                        vk::ShaderStageFlags::FRAGMENT,
-                    )
-                    .unwrap(),
+                    {
+                        fragment_entry = format!("{}\0", handle.fragment);
+                        self.create_shader_stage(
+                            &fragment_entry,
+                            vk::ShaderStageFlags::MESH_EXT,
+                        )
+                        .unwrap()
+                    }
                 ];
                 let vertex_input_state;
                 let input_assembly;
                 let vertex_bindings;
                 let vertex_attribute_descriptions;
+                let mesh_entry;
+                let task_entry;
+                let vertex_entry;
                 match &handle.model {
                     PipelineModel::Mesh { task, mesh } => {
-                        let mesh_path = format!("./core/shaders/bin/{}.slang.spv", mesh.path);
+                        mesh_entry = format!("{}\0", mesh);
                         stages.push(
                             self.create_shader_stage(
-                                &mesh_path,
-                                mesh_entry.as_ref().unwrap(),
+                                &mesh_entry,
                                 vk::ShaderStageFlags::MESH_EXT,
                             )
                             .unwrap(),
                         );
                         if let Some(task) = task {
-                            let amplicfication_path =
-                                format!("./core/shaders/bin/{}.slang.spv", task.path);
+                            task_entry = format!("{}\0", task);
                             stages.push(
                                 self.create_shader_stage(
-                                    &amplicfication_path,
-                                    amplicfication_entry.as_ref().unwrap(),
+                                    &task_entry,
                                     vk::ShaderStageFlags::TASK_EXT,
                                 )
                                 .unwrap(),
@@ -655,11 +592,10 @@ impl PipelineCache {
                         vertex,
                         vertex_buffer,
                     } => {
-                        let vertex_path = format!("./core/shaders/bin/{}.slang.spv", vertex.path);
+                        vertex_entry = format!("{}\0", vertex);
                         stages.push(
                             self.create_shader_stage(
-                                &vertex_path,
-                                &vertex_entry.as_ref().unwrap(),
+                                &vertex_entry,
                                 vk::ShaderStageFlags::VERTEX,
                             )
                             .unwrap(),

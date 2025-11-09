@@ -8,7 +8,7 @@ use crate::{
     bindless::Bindless,
     pipelines::{
         ComputePipelineHandle, PipelineModel, RasterDispatch, RasterPipelineHandle,
-        RayTracingPipelineHandle, ShaderPath, Vertex,
+        RayTracingPipelineHandle, Vertex,
     },
     state::Ctx,
     vkobjects::{
@@ -287,52 +287,41 @@ impl<'a, 'b, T: Default> CommandBuilder<'a, 'b, T> {
 }
 
 impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
-    pub fn fragment(mut self, path: &'static str, entry: &'static str) -> Self {
-        self.sub_builder.pipeline_handle.fragment = crate::pipelines::ShaderPath { path, entry };
+    pub fn fragment(mut self, entry: &'static str) -> Self {
+        self.sub_builder.pipeline_handle.fragment = entry;
         self
     }
-    pub fn fragment_path(self, path: &'static str) -> Self {
-        self.fragment(path, "main")
-    }
 
-    pub fn vertex(mut self, path: &'static str, entry: &'static str) -> Self {
+    pub fn vertex(mut self, entry: &'static str) -> Self {
         self.sub_builder.pipeline_handle.model = crate::pipelines::PipelineModel::Vertex {
-            vertex: ShaderPath { entry, path },
+            vertex: entry,
             vertex_buffer: false,
         };
         self
     }
-    pub fn vertex_path(self, path: &'static str) -> Self {
-        self.vertex(path, "main")
-    }
-
     pub fn backface_culling(mut self, backface_culling: bool) -> Self {
         self.sub_builder.pipeline_handle.backface_culling = backface_culling;
         self
     }
 
-    pub fn mesh(mut self, path: &'static str, entry: &'static str) -> Self {
+    pub fn mesh(mut self, entry: &'static str) -> Self {
         if let PipelineModel::Mesh { task: _, mesh } = &mut self.sub_builder.pipeline_handle.model {
-            mesh.entry = entry;
-            mesh.path = path;
+            *mesh = entry;
         } else {
             self.sub_builder.pipeline_handle.model = PipelineModel::Mesh {
+                mesh: entry,
                 task: None,
-                mesh: ShaderPath { path, entry },
             }
         }
         self
     }
-    pub fn task(mut self, path: &'static str, entry: &'static str) -> Self {
+    pub fn task(mut self, entry: &'static str) -> Self {
         if let PipelineModel::Mesh { task, mesh: _ } = &mut self.sub_builder.pipeline_handle.model {
-            *task = Some(ShaderPath { entry, path })
+            *task = Some(entry);
         } else {
             self.sub_builder.pipeline_handle.model = PipelineModel::Mesh {
-                task: Some(ShaderPath { path, entry }),
-                mesh: ShaderPath {
-                    path: "",
-                    entry: "",
-                },
+                task: Some(entry),
+                mesh: "",
             }
         }
         self
@@ -448,20 +437,20 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RasterBuilder> {
         self.cmd_buffer.barriers(self.resources);
         self.cmd_buffer.push_constants(&self.push_constants);
         if cfg!(debug_assertions) {
-            let mut shaders = vec![self.sub_builder.pipeline_handle.fragment.clone()];
-            match self.sub_builder.pipeline_handle.model {
-                PipelineModel::Vertex { ref vertex, .. } => shaders.push(vertex.clone()),
-                PipelineModel::Mesh { ref mesh, ref task } => {
-                    shaders.push(mesh.clone());
-                    if let Some(task) = task {
-                        shaders.push(task.clone());
-                    }
-                }
-            }
+            // let mut shaders = vec![self.sub_builder.pipeline_handle.fragment.clone()];
+            // match self.sub_builder.pipeline_handle.model {
+            //     PipelineModel::Vertex { ref vertex, .. } => shaders.push(vertex.clone()),
+            //     PipelineModel::Mesh { ref mesh, ref task } => {
+            //         shaders.push(mesh.clone());
+            //         if let Some(task) = task {
+            //             shaders.push(task.clone());
+            //         }
+            //     }
+            // }
 
-            self.cmd_buffer
-                .type_check(&self.push_constants, &shaders, &self.layout_validation)
-                .unwrap();
+            // self.cmd_buffer
+            //     .type_check(&self.push_constants, &shaders, &self.layout_validation)
+            //     .unwrap();
         }
         self.sub_builder.pipeline_handle.dispatch(
             self.cmd_buffer.handle,
@@ -490,15 +479,8 @@ pub struct ComputeBuilder {
 }
 
 impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
-    pub fn shader(mut self, path: &'static str, entry: &'static str) -> Self {
-        self.sub_builder.pipeline_handle.path = ShaderPath { path, entry };
-        self
-    }
-    pub fn shader_path(mut self, path: &'static str) -> Self {
-        self.sub_builder.pipeline_handle.path = ShaderPath {
-            path,
-            entry: "main",
-        };
+    pub fn shader(mut self, entry: &'static str) -> Self {
+        self.sub_builder.pipeline_handle.entry = entry;
         self
     }
 
@@ -506,13 +488,13 @@ impl<'a, 'b> CommandBuilder<'a, 'b, ComputeBuilder> {
         self.cmd_buffer.barriers(self.resources);
         self.cmd_buffer.push_constants(&self.push_constants);
         if cfg!(debug_assertions) {
-            self.cmd_buffer
-                .type_check(
-                    &self.push_constants,
-                    &vec![self.sub_builder.pipeline_handle.path.clone()],
-                    &self.layout_validation,
-                )
-                .unwrap();
+            // self.cmd_buffer
+            //     .type_check(
+            //         &self.push_constants,
+            //         &vec![self.sub_builder.pipeline_handle.entry.clone()],
+            //         &self.layout_validation,
+            //     )
+            //     .unwrap();
         }
         if let Some(buffer) = indirect_buffer {
             self.sub_builder.pipeline_handle.dispatch_indirect(
@@ -577,15 +559,8 @@ pub struct RayTracingBuilder {
 }
 
 impl<'a, 'b> CommandBuilder<'a, 'b, RayTracingBuilder> {
-    pub fn shader(mut self, path: &'static str, entry: &'static str) -> Self {
-        self.sub_builder.pipeline_handle.path = ShaderPath { path, entry };
-        self
-    }
-    pub fn shader_path(mut self, path: &'static str) -> Self {
-        self.sub_builder.pipeline_handle.path = ShaderPath {
-            path,
-            entry: "main",
-        };
+    pub fn shader(mut self, entry: &'static str) -> Self {
+        self.sub_builder.pipeline_handle.entry = entry;
         self
     }
 
@@ -593,13 +568,13 @@ impl<'a, 'b> CommandBuilder<'a, 'b, RayTracingBuilder> {
         self.cmd_buffer.barriers(self.resources);
         self.cmd_buffer.push_constants(&self.push_constants);
         if cfg!(debug_assertions) {
-            self.cmd_buffer
-                .type_check(
-                    &self.push_constants,
-                    &vec![self.sub_builder.pipeline_handle.path.clone()],
-                    &self.layout_validation,
-                )
-                .unwrap();
+            // self.cmd_buffer
+            //     .type_check(
+            //         &self.push_constants,
+            //         &vec![self.sub_builder.pipeline_handle.entry.clone()],
+            //         &self.layout_validation,
+            //     )
+            //     .unwrap();
         }
         self.sub_builder
             .pipeline_handle
@@ -947,111 +922,111 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn type_check(
-        &self,
-        push_constants: &Vec<PushConstant>,
-        shaders: &Vec<ShaderPath>,
-        layout_validation: &Vec<LayoutBlock>,
-    ) -> LayoutResult {
-        let mut cache = JSON_CACHE.lock().unwrap();
-        for shader_path in shaders {
-            let path = format!("./core/shaders/bin/{}.slang.json", shader_path.path);
-            let json = cache
-                .entry(path.clone())
-                .or_insert(json::parse(&std::fs::read_to_string(&path).unwrap()).unwrap());
+    // pub fn type_check(
+    //     &self,
+    //     push_constants: &Vec<PushConstant>,
+    //     shaders: &Vec<ShaderPath>,
+    //     layout_validation: &Vec<LayoutBlock>,
+    // ) -> LayoutResult {
+    //     let mut cache = JSON_CACHE.lock().unwrap();
+    //     for shader_path in shaders {
+    //         let path = format!("./core/shaders/bin/{}.slang.json", shader_path.path);
+    //         let json = cache
+    //             .entry(path.clone())
+    //             .or_insert(json::parse(&std::fs::read_to_string(&path).unwrap()).unwrap());
 
-            let binding = json["parameters"]
-                .members()
-                .find(|m| m["binding"]["kind"].as_str().unwrap() == "pushConstantBuffer")
-                .expect(&format!(
-                    "No Push Constant block found in shader {}",
-                    shader_path.path
-                ));
+    //         let binding = json["parameters"]
+    //             .members()
+    //             .find(|m| m["binding"]["kind"].as_str().unwrap() == "pushConstantBuffer")
+    //             .expect(&format!(
+    //                 "No Push Constant block found in shader {}",
+    //                 shader_path.path
+    //             ));
 
-            let binding = &binding["type"]["elementVarLayout"]["type"];
-            assert!(
-                binding["kind"] == "struct",
-                "Push Constant block must be a struct"
-            );
+    //         let binding = &binding["type"]["elementVarLayout"]["type"];
+    //         assert!(
+    //             binding["kind"] == "struct",
+    //             "Push Constant block must be a struct"
+    //         );
 
-            let members = binding["fields"].members().collect::<Vec<_>>();
-            assert!(
-                members.len() >= push_constants.len(),
-                "Push constant struct must have at least as many members as are in push constants"
-            );
+    //         let members = binding["fields"].members().collect::<Vec<_>>();
+    //         assert!(
+    //             members.len() >= push_constants.len(),
+    //             "Push constant struct must have at least as many members as are in push constants"
+    //         );
 
-            let mut offset = 0;
-            let mut byte_offset = 0;
-            let mut error = LayoutError {
-                file: shader_path.path.to_string(),
-                entry: shader_path.entry.to_string(),
-                field: "".to_string(),
-                _ty: LayoutErrorType::ConstantsTooLarge { expected_at: 0 },
-            };
-            for block in layout_validation {
-                match block {
-                    LayoutBlock::Constant { size } => {
-                        let constant_end = byte_offset + *size;
-                        while {
-                            let member = members[offset];
-                            let member_type = member["type"]["kind"].as_str().unwrap();
-                            let member_name = member["type"]["name"].as_str().unwrap_or("");
-                            member_type != "pointer"
-                                && member_name != "ImageHandle"
-                                && member_name != "TextureHandle"
-                                && offset < members.len()
-                        } {
-                            let member = members[offset];
-                            let member_size = member["binding"]["size"].as_u32().unwrap();
-                            offset += 1;
-                            byte_offset += member_size;
-                            if byte_offset > constant_end {
-                                error._ty = LayoutErrorType::ConstantsTooLarge {
-                                    expected_at: constant_end as usize,
-                                };
-                                return Err(error);
-                            }
-                        }
-                    }
-                    LayoutBlock::Type { name } => {
-                        let member = members[offset];
-                        let member_type = member["type"]["kind"].as_str().unwrap();
-                        let member_offset = member["binding"]["offset"].as_u32().unwrap();
-                        let member_field_name = member["name"].as_str().unwrap();
-                        error.field = member_field_name.to_string();
-                        let member_name = if member_type == "pointer" {
-                            member["type"]["valueType"].as_str().unwrap()
-                        } else if member_type == "struct" {
-                            member["type"]["name"].as_str().unwrap()
-                        } else {
-                            error._ty = LayoutErrorType::WrongType {
-                                expected: "Pointer or Struct".to_owned(),
-                                found: member_type.to_string(),
-                            };
-                            return Err(error);
-                        };
-                        if member_offset != byte_offset {
-                            error._ty = LayoutErrorType::WrongOffset {
-                                expected: byte_offset,
-                                found: member_offset,
-                            };
-                            return Err(error);
-                        }
-                        if member_name != *name {
-                            error._ty = LayoutErrorType::WrongTypeName {
-                                expected: name.to_string(),
-                                found: member_name.to_string(),
-                            };
-                            return Err(error);
-                        }
-                        offset += 1;
-                        byte_offset += 8;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
+    //         let mut offset = 0;
+    //         let mut byte_offset = 0;
+    //         let mut error = LayoutError {
+    //             file: shader_path.path.to_string(),
+    //             entry: shader_path.entry.to_string(),
+    //             field: "".to_string(),
+    //             _ty: LayoutErrorType::ConstantsTooLarge { expected_at: 0 },
+    //         };
+    //         for block in layout_validation {
+    //             match block {
+    //                 LayoutBlock::Constant { size } => {
+    //                     let constant_end = byte_offset + *size;
+    //                     while {
+    //                         let member = members[offset];
+    //                         let member_type = member["type"]["kind"].as_str().unwrap();
+    //                         let member_name = member["type"]["name"].as_str().unwrap_or("");
+    //                         member_type != "pointer"
+    //                             && member_name != "ImageHandle"
+    //                             && member_name != "TextureHandle"
+    //                             && offset < members.len()
+    //                     } {
+    //                         let member = members[offset];
+    //                         let member_size = member["binding"]["size"].as_u32().unwrap();
+    //                         offset += 1;
+    //                         byte_offset += member_size;
+    //                         if byte_offset > constant_end {
+    //                             error._ty = LayoutErrorType::ConstantsTooLarge {
+    //                                 expected_at: constant_end as usize,
+    //                             };
+    //                             return Err(error);
+    //                         }
+    //                     }
+    //                 }
+    //                 LayoutBlock::Type { name } => {
+    //                     let member = members[offset];
+    //                     let member_type = member["type"]["kind"].as_str().unwrap();
+    //                     let member_offset = member["binding"]["offset"].as_u32().unwrap();
+    //                     let member_field_name = member["name"].as_str().unwrap();
+    //                     error.field = member_field_name.to_string();
+    //                     let member_name = if member_type == "pointer" {
+    //                         member["type"]["valueType"].as_str().unwrap()
+    //                     } else if member_type == "struct" {
+    //                         member["type"]["name"].as_str().unwrap()
+    //                     } else {
+    //                         error._ty = LayoutErrorType::WrongType {
+    //                             expected: "Pointer or Struct".to_owned(),
+    //                             found: member_type.to_string(),
+    //                         };
+    //                         return Err(error);
+    //                     };
+    //                     if member_offset != byte_offset {
+    //                         error._ty = LayoutErrorType::WrongOffset {
+    //                             expected: byte_offset,
+    //                             found: member_offset,
+    //                         };
+    //                         return Err(error);
+    //                     }
+    //                     if member_name != *name {
+    //                         error._ty = LayoutErrorType::WrongTypeName {
+    //                             expected: name.to_string(),
+    //                             found: member_name.to_string(),
+    //                         };
+    //                         return Err(error);
+    //                     }
+    //                     offset += 1;
+    //                     byte_offset += 8;
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
 
     pub fn begin(&mut self) {
         let begin_info = vk::CommandBufferBeginInfo::default();
