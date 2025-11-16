@@ -452,7 +452,7 @@ impl PipelineCache {
     }
 
     pub fn new() -> Self {
-        let mut code = std::fs::File::open("./target/spirv-builder/spirv-unknown-vulkan1.4/release/deps/shaders.spv").unwrap();
+        let mut code = std::fs::File::open("./shaders/target/spirv-builder/spirv-unknown-vulkan1.4/debug/deps/shaders.spv").unwrap();
         let decoded_code = ash::util::read_spv(&mut code).unwrap();
         let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
 

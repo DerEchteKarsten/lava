@@ -17,6 +17,17 @@ use crate::{
     },
 };
 
+
+pub trait Shader {
+    type GpuBinding: Binding;
+    const STAGE: vk::PipelineStageFlags2;
+}
+
+pub trait Binding: Pod {
+    type CpuBinding;
+    fn from_cpu_binding(binding: &Self::CpuBinding, stage: ash::vk::PipelineStageFlags2) -> (Self, Vec<(ResourceHandle, ResourceState)>);
+}
+
 #[derive(Debug)]
 pub enum PushConstant {
     BindlessImage(u64),
@@ -70,125 +81,6 @@ pub struct RasterBuilder {
     index_buffer: Option<vk::Buffer>,
 }
 
-pub trait IntoShaderResourceHandle {
-    fn push_constant(&self) -> PushConstant;
-    fn resource_handle(&self) -> Option<ResourceHandle>;
-    fn aspect(&self) -> vk::ImageAspectFlags;
-    fn preferd_default_layout(&self) -> Option<vk::ImageLayout>;
-    fn type_name(&self) -> String;
-}
-
-impl<T: Copy + Pod, L: Location> IntoShaderResourceHandle for Buffer<T, L> {
-    fn push_constant(&self) -> PushConstant {
-        PushConstant::BufferPointer(self.address)
-    }
-    fn resource_handle(&self) -> Option<ResourceHandle> {
-        Some(ResourceHandle::Buffer(self.handle))
-    }
-    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
-        None
-    }
-    fn aspect(&self) -> vk::ImageAspectFlags {
-        vk::ImageAspectFlags::NONE
-    }
-    fn type_name(&self) -> String {
-        let type_name = std::any::type_name::<T>()
-            .rsplit("::")
-            .next()
-            .unwrap()
-            .to_string();
-
-        match type_name.as_str() {
-            "u8" => "uint8_t",
-            "u32" => "uint",
-            "i32" => "int",
-            "f32" => "float",
-            "f64" => "double",
-            "Vec2" => "vector",
-            "Vec3" => "vector",
-            "Vec4" => "vector",
-            "Mat3" => "matrix",
-            "Mat4" => "matrix",
-            _ => type_name.as_str(),
-        }
-        .to_string()
-    }
-}
-
-impl<T: Copy + Pod> IntoShaderResourceHandle for StorageBuffer<T> {
-    fn aspect(&self) -> vk::ImageAspectFlags {
-        self.buffer.aspect()
-    }
-    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
-        self.buffer.preferd_default_layout()
-    }
-    fn push_constant(&self) -> PushConstant {
-        self.buffer.push_constant()
-    }
-    fn resource_handle(&self) -> Option<ResourceHandle> {
-        self.buffer.resource_handle()
-    }
-    fn type_name(&self) -> String {
-        self.buffer.type_name()
-    }
-}
-
-impl IntoShaderResourceHandle for Image {
-    fn push_constant(&self) -> PushConstant {
-        PushConstant::BindlessImage(self.bindless_handle.expect("Image is neither a texture nor a storage image, consider adding either vk::Sampled or vk::StorageImage to your image usage flags.") as u64)
-    }
-    fn resource_handle(&self) -> Option<ResourceHandle> {
-        Some(ResourceHandle::Image((self.view, self.image)))
-    }
-    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
-        if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
-            Some(vk::ImageLayout::GENERAL)
-        } else {
-            None
-        }
-    }
-    fn aspect(&self) -> vk::ImageAspectFlags {
-        if self.format == vk::Format::D32_SFLOAT
-            || self.format == vk::Format::D16_UNORM
-            || self.format == vk::Format::D16_UNORM_S8_UINT
-            || self.format == vk::Format::D24_UNORM_S8_UINT
-            || self.format == vk::Format::D32_SFLOAT_S8_UINT
-        {
-            vk::ImageAspectFlags::DEPTH
-        } else {
-            vk::ImageAspectFlags::COLOR
-        }
-    }
-    fn type_name(&self) -> String {
-        if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
-            "ImageHandle".to_string()
-        } else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
-            "TextureHandle".to_string()
-        } else {
-            //Most likely storage Image
-            "ImageHandle".to_string()
-        }
-    }
-}
-
-impl IntoShaderResourceHandle for u64 {
-    fn push_constant(&self) -> PushConstant {
-        PushConstant::BufferPointer(*self)
-    }
-    fn resource_handle(&self) -> Option<ResourceHandle> {
-        None
-    }
-    fn preferd_default_layout(&self) -> Option<vk::ImageLayout> {
-        None
-    }
-    fn aspect(&self) -> vk::ImageAspectFlags {
-        vk::ImageAspectFlags::NONE
-    }
-    fn type_name(&self) -> String {
-        "".to_string()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct DrawIndirectCommand {
@@ -224,6 +116,7 @@ pub struct CommandBuilder<'a, 'b, T: Default> {
     #[cfg(debug_assertions)]
     layout_validation: Vec<LayoutBlock>,
 }
+
 
 impl<'a, 'b, T: Default> CommandBuilder<'a, 'b, T> {
     pub fn resource_access(
