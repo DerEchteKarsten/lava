@@ -40,7 +40,7 @@ impl ImageSize {
 #[derivative(Eq, PartialEq, Debug)]
 pub struct Image {
     pub bindless_handle: Option<BindlessHandle>,
-    pub image: vk::Image,
+    pub handle: vk::Image,
     pub view: vk::ImageView,
     #[derivative(PartialEq = "ignore")]
     pub allocation: Option<Arc<Mutex<MAllocation>>>,
@@ -54,7 +54,7 @@ impl Clone for Image {
         Self {
             size: self.size,
             format: self.format,
-            image: self.image,
+            handle: self.handle,
             usage: self.usage,
             view: self.view,
             allocation: self.allocation.clone(),
@@ -63,7 +63,7 @@ impl Clone for Image {
     }
 }
 
-pub(super) fn get_aspects(format: vk::Format) -> vk::ImageAspectFlags {
+pub fn get_aspects(format: vk::Format) -> vk::ImageAspectFlags {
     if format == vk::Format::D16_UNORM
         || format == vk::Format::D32_SFLOAT
         || format == vk::Format::X8_D24_UNORM_PACK32
@@ -180,93 +180,6 @@ pub trait ImageType {
             level_count: 1,
         }
     }
-
-    fn get_pipeline_stage_acces_tuple(
-        state: vk::ImageLayout,
-    ) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
-        match state {
-            vk::ImageLayout::UNDEFINED => {
-                (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::NONE)
-            }
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            ),
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-                vk::PipelineStageFlags2::FRAGMENT_SHADER
-                    | vk::PipelineStageFlags2::COMPUTE_SHADER
-                    | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS
-                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-                vk::AccessFlags2::SHADER_READ,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::GENERAL => (
-                vk::PipelineStageFlags2::COMPUTE_SHADER
-                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
-                    | vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::MEMORY_READ
-                    | vk::AccessFlags2::MEMORY_WRITE
-                    | vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::PRESENT_SRC_KHR => (
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::NONE,
-            ),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-            _ => {
-                log::error!("Unsupported layout transition!");
-                (
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
-                )
-            }
-        }
-    }
-
-    fn subresource_range_memory_barrier<'a>(
-        &self,
-        subresource_range: vk::ImageSubresourceRange,
-        old_layout: vk::ImageLayout,
-        new_layout: vk::ImageLayout,
-    ) -> vk::ImageMemoryBarrier2<'a> {
-        let (src_stage, src_access) = Self::get_pipeline_stage_acces_tuple(old_layout);
-        let (dst_stage, dst_access) = Self::get_pipeline_stage_acces_tuple(new_layout);
-        vk::ImageMemoryBarrier2::default()
-            .dst_access_mask(dst_access)
-            .dst_stage_mask(dst_stage)
-            .src_access_mask(src_access)
-            .src_stage_mask(src_stage)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .image(self.get_image())
-            .subresource_range(subresource_range)
-    }
-
-    fn memory_barrier<'a>(
-        &self,
-        old_layout: vk::ImageLayout,
-        new_layout: vk::ImageLayout,
-    ) -> vk::ImageMemoryBarrier2<'a> {
-        self.subresource_range_memory_barrier(
-            vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_array_layer: 0,
-                base_mip_level: 0,
-                layer_count: 1,
-                level_count: 1,
-            },
-            old_layout,
-            new_layout,
-        )
-    }
 }
 
 impl ImageType for Image {
@@ -280,7 +193,7 @@ impl ImageType for Image {
         self.format
     }
     fn get_image(&self) -> vk::Image {
-        self.image
+        self.handle
     }
     fn get_usage(&self) -> vk::ImageUsageFlags {
         self.usage
@@ -429,7 +342,7 @@ impl Image {
 
         let mut s = Self {
             usage,
-            image,
+            handle: image,
             allocation: Some(Arc::new(Mutex::new(MAllocation(allocation)))),
             format,
             size,
@@ -451,7 +364,7 @@ impl Image {
     pub fn destroy(&self) {
         unsafe {
             Ctx::device().destroy_image_view(self.view, None);
-            Ctx::device().destroy_image(self.image, None);
+            Ctx::device().destroy_image(self.handle, None);
         }
     }
 }

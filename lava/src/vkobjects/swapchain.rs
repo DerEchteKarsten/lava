@@ -128,7 +128,7 @@ impl Swapchain {
                 }
                 Image {
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                    image,
+                    handle: image,
                     format: format.format,
                     size: ImageSize::FullScreen,
                     view: Image::view(&device, image, format.format),
