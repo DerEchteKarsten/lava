@@ -1,4 +1,4 @@
-use std::{any, cell::LazyCell, collections::HashMap, fmt::Debug, marker::PhantomData, sync::Mutex};
+use std::{any, cell::LazyCell, collections::HashMap, fmt::Debug, marker::PhantomData, ops::{Index, IndexMut}, sync::Mutex};
 
 use ash::vk::{self, PipelineStageFlags2};
 use bytemuck::{Pod, Zeroable, bytes_of};
@@ -20,6 +20,7 @@ pub struct CommandBuffer<'a> {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) resource_hashes: &'a mut HashMap<ResourceHandle, ResourceState>,
 }
+
 pub trait Shader {
     type GpuBinding: Binding;
     const STAGE: vk::PipelineStageFlags2;
@@ -228,7 +229,11 @@ impl<'a, 'b, 'c, S: Shader> RasterBuilder<'a, 'b, 'c, S> {
             Ctx::window_height().unwrap(),
         );
     }
-}
+
+    pub fn bind(mut self, b: <<S as Shader>::GpuBinding as Binding>::CpuBinding<'c>) -> Self {
+        self.binding = Some(b);
+        self
+    }}
 
 pub struct ComputeBuilder<'a, 'b, 'c, S: Shader> {
     cmd_buffer: &'a mut CommandBuffer<'b>,
@@ -617,13 +622,13 @@ impl<'b> CommandBuffer<'b> {
         }
     }
 
-    pub fn begin(&mut self) {
+    pub(crate) fn begin(&mut self) {
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info) }.unwrap();
         Bindless::bind(&self.handle);
     }
 
-    pub fn end(&mut self) {
+    pub(crate) fn end(&mut self) {
         unsafe { Ctx::device().end_command_buffer(self.handle) }.unwrap();
     }
 }

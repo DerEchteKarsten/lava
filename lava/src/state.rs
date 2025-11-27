@@ -3,7 +3,7 @@ use std::{
     ffi::{c_char, c_void},
     fmt::{Debug, write},
     mem::MaybeUninit,
-    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU64},
+    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU64}, time::Instant,
 };
 
 use anyhow::{Result, anyhow};
@@ -225,10 +225,12 @@ impl Ctx {
             handle: f.cmd,
             resource_hashes: &mut s.resource_cache.lock().unwrap(),
         };
+        
         let img = Ctx::swapchain().unwrap().images[image_index as usize].clone();
         cmd.begin();
         let result = func(&mut cmd, img);
         cmd.end();
+
         s.frame_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);

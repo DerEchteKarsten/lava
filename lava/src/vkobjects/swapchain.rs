@@ -127,7 +127,7 @@ impl Swapchain {
                     unsafe { debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
                 }
                 Image {
-                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
                     handle: image,
                     format: format.format,
                     size: ImageSize::FullScreen,
