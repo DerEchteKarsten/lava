@@ -21,7 +21,7 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::{
     FRAMES_IN_FLIGHT,
-    bindless::Bindless,
+    bindless::{Bindless, BindlessHandle},
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     vkobjects::{
         image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface,
@@ -332,8 +332,12 @@ impl Ctx {
             };
 
             for (i, image) in swapchain.images.iter_mut().enumerate() {
-                Bindless::write_image(image, i as u32);
-                image.bindless_handle = Some(i as u32);
+                let handle = BindlessHandle {
+                    descriptor_index: i as u32,
+                    descriptor_set: 1
+                };
+                Bindless::write_image(image, handle);
+                image.bindless_handle = Some(handle);
             }
 
             s.swapchain.set(swapchain).unwrap();

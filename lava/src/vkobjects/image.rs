@@ -367,4 +367,32 @@ impl Image {
             Ctx::device().destroy_image(self.handle, None);
         }
     }
+
+    pub fn prefered_layout(&self) -> vk::ImageLayout{
+        if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            vk::ImageLayout::GENERAL
+        }else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        }else {
+            panic!("Image does not have SAMPELD or STORAGE usage flag")
+        }
+    }
+
+    pub fn mut_access(&self) -> vk::AccessFlags2 {
+        if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            vk::AccessFlags2::SHADER_STORAGE_WRITE | vk::AccessFlags2::SHADER_STORAGE_READ
+        }else {
+            panic!("Trying to write to Image that didnt have the STORAGE usage flag");
+        }
+    }
+
+    pub fn const_access(&self) -> vk::AccessFlags2 {
+        if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            vk::AccessFlags2::SHADER_STORAGE_READ
+        }else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+        }else {
+            panic!("Image does not have SAMPLED or STORAGE usage flag")
+        }
+    }
 }

@@ -2,6 +2,7 @@ use std::sync::{OnceLock, atomic::AtomicU32};
 
 use anyhow::Result;
 use ash::vk;
+use bytemuck::{Pod, Zeroable};
 
 use crate::{state::Ctx, vkobjects::image::ImageType};
 
@@ -17,7 +18,12 @@ pub struct Bindless {
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 
-pub type BindlessHandle = u32;
+#[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct BindlessHandle {
+    pub(crate) descriptor_set: u32,
+    pub(crate) descriptor_index: u32,
+}
 
 impl Bindless {
     fn get() -> &'static Self {
@@ -158,6 +164,7 @@ impl Bindless {
         let handle = Self::get()
             .num_images
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handle = BindlessHandle { descriptor_set: 1, descriptor_index: handle };
         Self::write_image(image, handle);
         handle
     }
@@ -166,6 +173,7 @@ impl Bindless {
         let handle = Self::get()
             .num_textures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handle = BindlessHandle { descriptor_set: 0, descriptor_index: handle };
         Self::write_texture(texture, handle);
         handle
     }
@@ -179,7 +187,7 @@ impl Bindless {
         let write = vk::WriteDescriptorSet::default()
             .descriptor_count(1)
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .dst_array_element(handle)
+            .dst_array_element(handle.descriptor_index)
             .dst_binding(0)
             .dst_set(Self::get().sets[1])
             .image_info(&image_info);
@@ -195,7 +203,7 @@ impl Bindless {
         let write = vk::WriteDescriptorSet::default()
             .descriptor_count(1)
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .dst_array_element(handle)
+            .dst_array_element(handle.descriptor_index)
             .dst_binding(1)
             .dst_set(Self::get().sets[0])
             .image_info(&image_info);

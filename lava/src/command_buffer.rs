@@ -467,6 +467,9 @@ impl<'b> CommandBuffer<'b> {
     }
 
     pub fn raster_vertex<'a, 'c, Fragment: Shader, Vertex: Shader>(&'a mut self) -> RasterBuilder<'a, 'b, 'c, Fragment> {
+        assert_eq!(Fragment::STAGE, vk::PipelineStageFlags2::FRAGMENT_SHADER);
+        assert_eq!(Vertex::STAGE, vk::PipelineStageFlags2::VERTEX_SHADER);
+
         RasterBuilder {
             cmd_buf: self,
             color_attachments: Vec::new(),
@@ -480,6 +483,9 @@ impl<'b> CommandBuffer<'b> {
     }
 
     pub fn raster_mesh<'a, 'c, Fragment: Shader, Mesh: Shader>(&'a mut self) -> RasterBuilder<'a, 'b, 'c, Fragment> {
+        assert_eq!(Fragment::STAGE, vk::PipelineStageFlags2::FRAGMENT_SHADER);
+        assert_eq!(Mesh::STAGE, vk::PipelineStageFlags2::MESH_SHADER_EXT);
+
         RasterBuilder {
             cmd_buf: self,
             color_attachments: Vec::new(),
@@ -493,6 +499,10 @@ impl<'b> CommandBuffer<'b> {
     }
 
     pub fn raster_task<'a, 'c, Fragment: Shader, Mesh: Shader, Task: Shader>(&'a mut self) -> RasterBuilder<'a, 'b, 'c, Fragment> {
+        assert_eq!(Fragment::STAGE, vk::PipelineStageFlags2::FRAGMENT_SHADER);
+        assert_eq!(Mesh::STAGE, vk::PipelineStageFlags2::MESH_SHADER_EXT);
+        assert_eq!(Task::STAGE, vk::PipelineStageFlags2::TASK_SHADER_EXT);
+
         RasterBuilder {
             cmd_buf: self,
             color_attachments: Vec::new(),
