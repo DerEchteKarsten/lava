@@ -10,7 +10,6 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub mod bindless;
 pub mod command_buffer;
-pub mod pipelines;
 pub mod state;
 pub mod vkobjects;
 

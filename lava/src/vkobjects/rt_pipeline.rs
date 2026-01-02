@@ -2,7 +2,6 @@ use anyhow::Result;
 use ash::vk;
 
 use crate::{
-    pipelines::PipelineCache,
     state::{Ctx, Functions},
     vkobjects::buffer::{Buffer, BufferUsageFlags, CpuBuffer},
 };
@@ -118,6 +117,7 @@ impl RaytracingPipeline {
         })
     }
 }
+
 
 pub struct ShaderBindingTable {
     pub _buffer: Buffer<u8, CpuBuffer>,
