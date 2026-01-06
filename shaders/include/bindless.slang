@@ -16,21 +16,6 @@ public struct Image<T : IImageDescriptor & __IDynamicResourceCastable> {
     uint32_t DescriptorIndex;
 
     public property bool IsNull { get { return DescriptorIndex == ~0; } }
-
-    public property T Instance {
-        get { if(DescriptorSet == 0) {
-            return TextureHeap[DescriptorIndex].as<T>();
-        } else {
-            return RWTextureHeap[DescriptorIndex].as<T>();
-        }}
-    }
-    public property T NonUniformInstance {
-        get { if (DescriptorSet == 0) {
-                return TextureHeap[NonUniformResourceIndex(DescriptorIndex)].as<T>();
-            } else {
-                return RWTextureHeap[NonUniformResourceIndex(DescriptorIndex)].as<T>();;
-            }}
-    }
 }
 
 public struct MutImage<T : IImageDescriptor & __IDynamicResourceCastable> {
@@ -38,44 +23,43 @@ public struct MutImage<T : IImageDescriptor & __IDynamicResourceCastable> {
     uint32_t DescriptorIndex;
 
     public property bool IsNull { get { return DescriptorIndex == ~0; } }
-
-    public property T Instance {
-        get { if (DescriptorSet == 0) {
-                return TextureHeap[DescriptorIndex].as<T>();
-            } else {
-                return RWTextureHeap[DescriptorIndex].as<T>();
-            }}
-    }
-    public property T NonUniformInstance {
-        get { if (DescriptorSet == 0) {
-                return TextureHeap[NonUniformResourceIndex(DescriptorIndex)].as<T>();
-            } else {
-                return RWTextureHeap[NonUniformResourceIndex(DescriptorIndex)].as<T>(); ;
-            }}
-    }
 }
 
 __generic<E : ITexelElement, Shape : __ITextureShape, let format : int>
 public extension Image<_Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>> {
-    typealias TextureType = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>;
+    typealias ReadTextureType = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>;
+    typealias WriteTextureType = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
 
     [ForceInline]
     public E Load(vector<uint, Shape.dimensions> pos) {
-        return Instance[pos];
+        if (DescriptorSet == 0) {
+            return TextureHeap[DescriptorIndex].asOpaqueDescriptor<ReadTextureType>()[pos];
+        } else {
+            return RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<WriteTextureType>()[pos];
+        }
     }
 }
 
 __generic<E : ITexelElement, Shape : __ITextureShape, let format : int>
 public extension MutImage<_Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>> {
-    typealias TextureType = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
+    typealias ReadTextureType = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>;
+    typealias WriteTextureType = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
 
     [ForceInline]
     public E Load(vector<uint, Shape.dimensions> pos) {
-        return Instance[pos];
+        if (DescriptorSet == 0) {
+            return TextureHeap[DescriptorIndex].asOpaqueDescriptor<ReadTextureType>()[pos];
+        } else {
+            return RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<WriteTextureType>()[pos];
+        };
     }
     [ForceInline]
     public void Store(vector<uint, Shape.dimensions> pos, E value) {
-        Instance[pos] = value;
+        if (DescriptorSet == 0) {
+            printf("Attempting to write to a readonly image!");
+        } else {
+            RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<WriteTextureType>()[pos] = value;
+        }
     }
 }
 

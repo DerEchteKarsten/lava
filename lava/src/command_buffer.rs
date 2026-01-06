@@ -26,7 +26,7 @@ pub struct ShaderHash {
 } 
 
 
-fn create_module<'a>(bytes: &[u8]) -> vk::ShaderModule {
+fn create_module(bytes: &[u8]) -> vk::ShaderModule {
     let decoded_code = ash::util::read_spv(&mut std::io::Cursor::new(bytes)).unwrap();
     let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
 
@@ -35,7 +35,6 @@ fn create_module<'a>(bytes: &[u8]) -> vk::ShaderModule {
 
 fn create_shader_stage<'a>(entry: &'a str, bytes: &[u8], stage: vk::ShaderStageFlags) -> (vk::ShaderModule, vk::PipelineShaderStageCreateInfo<'a>) {
     let module = create_module(bytes);
-
     (module, make_shader_stage(entry, stage, module))
 }
 
@@ -65,7 +64,7 @@ pub trait ComputePass {
                 .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
                 .unwrap()
             }[0];
-            Functions::set_debug_name(&Self::ENTRY, pipeline);
+            Functions::set_debug_name(Self::ENTRY, pipeline);
             unsafe { Ctx::device().destroy_shader_module(module, None) };
             pipeline
         }).clone()
@@ -520,7 +519,7 @@ impl<'a, 'b, 'c, S: RasterVertexShaderPass> RasterBuilder<'a,'b,'c,S> {
         let pipeline = S::get(&self.hash);
         self.draw_private(pipeline, Some(dispatch), width, height, [0,0,0]);
     }
-    pub fn draw_fullscreen(self, dispatch: RasterVertexDispatch, width: u32, height: u32) {
+    pub fn draw_fullscreen(self, dispatch: RasterVertexDispatch) {
         self.draw(dispatch, Ctx::window_width().unwrap(), Ctx::window_height().unwrap());
     }
 }
@@ -625,7 +624,12 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
                 },
             ));
         }
-        let mut shader_resouces = S::GpuBinding::resources(self.binding.as_ref().unwrap(), PipelineStageFlags2::TOP_OF_PIPE);
+        let stage = if dispatch.is_some() {
+            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::VERTEX_SHADER
+        }else {
+            vk::PipelineStageFlags2::MESH_SHADER_EXT
+        };
+        let mut shader_resouces = S::GpuBinding::resources(self.binding.as_ref().unwrap(), stage);
         self.resource_states.append(&mut shader_resouces);
         self.cmd_buf.barriers(self.resource_states);
         self.cmd_buf.push_constants::<S::GpuBinding>(self.binding.as_ref().unwrap());
@@ -1000,7 +1004,7 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn read_buffer<T: Copy + Pod + Debug>(
+    pub fn read_buffer<T: Copy + Pod>(
         &mut self,
         buffer: &Buffer<T, GpuBuffer>,
         staging: &Buffer<T, CpuBuffer>,
@@ -1066,7 +1070,7 @@ impl<'b> CommandBuffer<'b> {
         )]);
     }
 
-    pub fn push_constants<'a, B: Binding>(&mut self, binding: &B::CpuBinding<'a>) {
+    fn push_constants<'a, B: Binding>(&mut self, binding: &B::CpuBinding<'a>) {
         let binding = B::from_cpu_binding(binding);
         let constants = bytes_of(&binding);
         unsafe { Ctx::device().cmd_push_constants(self.handle, Bindless::layout(), vk::ShaderStageFlags::ALL, 0, constants) };
@@ -1081,32 +1085,25 @@ impl<'b> CommandBuffer<'b> {
                 .get(&resource)
                 .copied()
                 .unwrap_or(ResourceState {
-                    stages: vk::PipelineStageFlags2::empty(),
-                    access: vk::AccessFlags2::empty(),
+                    stages: vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    access: vk::AccessFlags2::NONE,
                     layout: vk::ImageLayout::UNDEFINED,
                     aspect: vk::ImageAspectFlags::COLOR,
                 });
             // fast path: same layout/access/queue and no write->read hazard => no barrier
-            let read_to_read = prev.access.contains(vk::AccessFlags2::SHADER_READ)
-                && !prev.access.intersects(vk::AccessFlags2::SHADER_WRITE)
-                && new.access.contains(vk::AccessFlags2::SHADER_READ)
-                && !new.access.intersects(vk::AccessFlags2::SHADER_WRITE);
+            let read_to_read = prev.access.contains(vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_SAMPLED_READ)
+                && !prev.access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                && new.access.contains(vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_SAMPLED_READ)
+                && !new.access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE);
             let same_layout = prev.layout == new.layout;
+            let first_use = prev.stages.contains(vk::PipelineStageFlags2::TOP_OF_PIPE);
 
-            let need_barrier = !read_to_read || !same_layout;
+            let need_barrier = !read_to_read || !same_layout || !first_use;
 
             if need_barrier {
                 // src/dst stages & access: from prev -> next
-                let src_stage_mask = if prev.stages.is_empty() {
-                    vk::PipelineStageFlags2::TOP_OF_PIPE
-                } else {
-                    prev.stages
-                };
-                let dst_stage_mask = if new.stages.is_empty() {
-                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE
-                } else {
-                    new.stages
-                };
+                let src_stage_mask = prev.stages;
+                let dst_stage_mask = new.stages;
 
                 match resource {
                     ResourceHandle::Buffer(buffer) => {
@@ -1146,7 +1143,6 @@ impl<'b> CommandBuffer<'b> {
                     }
                 };
             }
-
             self.resource_hashes.insert(resource.clone(), new.clone());
         }
         if !image_barriers.is_empty() || !buffer_barriers.is_empty() {

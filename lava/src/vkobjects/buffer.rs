@@ -127,6 +127,21 @@ impl<T: Copy + Pod> Deref for StorageBuffer<T> {
     }
 }
 
+impl<T: Copy + Pod> AsRef<Buffer<T>> for StorageBuffer<T> {
+    fn as_ref(&self) -> &Buffer<T> {
+        &self.buffer
+    }
+}
+
+
+
+impl<T: Copy + Pod> AsMut<Buffer<T>> for StorageBuffer<T> {
+    fn as_mut(&mut self) -> &mut Buffer<T> {
+        &mut self.buffer
+    }
+}
+
+
 impl<T: Copy + Pod> DerefMut for StorageBuffer<T> {
     fn deref_mut(&mut self) -> &mut Buffer<T, GpuBuffer> {
         &mut self.buffer

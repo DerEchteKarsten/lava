@@ -236,7 +236,7 @@ impl Ctx {
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
         let waits = [vk::SemaphoreSubmitInfo {
             semaphore: f.image_available,
-            stage_mask: vk::PipelineStageFlags2::NONE,
+            stage_mask: vk::PipelineStageFlags2::TOP_OF_PIPE,
             ..Default::default()
         }];
 
@@ -377,10 +377,10 @@ impl Ctx {
 
         let mut features = Features::default();
         features.present = window.is_some();
-        features.debug_utils = false;
         #[cfg(debug_assertions)]
         {
             features.debug_utils = enable_validation;
+            features.device_debug_utils = enable_validation;
         }
         let mut validation_features;
         let mut instance_info = vk::InstanceCreateInfo::default();
@@ -417,7 +417,6 @@ impl Ctx {
                     vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
                         | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                        | vk::DebugUtilsMessageTypeFlagsEXT::DEVICE_ADDRESS_BINDING,
                 )
                 .pfn_user_callback(Some(vulkan_debug_callback));
             unsafe {
@@ -651,8 +650,7 @@ unsafe extern "system" fn vulkan_debug_callback(
         if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
             let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
             let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-            if let Some(s) = STATE.get()
-                && !split.is_empty()
+            if let Some(s) = STATE.get() && split.len() > 1
             {
                 let printf_message = split[1..]
                     .iter()
@@ -672,7 +670,9 @@ unsafe extern "system" fn vulkan_debug_callback(
                 }
                 Flag::WARNING => log::warn!("{}", message),
                 Flag::ERROR => log::error!("{}", message),
-                _ => {}
+                _ => {
+                    log::info!("{}", message)
+                }
             }
         }
     }
@@ -690,17 +690,13 @@ pub struct Features {
 impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
         let mut extensions = vec![
-            ash::khr::get_memory_requirements2::NAME,
-            ash::khr::synchronization2::NAME,
-            ash::ext::descriptor_indexing::NAME,
             ash::ext::extended_dynamic_state3::NAME,
-            ash::ext::scalar_block_layout::NAME,
         ];
         if self.present {
             extensions.push(ash::khr::swapchain::NAME);
         }
         if self.debug_utils {
-            extensions.push(ash::khr::shader_non_semantic_info::NAME);
+            // extensions.push(ash::ext::device_address_binding_report::NAME);
         }
         if self.device_debug_utils {
             extensions.push(ash::ext::debug_utils::NAME);
@@ -710,7 +706,6 @@ impl Features {
         }
         if self.raytracing {
             extensions.push(ash::khr::ray_tracing_pipeline::NAME);
-            extensions.push(ash::khr::shader_float_controls::NAME);
             extensions.push(ash::khr::deferred_host_operations::NAME);
             extensions.push(ash::khr::acceleration_structure::NAME);
         }
@@ -743,6 +738,9 @@ impl Features {
             .timeline_semaphore(true)
             .scalar_block_layout(true)
             .storage_push_constant8(true)
+            .vulkan_memory_model(true)
+            .vulkan_memory_model_device_scope(true)
+            .storage_buffer8_bit_access(true)
             .shader_int8(true);
         *vk13 = vk13
             .dynamic_rendering(true)
