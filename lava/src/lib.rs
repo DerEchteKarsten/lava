@@ -18,8 +18,9 @@ pub const FRAMES_IN_FLIGHT: usize = 3;
 pub fn init<T: HasDisplayHandle + HasWindowHandle>(
     window: Option<&T>,
     enable_validation: bool,
+    enable_gpu_assited_validation: bool
 ) -> Result<()> {
-    Ctx::init(window, enable_validation)?;
+    Ctx::init(window, enable_validation, enable_gpu_assited_validation)?;
     Bindless::init()?;
 
     for i in &mut Ctx::swapchain().unwrap().images {

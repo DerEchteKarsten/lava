@@ -350,6 +350,7 @@ impl Ctx {
     pub(super) fn init<T: HasWindowHandle + HasDisplayHandle>(
         window: Option<&T>,
         enable_validation: bool,
+        enable_gpu_assited_validation: bool,
     ) -> Result<()> {
         if STATE.get().is_some() {
             return Ok(());
@@ -382,17 +383,22 @@ impl Ctx {
             features.debug_utils = enable_validation;
             features.device_debug_utils = enable_validation;
         }
-        let mut validation_features;
+        let mut validation_features = vk::ValidationFeaturesEXT::default();
+        let mut validation_f;
         let mut instance_info = vk::InstanceCreateInfo::default();
         if features.debug_utils {
             instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
-            validation_features =
-                vk::ValidationFeaturesEXT::default().enabled_validation_features(&[
+            validation_f = vec![
                     vk::ValidationFeatureEnableEXT::DEBUG_PRINTF,
-                    vk::ValidationFeatureEnableEXT::GPU_ASSISTED,
                     vk::ValidationFeatureEnableEXT::BEST_PRACTICES,
                     vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION,
-                ]);
+                ];
+            if enable_gpu_assited_validation {
+                validation_f.push(vk::ValidationFeatureEnableEXT::GPU_ASSISTED);
+            }
+
+            validation_features = validation_features.
+                enabled_validation_features(&validation_f);
 
             instance_info = instance_info
                 .enabled_layer_names(&layers_names_raw)
