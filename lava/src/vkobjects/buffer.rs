@@ -40,6 +40,7 @@ impl Location for GpuBuffer {}
 impl Location for CpuBuffer {}
 
 bitflags! {
+    #[derive(Clone, Copy)]
     pub struct BufferUsageFlags: u32 {
         const STORAGE = vk::BufferUsageFlags::STORAGE_BUFFER.as_raw();
         const INDIRECT_COMMAND = vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw();
@@ -65,19 +66,19 @@ pub struct Buffer<T: Copy + Pod, L: Location = GpuBuffer> {
     pub handle: vk::Buffer,
     pub address: u64,
     pub(crate) size: u64,
-    pub(crate) usage: vk::BufferUsageFlags,
-    pub(crate) alignment: Option<u32>,
     pub(crate) allocation: Arc<Mutex<MAllocation>>,
     _location_marker: PhantomData<L>,
     _type_marker: PhantomData<T>,
 }
 
-pub struct StorageBuffer<T: Copy + Pod> {
-    pub(crate) buffer: Buffer<T, GpuBuffer>,
+pub struct StorageBuffer<T: Copy + Pod, L: Location = GpuBuffer> {
+    pub(crate) buffer: Buffer<T, L>,
     size: u64,
+    usage: vk::BufferUsageFlags,
+    alignment: Option<u32>,
 }
 
-impl<T: Copy + Pod> Default for StorageBuffer<T> {
+impl<T: Copy + Pod, L: Location+ 'static> Default for StorageBuffer<T, L> {
     fn default() -> Self {
         StorageBuffer::new(BufferUsageFlags::STORAGE).unwrap()
     }
@@ -86,7 +87,7 @@ impl<T: Copy + Pod> Default for StorageBuffer<T> {
 impl<T: Copy + Pod> Buffer<T, CpuBuffer> {
     pub fn from_data(usage: BufferUsageFlags, data: &[T]) -> Result<Self> {
         let mut buffer = Buffer::new(usage, data.len())?;
-        buffer.copy_from_slice(data)?;
+        buffer.copy_from_slice(data, 0)?;
         Ok(buffer)
     }
 }
@@ -96,7 +97,7 @@ impl<T: Copy + Pod> Buffer<T, GpuBuffer> {
         staging_buffer: &mut Buffer<u8, CpuBuffer>,
         data: &[T],
     ) -> Result<Self> {
-        staging_buffer.copy_from_slice(data)?;
+        staging_buffer.copy_from_slice(data, 0)?;
         let mut buffer = Buffer::new(usage, data.len())?;
         buffer.copy_from(
             staging_buffer.cast_mut(),
@@ -106,7 +107,7 @@ impl<T: Copy + Pod> Buffer<T, GpuBuffer> {
         Ok(buffer)
     }
 }
-impl<T: Copy + Pod> StorageBuffer<T> {
+impl<T: Copy + Pod> StorageBuffer<T, GpuBuffer> {
     pub fn from_data(
         usage: BufferUsageFlags,
         staging_buffer: &mut Buffer<u8, CpuBuffer>,
@@ -116,34 +117,49 @@ impl<T: Copy + Pod> StorageBuffer<T> {
         Ok(Self {
             size: buffer.size,
             buffer: buffer,
+            usage: usage.to_vk(),
+            alignment: None,
         })
     }
 }
 
-impl<T: Copy + Pod> Deref for StorageBuffer<T> {
-    type Target = Buffer<T, GpuBuffer>;
-    fn deref(&self) -> &Buffer<T, GpuBuffer> {
+impl<T: Copy + Pod, L: Location> Deref for StorageBuffer<T, L> {
+    type Target = Buffer<T, L>;
+    fn deref(&self) -> &Buffer<T, L> {
         &self.buffer
     }
 }
 
-impl<T: Copy + Pod> AsRef<Buffer<T>> for StorageBuffer<T> {
-    fn as_ref(&self) -> &Buffer<T> {
+impl<T: Copy + Pod, L: Location> AsRef<Buffer<T, L>> for StorageBuffer<T, L> {
+    fn as_ref(&self) -> &Buffer<T, L> {
         &self.buffer
     }
 }
 
-
-
-impl<T: Copy + Pod> AsMut<Buffer<T>> for StorageBuffer<T> {
-    fn as_mut(&mut self) -> &mut Buffer<T> {
+impl<T: Copy + Pod, L: Location> AsMut<Buffer<T, L>> for StorageBuffer<T, L> {
+    fn as_mut(&mut self) -> &mut Buffer<T, L> {
         &mut self.buffer
     }
 }
 
+impl<T: Copy + Pod> AsMut<Buffer<T>> for StorageBuffer<T, CpuBuffer> {
+    fn as_mut(&mut self) -> &mut Buffer<T> {
+        self.buffer.cast_mut_location()
+    }
+}
 
-impl<T: Copy + Pod> DerefMut for StorageBuffer<T> {
-    fn deref_mut(&mut self) -> &mut Buffer<T, GpuBuffer> {
+impl<T: Copy + Pod> AsRef<Buffer<T>> for StorageBuffer<T, CpuBuffer> {
+    fn as_ref(&self) -> &Buffer<T> {
+        self.buffer.cast_location()
+    }
+}
+
+
+
+
+
+impl<T: Copy + Pod, L: Location> DerefMut for StorageBuffer<T, L> {
+    fn deref_mut(&mut self) -> &mut Buffer<T, L> {
         &mut self.buffer
     }
 }
@@ -186,11 +202,9 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
             _location_marker: PhantomData,
             _type_marker: PhantomData,
             address,
-            alignment: None,
             allocation: Arc::new(Mutex::new(MAllocation(allocation))),
             handle: buffer,
             size: num_bytes as u64,
-            usage,
         })
     }
     pub fn new(usage: BufferUsageFlags, size: usize) -> Result<Self> {
@@ -222,7 +236,7 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
             })
             .unwrap();
     }
-    pub fn len(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         (self.size / size_of::<T>() as u64) as usize
     }
 
@@ -236,19 +250,34 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
     pub fn cast_mut<B: Copy + Pod>(&mut self) -> &mut Buffer<B, L> {
         unsafe { (self as *mut Self as *mut Buffer<B, L>).as_mut().unwrap() }
     }
+
+    pub fn cast_location<newL: Location>(&self) -> &Buffer<T, newL> {
+        unsafe {
+            (self as *const Self as *const Buffer<T, newL>)
+                .as_ref()
+                .unwrap()
+        }
+    }
+    pub fn cast_mut_location<newL: Location>(&mut self) -> &mut Buffer<T, newL> {
+        unsafe { (self as *mut Self as *mut Buffer<T, newL>).as_mut().unwrap() }
+    }
 }
 
-impl<T: Copy + Pod> StorageBuffer<T> {
+impl<T: Copy + Pod, L: Location + 'static> StorageBuffer<T, L> {
     pub fn with_capacity(usage: BufferUsageFlags, capacity: usize) -> Result<Self> {
         Ok(Self {
+            usage: usage.clone().to_vk(),
             buffer: Buffer::new(usage, capacity)?,
             size: 0,
+            alignment: None,
         })
     }
     pub fn new(usage: BufferUsageFlags) -> Result<Self> {
         Ok(Self {
-            buffer: Buffer::with_alignment(usage, 1024, None)?,
+            buffer: Buffer::new(usage.clone(), 1024)?,
             size: 0,
+            alignment: None,
+            usage: usage.to_vk()
         })
     }
     pub fn len(&self) -> usize {
@@ -258,11 +287,10 @@ impl<T: Copy + Pod> StorageBuffer<T> {
         if self.buffer.size < size {
             let capacity = size.next_power_of_two();
             let buffer = Buffer::with_alignment(
-                BufferUsageFlags::from_bits_retain(self.buffer.usage.as_raw()),
+                BufferUsageFlags::from_bits_retain(self.usage.as_raw()),
                 capacity,
-                self.buffer.alignment,
+                self.alignment,
             )?;
-            log::info!("{:#?}", buffer.usage);
             if self.size != 0 {
                 Ctx::transfer_queue().execute_command_wait(|cmd| {
                     unsafe {
@@ -289,7 +317,7 @@ impl<T: Copy + Pod> StorageBuffer<T> {
 
 impl<T: Copy + Pod> Buffer<T, GpuBuffer> {
     pub fn read(&self, staging_buffer: &mut Buffer<u8, CpuBuffer>) -> Vec<T> {
-        self.read_len(staging_buffer, self.len())
+        self.read_len(staging_buffer, self.capacity())
     }
     pub fn read_len(&self, staging_buffer: &mut Buffer<u8, CpuBuffer>, len: usize) -> Vec<T> {
         staging_buffer
@@ -314,18 +342,18 @@ impl<T: Copy + Pod> Buffer<T, CpuBuffer> {
         }
     }
     pub fn read(&self) -> Vec<T> {
-        self.read_len(self.len())
+        self.read_len(self.capacity())
     }
-    pub fn copy_from_slice<B: Copy>(&mut self, slice: &[B]) -> Result<()> {
+    pub fn copy_from_slice<B: Copy>(&mut self, slice: &[B], offset: usize) -> Result<()> {
         let allocation = &self.allocation;
         let mut alloc = allocation.lock().unwrap();
         let alloc = &mut alloc.0;
-        presser::copy_from_slice_to_offset(slice, alloc, 0).unwrap();
+        presser::copy_from_slice_to_offset(slice, alloc, offset).unwrap();
         Ok(())
     }
 }
 
-impl<T: Copy + Pod> StorageBuffer<T> {
+impl<T: Copy + Pod> StorageBuffer<T, GpuBuffer> {
     pub fn push(&mut self, staging_buffer: &mut Buffer<u8, CpuBuffer>, data: &[T]) {
         if data.len() == 0 {
             return;
@@ -342,6 +370,7 @@ impl<T: Copy + Pod> StorageBuffer<T> {
                         ..data
                             .len()
                             .min((i + 1) * (staging_buffer.size as usize / size_of::<T>()))],
+                    0
                 )
                 .unwrap();
             let staging_size = staging_buffer.size;
@@ -353,3 +382,18 @@ impl<T: Copy + Pod> StorageBuffer<T> {
         }
     }
 }
+
+impl<T: Copy + Pod> StorageBuffer<T, CpuBuffer> {
+    pub fn push(&mut self, data: &[T]) {
+        if data.len() == 0 {
+            return;
+        }
+        let offset = self.size;
+        let size = data.len() * size_of::<T>();
+
+        self.assert_size(size as u64 + offset).unwrap();
+
+        self.copy_from_slice(data, offset as usize).unwrap();
+    }
+}
+

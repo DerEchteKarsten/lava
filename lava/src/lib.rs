@@ -4,7 +4,7 @@
 #![feature(let_chains)]
 #![feature(const_trait_impl)]
 
-use crate::{bindless::Bindless, state::Ctx};
+use crate::{bindless::Bindless, state::{Ctx, STATE}};
 use anyhow::{Ok, Result};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -28,6 +28,10 @@ pub fn init<T: HasDisplayHandle + HasWindowHandle>(
         i.bindless_handle = Some(handle);
     }
     Ok(())
+}
+
+pub fn is_init() -> bool {
+    STATE.get().is_some()
 }
 
 pub fn destroy() {

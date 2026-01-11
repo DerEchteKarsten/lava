@@ -1,7 +1,7 @@
 use std::{any, cell::{LazyCell, OnceCell}, collections::HashMap, ffi::CStr, fmt::Debug, marker::PhantomData, ops::{Index, IndexMut}, sync::{Mutex, OnceLock}};
 
 use anyhow::Result;
-use ash::vk::{self, PipelineStageFlags2, ShaderStageFlags};
+use ash::vk::{self, IndexType, PipelineStageFlags2, ShaderStageFlags};
 use bytemuck::{Pod, Zeroable, bytes_of};
 
 use crate::{
@@ -116,7 +116,6 @@ pub trait RayTracingPass {
 #[derive(Hash, PartialEq, Eq, Clone)]
 pub struct RasterHash {
     backface_culling: bool,
-    vertex_buffer: bool,
     color_formats: Vec<vk::Format>,
     depth_format: vk::Format,
     stencil_format: vk::Format,
@@ -126,7 +125,6 @@ pub trait RasterVertexShaderPass: RasterPass {
     const VERTEX: &'static str;
     const FRAGMENT: &'static str;
     const BYTES: &[u8];
-    type Vertex: Pod;
 
     fn module_cache() -> &'static OnceLock<vk::ShaderModule>;
     
@@ -143,45 +141,7 @@ pub trait RasterVertexShaderPass: RasterPass {
                 make_shader_stage(Self::VERTEX, vk::ShaderStageFlags::VERTEX, *module),
             ];
 
-            let vertex_bindings; let vertex_attribute_descriptions;
-            let (vertex_input_state, input_assembly) = if hash.vertex_buffer {
-                vertex_bindings = [vk::VertexInputBindingDescription::default()
-                    .binding(0)
-                    .stride(size_of::<Self::Vertex>() as u32)
-                    .input_rate(vk::VertexInputRate::VERTEX)];
-                vertex_attribute_descriptions= [
-                    vk::VertexInputAttributeDescription::default()
-                        .binding(0)
-                        .location(0)
-                        .format(vk::Format::R32G32B32_SFLOAT)
-                        .offset(0),
-                    vk::VertexInputAttributeDescription::default()
-                        .binding(0)
-                        .location(1)
-                        .format(vk::Format::R32G32B32_SFLOAT)
-                        .offset(12),
-                    vk::VertexInputAttributeDescription::default()
-                        .binding(0)
-                        .location(2)
-                        .format(vk::Format::R32G32_SFLOAT)
-                        .offset(24),
-                ];
-                (vk::PipelineVertexInputStateCreateInfo::default()
-                    .vertex_binding_descriptions(&vertex_bindings)
-                    .vertex_attribute_descriptions(&vertex_attribute_descriptions)
-                ,vk::PipelineInputAssemblyStateCreateInfo::default()
-                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-                    .primitive_restart_enable(false)
-                )
-            } else {
-                (vk::PipelineVertexInputStateCreateInfo::default()
-                    .vertex_attribute_descriptions(&[])
-                    .vertex_binding_descriptions(&[]),
-                vk::PipelineInputAssemblyStateCreateInfo::default()
-                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-                    .primitive_restart_enable(false))
-            };
-            create_raster_pipeline(&stages, hash, Some((vertex_input_state, input_assembly)))
+            create_raster_pipeline(&stages, hash)
         }).clone()
     }
 }
@@ -209,19 +169,23 @@ pub trait RasterMeshShaderPass: RasterPass {
             if let Some(hash) = Self::TASK {
                 stages.push(make_shader_stage(hash, vk::ShaderStageFlags::TASK_EXT, *module));
             }
-            create_raster_pipeline(&stages, hash, None)
+            create_raster_pipeline(&stages, hash)
         }).clone()
     }
 }
 
 
-fn create_raster_pipeline(stages: &[vk::PipelineShaderStageCreateInfo<'_>], hash: &RasterHash, ia: Option<(vk::PipelineVertexInputStateCreateInfo, vk::PipelineInputAssemblyStateCreateInfo)>) -> vk::Pipeline{
+fn create_raster_pipeline(stages: &[vk::PipelineShaderStageCreateInfo<'_>], hash: &RasterHash) -> vk::Pipeline{
     let mut create_info = vk::GraphicsPipelineCreateInfo::default();
-    if let Some((vertex_input_state, input_assembly)) = &ia {
-        create_info = create_info
-            .vertex_input_state(&vertex_input_state)
-            .input_assembly_state(&input_assembly);
-    }
+    let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .primitive_restart_enable(false)
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_attribute_descriptions(&[])
+        .vertex_binding_descriptions(&[]);
+    create_info = create_info.input_assembly_state(&ia)
+        .vertex_input_state(&vertex_input_state);
+
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&hash.color_formats)
             .depth_attachment_format(hash.depth_format)
@@ -342,7 +306,6 @@ pub struct RasterBuilder<'a, 'b, 'c, S: RasterPass> {
     hash: RasterHash,
     color_attachments: Vec<(Image, Option<[f32;4]>)>,
     depth_attachment: Option<Image>,
-    vertex_buffer: Option<vk::Buffer>,
     index_buffer: Option<vk::Buffer>,
     resource_states: Vec<(ResourceHandle, ResourceState)>,
     cmd_buf: &'a mut CommandBuffer<'b>,
@@ -491,21 +454,6 @@ impl<'a, 'b, 'c, S: RasterVertexShaderPass> RasterBuilder<'a,'b,'c,S> {
         ));
         self
     }
-    pub fn vertex_buffer(mut self, buffer: &Buffer<S::Vertex, GpuBuffer>) -> Self {
-        assert!(self.vertex_buffer.is_none());
-        assert!(size_of::<S::Vertex>() > 0);
-        self.vertex_buffer = Some(buffer.handle);
-        self.resource_states.push((
-            ResourceHandle::Buffer(buffer.handle),
-            ResourceState {
-                access: vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
-                aspect: vk::ImageAspectFlags::NONE,
-                layout: vk::ImageLayout::UNDEFINED,
-                stages: vk::PipelineStageFlags2::VERTEX_INPUT,
-            }
-        ));
-        self
-    }
     pub fn draw(mut self, dispatch: RasterVertexDispatch, width: u32, height: u32) {
         self.hash.color_formats = self.color_attachments
         .iter()
@@ -515,7 +463,6 @@ impl<'a, 'b, 'c, S: RasterVertexShaderPass> RasterBuilder<'a,'b,'c,S> {
             .as_ref()
             .and_then(|d| Some(d.format))
             .unwrap_or(vk::Format::UNDEFINED);
-        self.hash.vertex_buffer = self.vertex_buffer.is_some();
         let pipeline = S::get(&self.hash);
         self.draw_private(pipeline, Some(dispatch), width, height, [0,0,0]);
     }
@@ -708,8 +655,8 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
                 }],
             );
             if let Some(dispatch) = dispatch {
-                if let Some(vertex_buffer) = self.vertex_buffer {
-                    Ctx::device().cmd_bind_vertex_buffers(self.cmd_buf.handle, 0, &[vertex_buffer], &[0]);
+                if let Some(index_buffer) = self.index_buffer {
+                    Ctx::device().cmd_bind_index_buffer(self.cmd_buf.handle, index_buffer, 0, IndexType::UINT32);
                 }
                 match dispatch {
                     RasterVertexDispatch::Draw {
@@ -1039,9 +986,8 @@ impl<'b> CommandBuffer<'b> {
             depth_attachment: None,
             index_buffer: None,
             resource_states: Vec::new(),
-            vertex_buffer: None,
             binding: None,
-            hash: RasterHash { backface_culling: true, vertex_buffer: false, color_formats: Vec::new(), depth_format: vk::Format::UNDEFINED, stencil_format: vk::Format::UNDEFINED }
+            hash: RasterHash { backface_culling: true,color_formats: Vec::new(), depth_format: vk::Format::UNDEFINED, stencil_format: vk::Format::UNDEFINED }
         }
     }
 
@@ -1090,18 +1036,19 @@ impl<'b> CommandBuffer<'b> {
                     layout: vk::ImageLayout::UNDEFINED,
                     aspect: vk::ImageAspectFlags::COLOR,
                 });
-            // fast path: same layout/access/queue and no write->read hazard => no barrier
-            let read_to_read = prev.access.contains(vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_SAMPLED_READ)
-                && !prev.access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                && new.access.contains(vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_SAMPLED_READ)
-                && !new.access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE);
+
+                let read_flags = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ;
+            let write_flags = vk::AccessFlags2::SHADER_STORAGE_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+            let read_to_read = prev.access.contains(read_flags)
+                && !prev.access.contains(write_flags)
+                && new.access.contains(read_flags)
+                && !new.access.contains(write_flags);
             let same_layout = prev.layout == new.layout;
             let first_use = prev.stages.contains(vk::PipelineStageFlags2::TOP_OF_PIPE);
 
             let need_barrier = !read_to_read || !same_layout || !first_use;
 
             if need_barrier {
-                // src/dst stages & access: from prev -> next
                 let src_stage_mask = prev.stages;
                 let dst_stage_mask = new.stages;
 

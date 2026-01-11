@@ -643,7 +643,7 @@ impl Ctx {
     }
 }
 
-static STATE: OnceLock<Ctx> = OnceLock::new();
+pub(crate)  static STATE: OnceLock<Ctx> = OnceLock::new();
 
 unsafe extern "system" fn vulkan_debug_callback(
     flag: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -697,6 +697,7 @@ impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
         let mut extensions = vec![
             ash::ext::extended_dynamic_state3::NAME,
+            // unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_KHR_unified_image_layouts\0") }
         ];
         if self.present {
             extensions.push(ash::khr::swapchain::NAME);

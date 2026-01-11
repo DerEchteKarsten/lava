@@ -213,7 +213,7 @@ impl ShaderBindingTable {
             }
         }
 
-        buffer.copy_from_slice(&stb_data)?;
+        buffer.copy_from_slice(&stb_data, 0)?;
 
         let raygen_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(buffer.address)
