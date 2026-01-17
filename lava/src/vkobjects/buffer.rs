@@ -283,6 +283,9 @@ impl<T: Copy + Pod, L: Location + 'static> StorageBuffer<T, L> {
     pub fn len(&self) -> usize {
         (self.size / size_of::<T>() as u64) as usize
     }
+    pub fn clear(&mut self) {
+        self.size = 0;
+    }
     pub fn assert_size(&mut self, size: u64) -> Result<()> {
         if self.buffer.size < size {
             let capacity = size.next_power_of_two();
@@ -393,7 +396,7 @@ impl<T: Copy + Pod> StorageBuffer<T, CpuBuffer> {
 
         self.assert_size(size as u64 + offset).unwrap();
 
-        self.copy_from_slice(data, offset as usize).unwrap();
+        self.copy_from_slice(data, offset as usize / size_of::<T>()).unwrap();
     }
 }
 

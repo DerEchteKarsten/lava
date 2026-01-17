@@ -1,4 +1,5 @@
 #define NUM_SAMPLERS 1
+[vk::binding(0, 0)] SamplerState SamplerHeap[];
 [vk::binding(NUM_SAMPLERS, 0)] __DynamicResource TextureHeap[];
 [vk::binding(0, 1)] __DynamicResource RWTextureHeap[];
 
@@ -37,6 +38,10 @@ public extension Image<_Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>> {
         } else {
             return RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<WriteTextureType>()[pos];
         }
+    }
+    [ForceInline]
+    public E Sample(vector<float, Shape.dimensions> pos) {
+        return TextureHeap[DescriptorIndex].asOpaqueDescriptor<ReadTextureType>().Sample(SamplerHeap[0], pos);
     }
 }
 

@@ -116,6 +116,7 @@ pub trait RayTracingPass {
 #[derive(Hash, PartialEq, Eq, Clone)]
 pub struct RasterHash {
     backface_culling: bool,
+    wire_frame: bool,
     color_formats: Vec<vk::Format>,
     depth_format: vk::Format,
     stencil_format: vk::Format,
@@ -207,14 +208,14 @@ fn create_raster_pipeline(stages: &[vk::PipelineShaderStageCreateInfo<'_>], hash
         .iter()
         .map(|_| {
             vk::PipelineColorBlendAttachmentState::default()
-                .blend_enable(false)
+                .blend_enable(true)
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
                 .alpha_blend_op(vk::BlendOp::ADD)
                 .color_blend_op(vk::BlendOp::ADD)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .dst_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-                .src_alpha_blend_factor(vk::BlendFactor::SRC_ALPHA)
-                .src_color_blend_factor(vk::BlendFactor::SRC_COLOR)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
         })
         .collect::<Vec<_>>();
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
@@ -230,7 +231,11 @@ fn create_raster_pipeline(stages: &[vk::PipelineShaderStageCreateInfo<'_>], hash
         .depth_clamp_enable(false)
         .rasterizer_discard_enable(false)
         .line_width(1.0)
-        .polygon_mode(vk::PolygonMode::FILL)
+        .polygon_mode(if hash.wire_frame {
+            vk::PolygonMode::LINE
+        }else {
+            vk::PolygonMode::FILL
+        })
         .cull_mode(if hash.backface_culling {
             vk::CullModeFlags::BACK
         } else {
@@ -496,6 +501,10 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         self.hash.backface_culling = backface_culling;
         self
     }
+    pub fn wire_frame(mut self, wire_frame: bool) -> Self {
+        self.hash.wire_frame = wire_frame;
+        self
+    }
 
     pub fn color_attachment(mut self, image: &Image, clear: Option<[f32; 4]>) -> Self {
         self
@@ -504,7 +513,7 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         self.resource_states.push((
             ResourceHandle::Image((image.view, image.handle)),
             ResourceState {
-                access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | if clear.is_none() {vk::AccessFlags2::COLOR_ATTACHMENT_READ} else {vk::AccessFlags2::empty()},
                 layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 stages: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 aspect: vk::ImageAspectFlags::COLOR,
@@ -777,7 +786,7 @@ impl<'a, 'b, 'c, S: ComputePass> ComputeBuilder<'a, 'b, 'c, S> {
     }
 
     pub fn dispatch_indirect<L: Location, T: Copy + Pod>(
-        mut self,
+        self,
         buffer: &Buffer<T, L>,
         offset: u32,
     ) {
@@ -987,7 +996,7 @@ impl<'b> CommandBuffer<'b> {
             index_buffer: None,
             resource_states: Vec::new(),
             binding: None,
-            hash: RasterHash { backface_culling: true,color_formats: Vec::new(), depth_format: vk::Format::UNDEFINED, stencil_format: vk::Format::UNDEFINED }
+            hash: RasterHash { backface_culling: true,color_formats: Vec::new(), depth_format: vk::Format::UNDEFINED, stencil_format: vk::Format::UNDEFINED, wire_frame: false }
         }
     }
 

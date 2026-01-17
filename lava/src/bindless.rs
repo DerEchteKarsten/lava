@@ -21,8 +21,8 @@ static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct BindlessHandle {
-    pub(crate) descriptor_set: u32,
-    pub(crate) descriptor_index: u32,
+    pub descriptor_set: u32,
+    pub descriptor_index: u32,
 }
 
 impl Bindless {
