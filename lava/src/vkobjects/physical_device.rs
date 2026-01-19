@@ -58,7 +58,7 @@ pub struct PhysicalDevice {
 
 impl PhysicalDevice {
     pub fn new(
-        surface: Option<&vk::SurfaceKHR>,
+        surface: &vk::SurfaceKHR,
         surface_fn: Option<&ash::khr::surface::Instance>,
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
@@ -80,7 +80,7 @@ impl PhysicalDevice {
             .into_iter()
             .enumerate()
             .map(|(index, p)| {
-                let present_support = if let Some(surface) = surface {
+                let present_support =
                     unsafe {
                         surface_fn
                             .unwrap()
@@ -90,10 +90,7 @@ impl PhysicalDevice {
                                 *surface,
                             )
                             .unwrap()
-                    }
-                } else {
-                    false
-                };
+                    };
 
                 QueueFamily {
                     index: index as _,
@@ -113,25 +110,20 @@ impl PhysicalDevice {
             })
             .collect::<Vec<String>>();
 
-        let supported_surface_formats = if let Some(surface) = surface {
+        let supported_surface_formats = 
             unsafe {
                 surface_fn
                     .unwrap()
                     .get_physical_device_surface_formats(physical_device, *surface)?
-            }
-        } else {
-            vec![]
-        };
+            };
 
-        let supported_present_modes = if let Some(surface) = surface {
+        let supported_present_modes = 
             unsafe {
                 surface_fn
                     .unwrap()
                     .get_physical_device_surface_present_modes(physical_device, *surface)?
-            }
-        } else {
-            vec![]
-        };
+            };
+
         let mut ray_tracing_feature = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
         let mut acceleration_struct_feature =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
@@ -154,7 +146,7 @@ impl PhysicalDevice {
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
 
         let features = Features {
-            present: surface.is_some(),
+            present: true,
             debug_utils: true,
             device_debug_utils: supported_extensions
                 .contains(&ash::ext::debug_utils::NAME.to_str().unwrap().to_owned()),
@@ -200,7 +192,7 @@ impl PhysicalDevice {
     }
 
     pub fn enumerate_physical_devices(
-        surface: Option<&vk::SurfaceKHR>,
+        surface: &vk::SurfaceKHR,
         instance: &ash::Instance,
         surface_fn: Option<&ash::khr::surface::Instance>,
     ) -> Result<Vec<PhysicalDevice>> {

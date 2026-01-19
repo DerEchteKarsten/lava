@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ash::vk;
 
-use crate::state::Ctx;
+use crate::{command_buffer::CommandBuffer, state::{Ctx, STATE}};
 
 #[derive(Debug)]
 pub struct Queue {
@@ -30,7 +30,7 @@ impl Queue {
         })
     }
 
-    pub fn execute_command_wait<R, F: FnOnce(&vk::CommandBuffer) -> R>(
+    pub fn execute_command_wait<R, F: FnOnce(&mut CommandBuffer) -> R>(
         &self,
         executor: F,
     ) -> Result<R> {
@@ -47,7 +47,13 @@ impl Queue {
 
             Ctx::device().begin_command_buffer(command_buffer, &begin_info)?;
 
-            let executor_result = executor(&command_buffer);
+            let mut resource_hashes = STATE.get().unwrap().resource_cache.lock().unwrap();
+
+            let mut cmd_buffer = CommandBuffer {
+                handle: command_buffer,
+                resource_hashes: &mut resource_hashes
+            };
+            let executor_result = executor(&mut cmd_buffer);
 
             Ctx::device().end_command_buffer(command_buffer)?;
 

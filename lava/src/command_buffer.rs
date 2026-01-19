@@ -1,7 +1,7 @@
 use std::{any, cell::{LazyCell, OnceCell}, collections::HashMap, ffi::CStr, fmt::Debug, marker::PhantomData, ops::{Index, IndexMut}, sync::{Mutex, OnceLock}};
 
 use anyhow::Result;
-use ash::vk::{self, IndexType, PipelineStageFlags2, ShaderStageFlags};
+use ash::vk::{self, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
 use bytemuck::{Pod, Zeroable, bytes_of};
 
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     state::{Ctx, Functions},
     vkobjects::{
         buffer::{Buffer, CpuBuffer, GpuBuffer, Location, StorageBuffer},
-        image::Image, rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
+        image::{Image, ImageType}, rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
     },
 };
 
@@ -212,17 +212,17 @@ fn create_raster_pipeline(stages: &[vk::PipelineShaderStageCreateInfo<'_>], hash
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
                 .alpha_blend_op(vk::BlendOp::ADD)
                 .color_blend_op(vk::BlendOp::ADD)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
         })
         .collect::<Vec<_>>();
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
         .attachments(color_blend_attachments.as_slice())
         .logic_op_enable(false)
         .logic_op(vk::LogicOp::COPY)
-        .blend_constants([0.0, 0.0, 0.0, 0.0]);
+        .blend_constants([1.0, 1.0, 1.0, 1.0]);
 
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
         .scissor_count(1)
@@ -353,6 +353,7 @@ pub enum RasterVertexDispatch {
         instance_count: u32,
     },
     DrawIndexed {
+        index_offset: u32,
         triangle_count: u32,
         instance_count: u32,
     },
@@ -388,8 +389,9 @@ impl RasterVertexDispatch {
             instance_count,
         }
     }
-    pub fn indexed(triangle_count: u32, instance_count: u32) -> Self {
+    pub fn indexed(triangle_count: u32, instance_count: u32, index_offset: u32) -> Self {
         Self::DrawIndexed {
+            index_offset,
             triangle_count,
             instance_count,
         }
@@ -459,7 +461,7 @@ impl<'a, 'b, 'c, S: RasterVertexShaderPass> RasterBuilder<'a,'b,'c,S> {
         ));
         self
     }
-    pub fn draw(mut self, dispatch: RasterVertexDispatch, width: u32, height: u32) {
+    pub fn draw(mut self, dispatch: RasterVertexDispatch, width: u32, height: u32, scissors: &[vk::Rect2D]) {
         self.hash.color_formats = self.color_attachments
         .iter()
             .map(|e| e.0.format)
@@ -469,16 +471,22 @@ impl<'a, 'b, 'c, S: RasterVertexShaderPass> RasterBuilder<'a,'b,'c,S> {
             .and_then(|d| Some(d.format))
             .unwrap_or(vk::Format::UNDEFINED);
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, Some(dispatch), width, height, [0,0,0]);
+        self.draw_private(pipeline, Some(dispatch), width, height, [0,0,0], scissors);
     }
     pub fn draw_fullscreen(self, dispatch: RasterVertexDispatch) {
-        self.draw(dispatch, Ctx::window_width().unwrap(), Ctx::window_height().unwrap());
+        self.draw(dispatch, Ctx::window_width(), Ctx::window_height(), &[vk::Rect2D {
+            extent: vk::Extent2D {
+                width: Ctx::window_width(),
+                height: Ctx::window_height(),
+            },
+            offset: vk::Offset2D { x: 0, y: 0 },
+        }]);
     }
 }
 
 
 impl<'a, 'b, 'c, S: RasterMeshShaderPass> RasterBuilder<'a,'b,'c,S> {
-    pub fn launch(mut self, x: u32, y: u32, z: u32, width: u32, height: u32) {
+    pub fn launch(mut self, x: u32, y: u32, z: u32, width: u32, height: u32, scissors: &[vk::Rect2D]) {
         self.hash.color_formats = self.color_attachments
             .iter()
             .map(|e| e.0.format)
@@ -488,10 +496,16 @@ impl<'a, 'b, 'c, S: RasterMeshShaderPass> RasterBuilder<'a,'b,'c,S> {
             .and_then(|d| Some(d.format))
             .unwrap_or(vk::Format::UNDEFINED);
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, None, width, height, [x,y,z]);
+        self.draw_private(pipeline, None, width, height, [x,y,z], scissors);
     }
     pub fn launch_fullscrean(self, x: u32, y: u32, z: u32) {
-        self.launch(x,y,z, Ctx::window_width().unwrap(), Ctx::window_height().unwrap());
+        self.launch(x,y,z, Ctx::window_width(), Ctx::window_height(), &[vk::Rect2D {
+            extent: vk::Extent2D {
+                width: Ctx::window_width(),
+                height: Ctx::window_height(),
+            },
+            offset: vk::Offset2D { x: 0, y: 0 },
+        }]);
     }
 }
 
@@ -539,7 +553,7 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         self
     }
 
-    fn draw_private(mut self, pipeline: vk::Pipeline, dispatch: Option<RasterVertexDispatch>, width: u32, height: u32, launch: [u32; 3]) {
+    fn draw_private(mut self, pipeline: vk::Pipeline, dispatch: Option<RasterVertexDispatch>, width: u32, height: u32, launch: [u32; 3], scissors: &[vk::Rect2D]) {
         let buffers = if let Some(dispatch) = &dispatch {
         match dispatch {
             RasterVertexDispatch::DrawIndexedIndirect {
@@ -646,8 +660,8 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
                 &[vk::Viewport {
                     x: 0.0,
                     y: 0.0,
-                    width: Ctx::window_width().unwrap_or(0) as f32,
-                    height: Ctx::window_height().unwrap_or(0) as f32,
+                    width: width as f32,
+                    height: height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -655,13 +669,7 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
             Ctx::device().cmd_set_scissor(
                 self.cmd_buf.handle,
                 0,
-                &[vk::Rect2D {
-                    extent: vk::Extent2D {
-                        width: Ctx::window_width().unwrap_or(0),
-                        height: Ctx::window_height().unwrap_or(0),
-                    },
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                }],
+                scissors,
             );
             if let Some(dispatch) = dispatch {
                 if let Some(index_buffer) = self.index_buffer {
@@ -675,11 +683,12 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
                     RasterVertexDispatch::DrawIndexed {
                         triangle_count,
                         instance_count,
+                        index_offset,
                     } => Ctx::device().cmd_draw_indexed(
                         self.cmd_buf.handle,
                         triangle_count * 3,
                         instance_count,
-                        0,
+                        index_offset,
                         0,
                         0,
                     ),
@@ -799,8 +808,8 @@ impl<'a, 'b, 'c, S: ComputePass> ComputeBuilder<'a, 'b, 'c, S> {
     pub fn dispatch_fullscreen(self) {
         self.build(
             [
-                Ctx::window_width().unwrap().div_ceil(8),
-                Ctx::window_height().unwrap().div_ceil(8),
+                Ctx::window_width().div_ceil(8),
+                Ctx::window_height().div_ceil(8),
                 1,
             ],
             None,
@@ -809,8 +818,8 @@ impl<'a, 'b, 'c, S: ComputePass> ComputeBuilder<'a, 'b, 'c, S> {
     pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
         self.build(
             [
-                Ctx::window_width().unwrap().div_ceil(x),
-                Ctx::window_height().unwrap().div_ceil(y),
+                Ctx::window_width().div_ceil(x),
+                Ctx::window_height().div_ceil(y),
                 1,
             ],
             None,
@@ -859,12 +868,12 @@ impl<'a, 'b, 'c, S: RayTracingPass> RayTracingBuilder<'a, 'b, 'c, S> {
         self.build([x, y]);
     }
     pub fn dispatch_fullscreen(self) {
-        self.build([Ctx::window_width().unwrap(), Ctx::window_height().unwrap()]);
+        self.build([Ctx::window_width(), Ctx::window_height()]);
     }
     pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
         self.build([
-            Ctx::window_width().unwrap().div_ceil(x),
-            Ctx::window_height().unwrap().div_ceil(y),
+            Ctx::window_width().div_ceil(x),
+            Ctx::window_height().div_ceil(y),
         ]);
     }
 }
@@ -919,6 +928,66 @@ impl<'b> CommandBuffer<'b> {
             )
         };
     }
+
+    pub fn blit_image(
+        &mut self,
+        src: &Image,
+        dst: &Image,
+    ) {
+        self.barriers(vec![
+            (
+                ResourceHandle::Image((src.view, src.handle)),
+                ResourceState {
+                    access: vk::AccessFlags2::TRANSFER_READ,
+                    stages: vk::PipelineStageFlags2::TRANSFER,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                },
+            ),
+            (
+                ResourceHandle::Image((dst.view, dst.handle)),
+                ResourceState {
+                    access: vk::AccessFlags2::TRANSFER_WRITE,
+                    stages: vk::PipelineStageFlags2::TRANSFER,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                },
+            ),
+        ]);
+        let src_size = src.size.size();
+        let dst_size = dst.size.size();
+        let regions = [
+            vk::ImageBlit {
+                src_offsets: [vk::Offset3D::default(), vk::Offset3D {
+                    x: src_size.x as i32,
+                    y: src_size.y as i32,
+                    z: 1,
+                }],
+                dst_offsets: [vk::Offset3D::default(), vk::Offset3D {
+                    x: src_size.x as i32,
+                    y: src_size.y as i32,
+                    z: 1,
+                }],
+                src_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                    mip_level: 0,
+                },
+                dst_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                    mip_level: 0,
+                },
+            }
+        ];
+        unsafe {
+            Ctx::device().cmd_blit_image(self.handle, src.handle, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst.handle, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &regions, vk::Filter::LINEAR);
+        }
+    }
+
+
     pub fn copy_buffer<T: Copy + Pod, L: Location, B: Location>(
         &mut self,
         src: &Buffer<T, L>,
@@ -956,6 +1025,52 @@ impl<'b> CommandBuffer<'b> {
                     dst_offset: dst_offset as u64,
                     size: num_bytes as u64,
                 }],
+            )
+        };
+    }
+
+    pub fn copy_buffer_to_image<T: Copy + Pod, L: Location>(
+        &mut self,
+        src: &Buffer<T, L>,
+        dst: &Image,
+    ) {
+        self.barriers(vec![
+            (
+                ResourceHandle::Buffer(src.handle),
+                ResourceState {
+                    access: vk::AccessFlags2::TRANSFER_READ,
+                    stages: vk::PipelineStageFlags2::TRANSFER,
+                    ..Default::default()
+                },
+            ),
+            (
+                ResourceHandle::Image((dst.view, dst.handle)),
+                ResourceState {
+                    access: vk::AccessFlags2::TRANSFER_WRITE,
+                    stages: vk::PipelineStageFlags2::TRANSFER,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                },
+            ),
+        ]);
+        let size = dst.size.size();
+        let regions = [
+            vk::BufferImageCopy {
+                image_extent: ash::vk::Extent3D { width: size.x, height: size.y, depth: 1 },
+                image_subresource: ash::vk::ImageSubresourceLayers { aspect_mask: ash::vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                buffer_image_height: 0,
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                image_offset: Offset3D {x: 0, y: 0, z: 0}
+            }
+        ];
+        unsafe {
+            Ctx::device().cmd_copy_buffer_to_image(
+                self.handle,
+                src.handle,
+                dst.handle,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions
             )
         };
     }
@@ -1031,6 +1146,18 @@ impl<'b> CommandBuffer<'b> {
         unsafe { Ctx::device().cmd_push_constants(self.handle, Bindless::layout(), vk::ShaderStageFlags::ALL, 0, constants) };
     }
 
+    pub fn transition_layout(&mut self, image: &Image, layout: vk::ImageLayout) {
+        self.barriers(vec![(
+            ResourceHandle::Image((image.view, image.handle)),
+            ResourceState {
+                access: vk::AccessFlags2::empty(),
+                aspect: vk::ImageAspectFlags::COLOR,
+                layout,
+                stages: vk::PipelineStageFlags2::TOP_OF_PIPE,
+            })
+        ]);
+    }
+
     fn barriers(&mut self, resources: Vec<(ResourceHandle, ResourceState)>) {
         let mut image_barriers = Vec::new();
         let mut buffer_barriers = Vec::new();
@@ -1060,7 +1187,6 @@ impl<'b> CommandBuffer<'b> {
             if need_barrier {
                 let src_stage_mask = prev.stages;
                 let dst_stage_mask = new.stages;
-
                 match resource {
                     ResourceHandle::Buffer(buffer) => {
                         buffer_barriers.push(vk::BufferMemoryBarrier2 {

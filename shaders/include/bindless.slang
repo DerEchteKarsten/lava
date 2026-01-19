@@ -15,6 +15,11 @@ __generic<E : ITexelElement, Shape : __ITextureShape, int isArray, int isMS, int
 public struct Image<T : IImageDescriptor & __IDynamicResourceCastable> {
     uint32_t DescriptorSet;
     uint32_t DescriptorIndex;
+    __init(uint32_t DescriptorSet, uint32_t DescriptorIndex)
+    {
+        DescriptorSet = DescriptorSet;
+        DescriptorIndex = DescriptorIndex;
+    }
 
     public property bool IsNull { get { return DescriptorIndex == ~0; } }
 }

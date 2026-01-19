@@ -221,18 +221,7 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
         }
         Ctx::transfer_queue()
             .execute_command_wait(|cmd| {
-                unsafe {
-                    Ctx::device().cmd_copy_buffer(
-                        *cmd,
-                        src_buffer.handle,
-                        self.handle,
-                        &[vk::BufferCopy {
-                            src_offset: 0,
-                            size: num_bytes,
-                            dst_offset: offset,
-                        }],
-                    )
-                };
+                cmd.copy_buffer(src_buffer, self, num_bytes as usize / size_of::<T>(), 0, offset as u32);
             })
             .unwrap();
     }
@@ -298,7 +287,7 @@ impl<T: Copy + Pod, L: Location + 'static> StorageBuffer<T, L> {
                 Ctx::transfer_queue().execute_command_wait(|cmd| {
                     unsafe {
                         Ctx::device().cmd_copy_buffer(
-                            *cmd,
+                            cmd.handle,
                             self.buffer.handle,
                             buffer.handle,
                             &[vk::BufferCopy {
@@ -313,7 +302,6 @@ impl<T: Copy + Pod, L: Location + 'static> StorageBuffer<T, L> {
             unsafe { Ctx::device().destroy_buffer(self.buffer.handle, None) };
             self.buffer = buffer;
         }
-        self.size = size;
         Ok(())
     }
 }
@@ -365,6 +353,7 @@ impl<T: Copy + Pod> StorageBuffer<T, GpuBuffer> {
         let size = data.len() * size_of::<T>();
 
         self.assert_size(size as u64 + offset).unwrap();
+        self.size += size as u64;
 
         for i in 0..size.div_ceil(staging_buffer.size as usize) {
             staging_buffer
@@ -395,8 +384,9 @@ impl<T: Copy + Pod> StorageBuffer<T, CpuBuffer> {
         let size = data.len() * size_of::<T>();
 
         self.assert_size(size as u64 + offset).unwrap();
+        self.size += size as u64;
 
-        self.copy_from_slice(data, offset as usize / size_of::<T>()).unwrap();
+        self.copy_from_slice(data, offset as usize).unwrap();
     }
 }
 

@@ -42,7 +42,8 @@ pub struct Ctx {
     features: Features,
     device: Device,
     physical_device: PhysicalDevice,
-    present: Option<Present>,
+    present: Present,
+    pub(crate) resource_cache: Mutex<HashMap<ResourceHandle, ResourceState>>,
     queue: Queue,
     transfer_queue: Option<Queue>,
     present_queue: Option<Queue>,
@@ -70,7 +71,6 @@ impl Debug for Ctx {
 
 #[derive(Debug)]
 pub struct Present {
-    resource_cache: Mutex<HashMap<ResourceHandle, ResourceState>>,
     frame_counter: AtomicU64,
     surface: Surface,
     swapchain: Mutex<Swapchain>,
@@ -86,8 +86,6 @@ impl Ctx {
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .as_ref()
-            .unwrap()
             .swpachain_needs_resizing
             .lock()
             .unwrap()) = Some((width, height));
@@ -136,41 +134,37 @@ impl Ctx {
             .lock()
             .unwrap()
     }
-    pub fn surface() -> Option<&'static Surface> {
-        STATE
+    pub fn surface() -> &'static Surface{
+        &STATE
             .get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .as_ref()
-            .map(|p| &p.surface)
+            .surface
     }
-    pub fn swapchain<'a>() -> Option<MutexGuard<'a, Swapchain>> {
+    pub fn swapchain<'a>() -> MutexGuard<'a, Swapchain> {
         STATE
             .get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .as_ref()
-            .map(|p| p.swapchain.lock().unwrap())
+            .swapchain.lock().unwrap()
     }
-    pub fn window_width() -> Option<u32> {
+    pub fn window_width() -> u32 {
         STATE
             .get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .as_ref()
-            .map(|p| p.swapchain.lock().unwrap().size[0])
+            .swapchain.lock().unwrap().size[0]
     }
-    pub fn window_height() -> Option<u32> {
+    pub fn window_height() -> u32 {
         STATE
             .get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .as_ref()
-            .map(|p| p.swapchain.lock().unwrap().size[1])
+            .swapchain.lock().unwrap().size[1]
     }
 
     pub fn features() -> Features {
@@ -188,21 +182,17 @@ impl Ctx {
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .as_ref()
-            .map(|p| p.frame_counter.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0)
+            .frame_counter.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn next_frame<'a, F: FnMut(&mut CommandBuffer, Image) -> Result<()>>(
         func: &mut F,
     ) -> Result<()> {
-        let s = STATE
+        let ctx = STATE
             .get()
-            .unwrap()
-            .present
-            .as_ref()
-            .ok_or(anyhow!("No Present Context"))
             .unwrap();
+
+        let s = &ctx.present;
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
         let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
@@ -213,20 +203,22 @@ impl Ctx {
         }
 
         let (image_index, _suboptimal) = unsafe {
-            Functions::swapchain().unwrap().acquire_next_image(
+            Functions::swapchain().acquire_next_image(
                 s.swapchain.lock().unwrap().handle,
                 u64::MAX,
                 f.image_available,
                 vk::Fence::null(),
             )
         }?;
+{}
+        let mut resource_cache = ctx.resource_cache.lock().unwrap();
 
         let mut cmd = CommandBuffer {
             handle: f.cmd,
-            resource_hashes: &mut s.resource_cache.lock().unwrap(),
+            resource_hashes: &mut resource_cache,
         };
         
-        let img = Ctx::swapchain().unwrap().images[image_index as usize].clone();
+        let img = Ctx::swapchain().images[image_index as usize].clone();
         cmd.begin();
         let result = func(&mut cmd, img);
         cmd.end();
@@ -291,10 +283,9 @@ impl Ctx {
             .wait_semaphores(&wait_sems)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        Ctx::swapchain().unwrap().resized = false;
+        Ctx::swapchain().resized = false;
         match unsafe {
             Functions::swapchain()
-                .unwrap()
                 .queue_present(Ctx::present_queue().handle, &present)
         } {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -309,14 +300,14 @@ impl Ctx {
             let size = if let Some(size) = *s.swpachain_needs_resizing.lock().unwrap() {
                 [size.0, size.1]
             } else {
-                Ctx::swapchain().unwrap().size
+                Ctx::swapchain().size
             };
             let mut swapchain = Swapchain::new(
-                Ctx::surface().unwrap(),
+                Ctx::surface(),
                 Ctx::device(),
                 Ctx::queue().family_index,
                 Ctx::present_queue().family_index,
-                Functions::swapchain().unwrap(),
+                Functions::swapchain(),
                 Functions::debug_utils(),
                 Some(s.swapchain.lock().unwrap().handle),
                 Some(size),
@@ -327,8 +318,7 @@ impl Ctx {
             unsafe {
                 Ctx::device().device_wait_idle().unwrap();
                 Functions::swapchain()
-                    .unwrap()
-                    .destroy_swapchain(Ctx::swapchain().unwrap().handle, None);
+                    .destroy_swapchain(Ctx::swapchain().handle, None);
             };
 
             for (i, image) in swapchain.images.iter_mut().enumerate() {
@@ -348,7 +338,7 @@ impl Ctx {
     }
 
     pub(super) fn init<T: HasWindowHandle + HasDisplayHandle>(
-        window: Option<&T>,
+        window: &T,
         enable_validation: bool,
         enable_gpu_assited_validation: bool,
     ) -> Result<()> {
@@ -368,16 +358,13 @@ impl Ctx {
             .map(|raw_name| raw_name.as_ptr())
             .collect();
 
-        let mut instance_extensions = if let Some(window) = window {
+        let mut instance_extensions = 
             ash_window::enumerate_required_extensions(window.display_handle().unwrap().into())
                 .unwrap()
-                .to_vec()
-        } else {
-            vec![]
-        };
+                .to_vec();
 
         let mut features = Features::default();
-        features.present = window.is_some();
+        features.present = true;
         #[cfg(debug_assertions)]
         {
             features.debug_utils = enable_validation;
@@ -434,8 +421,7 @@ impl Ctx {
             };
         }
 
-        let surface = if let Some(window) = window {
-            Some(
+        let surface = 
                 unsafe {
                     ash_window::create_surface(
                         &entry,
@@ -445,20 +431,12 @@ impl Ctx {
                         None,
                     )
                 }
-                .unwrap(),
-            )
-        } else {
-            None
-        };
+                .unwrap();
 
-        let surface_fn = if window.is_some() {
-            Some(ash::khr::surface::Instance::new(&entry, &instance))
-        } else {
-            None
-        };
+        let surface_fn = Some(ash::khr::surface::Instance::new(&entry, &instance));
 
         let physical_devices = PhysicalDevice::enumerate_physical_devices(
-            surface.as_ref(),
+            &surface,
             &instance,
             surface_fn.as_ref(),
         )?;
@@ -533,29 +511,22 @@ impl Ctx {
             }
         }
 
-        let surface = if let Some(surface) = surface {
+        let surface = 
             Some(Surface::new(
                 surface,
                 &physical_device,
                 &surface_fn.as_ref().unwrap(),
-            ))
-        } else {
-            None
-        };
+            ));
+
         let mut info = vk::SemaphoreTypeCreateInfo {
             semaphore_type: vk::SemaphoreType::TIMELINE,
             initial_value: 0,
             ..Default::default()
         };
-        let swapchain_fn = if window.is_some() {
-            Some(ash::khr::swapchain::Device::new(&instance, &device))
-        } else {
-            None
-        };
+        let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
 
-        let present = if window.is_some() {
-            Some(Present {
-                resource_cache: Mutex::new(HashMap::new()),
+        let present = 
+            Present {
                 swpachain_needs_resizing: Mutex::new(None),
                 swapchain: Mutex::new(Swapchain::new(
                     &surface.as_ref().unwrap(),
@@ -565,7 +536,7 @@ impl Ctx {
                         .as_ref()
                         .map(|e| e.index)
                         .unwrap_or(graphics_queue_family.index),
-                    &swapchain_fn.as_ref().unwrap(),
+                    &swapchain_fn,
                     debug_utils.as_ref(),
                     None,
                     None,
@@ -579,10 +550,7 @@ impl Ctx {
                 },
                 surface: surface.unwrap(),
                 frames,
-            })
-        } else {
-            None
-        };
+            };
 
         let ctx = Self {
             allocator: Mutex::new(allocator),
@@ -603,6 +571,7 @@ impl Ctx {
             features: features.clone(),
             #[cfg(debug_assertions)]
             printf: Mutex::new(HashMap::new()),
+            resource_cache: Mutex::new(HashMap::new()),
         };
         STATE.set(ctx).unwrap();
         FUNCTIONS
@@ -755,6 +724,7 @@ impl Features {
             .synchronization2(true);
         let phfeatures = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
+            .fill_mode_non_solid(true)
             .fragment_stores_and_atomics(true)
             .shader_int16(true)
             .vertex_pipeline_stores_and_atomics(true);
@@ -793,8 +763,8 @@ impl Features {
 pub struct Functions {
     instance: ash::Instance,
     entry: ash::Entry,
+    swapchain: ash::khr::swapchain::Device,
     surface: Option<ash::khr::surface::Instance>,
-    swapchain: Option<ash::khr::swapchain::Device>,
     debug_utils: Option<ash::ext::debug_utils::Instance>,
     device_debug_utils: Option<ash::ext::debug_utils::Device>,
     mesh: Option<ash::ext::mesh_shader::Device>,
@@ -820,8 +790,8 @@ impl Functions {
     pub fn entry() -> &'static ash::Entry {
         &get().entry
     }
-    pub fn swapchain() -> Option<&'static ash::khr::swapchain::Device> {
-        get().swapchain.as_ref()
+    pub fn swapchain() -> &'static ash::khr::swapchain::Device {
+        &get().swapchain
     }
     pub fn debug_utils() -> Option<&'static ash::ext::debug_utils::Device> {
         get().device_debug_utils.as_ref()

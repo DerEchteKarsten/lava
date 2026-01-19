@@ -25,11 +25,11 @@ impl ImageSize {
     pub fn size(self) -> UVec2 {
         match self {
             Self::FullScreen => {
-                UVec2::new(Ctx::window_width().unwrap(), Ctx::window_height().unwrap())
+                UVec2::new(Ctx::window_width(), Ctx::window_height())
             }
             Self::FractionalFullScreen(dx, dy) => UVec2::new(
-                (Ctx::window_width().unwrap()).div_ceil(dx),
-                (Ctx::window_height().unwrap()).div_ceil(dy),
+                (Ctx::window_width()).div_ceil(dx),
+                (Ctx::window_height()).div_ceil(dy),
             ),
             Self::XY(x, y) => UVec2::new(x, y),
         }
