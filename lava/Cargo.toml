@@ -15,4 +15,5 @@ gpu-allocator = { version = "0.27", default-features = false, features = ["vulka
 json = "0.12.4"
 log = "0.4.28"
 presser = "0.3.1"
+tracy-client = {version = "0.18.4", features = ["enable"]}
 winit = "0.30.12"

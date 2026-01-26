@@ -65,14 +65,14 @@ impl BufferUsageFlags {
 pub struct Buffer<T: Copy + Pod, L: Location = GpuBuffer> {
     pub handle: vk::Buffer,
     pub address: u64,
-    pub(crate) size: u64,
+    pub size: u64,
     pub(crate) allocation: Arc<Mutex<MAllocation>>,
     _location_marker: PhantomData<L>,
     _type_marker: PhantomData<T>,
 }
 
 pub struct StorageBuffer<T: Copy + Pod, L: Location = GpuBuffer> {
-    pub(crate) buffer: Buffer<T, L>,
+    pub buffer: Buffer<T, L>,
     size: u64,
     usage: vk::BufferUsageFlags,
     alignment: Option<u32>,

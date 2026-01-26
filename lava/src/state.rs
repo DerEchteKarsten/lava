@@ -48,7 +48,6 @@ pub struct Ctx {
     transfer_queue: Option<Queue>,
     present_queue: Option<Queue>,
     allocator: Mutex<Allocator>,
-    #[cfg(debug_assertions)]
     printf: Mutex<HashMap<String, usize>>,
 }
 
@@ -185,9 +184,10 @@ impl Ctx {
             .frame_counter.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn next_frame<'a, F: FnMut(&mut CommandBuffer, Image) -> Result<()>>(
-        func: &mut F,
-    ) -> Result<()> {
+
+    pub fn start_frame() {
+        tracy_client::frame_mark();
+        let _span = tracy_client::span!("StartFrame");
         let ctx = STATE
             .get()
             .unwrap();
@@ -197,20 +197,35 @@ impl Ctx {
         let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
         unsafe {
-            Ctx::device().wait_for_fences(&[f.fence], true, u64::MAX)?;
-            Ctx::device().reset_fences(&[f.fence])?;
-            Ctx::device().reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())?;
+            let _span = tracy_client::span!("Wait for Fences");
+            Ctx::device().wait_for_fences(&[f.fence], true, u64::MAX).unwrap();
+            Ctx::device().reset_fences(&[f.fence]).unwrap();
+            Ctx::device().reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty()).unwrap();
         }
+    }
 
+    pub fn record_frame<'a, F: FnMut(&mut CommandBuffer, Image) -> Result<()>>(
+        func: &mut F,
+    ) -> Result<()> {
+        let _span = tracy_client::span!("Next Frame");
+        let ctx = STATE
+            .get()
+            .unwrap();
+
+        let s = &ctx.present;
+        let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
+        let f = &s.frames[frame_in_flight as usize];
         let (image_index, _suboptimal) = unsafe {
+            let _span = tracy_client::span!("Acquire next Image");
             Functions::swapchain().acquire_next_image(
                 s.swapchain.lock().unwrap().handle,
                 u64::MAX,
                 f.image_available,
                 vk::Fence::null(),
             )
-        }?;
-{}
+        }.unwrap();
+
         let mut resource_cache = ctx.resource_cache.lock().unwrap();
 
         let mut cmd = CommandBuffer {
@@ -223,9 +238,8 @@ impl Ctx {
         let result = func(&mut cmd, img);
         cmd.end();
 
-        s.frame_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let frame = s.frame_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let waits = [vk::SemaphoreSubmitInfo {
             semaphore: f.image_available,
             stage_mask: vk::PipelineStageFlags2::TOP_OF_PIPE,
@@ -254,6 +268,7 @@ impl Ctx {
             .signal_semaphore_infos(&signals);
 
         unsafe {
+            let _span = tracy_client::span!("Queue Submit");
             Ctx::device().queue_submit2(
                 Ctx::queue().handle,
                 std::slice::from_ref(&submit),
@@ -285,6 +300,7 @@ impl Ctx {
             .image_indices(&indices);
         Ctx::swapchain().resized = false;
         match unsafe {
+            let _span = tracy_client::span!("Present");
             Functions::swapchain()
                 .queue_present(Ctx::present_queue().handle, &present)
         } {
@@ -296,6 +312,7 @@ impl Ctx {
         }
 
         if needs_recreation {
+            let _span = tracy_client::span!("Swapchain Recreation");
             log::info!("resized swapchain");
             let size = if let Some(size) = *s.swpachain_needs_resizing.lock().unwrap() {
                 [size.0, size.1]
@@ -569,7 +586,6 @@ impl Ctx {
             device,
             present,
             features: features.clone(),
-            #[cfg(debug_assertions)]
             printf: Mutex::new(HashMap::new()),
             resource_cache: Mutex::new(HashMap::new()),
         };

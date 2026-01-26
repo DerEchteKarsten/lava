@@ -13,7 +13,7 @@ pub mod command_buffer;
 pub mod state;
 pub mod vkobjects;
 
-pub const FRAMES_IN_FLIGHT: usize = 3;
+pub const FRAMES_IN_FLIGHT: usize = 2;
 
 pub fn init<T: HasDisplayHandle + HasWindowHandle>(
     window: &T,
