@@ -29,6 +29,22 @@ use crate::{
     },
 };
 
+#[cfg(feature = "trace")]
+#[macro_export]
+macro_rules! tracy_span {
+    ($name:expr) => {
+        tracy_client::span!($name)
+    };
+}
+
+#[cfg(not(feature = "trace"))]
+#[macro_export]
+macro_rules! tracy_span {
+    ($name:expr) => {
+        ()
+    };
+}
+
 #[derive(Debug)]
 pub struct Frame {
     fence: vk::Fence,               // fence-per-frame for CPU recycling
@@ -186,8 +202,7 @@ impl Ctx {
 
 
     pub fn start_frame() {
-        tracy_client::frame_mark();
-        let _span = tracy_client::span!("StartFrame");
+        tracy_span!("StartFrame");
         let ctx = STATE
             .get()
             .unwrap();
@@ -197,7 +212,7 @@ impl Ctx {
         let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
         unsafe {
-            let _span = tracy_client::span!("Wait for Fences");
+            tracy_span!("Wait for Fences");
             Ctx::device().wait_for_fences(&[f.fence], true, u64::MAX).unwrap();
             Ctx::device().reset_fences(&[f.fence]).unwrap();
             Ctx::device().reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty()).unwrap();
@@ -207,7 +222,7 @@ impl Ctx {
     pub fn record_frame<'a, F: FnMut(&mut CommandBuffer, Image) -> Result<()>>(
         func: &mut F,
     ) -> Result<()> {
-        let _span = tracy_client::span!("Next Frame");
+        tracy_span!("Next Frame");
         let ctx = STATE
             .get()
             .unwrap();
@@ -217,7 +232,7 @@ impl Ctx {
         let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
         let (image_index, _suboptimal) = unsafe {
-            let _span = tracy_client::span!("Acquire next Image");
+            tracy_span!("Acquire next Image");
             Functions::swapchain().acquire_next_image(
                 s.swapchain.lock().unwrap().handle,
                 u64::MAX,
@@ -268,7 +283,7 @@ impl Ctx {
             .signal_semaphore_infos(&signals);
 
         unsafe {
-            let _span = tracy_client::span!("Queue Submit");
+            tracy_span!("Queue Submit");
             Ctx::device().queue_submit2(
                 Ctx::queue().handle,
                 std::slice::from_ref(&submit),
@@ -300,7 +315,7 @@ impl Ctx {
             .image_indices(&indices);
         Ctx::swapchain().resized = false;
         match unsafe {
-            let _span = tracy_client::span!("Present");
+            tracy_span!("Present");
             Functions::swapchain()
                 .queue_present(Ctx::present_queue().handle, &present)
         } {
@@ -312,7 +327,7 @@ impl Ctx {
         }
 
         if needs_recreation {
-            let _span = tracy_client::span!("Swapchain Recreation");
+            tracy_span!("Swapchain Recreation");
             log::info!("resized swapchain");
             let size = if let Some(size) = *s.swpachain_needs_resizing.lock().unwrap() {
                 [size.0, size.1]

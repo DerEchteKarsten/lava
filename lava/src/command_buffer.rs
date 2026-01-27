@@ -5,12 +5,10 @@ use ash::vk::{self, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
 use bytemuck::{Pod, Zeroable, bytes_of};
 
 use crate::{
-    bindless::Bindless,
-    state::{Ctx, Functions},
-    vkobjects::{
+    bindless::Bindless, state::{Ctx, Functions}, tracy_span, vkobjects::{
         buffer::{Buffer, CpuBuffer, GpuBuffer, Location, StorageBuffer},
         image::{Image, ImageType}, rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
-    },
+    }
 };
 
 pub struct CommandBuffer<'a> {
@@ -55,7 +53,7 @@ pub trait ComputePass {
 
     fn get() -> vk::Pipeline {
         Self::cache().get_or_init(|| {
-            let _span = tracy_client::span!("create compute pipeline");
+            tracy_span!("create compute pipeline");
             let (module, stage) = create_shader_stage(Self::ENTRY, Self::BYTES, vk::ShaderStageFlags::COMPUTE);
             let create_info = vk::ComputePipelineCreateInfo::default()
                 .layout(Bindless::layout())
@@ -83,7 +81,7 @@ pub trait RayTracingPass {
 
     fn get<'a>() -> &'a RaytracingPipeline {
         Self::cache().get_or_init(|| {
-            let _span = tracy_client::span!("create raytracing pipeline");
+            tracy_span!("create raytracing pipeline");
             let module = create_module(Self::BYTES);
             let raygen = make_shader_stage(Self::RAYGEN, vk::ShaderStageFlags::RAYGEN_KHR, module); 
             let hit = make_shader_stage(Self::HIT, vk::ShaderStageFlags::CLOSEST_HIT_KHR, module); 
@@ -179,7 +177,7 @@ pub trait RasterMeshShaderPass: RasterPass {
 
 
 fn create_raster_pipeline(stages: &[vk::PipelineShaderStageCreateInfo<'_>], hash: &RasterHash) -> vk::Pipeline{
-    let _span = tracy_client::span!("create raster pipeline");
+    tracy_span!("create raster pipeline");
 
     let mut create_info = vk::GraphicsPipelineCreateInfo::default();
     let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -558,7 +556,7 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
     }
 
     fn draw_private(mut self, pipeline: vk::Pipeline, dispatch: Option<RasterVertexDispatch>, width: u32, height: u32, launch: [u32; 3], scissors: &[vk::Rect2D]) {
-        let _span = tracy_client::span!("draw");
+        tracy_span!("draw");
         let buffers = if let Some(dispatch) = &dispatch {
         match dispatch {
             RasterVertexDispatch::DrawIndexedIndirect {
@@ -773,7 +771,7 @@ impl<'a, 'b, 'c, S: ComputePass> ComputeBuilder<'a, 'b, 'c, S> {
 
         
     fn build(self, dispatch: [u32; 3], indirect_buffer: Option<(vk::Buffer, u32)>) {
-        let _span = tracy_client::span!("compute");
+        tracy_span!("compute");
         let mut resources = S::GpuBinding::resources(self.binding.as_ref().unwrap(), vk::PipelineStageFlags2::COMPUTE_SHADER);
         if let Some(indirect) = indirect_buffer {
             resources.push((
@@ -891,7 +889,7 @@ impl<'b> CommandBuffer<'b> {
         offset: u32,
         data: u32,
     ) {
-        let _span = tracy_client::span!("fill_buffer");
+        tracy_span!("fill_buffer");
         self.barriers(vec![(
             ResourceHandle::Buffer(buffer.handle),
             ResourceState {
@@ -917,7 +915,7 @@ impl<'b> CommandBuffer<'b> {
         element: usize,
         data: &T,
     ) {
-        let _span = tracy_client::span!("update_buffer_element");
+        tracy_span!("update_buffer_element");
         self.barriers(vec![(
             ResourceHandle::Buffer(buffer.handle),
             ResourceState {
@@ -942,7 +940,7 @@ impl<'b> CommandBuffer<'b> {
         src: &Image,
         dst: &Image,
     ) {
-        let _span = tracy_client::span!("blit_image");
+        tracy_span!("blit_image");
         self.barriers(vec![
             (
                 ResourceHandle::Image((src.view, src.handle)),
@@ -1005,7 +1003,7 @@ impl<'b> CommandBuffer<'b> {
         src_offset: u32,
         dst_offset: u32,
     ) {
-        let _span = tracy_client::span!("copy_buffer");
+        tracy_span!("copy_buffer");
         self.barriers(vec![
             (
                 ResourceHandle::Buffer(src.handle),
@@ -1044,7 +1042,7 @@ impl<'b> CommandBuffer<'b> {
         src: &Buffer<T, L>,
         dst: &Image,
     ) {
-        let _span = tracy_client::span!("copy_buffer_to_image");
+        tracy_span!("copy_buffer_to_image");
         self.barriers(vec![
             (
                 ResourceHandle::Buffer(src.handle),
@@ -1093,7 +1091,7 @@ impl<'b> CommandBuffer<'b> {
         num_elements: usize,
         offset: usize,
     ) -> Vec<T> {
-        let _span = tracy_client::span!("read_buffer");
+        tracy_span!("read_buffer");
         if !cfg!(debug_assertions) {
             log::warn!("Using read_buffer in release can cause performance problems!");
         }
@@ -1141,7 +1139,7 @@ impl<'b> CommandBuffer<'b> {
     }
 
     pub fn present(&mut self, swapchain_image: Image) {
-        let _span = tracy_client::span!("present_barriers");
+        tracy_span!("present_barriers");
         self.barriers(vec![(
             ResourceHandle::Image((swapchain_image.view, swapchain_image.handle)),
             ResourceState {
@@ -1160,7 +1158,7 @@ impl<'b> CommandBuffer<'b> {
     }
 
     pub fn transition_layout(&mut self, image: &Image, layout: vk::ImageLayout) {
-        let _span = tracy_client::span!("transition_layout");
+        tracy_span!("transition_layout");
         self.barriers(vec![(
             ResourceHandle::Image((image.view, image.handle)),
             ResourceState {
@@ -1173,7 +1171,7 @@ impl<'b> CommandBuffer<'b> {
     }
 
     fn barriers(&mut self, resources: Vec<(ResourceHandle, ResourceState)>) {
-        let _span = tracy_client::span!("barriers");
+        tracy_span!("barriers");
         let mut image_barriers = Vec::new();
         let mut buffer_barriers = Vec::new();
         for (resource, new) in resources {

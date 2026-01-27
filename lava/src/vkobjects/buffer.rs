@@ -263,7 +263,7 @@ impl<T: Copy + Pod, L: Location + 'static> StorageBuffer<T, L> {
     }
     pub fn new(usage: BufferUsageFlags) -> Result<Self> {
         Ok(Self {
-            buffer: Buffer::new(usage.clone(), 1024)?,
+            buffer: Buffer::new(usage.clone(), 1024 / size_of::<T>())?,
             size: 0,
             alignment: None,
             usage: usage.to_vk()
