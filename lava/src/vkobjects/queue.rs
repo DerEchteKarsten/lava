@@ -1,3 +1,5 @@
+use std::u64;
+
 use anyhow::Result;
 use ash::vk;
 
@@ -30,10 +32,10 @@ impl Queue {
         })
     }
 
-    pub fn execute_command_wait<R, F: FnOnce(&mut CommandBuffer) -> R>(
+    fn execute_command<R, F: FnOnce(&mut CommandBuffer) -> R>(
         &self,
         executor: F,
-    ) -> Result<R> {
+    ) -> Result<(R, vk::Fence, vk::CommandBuffer)> {
         unsafe {
             let command_buffer = Ctx::device().allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -71,11 +73,49 @@ impl Queue {
                 fence,
             )?;
 
-            Ctx::device().wait_for_fences(&[fence], true, u64::MAX)?;
+            Ok((executor_result, fence, command_buffer))
+        }
+    }
 
+    pub fn execute_command_wait<R, F: FnOnce(&mut CommandBuffer) -> R>(
+        &self,
+        executor: F,
+    ) -> Result<R> {
+        let (res, fence, command_buffer) = self.execute_command(executor)?;
+        unsafe {
+            Ctx::device().wait_for_fences(&[fence], true, u64::MAX);
             Ctx::device().free_command_buffers(self.percistent_command_pool, &[command_buffer]);
+        }
+        Ok(res)
+    }
 
-            Ok(executor_result)
+    pub async fn execute_command_async<R, F: FnOnce(&mut CommandBuffer) -> R>(
+        &self,
+        executor: F,
+    ) -> Result<R> {
+        let (res, fence, command_buffer) = self.execute_command(executor)?;
+        unsafe {
+            FenceFuture {
+                fence
+            }.await;
+            Ctx::device().free_command_buffers(self.percistent_command_pool, &[command_buffer]);
+        }
+        Ok(res)
+    }
+    
+}
+
+struct FenceFuture { 
+    fence: vk::Fence,
+}
+
+impl Future for FenceFuture {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        if unsafe { Ctx::device().get_fence_status(self.fence).unwrap() } {
+            std::task::Poll::Ready(())
+        }else  {
+            std::task::Poll::Pending
         }
     }
 }
