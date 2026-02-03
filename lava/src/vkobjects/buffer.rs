@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::Result;
@@ -66,7 +66,7 @@ pub struct Buffer<T: Copy + Pod, L: Location = GpuBuffer> {
     pub handle: vk::Buffer,
     pub address: u64,
     pub size: u64,
-    pub(crate) allocation: Arc<Mutex<MAllocation>>,
+    pub allocation: Arc<RwLock<MAllocation>>,
     _location_marker: PhantomData<L>,
     _type_marker: PhantomData<T>,
 }
@@ -202,7 +202,7 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
             _location_marker: PhantomData,
             _type_marker: PhantomData,
             address,
-            allocation: Arc::new(Mutex::new(MAllocation(allocation))),
+            allocation: Arc::new(RwLock::new(MAllocation(allocation))),
             handle: buffer,
             size: num_bytes as u64,
         })
@@ -227,6 +227,12 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
     }
     pub fn capacity(&self) -> usize {
         (self.size / size_of::<T>() as u64) as usize
+    }
+
+    pub fn cast_owned<B: Copy + Pod>(self) -> Buffer<B, L> {
+        unsafe {
+            std::mem::transmute(self)
+        }
     }
 
     pub fn cast<B: Copy + Pod>(&self) -> &Buffer<B, L> {
@@ -321,7 +327,7 @@ impl<T: Copy + Pod> Buffer<T, GpuBuffer> {
 impl<T: Copy + Pod> Buffer<T, CpuBuffer> {
     pub fn read_len(&self, num_elements: usize) -> Vec<T> {
         let allocation = &self.allocation;
-        let mut alloc = allocation.lock().unwrap();
+        let mut alloc = allocation.write().unwrap();
         let alloc = &mut alloc.0;
         unsafe {
             let ptr = alloc.mapped_ptr().unwrap().as_ptr();
@@ -337,7 +343,7 @@ impl<T: Copy + Pod> Buffer<T, CpuBuffer> {
     }
     pub fn copy_from_slice<B: Copy>(&mut self, slice: &[B], offset: usize) -> Result<()> {
         let allocation = &self.allocation;
-        let mut alloc = allocation.lock().unwrap();
+        let mut alloc = allocation.write().unwrap();
         let alloc = &mut alloc.0;
         presser::copy_from_slice_to_offset(slice, alloc, offset).unwrap();
         Ok(())

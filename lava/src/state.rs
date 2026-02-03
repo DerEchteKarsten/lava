@@ -17,7 +17,7 @@ use gpu_allocator::{
     vulkan::{Allocator, AllocatorCreateDesc},
 };
 use std::ffi::CStr;
-use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use winit::raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle};
 
 use crate::{
     FRAMES_IN_FLIGHT,
@@ -83,6 +83,7 @@ impl Debug for Ctx {
         )
     }
 }
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 #[derive(Debug)]
 pub struct Present {
@@ -369,8 +370,9 @@ impl Ctx {
         result
     }
 
-    pub(super) fn init<T: HasWindowHandle + HasDisplayHandle>(
-        window: &T,
+    pub(super) fn init(
+        display: &RawDisplayHandle,
+        window: &RawWindowHandle,
         enable_validation: bool,
         enable_gpu_assited_validation: bool,
     ) -> Result<()> {
@@ -391,7 +393,7 @@ impl Ctx {
             .collect();
 
         let mut instance_extensions = 
-            ash_window::enumerate_required_extensions(window.display_handle().unwrap().into())
+            ash_window::enumerate_required_extensions(*display)
                 .unwrap()
                 .to_vec();
 
@@ -458,8 +460,8 @@ impl Ctx {
                     ash_window::create_surface(
                         &entry,
                         &instance,
-                        window.display_handle().unwrap().into(),
-                        window.window_handle().unwrap().into(),
+                        *display,
+                        *window,
                         None,
                     )
                 }
