@@ -1,12 +1,12 @@
 use std::{any, cell::{LazyCell, OnceCell}, collections::HashMap, ffi::CStr, fmt::Debug, marker::PhantomData, ops::{Index, IndexMut}, sync::{Mutex, OnceLock}};
 
 use anyhow::Result;
-use ash::vk::{self, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
+use ash::vk::{self, BufferCopy, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
 use bytemuck::{Pod, Zeroable, bytes_of};
 
 use crate::{
     bindless::Bindless, state::{Ctx, Functions}, tracy_span, vkobjects::{
-        buffer::{Buffer, CpuBuffer, GpuBuffer, Location, StorageBuffer},
+        buffer::{Buffer, BufferSlice, CpuBuffer, GpuBuffer, Location, StorageBuffer},
         image::{Image, ImageType}, rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
     }
 };
@@ -997,11 +997,23 @@ impl<'b> CommandBuffer<'b> {
 
     pub fn copy_buffer<T: Copy + Pod, L: Location, B: Location>(
         &mut self,
-        src: &Buffer<T, L>,
-        dst: &Buffer<T, B>,
+        src: &BufferSlice<T, L>,
+        dst: &BufferSlice<T, B>,
         num_elements: usize,
         src_offset: u32,
         dst_offset: u32,
+    ) {
+        let num_bytes = num_elements * size_of::<T>();
+        self.copy_buffer_regions(src, dst, 
+        &[src.]);
+    }
+
+
+    pub fn copy_buffer_regions<T: Copy + Pod, L: Location, B: Location>(
+        &mut self,
+        src: &BufferSlice<T, L>,
+        dst: &BufferSlice<T, B>,
+        regions: &[BufferCopy]
     ) {
         tracy_span!("copy_buffer");
         self.barriers(vec![
@@ -1022,17 +1034,12 @@ impl<'b> CommandBuffer<'b> {
                 },
             ),
         ]);
-        let num_bytes = num_elements * size_of::<T>();
         unsafe {
             Ctx::device().cmd_copy_buffer(
                 self.handle,
                 src.handle,
                 dst.handle,
-                &[vk::BufferCopy {
-                    src_offset: src_offset as u64,
-                    dst_offset: dst_offset as u64,
-                    size: num_bytes as u64,
-                }],
+                regions,
             )
         };
     }
