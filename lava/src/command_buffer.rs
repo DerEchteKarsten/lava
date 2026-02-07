@@ -999,13 +999,8 @@ impl<'b> CommandBuffer<'b> {
         &mut self,
         src: &BufferSlice<T, L>,
         dst: &BufferSlice<T, B>,
-        num_elements: usize,
-        src_offset: u32,
-        dst_offset: u32,
     ) {
-        let num_bytes = num_elements * size_of::<T>();
-        self.copy_buffer_regions(src, dst, 
-        &[src.]);
+        self.copy_buffer_regions(src, dst, &[src.region(dst)]);
     }
 
 
@@ -1093,21 +1088,16 @@ impl<'b> CommandBuffer<'b> {
 
     pub fn read_buffer<T: Copy + Pod>(
         &mut self,
-        buffer: &Buffer<T, GpuBuffer>,
-        staging: &Buffer<T, CpuBuffer>,
-        num_elements: usize,
-        offset: usize,
+        buffer: BufferSlice<T, GpuBuffer>,
+        staging: BufferSlice<T, CpuBuffer>,
     ) -> Vec<T> {
         tracy_span!("read_buffer");
         if !cfg!(debug_assertions) {
-            log::warn!("Using read_buffer in release can cause performance problems!");
+            log::warn!("Using read_buffer in release can cause performance problems! Also only reads last frames values!");
         }
         self.copy_buffer(
-            buffer,
-            staging,
-            num_elements,
-            offset as u32 * size_of::<T>() as u32,
-            0,
+            &buffer,
+            &staging,
         );
         self.barriers(vec![(
             ResourceHandle::Buffer(staging.handle),
@@ -1117,7 +1107,10 @@ impl<'b> CommandBuffer<'b> {
                 ..Default::default()
             },
         )]);
-        staging.read_len(num_elements)
+        let res = vec![unsafe { std::mem::zeroed::<T>() }; buffer.len()];
+        let mut slice = BufferSlice::from(res.as_slice());
+        staging.num_bytes(buffer.size).mem_copy_to(&mut slice);
+        res
     }
 
     pub fn raster<'a, 'c, S: RasterPass>(&'a mut self) -> RasterBuilder<'a, 'b, 'c, S> {
