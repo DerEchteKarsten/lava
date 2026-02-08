@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.99"
 ash = "0.38.0"
 ash-window = "0.13.0"
+async-std = "1.13.2"
 bitflags = "2.10.0"
 bytemuck = { version = "1.24.0", features = ["derive"] }
 derivative = "2.2.0"

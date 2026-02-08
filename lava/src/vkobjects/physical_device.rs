@@ -80,17 +80,12 @@ impl PhysicalDevice {
             .into_iter()
             .enumerate()
             .map(|(index, p)| {
-                let present_support =
-                    unsafe {
-                        surface_fn
-                            .unwrap()
-                            .get_physical_device_surface_support(
-                                physical_device,
-                                index as _,
-                                *surface,
-                            )
-                            .unwrap()
-                    };
+                let present_support = unsafe {
+                    surface_fn
+                        .unwrap()
+                        .get_physical_device_surface_support(physical_device, index as _, *surface)
+                        .unwrap()
+                };
 
                 QueueFamily {
                     index: index as _,
@@ -110,19 +105,17 @@ impl PhysicalDevice {
             })
             .collect::<Vec<String>>();
 
-        let supported_surface_formats = 
-            unsafe {
-                surface_fn
-                    .unwrap()
-                    .get_physical_device_surface_formats(physical_device, *surface)?
-            };
+        let supported_surface_formats = unsafe {
+            surface_fn
+                .unwrap()
+                .get_physical_device_surface_formats(physical_device, *surface)?
+        };
 
-        let supported_present_modes = 
-            unsafe {
-                surface_fn
-                    .unwrap()
-                    .get_physical_device_surface_present_modes(physical_device, *surface)?
-            };
+        let supported_present_modes = unsafe {
+            surface_fn
+                .unwrap()
+                .get_physical_device_surface_present_modes(physical_device, *surface)?
+        };
 
         let mut ray_tracing_feature = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
         let mut acceleration_struct_feature =

@@ -3,11 +3,16 @@
 #![feature(lock_value_accessors)]
 #![feature(let_chains)]
 #![feature(const_trait_impl)]
+#![feature(specialization)]
 
-use crate::{bindless::Bindless, state::{Ctx, STATE}};
+use crate::{
+    bindless::Bindless,
+    state::{Ctx, STATE},
+};
 use anyhow::{Ok, Result};
 
 pub mod bindless;
+pub mod buffer;
 pub mod command_buffer;
 pub mod state;
 pub mod vkobjects;
@@ -19,9 +24,14 @@ pub fn init(
     display: &RawDisplayHandle,
     window: &RawWindowHandle,
     enable_validation: bool,
-    enable_gpu_assited_validation: bool
+    enable_gpu_assited_validation: bool,
 ) -> Result<()> {
-    Ctx::init(display, window, enable_validation, enable_gpu_assited_validation)?;
+    Ctx::init(
+        display,
+        window,
+        enable_validation,
+        enable_gpu_assited_validation,
+    )?;
     Bindless::init()?;
 
     for i in &mut Ctx::swapchain().images {

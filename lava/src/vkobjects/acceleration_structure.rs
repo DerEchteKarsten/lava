@@ -1,10 +1,7 @@
 use anyhow::Result;
 use ash::vk;
 
-use crate::{
-    state::Functions,
-    vkobjects::buffer::{Buffer, BufferUsageFlags, GpuBuffer, StorageBuffer},
-};
+use crate::{buffer::Buffer, state::Functions};
 
 pub struct AccelerationStructure {
     pub ty: vk::AccelerationStructureTypeKHR,
@@ -13,21 +10,17 @@ pub struct AccelerationStructure {
 }
 
 impl AccelerationStructure {
-    pub fn new(
+    pub fn get_build_size<'a>(
         level: vk::AccelerationStructureTypeKHR,
-        as_geometry: &[vk::AccelerationStructureGeometryKHR],
-        as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
-        max_primitive_counts: &[u32],
-        offset: u64,
-        scratch_buffer: &mut StorageBuffer<u8>,
-        cmd: &vk::CommandBuffer,
-    ) -> Result<AccelerationStructure> {
+        as_geometry: &'a [vk::AccelerationStructureGeometryKHR],
+        max_primitive_counts: &'a [u32],
+    ) -> vk::AccelerationStructureBuildSizesInfoKHR<'a> {
         let build_geo_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(level)
             .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
             .geometries(as_geometry);
 
-        let build_size = unsafe {
+        unsafe {
             let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
             Functions::acceleration_structure()
                 .unwrap()
@@ -38,17 +31,22 @@ impl AccelerationStructure {
                     &mut size_info,
                 );
             size_info
-        };
-
-        scratch_buffer.assert_size(build_size.build_scratch_size)?;
-        let buffer = Buffer::<u8, GpuBuffer>::new(
-            BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE,
-            build_size.acceleration_structure_size as usize,
-        )?;
+        }
+    }
+    pub fn new(
+        level: vk::AccelerationStructureTypeKHR,
+        as_geometry: &[vk::AccelerationStructureGeometryKHR],
+        as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
+        max_primitive_counts: &[u32],
+        offset: u64,
+        scratch_buffer: &mut Buffer<u8>,
+        buffer: &Buffer<u8>,
+        cmd: &vk::CommandBuffer,
+    ) -> Result<AccelerationStructure> {
         let create_info = vk::AccelerationStructureCreateInfoKHR::default()
             .buffer(buffer.handle)
             .offset(offset)
-            .size(build_size.acceleration_structure_size)
+            .size(buffer.size)
             .ty(level);
         let handle = unsafe {
             Functions::acceleration_structure()
@@ -74,7 +72,7 @@ impl AccelerationStructure {
         Ok(AccelerationStructure {
             accel: handle,
             ty: level,
-            size: build_size.acceleration_structure_size,
+            size: buffer.size,
         })
     }
 }

@@ -3,14 +3,16 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use ash::vk;
 use glam::UVec2;
-use gpu_allocator::{MemoryLocation, vulkan::AllocationCreateDesc};
+use gpu_allocator::{
+    MemoryLocation,
+    vulkan::{Allocation, AllocationCreateDesc},
+};
 
 use derivative::Derivative;
 
 use crate::{
     bindless::{Bindless, BindlessHandle},
     state::Ctx,
-    vkobjects::buffer::MAllocation,
 };
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Default)]
@@ -24,9 +26,7 @@ pub enum ImageSize {
 impl ImageSize {
     pub fn size(self) -> UVec2 {
         match self {
-            Self::FullScreen => {
-                UVec2::new(Ctx::window_width(), Ctx::window_height())
-            }
+            Self::FullScreen => UVec2::new(Ctx::window_width(), Ctx::window_height()),
             Self::FractionalFullScreen(dx, dy) => UVec2::new(
                 (Ctx::window_width()).div_ceil(dx),
                 (Ctx::window_height()).div_ceil(dy),
@@ -43,24 +43,10 @@ pub struct Image {
     pub handle: vk::Image,
     pub view: vk::ImageView,
     #[derivative(PartialEq = "ignore")]
-    pub allocation: Option<Arc<Mutex<MAllocation>>>,
+    pub allocation: Option<Allocation>,
     pub size: ImageSize,
     pub format: vk::Format,
     pub usage: vk::ImageUsageFlags,
-}
-
-impl Clone for Image {
-    fn clone(&self) -> Self {
-        Self {
-            size: self.size,
-            format: self.format,
-            handle: self.handle,
-            usage: self.usage,
-            view: self.view,
-            allocation: self.allocation.clone(),
-            bindless_handle: self.bindless_handle,
-        }
-    }
 }
 
 pub fn get_aspects(format: vk::Format) -> vk::ImageAspectFlags {
@@ -343,7 +329,7 @@ impl Image {
         let mut s = Self {
             usage,
             handle: image,
-            allocation: Some(Arc::new(Mutex::new(MAllocation(allocation)))),
+            allocation: Some(allocation),
             format,
             size,
             view,
@@ -361,19 +347,22 @@ impl Image {
         Ok(s)
     }
 
-    pub fn destroy(&self) {
+    pub fn destroy(&mut self) {
         unsafe {
+            if let Some(allocation) = self.allocation.take() {
+                Ctx::allocator().free(allocation);
+            }
             Ctx::device().destroy_image_view(self.view, None);
             Ctx::device().destroy_image(self.handle, None);
         }
     }
 
-    pub fn prefered_layout(&self) -> vk::ImageLayout{
+    pub fn prefered_layout(&self) -> vk::ImageLayout {
         if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
             vk::ImageLayout::GENERAL
-        }else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        } else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-        }else {
+        } else {
             panic!("Image does not have SAMPELD or STORAGE usage flag")
         }
     }
@@ -381,7 +370,7 @@ impl Image {
     pub fn mut_access(&self) -> vk::AccessFlags2 {
         if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
             vk::AccessFlags2::SHADER_STORAGE_WRITE | vk::AccessFlags2::SHADER_STORAGE_READ
-        }else {
+        } else {
             panic!("Trying to write to Image that didnt have the STORAGE usage flag");
         }
     }
@@ -389,9 +378,9 @@ impl Image {
     pub fn const_access(&self) -> vk::AccessFlags2 {
         if self.usage.contains(vk::ImageUsageFlags::STORAGE) {
             vk::AccessFlags2::SHADER_STORAGE_READ
-        }else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        } else if self.usage.contains(vk::ImageUsageFlags::SAMPLED) {
             vk::AccessFlags2::SHADER_SAMPLED_READ
-        }else {
+        } else {
             panic!("Image does not have SAMPLED or STORAGE usage flag")
         }
     }

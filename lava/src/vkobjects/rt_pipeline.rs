@@ -2,8 +2,8 @@ use anyhow::Result;
 use ash::vk;
 
 use crate::{
+    buffer::{AsBuffer, Buffer, BufferUsageFlags, CpuBuffer, slice::BufferSlice},
     state::{Ctx, Functions},
-    vkobjects::buffer::{Buffer, BufferUsageFlags, CpuBuffer},
 };
 
 pub fn alinged_size(size: u32, alignment: u32) -> u32 {
@@ -50,7 +50,6 @@ impl RaytracingPipeline {
         let mut groups = vec![];
 
         for shader in shaders_create_info.iter() {
-    
             match shader.group {
                 RayTracingShaderGroup::RayGen => shader_group_info.raygen_shader_count += 1,
                 RayTracingShaderGroup::Miss => shader_group_info.miss_shader_count += 1,
@@ -117,7 +116,6 @@ impl RaytracingPipeline {
         })
     }
 }
-
 
 pub struct ShaderBindingTable {
     pub _buffer: Buffer<u8, CpuBuffer>,
@@ -213,7 +211,9 @@ impl ShaderBindingTable {
             }
         }
 
-        buffer.copy_from_slice(&stb_data, 0)?;
+        buffer
+            .whole()
+            .mem_copy_from(BufferSlice::from(stb_data.as_slice()));
 
         let raygen_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(buffer.address)

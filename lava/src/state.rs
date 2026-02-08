@@ -3,7 +3,8 @@ use std::{
     ffi::{c_char, c_void},
     fmt::{Debug, write},
     mem::MaybeUninit,
-    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU64}, time::Instant,
+    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU64},
+    time::Instant,
 };
 
 use anyhow::{Result, anyhow};
@@ -12,21 +13,21 @@ use ash::{
     ext::debug_utils,
     vk::{self, Handle},
 };
+use bytemuck::Pod;
 use gpu_allocator::{
     AllocationSizes, AllocatorDebugSettings,
     vulkan::{Allocator, AllocatorCreateDesc},
 };
 use std::ffi::CStr;
-use winit::raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle};
+use winit::raw_window_handle::{
+    HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle,
+};
 
 use crate::{
-    FRAMES_IN_FLIGHT,
-    bindless::{Bindless, BindlessHandle},
-    command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
-    vkobjects::{
+    FRAMES_IN_FLIGHT, bindless::{Bindless, BindlessHandle}, buffer::{Buffer, GpuBuffer, Location}, command_buffer::{CommandBuffer, ResourceHandle, ResourceState}, vkobjects::{
         image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface,
         swapchain::Swapchain,
-    },
+    }
 };
 
 #[cfg(feature = "trace")]
@@ -65,6 +66,7 @@ pub struct Ctx {
     present_queue: Option<Queue>,
     allocator: Mutex<Allocator>,
     printf: Mutex<HashMap<String, usize>>,
+    delay_deletion: Mutex<Vec<(Buffer<u8>, u64)>>,
 }
 
 impl Debug for Ctx {
@@ -150,7 +152,17 @@ impl Ctx {
             .lock()
             .unwrap()
     }
-    pub fn surface() -> &'static Surface{
+    pub fn delay_deletion<T: Copy + Pod, L: Location + 'static>(buff: Buffer<T, L>) {
+        STATE
+            .get()
+            .ok_or(anyhow!("Vulkan Context was not Initilized"))
+            .unwrap()
+            .delay_deletion
+            .lock()
+            .unwrap()
+            .push((buff.cast_owned(), Ctx::current_frame()));
+    }
+    pub fn surface() -> &'static Surface {
         &STATE
             .get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
@@ -164,7 +176,9 @@ impl Ctx {
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .swapchain.lock().unwrap()
+            .swapchain
+            .lock()
+            .unwrap()
     }
     pub fn window_width() -> u32 {
         STATE
@@ -172,7 +186,10 @@ impl Ctx {
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .swapchain.lock().unwrap().size[0]
+            .swapchain
+            .lock()
+            .unwrap()
+            .size[0]
     }
     pub fn window_height() -> u32 {
         STATE
@@ -180,7 +197,10 @@ impl Ctx {
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .swapchain.lock().unwrap().size[1]
+            .swapchain
+            .lock()
+            .unwrap()
+            .size[1]
     }
 
     pub fn features() -> Features {
@@ -198,39 +218,57 @@ impl Ctx {
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
             .present
-            .frame_counter.load(std::sync::atomic::Ordering::Relaxed)
+            .frame_counter
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn frame_in_flight() -> usize {
+        STATE
+            .get()
+            .ok_or(anyhow!("Vulkan Context was not Initilized"))
+            .unwrap()
+            .present
+            .frame_counter
+            .load(std::sync::atomic::Ordering::Relaxed) as usize % FRAMES_IN_FLIGHT
+    }
 
     pub fn start_frame() {
         tracy_span!("StartFrame");
-        let ctx = STATE
-            .get()
-            .unwrap();
+        let ctx = STATE.get().unwrap();
 
         let s = &ctx.present;
-        let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
-        let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
+        let frame = s
+            .frame_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let frame_in_flight = frame % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
         unsafe {
             tracy_span!("Wait for Fences");
-            Ctx::device().wait_for_fences(&[f.fence], true, u64::MAX).unwrap();
+            Ctx::device()
+                .wait_for_fences(&[f.fence], true, u64::MAX)
+                .unwrap();
+            let state = STATE.get().unwrap();
+            let mut lock = state.delay_deletion.lock().unwrap();
+            lock.retain(|(_, last_used)| {
+                (last_used + FRAMES_IN_FLIGHT as u64) >= frame 
+            });
             Ctx::device().reset_fences(&[f.fence]).unwrap();
-            Ctx::device().reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty()).unwrap();
+            Ctx::device()
+                .reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())
+                .unwrap();
         }
     }
 
-    pub fn record_frame<'a, F: FnMut(&mut CommandBuffer, Image) -> Result<()>>(
+    pub fn record_frame<'a, F: FnMut(&mut CommandBuffer, &Image) -> Result<()>>(
         func: &mut F,
     ) -> Result<()> {
         tracy_span!("Next Frame");
-        let ctx = STATE
-            .get()
-            .unwrap();
+        let ctx = STATE.get().unwrap();
 
         let s = &ctx.present;
         let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
-        let frame_in_flight = (frame + 1) % FRAMES_IN_FLIGHT as u64;
+        let frame_in_flight = frame % FRAMES_IN_FLIGHT as u64;
         let f = &s.frames[frame_in_flight as usize];
         let (image_index, _suboptimal) = unsafe {
             tracy_span!("Acquire next Image");
@@ -240,7 +278,8 @@ impl Ctx {
                 f.image_available,
                 vk::Fence::null(),
             )
-        }.unwrap();
+        }
+        .unwrap();
 
         let mut resource_cache = ctx.resource_cache.lock().unwrap();
 
@@ -248,14 +287,18 @@ impl Ctx {
             handle: f.cmd,
             resource_hashes: &mut resource_cache,
         };
-        
-        let img = Ctx::swapchain().images[image_index as usize].clone();
-        cmd.begin();
-        let result = func(&mut cmd, img);
-        cmd.end();
 
-        let frame = s.frame_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        {
+            let img =
+                std::mem::replace(&mut Ctx::swapchain().images[image_index as usize], unsafe {
+                    std::mem::zeroed()
+                });
+            cmd.begin();
+            func(&mut cmd, &img)?;
+            cmd.end();
+            Ctx::swapchain().images[image_index as usize] = img;
+        }
+
         let waits = [vk::SemaphoreSubmitInfo {
             semaphore: f.image_available,
             stage_mask: vk::PipelineStageFlags2::TOP_OF_PIPE,
@@ -317,8 +360,7 @@ impl Ctx {
         Ctx::swapchain().resized = false;
         match unsafe {
             tracy_span!("Present");
-            Functions::swapchain()
-                .queue_present(Ctx::present_queue().handle, &present)
+            Functions::swapchain().queue_present(Ctx::present_queue().handle, &present)
         } {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 needs_recreation = true;
@@ -350,14 +392,13 @@ impl Ctx {
 
             unsafe {
                 Ctx::device().device_wait_idle().unwrap();
-                Functions::swapchain()
-                    .destroy_swapchain(Ctx::swapchain().handle, None);
+                Functions::swapchain().destroy_swapchain(Ctx::swapchain().handle, None);
             };
 
             for (i, image) in swapchain.images.iter_mut().enumerate() {
                 let handle = BindlessHandle {
                     descriptor_index: i as u32,
-                    descriptor_set: 1
+                    descriptor_set: 1,
                 };
                 Bindless::write_image(image, handle);
                 image.bindless_handle = Some(handle);
@@ -366,8 +407,7 @@ impl Ctx {
             s.swapchain.set(swapchain).unwrap();
             s.swpachain_needs_resizing.set(None).unwrap();
         }
-
-        result
+        Ok(())
     }
 
     pub(super) fn init(
@@ -392,10 +432,9 @@ impl Ctx {
             .map(|raw_name| raw_name.as_ptr())
             .collect();
 
-        let mut instance_extensions = 
-            ash_window::enumerate_required_extensions(*display)
-                .unwrap()
-                .to_vec();
+        let mut instance_extensions = ash_window::enumerate_required_extensions(*display)
+            .unwrap()
+            .to_vec();
 
         let mut features = Features::default();
         features.present = true;
@@ -410,16 +449,15 @@ impl Ctx {
         if features.debug_utils {
             instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
             validation_f = vec![
-                    vk::ValidationFeatureEnableEXT::DEBUG_PRINTF,
-                    vk::ValidationFeatureEnableEXT::BEST_PRACTICES,
-                    vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION,
-                ];
+                vk::ValidationFeatureEnableEXT::DEBUG_PRINTF,
+                vk::ValidationFeatureEnableEXT::BEST_PRACTICES,
+                vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION,
+            ];
             if enable_gpu_assited_validation {
                 validation_f.push(vk::ValidationFeatureEnableEXT::GPU_ASSISTED);
             }
 
-            validation_features = validation_features.
-                enabled_validation_features(&validation_f);
+            validation_features = validation_features.enabled_validation_features(&validation_f);
 
             instance_info = instance_info
                 .enabled_layer_names(&layers_names_raw)
@@ -443,7 +481,7 @@ impl Ctx {
                 .message_type(
                     vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
                         | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 )
                 .pfn_user_callback(Some(vulkan_debug_callback));
             unsafe {
@@ -455,25 +493,14 @@ impl Ctx {
             };
         }
 
-        let surface = 
-                unsafe {
-                    ash_window::create_surface(
-                        &entry,
-                        &instance,
-                        *display,
-                        *window,
-                        None,
-                    )
-                }
+        let surface =
+            unsafe { ash_window::create_surface(&entry, &instance, *display, *window, None) }
                 .unwrap();
 
         let surface_fn = Some(ash::khr::surface::Instance::new(&entry, &instance));
 
-        let physical_devices = PhysicalDevice::enumerate_physical_devices(
-            &surface,
-            &instance,
-            surface_fn.as_ref(),
-        )?;
+        let physical_devices =
+            PhysicalDevice::enumerate_physical_devices(&surface, &instance, surface_fn.as_ref())?;
         let (physical_device, graphics_queue_family, present_queue_family, transfer_queue_family) =
             PhysicalDevice::select_suitable_physical_device(
                 physical_devices.as_slice(),
@@ -545,12 +572,11 @@ impl Ctx {
             }
         }
 
-        let surface = 
-            Some(Surface::new(
-                surface,
-                &physical_device,
-                &surface_fn.as_ref().unwrap(),
-            ));
+        let surface = Some(Surface::new(
+            surface,
+            &physical_device,
+            &surface_fn.as_ref().unwrap(),
+        ));
 
         let mut info = vk::SemaphoreTypeCreateInfo {
             semaphore_type: vk::SemaphoreType::TIMELINE,
@@ -559,32 +585,31 @@ impl Ctx {
         };
         let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
 
-        let present = 
-            Present {
-                swpachain_needs_resizing: Mutex::new(None),
-                swapchain: Mutex::new(Swapchain::new(
-                    &surface.as_ref().unwrap(),
-                    &device,
-                    graphics_queue_family.index,
-                    present_queue_family
-                        .as_ref()
-                        .map(|e| e.index)
-                        .unwrap_or(graphics_queue_family.index),
-                    &swapchain_fn,
-                    debug_utils.as_ref(),
+        let present = Present {
+            swpachain_needs_resizing: Mutex::new(None),
+            swapchain: Mutex::new(Swapchain::new(
+                &surface.as_ref().unwrap(),
+                &device,
+                graphics_queue_family.index,
+                present_queue_family
+                    .as_ref()
+                    .map(|e| e.index)
+                    .unwrap_or(graphics_queue_family.index),
+                &swapchain_fn,
+                debug_utils.as_ref(),
+                None,
+                None,
+            )?),
+            frame_counter: AtomicU64::new(0),
+            timeline: unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut info),
                     None,
-                    None,
-                )?),
-                frame_counter: AtomicU64::new(0),
-                timeline: unsafe {
-                    device.create_semaphore(
-                        &vk::SemaphoreCreateInfo::default().push_next(&mut info),
-                        None,
-                    )?
-                },
-                surface: surface.unwrap(),
-                frames,
-            };
+                )?
+            },
+            surface: surface.unwrap(),
+            frames,
+        };
 
         let ctx = Self {
             allocator: Mutex::new(allocator),
@@ -605,6 +630,7 @@ impl Ctx {
             features: features.clone(),
             printf: Mutex::new(HashMap::new()),
             resource_cache: Mutex::new(HashMap::new()),
+            delay_deletion: Mutex::new(Vec::new()),
         };
         STATE.set(ctx).unwrap();
         FUNCTIONS
@@ -645,7 +671,7 @@ impl Ctx {
     }
 }
 
-pub(crate)  static STATE: OnceLock<Ctx> = OnceLock::new();
+pub(crate) static STATE: OnceLock<Ctx> = OnceLock::new();
 
 unsafe extern "system" fn vulkan_debug_callback(
     flag: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -658,7 +684,8 @@ unsafe extern "system" fn vulkan_debug_callback(
         if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
             let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
             let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-            if let Some(s) = STATE.get() && split.len() > 1
+            if let Some(s) = STATE.get()
+                && split.len() > 1
             {
                 let printf_message = split[1..]
                     .iter()

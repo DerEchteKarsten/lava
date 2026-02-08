@@ -164,7 +164,10 @@ impl Bindless {
         let handle = Self::get()
             .num_images
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let handle = BindlessHandle { descriptor_set: 1, descriptor_index: handle };
+        let handle = BindlessHandle {
+            descriptor_set: 1,
+            descriptor_index: handle,
+        };
         Self::write_image(image, handle);
         handle
     }
@@ -173,7 +176,10 @@ impl Bindless {
         let handle = Self::get()
             .num_textures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let handle = BindlessHandle { descriptor_set: 0, descriptor_index: handle };
+        let handle = BindlessHandle {
+            descriptor_set: 0,
+            descriptor_index: handle,
+        };
         Self::write_texture(texture, handle);
         handle
     }

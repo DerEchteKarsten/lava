@@ -3,7 +3,10 @@ use std::u64;
 use anyhow::Result;
 use ash::vk;
 
-use crate::{command_buffer::CommandBuffer, state::{Ctx, STATE}};
+use crate::{
+    command_buffer::CommandBuffer,
+    state::{Ctx, STATE},
+};
 
 #[derive(Debug)]
 pub struct Queue {
@@ -53,7 +56,7 @@ impl Queue {
 
             let mut cmd_buffer = CommandBuffer {
                 handle: command_buffer,
-                resource_hashes: &mut resource_hashes
+                resource_hashes: &mut resource_hashes,
             };
             let executor_result = executor(&mut cmd_buffer);
 
@@ -95,26 +98,26 @@ impl Queue {
     ) -> Result<R> {
         let (res, fence, command_buffer) = self.execute_command(executor)?;
         unsafe {
-            FenceFuture {
-                fence
-            }.await;
+            FenceFuture { fence }.await;
             Ctx::device().free_command_buffers(self.percistent_command_pool, &[command_buffer]);
         }
         Ok(res)
     }
-    
 }
 
-struct FenceFuture { 
+struct FenceFuture {
     fence: vk::Fence,
 }
 
 impl Future for FenceFuture {
     type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         if unsafe { Ctx::device().get_fence_status(self.fence).unwrap() } {
             std::task::Poll::Ready(())
-        }else  {
+        } else {
             std::task::Poll::Pending
         }
     }
