@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use crate::FRAMES_IN_FLIGHT;
-use crate::buffer::{BufferUsageFlags, CpuBuffer, GpuBuffer};
 use crate::buffer::{AsBuffer, Buffer, Location, slice::BufferSlice};
+use crate::buffer::{BufferUsageFlags, CpuBuffer, GpuBuffer};
 use crate::command_buffer::CommandBuffer;
 use crate::state::Ctx;
 
@@ -49,9 +49,7 @@ impl RangeAllocator {
     pub fn new(total_size: u64) -> Self {
         let mut free_ranges = BTreeMap::new();
         free_ranges.insert(0, total_size);
-        Self {
-            free_ranges,
-        }
+        Self { free_ranges }
     }
 }
 
@@ -119,7 +117,6 @@ impl<T: AsBuffer> SubAllocated<T, ArenaAllocator> {
     }
 }
 
-
 #[derive(Clone, Default)]
 pub struct QueueAllocated<B: AsBuffer> {
     buffer: [B; FRAMES_IN_FLIGHT],
@@ -139,7 +136,10 @@ impl<B: AsBuffer> AsBuffer for QueueAllocated<B> {
 
 impl<B: AsBuffer> QueueAllocated<B> {
     pub fn new(buffer: [B; FRAMES_IN_FLIGHT]) -> Self {
-        QueueAllocated { buffer, queue: Vec::new() }    
+        QueueAllocated {
+            buffer,
+            queue: Vec::new(),
+        }
     }
     pub fn push(&mut self, value: B::DataType) {
         self.queue.push(value);
@@ -152,11 +152,9 @@ impl<B: AsBuffer> QueueAllocated<B> {
         let buffer = self.buffer[Ctx::frame_in_flight()].get_mut();
         //Safe to delete becouse we are sure this buffer isnt used
         if buffer.size < size {
-            *buffer = Buffer::with_alignment(
-                    BufferUsageFlags::STORAGE,
-                    size.next_power_of_two(),
-                    None,
-                ).unwrap();
+            *buffer =
+                Buffer::with_alignment(BufferUsageFlags::STORAGE, size.next_power_of_two(), None)
+                    .unwrap();
         }
     }
     pub fn clear(&mut self) -> Vec<B::DataType> {
@@ -210,7 +208,7 @@ impl<A: SubAllocator> AsyncSubAllocator<A> {
                 return v;
             }
             log::error!("Staging Buffer Full!!");
-        };
+        }
     }
     pub async fn deallocate<T: Copy + Pod, L: Location>(&self, slice: BufferSlice<T, L>) {
         let mut allocator = self.allocator.lock().await;

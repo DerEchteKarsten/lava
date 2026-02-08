@@ -14,9 +14,9 @@ use anyhow::{Ok, Result};
 pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;
+pub mod image;
 pub mod state;
 pub mod vkobjects;
-
 pub const FRAMES_IN_FLIGHT: usize = 2;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 

@@ -146,18 +146,12 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
         })
     }
 
-    pub fn assert_size(
-        &mut self,
-        size: u64,
-    ) {
+    pub fn assert_size(&mut self, size: u64) {
         if self.size < size {
             Ctx::delay_deletion(std::mem::replace(
                 self,
-                Buffer::with_alignment(
-                    BufferUsageFlags::STORAGE,
-                    size.next_power_of_two(),
-                    None,
-                ).unwrap()
+                Buffer::with_alignment(BufferUsageFlags::STORAGE, size.next_power_of_two(), None)
+                    .unwrap(),
             ));
         }
     }

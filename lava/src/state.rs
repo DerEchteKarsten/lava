@@ -24,10 +24,14 @@ use winit::raw_window_handle::{
 };
 
 use crate::{
-    FRAMES_IN_FLIGHT, bindless::{Bindless, BindlessHandle}, buffer::{Buffer, GpuBuffer, Location}, command_buffer::{CommandBuffer, ResourceHandle, ResourceState}, vkobjects::{
+    FRAMES_IN_FLIGHT,
+    bindless::{Bindless, BindlessHandle},
+    buffer::{Buffer, GpuBuffer, Location},
+    command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
+    vkobjects::{
         image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface,
         swapchain::Swapchain,
-    }
+    },
 };
 
 #[cfg(feature = "trace")]
@@ -229,7 +233,8 @@ impl Ctx {
             .unwrap()
             .present
             .frame_counter
-            .load(std::sync::atomic::Ordering::Relaxed) as usize % FRAMES_IN_FLIGHT
+            .load(std::sync::atomic::Ordering::Relaxed) as usize
+            % FRAMES_IN_FLIGHT
     }
 
     pub fn start_frame() {
@@ -250,9 +255,7 @@ impl Ctx {
                 .unwrap();
             let state = STATE.get().unwrap();
             let mut lock = state.delay_deletion.lock().unwrap();
-            lock.retain(|(_, last_used)| {
-                (last_used + FRAMES_IN_FLIGHT as u64) >= frame 
-            });
+            lock.retain(|(_, last_used)| (last_used + FRAMES_IN_FLIGHT as u64) >= frame);
             Ctx::device().reset_fences(&[f.fence]).unwrap();
             Ctx::device()
                 .reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())

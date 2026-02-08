@@ -86,7 +86,9 @@ impl Queue {
     ) -> Result<R> {
         let (res, fence, command_buffer) = self.execute_command(executor)?;
         unsafe {
-            Ctx::device().wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            Ctx::device()
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .unwrap();
             Ctx::device().free_command_buffers(self.percistent_command_pool, &[command_buffer]);
         }
         Ok(res)
