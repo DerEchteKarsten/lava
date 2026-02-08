@@ -954,7 +954,7 @@ impl<'b> CommandBuffer<'b> {
 
     pub fn copy_buffer_to_image<T: Copy + Pod, L: Location>(
         &mut self,
-        src: &BufferSlice<T, L>,
+        src: BufferSlice<T, L>,
         dst: &Image,
     ) {
         tracy_span!("copy_buffer_to_image");

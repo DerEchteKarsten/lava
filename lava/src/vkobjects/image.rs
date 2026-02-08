@@ -1,7 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{any::TypeId, marker::PhantomData, ops::Range, sync::{Arc, Mutex}};
 
 use anyhow::Result;
 use ash::vk;
+use bytemuck::Pod;
 use glam::UVec2;
 use gpu_allocator::{
     MemoryLocation,
@@ -24,7 +25,7 @@ pub enum ImageSize {
 }
 
 impl ImageSize {
-    pub fn size(self) -> UVec2 {
+    pub fn size(self) -> vk::Extent3D {
         match self {
             Self::FullScreen => UVec2::new(Ctx::window_width(), Ctx::window_height()),
             Self::FractionalFullScreen(dx, dy) => UVec2::new(
@@ -36,235 +37,231 @@ impl ImageSize {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Eq, PartialEq, Debug)]
-pub struct Image {
-    pub bindless_handle: Option<BindlessHandle>,
+trait UsageSet: 'static {
+    const VK: vk::ImageUsageFlags;
+}
+
+pub struct Sampled;
+pub struct Storage;
+pub struct ColorAttachment;
+pub struct DepthAttachment;
+pub struct ColorAttachmentSampled;
+pub struct DepthAttachmentSampled;
+pub struct SampledStorage;
+
+impl UsageSet for Sampled {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;
+}
+impl UsageSet for Storage {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::STORAGE;
+}
+impl UsageSet for ColorAttachment {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+}
+impl UsageSet for DepthAttachment {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+}
+impl UsageSet for ColorAttachmentSampled {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::SAMPLED.as_raw());
+}
+impl UsageSet for DepthAttachmentSampled {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT.as_raw() | vk::ImageUsageFlags::SAMPLED.as_raw());
+}
+impl UsageSet for SampledStorage {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw());
+}
+
+pub(crate) trait IsSampled: UsageSet {}
+pub(crate) trait IsStorage: UsageSet {}
+pub(crate) trait IsColorAttachment: UsageSet {}
+pub(crate) trait IsDepthAttachment: UsageSet {}
+
+
+impl IsSampled for Sampled {}
+impl IsSampled for ColorAttachmentSampled {}
+impl IsSampled for DepthAttachmentSampled {}
+impl IsSampled for SampledStorage {}
+
+impl IsStorage for Storage {}
+impl IsStorage for SampledStorage {}
+
+impl IsColorAttachment for ColorAttachment {}
+impl IsColorAttachment for ColorAttachmentSampled {}
+
+impl IsDepthAttachment for DepthAttachment {}
+impl IsDepthAttachment for DepthAttachmentSampled {}
+
+trait TexelType {
+    const _CHECK: ();
+    type Component: Pod;
+    const NUM_COMPONENT: usize;
+}
+
+impl<const N: usize> TexelType for [u8; N] {
+    const _CHECK: () = assert!(N <= 4);
+    const NUM_COMPONENT: usize = N;
+    type Component = u8;
+} 
+
+impl<const N: usize> TexelType for [u16; N] {
+    const _CHECK: () = assert!(N <= 4);
+    const NUM_COMPONENT: usize = N;
+    type Component = u16;
+} 
+
+impl<const N: usize> TexelType for [u32; N] {
+    const _CHECK: () = assert!(N <= 4);
+    const NUM_COMPONENT: usize = N;
+    type Component = u32;
+} 
+
+impl<const N: usize> TexelType for [f32; N] {
+    const _CHECK: () = assert!(N <= 4);
+    const NUM_COMPONENT: usize = N;
+    type Component = f32;
+} 
+
+trait Encoding {}
+
+struct UNorm;
+impl Encoding for UNorm {}
+struct SNorm;
+impl Encoding for SNorm {}
+struct UInt;
+impl Encoding for UInt {}
+struct SInt;
+impl Encoding for SInt {}
+struct UScaled;
+impl Encoding for UScaled {}
+struct SScaled;
+impl Encoding for SScaled {}
+struct Float;
+impl Encoding for Float {}
+struct SRgb;
+impl Encoding for SRgb {}
+
+
+struct Format<T: TexelType, E: Encoding> {
+    _m1: PhantomData<T>,
+    _m2: PhantomData<E>,
+}
+
+impl<T: TexelType, E: Encoding> VkFormat for Format<T, E> {
+    const FORMAT: vk::Format = const {
+        use vk::Format;
+        match (TypeId::of::<T::Component>(), T::NUM_COMPONENT, TypeId::of::<E>()) {
+                (TypeId::of::<u8>(), 1, TypeId::of::<UNorm>()) => Format::R8_UNORM,
+                (TypeId::of::<u8>(), 1, TypeId::of::<SNorm>()) => Format::R8_SNORM,
+                (TypeId::of::<u8>(), 1, TypeId::of::<UInt>()) => Format::R8_UINT,
+                (TypeId::of::<u8>(), 1, TypeId::of::<SInt>()) => Format::R8_SINT,
+
+                (TypeId::of::<u8>(), 2, TypeId::of::<UNorm>()) => Format::R8G8_UNORM,
+                (TypeId::of::<u8>(), 2, TypeId::of::<SNorm>()) => Format::R8G8_SNORM,
+                (TypeId::of::<u8>(), 2, TypeId::of::<UInt>()) => Format::R8G8_UINT,
+                (TypeId::of::<u8>(), 2, TypeId::of::<SInt>()) => Format::R8G8_SINT,
+
+                (TypeId::of::<u8>(), 3, TypeId::of::<UNorm>()) => Format::R8G8B8_UNORM,
+                (TypeId::of::<u8>(), 3, TypeId::of::<SNorm>()) => Format::R8G8B8_SNORM,
+                (TypeId::of::<u8>(), 3, TypeId::of::<UInt>()) => Format::R8G8B8_UINT,
+                (TypeId::of::<u8>(), 3, TypeId::of::<SInt>()) => Format::R8G8B8_SINT,
+
+                (TypeId::of::<u8>(), 4, TypeId::of::<UNorm>()) => Format::R8G8B8A8_UNORM,
+                (TypeId::of::<u8>(), 4, TypeId::of::<SNorm>()) => Format::R8G8B8A8_SNORM,
+                (TypeId::of::<u8>(), 4, TypeId::of::<UInt>()) => Format::R8G8B8A8_UINT,
+                (TypeId::of::<u8>(), 4, TypeId::of::<SInt>()) => Format::R8G8B8A8_SINT,
+
+                // 16-bit UNORM/SNORM/UINT/SINT/FLOAT
+                (TypeId::of::<u16>(), 1, TypeId::of::<UNorm>()) => Format::R16_UNORM,
+                (TypeId::of::<u16>(), 1, TypeId::of::<SNorm>()) => Format::R16_SNORM,
+                (TypeId::of::<u16>(), 1, TypeId::of::<UInt>()) => Format::R16_UINT,
+                (TypeId::of::<u16>(), 1, TypeId::of::<SInt>()) => Format::R16_SINT,
+                (TypeId::of::<u16>(), 1, TypeId::of::<Float>()) => Format::R16_SFLOAT,
+
+                (TypeId::of::<u16>(), 2, TypeId::of::<UNorm>()) => Format::R16G16_UNORM,
+                (TypeId::of::<u16>(), 2, TypeId::of::<SNorm>()) => Format::R16G16_SNORM,
+                (TypeId::of::<u16>(), 2, TypeId::of::<UInt>()) => Format::R16G16_UINT,
+                (TypeId::of::<u16>(), 2, TypeId::of::<SInt>()) => Format::R16G16_SINT,
+                (TypeId::of::<u16>(), 2, TypeId::of::<Float>()) => Format::R16G16_SFLOAT,
+
+                (TypeId::of::<u16>(), 3, TypeId::of::<UNorm>()) => Format::R16G16B16_UNORM,
+                (TypeId::of::<u16>(), 3, TypeId::of::<SNorm>()) => Format::R16G16B16_SNORM,
+                (TypeId::of::<u16>(), 3, TypeId::of::<UInt>()) => Format::R16G16B16_UINT,
+                (TypeId::of::<u16>(), 3, TypeId::of::<SInt>()) => Format::R16G16B16_SINT,
+                (TypeId::of::<u16>(), 3, TypeId::of::<Float>()) => Format::R16G16B16_SFLOAT,
+
+                (TypeId::of::<u16>(), 4, TypeId::of::<UNorm>()) => Format::R16G16B16A16_UNORM,
+                (TypeId::of::<u16>(), 4, TypeId::of::<SNorm>()) => Format::R16G16B16A16_SNORM,
+                (TypeId::of::<u16>(), 4, TypeId::of::<UInt>()) => Format::R16G16B16A16_UINT,
+                (TypeId::of::<u16>(), 4, TypeId::of::<SInt>()) => Format::R16G16B16A16_SINT,
+                (TypeId::of::<u16>(), 4, TypeId::of::<Float>()) => Format::R16G16B16A16_SFLOAT,
+
+                // 32-bit floats / ints
+                (TypeId::of::<f32>(), 1, TypeId::of::<Float>()) => Format::R32_SFLOAT,
+                (TypeId::of::<f32>(), 2, TypeId::of::<Float>()) => Format::R32G32_SFLOAT,
+                (TypeId::of::<f32>(), 3, TypeId::of::<Float>()) => Format::R32G32B32_SFLOAT,
+                (TypeId::of::<f32>(), 4, TypeId::of::<Float>()) => Format::R32G32B32A32_SFLOAT,
+
+                (TypeId::of::<u32>(), 1, TypeId::of::<UInt>()) => Format::R32_UINT,
+                (TypeId::of::<u32>(), 2, TypeId::of::<UInt>()) => Format::R32G32_UINT,
+                (TypeId::of::<u32>(), 3, TypeId::of::<UInt>()) => Format::R32G32B32_UINT,
+                (TypeId::of::<u32>(), 4, TypeId::of::<UInt>()) => Format::R32G32B32A32_UINT,
+
+                (TypeId::of::<i32>(), 1, TypeId::of::<SInt>()) => Format::R32_SINT,
+                (TypeId::of::<i32>(), 2, TypeId::of::<SInt>()) => Format::R32G32_SINT,
+                (TypeId::of::<i32>(), 3, TypeId::of::<SInt>()) => Format::R32G32B32_SINT,
+                (TypeId::of::<i32>(), 4, TypeId::of::<SInt>()) => Format::R32G32B32A32_SINT,
+
+                // 64-bit floats / ints
+                (TypeId::of::<f64>(), 1, TypeId::of::<Float>()) => Format::R64_SFLOAT,
+                (TypeId::of::<f64>(), 2, TypeId::of::<Float>()) => Format::R64G64_SFLOAT,
+                (TypeId::of::<f64>(), 3, TypeId::of::<Float>()) => Format::R64G64B64_SFLOAT,
+                (TypeId::of::<f64>(), 4, TypeId::of::<Float>()) => Format::R64G64B64A64_SFLOAT,
+
+                (TypeId::of::<u64>(), 1, TypeId::of::<UInt>()) => Format::R64_UINT,
+                (TypeId::of::<u64>(), 2, TypeId::of::<UInt>()) => Format::R64G64_UINT,
+                (TypeId::of::<u64>(), 3, TypeId::of::<UInt>()) => Format::R64G64B64_UINT,
+                (TypeId::of::<u64>(), 4, TypeId::of::<UInt>()) => Format::R64G64B64A64_UINT,
+
+                (TypeId::of::<i64>(), 1, TypeId::of::<SInt>()) => Format::R64_SINT,
+                (TypeId::of::<i64>(), 2, TypeId::of::<SInt>()) => Format::R64G64_SINT,
+                (TypeId::of::<i64>(), 3, TypeId::of::<SInt>()) => Format::R64G64B64_SINT,
+                (TypeId::of::<i64>(), 4, TypeId::of::<SInt>()) => Format::R64G64B64A64_SINT,
+
+                (TypeId::of::<f32>(), 1, TypeId::of::<Float>()) => Format::D32_SFLOAT,
+                (TypeId::of::<u16>(), 1, TypeId::of::<UNorm>()) => Format::D16_UNORM,
+                (TypeId::of::<u32>(), 1, TypeId::of::<UInt>()) => Format::S8_UINT,
+                (TypeId::of::<u16>(), 2, TypeId::of::<UNorm>()) => Format::D16_UNORM_S8_UINT,
+                (TypeId::of::<u32>(), 2, TypeId::of::<UNorm>()) => Format::D24_UNORM_S8_UINT,
+                _ => unreachable!(),
+        }
+    };
+}
+
+trait VkFormat {
+    const FORMAT: vk::Format;
+}
+
+#[derive(Debug)]
+pub struct Image<F: VkFormat, U: UsageSet> {
     pub handle: vk::Image,
-    pub view: vk::ImageView,
-    #[derivative(PartialEq = "ignore")]
-    pub allocation: Option<Allocation>,
+    pub allocation: Allocation,
     pub size: ImageSize,
-    pub format: vk::Format,
-    pub usage: vk::ImageUsageFlags,
+    pub mips: u32,
+    pub extend: vk::Extent3D,
+    _format: PhantomData<F>,
+    _usage: PhantomData<U>
 }
 
-pub fn get_aspects(format: vk::Format) -> vk::ImageAspectFlags {
-    if format == vk::Format::D16_UNORM
-        || format == vk::Format::D32_SFLOAT
-        || format == vk::Format::X8_D24_UNORM_PACK32
-    {
-        vk::ImageAspectFlags::DEPTH
-    } else if format == vk::Format::D16_UNORM_S8_UINT
-        || format == vk::Format::D24_UNORM_S8_UINT
-        || format == vk::Format::D32_SFLOAT_S8_UINT
-    {
-        vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
-    } else if format == vk::Format::S8_UINT {
-        vk::ImageAspectFlags::STENCIL
-    } else {
-        vk::ImageAspectFlags::COLOR
-    }
-}
-pub trait ImageType {
-    fn get_extent(&self) -> vk::Extent2D;
-    fn get_image(&self) -> vk::Image;
-    fn get_usage(&self) -> vk::ImageUsageFlags;
-    fn get_format(&self) -> vk::Format;
-    fn get_view(&self) -> vk::ImageView;
-    fn copy(
-        &self,
-        cmd: &vk::CommandBuffer,
-        other: &impl ImageType,
-        src_layout: vk::ImageLayout,
-        dst_layout: vk::ImageLayout,
-    ) {
-        unsafe {
-            Ctx::device().cmd_copy_image(
-                *cmd,
-                self.get_image(),
-                src_layout,
-                other.get_image(),
-                dst_layout,
-                &[vk::ImageCopy::default()
-                    .extent(vk::Extent3D {
-                        width: self.get_extent().width,
-                        height: self.get_extent().height,
-                        depth: 1,
-                    })
-                    .src_offset(vk::Offset3D::default())
-                    .dst_offset(vk::Offset3D::default())
-                    .src_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: get_aspects(self.get_format()),
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .dst_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: get_aspects(other.get_format()),
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })],
-            )
-        };
-    }
-
-    fn blit(
-        &self,
-        cmd: &vk::CommandBuffer,
-        other: &impl ImageType,
-        src_layout: vk::ImageLayout,
-        dst_layout: vk::ImageLayout,
-    ) {
-        unsafe {
-            Ctx::device().cmd_blit_image(
-                *cmd,
-                self.get_image(),
-                src_layout,
-                other.get_image(),
-                dst_layout,
-                &[vk::ImageBlit::default()
-                    .src_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: self.get_extent().width as _,
-                            y: self.get_extent().height as _,
-                            z: 1,
-                        },
-                    ])
-                    .dst_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: other.get_extent().width as _,
-                            y: other.get_extent().height as _,
-                            z: 1,
-                        },
-                    ])
-                    .src_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: get_aspects(self.get_format()),
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .dst_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: get_aspects(other.get_format()),
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })],
-                vk::Filter::NEAREST,
-            )
-        };
-    }
-    fn subresource_range(&self) -> vk::ImageSubresourceRange {
-        vk::ImageSubresourceRange {
-            aspect_mask: get_aspects(self.get_format()),
-            base_array_layer: 0,
-            base_mip_level: 0,
-            layer_count: 1,
-            level_count: 1,
-        }
-    }
-}
-
-impl ImageType for Image {
-    fn get_extent(&self) -> vk::Extent2D {
-        vk::Extent2D {
-            width: self.size.size().x,
-            height: self.size.size().y,
-        }
-    }
-    fn get_format(&self) -> vk::Format {
-        self.format
-    }
-    fn get_image(&self) -> vk::Image {
-        self.handle
-    }
-    fn get_usage(&self) -> vk::ImageUsageFlags {
-        self.usage
-    }
-    fn get_view(&self) -> vk::ImageView {
-        self.view
-    }
+pub struct ImageView {
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    pub mips: Range<u32>,
+    pub aspect: vk::ImageAspectFlags,
+    pub offset: vk::Offset3D,
+    pub extend: vk::Extent3D,
 }
 
 impl Image {
-    // pub fn new_from_data(
-    //     ctx: &mut Context,
-    //     image: DynamicImage,
-    //     format: vk::Format,
-    // ) -> Result<Self> {
-    //     let (width, height) = image.dimensions();
-    //     let image_buffer = if format != vk::Format::R8G8B8A8_SRGB {
-    //         let image_data = image.to_rgba32f();
-    //         let image_data_raw = image_data.as_raw();
-
-    //         let image_buffer = Buffer::new(
-    //             ctx,
-    //             vk::BufferUsageFlags::TRANSFER_SRC,
-    //             MemoryLocation::CpuToGpu,
-    //             (size_of::<f32>() * image_data.len()) as u64,
-    //         )?;
-    //         image_buffer.copy_data_to_buffer(image_data_raw.as_slice())?;
-    //         image_buffer
-    //     } else {
-    //         let image_data = image.to_rgba8();
-    //         let image_data_raw = image_data.as_raw();
-
-    //         let image_buffer = Buffer::new(
-    //             ctx,
-    //             vk::BufferUsageFlags::TRANSFER_SRC,
-    //             MemoryLocation::CpuToGpu,
-    //             (size_of::<u8>() * image_data.len()) as u64,
-    //         )?;
-
-    //         image_buffer.copy_data_to_buffer(image_data_raw.as_slice())?;
-    //         image_buffer
-    //     };
-
-    //     let texture_image = Image::new_2d(
-    //         ctx,
-    //         vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-    //         MemoryLocation::GpuOnly,
-    //         format,
-    //         width,
-    //         height,
-    //     )?;
-    //     ctx.execute_one_time_commands(|cmd| {
-    //         let barrier = texture_image.memory_barrier(
-    //             vk::ImageLayout::UNDEFINED,
-    //             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-    //         );
-    //         unsafe {
-    //             ctx.device.cmd_pipeline_barrier2(
-    //                 *cmd,
-    //                 &vk::DependencyInfo::default().image_memory_barriers(&[barrier]),
-    //             )
-    //         };
-
-    //         image_buffer.copy_to_image(
-    //             &ctx,
-    //             cmd,
-    //             &texture_image,
-    //             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-    //         );
-
-    //         let barrier = texture_image.memory_barrier(
-    //             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-    //             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    //         );
-    //         unsafe {
-    //             ctx.device.cmd_pipeline_barrier2(
-    //                 *cmd,
-    //                 &vk::DependencyInfo::default().image_memory_barriers(&[barrier]),
-    //             )
-    //         };
-    //     })?;
-    //     let extend = texture_image.extent;
-    //     Ok(texture_image)
-    // }
-
     pub(super) fn view(
         device: &ash::Device,
         image: vk::Image,

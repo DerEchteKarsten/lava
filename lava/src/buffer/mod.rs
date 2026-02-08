@@ -85,6 +85,7 @@ pub struct Buffer<T: Copy + Pod, L: Location = GpuBuffer> {
 
 impl<T: Copy + Pod, L: Location> Drop for Buffer<T, L> {
     fn drop(&mut self) {
+        unsafe { Ctx::device().destroy_buffer(self.handle, None) };
         let alloc = std::mem::take(&mut self.allocation);
         Ctx::allocator().free(alloc).unwrap();
     }

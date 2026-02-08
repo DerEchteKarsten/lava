@@ -1,4 +1,4 @@
-use ash::vk;
+use ash::vk::{self};
 use async_std::sync::Mutex;
 use bytemuck::Pod;
 use std::default;
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use crate::FRAMES_IN_FLIGHT;
-use crate::buffer::{CpuBuffer, GpuBuffer};
+use crate::buffer::{BufferUsageFlags, CpuBuffer, GpuBuffer};
 use crate::buffer::{AsBuffer, Buffer, Location, slice::BufferSlice};
 use crate::command_buffer::CommandBuffer;
 use crate::state::Ctx;
@@ -122,31 +122,48 @@ impl<T: AsBuffer> SubAllocated<T, ArenaAllocator> {
 
 #[derive(Clone, Default)]
 pub struct QueueAllocated<B: AsBuffer> {
-    pub buffer: [B; FRAMES_IN_FLIGHT],
-    pub queue: Vec<B::DataType>,
+    buffer: [B; FRAMES_IN_FLIGHT],
+    queue: Vec<B::DataType>,
 }
 
-impl<T: AsBuffer> std::ops::Deref for QueueAllocated<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.buffer[Ctx::frame_in_flight()]
+impl<B: AsBuffer> AsBuffer for QueueAllocated<B> {
+    type Location = B::Location;
+    type DataType = B::DataType;
+    fn get_ref(&self) -> &Buffer<Self::DataType, Self::Location> {
+        self.buffer[Ctx::frame_in_flight()].get_ref()
+    }
+    fn get_mut(&mut self) -> &mut Buffer<Self::DataType, Self::Location> {
+        self.buffer[Ctx::frame_in_flight()].get_mut()
     }
 }
-
-impl<T: AsBuffer> std::ops::DerefMut for QueueAllocated<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer[Ctx::frame_in_flight()]
-    }
-}
-
 
 impl<B: AsBuffer> QueueAllocated<B> {
+    pub fn new(buffer: [B; FRAMES_IN_FLIGHT]) -> Self {
+        QueueAllocated { buffer, queue: Vec::new() }    
+    }
     pub fn push(&mut self, value: B::DataType) {
         self.queue.push(value);
     }
+    pub fn extend<T: IntoIterator<Item = B::DataType>>(&mut self, itter: T) {
+        self.queue.extend(itter);
+    }
     pub fn assert_size(&mut self) {
         let size = self.queue_size();
-        self.buffer[Ctx::frame_in_flight()].get_mut().assert_size(size);
+        let buffer = self.buffer[Ctx::frame_in_flight()].get_mut();
+        //Safe to delete becouse we are sure this buffer isnt used
+        if buffer.size < size {
+            *buffer = Buffer::with_alignment(
+                    BufferUsageFlags::STORAGE,
+                    size.next_power_of_two(),
+                    None,
+                ).unwrap();
+        }
+    }
+    pub fn clear(&mut self) -> Vec<B::DataType> {
+        std::mem::take(&mut self.queue)
+    }
+    pub fn len(&self) -> usize {
+        self.queue.len()
     }
     pub fn queue_size(&self) -> u64 {
         (self.queue.len() * size_of::<B::DataType>()) as u64
