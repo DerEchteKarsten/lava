@@ -1,11 +1,11 @@
 use std::{marker::PhantomData, ops::Range};
 
 use anyhow::Result;
-use ash::vk;
-use gpu_allocator::vulkan::Allocation;
+use ash::vk::{self, ComponentSwizzle};
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 
 use crate::{
-    image::{format::VkFormat, usage::UsageSet},
+    image::{format::VkFormat, slice::AsImage, usage::UsageSet},
     state::Ctx,
 };
 
@@ -49,7 +49,7 @@ pub struct Image<F: VkFormat, U: UsageSet> {
     pub whole_view: vk::ImageView,
     pub allocation: Allocation,
     pub mips: u32,
-    pub extend: vk::Extent3D,
+    pub extent: vk::Extent3D,
     _format: PhantomData<F>,
     _usage: PhantomData<U>,
 }
@@ -66,10 +66,42 @@ impl<F: VkFormat, U: UsageSet> Image<F, U> {
             mip_levels: mips,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: U::VK | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
             ..Default::default()
         };
             
-        let image = unsafe { Ctx::device().create_image(create_info, None) }?;
+        let image = unsafe { Ctx::device().create_image(&create_info, None) }?;
+        let requirements = unsafe { Ctx::device().get_image_memory_requirements(image) };
 
+        let desc = AllocationCreateDesc {
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            linear: false,
+            location: gpu_allocator::MemoryLocation::GpuOnly,
+            name: "ImageMemory",
+            requirements,
+        };
+        let allocation = Ctx::allocator().allocate(&desc)?;
+        let mut s = Self {
+            _format: PhantomData,
+            _usage: PhantomData,
+            allocation,
+            extent,
+            handle: image,
+            mips,
+            whole_view: vk::ImageView::null(),
+        };
+        let view = s.create_new_view(0, mips, vk::ComponentMapping{
+            r: ComponentSwizzle::R,
+            g: ComponentSwizzle::G,
+            b: ComponentSwizzle::B,
+            a: ComponentSwizzle::A,
+        });
+        s.whole_view = view.view;
+        Ok(s)
+    }
+
+    fn new(size: ImageSize) -> Result<Self> {
+        Self::new_mipped(size, 1)
     }
 }

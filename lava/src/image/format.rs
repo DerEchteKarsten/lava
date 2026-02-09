@@ -37,30 +37,31 @@ impl<const N: usize, T: Pod> TexelType for [T; N] {
 
 trait Encoding {}
 
-struct UNorm;
+pub struct UNorm;
 impl Encoding for UNorm {}
-struct SNorm;
+pub struct SNorm;
 impl Encoding for SNorm {}
-struct UInt;
+pub struct UInt;
 impl Encoding for UInt {}
-struct SInt;
+pub struct SInt;
 impl Encoding for SInt {}
-struct UScaled;
+pub struct UScaled;
 impl Encoding for UScaled {}
-struct SScaled;
+pub struct SScaled;
 impl Encoding for SScaled {}
-struct Float;
+pub struct Float;
 impl Encoding for Float {}
-struct SRgb;
+pub struct SRgb;
 impl Encoding for SRgb {}
 
-struct Format<T: TexelType, E: Encoding> {
+
+pub struct Format<T: TexelType, E: Encoding> {
     _m1: PhantomData<T>,
     _m2: PhantomData<E>,
 }
 
 impl<T: TexelType, E: Encoding> VkFormat for Format<T, E> {
-    const ASPECTS: vk::ImageAspectFlags = TexelType::ASPECT;
+    const ASPECTS: vk::ImageAspectFlags = T::ASPECT;
     const FORMAT: vk::Format = const {
         use vk::Format;
         match (
@@ -153,9 +154,19 @@ impl<T: TexelType, E: Encoding> VkFormat for Format<T, E> {
             _ => unreachable!(),
         }
     };
+    const SWAPCHAIN: bool = false;
+}
+
+pub(crate) struct SwapchainFormat;
+
+impl VkFormat for SwapchainFormat {
+    const FORMAT: vk::Format = vk::Format::UNDEFINED;
+    const ASPECTS: vk::ImageAspectFlags = vk::ImageAspectFlags::COLOR;
+    const SWAPCHAIN: bool = true;
 }
 
 pub(crate) trait VkFormat {
     const FORMAT: vk::Format;
+    const SWAPCHAIN: bool;
     const ASPECTS: vk::ImageAspectFlags;
 }

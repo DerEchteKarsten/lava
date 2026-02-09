@@ -1,10 +1,10 @@
 use std::sync::{OnceLock, atomic::AtomicU32};
 
 use anyhow::Result;
-use ash::vk;
+use ash::vk::{self};
 use bytemuck::{Pod, Zeroable};
 
-use crate::{state::Ctx, vkobjects::image::ImageType};
+use crate::{image::{format::VkFormat, slice::ImageView, usage::{IsSampled, IsStorage, UsageSet}}, state::Ctx};
 
 #[derive(Debug)]
 pub struct Bindless {
@@ -160,7 +160,7 @@ impl Bindless {
         Ok(())
     }
 
-    pub fn push_image(image: &impl ImageType) -> BindlessHandle {
+    pub fn push_image<F: VkFormat, U: IsStorage>(image: ImageView<F, U>) -> BindlessHandle {
         let handle = Self::get()
             .num_images
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -172,7 +172,7 @@ impl Bindless {
         handle
     }
 
-    pub fn push_texture(texture: &impl ImageType) -> BindlessHandle {
+    pub fn push_texture<F: VkFormat, U: IsSampled>(texture: ImageView<F, U>) -> BindlessHandle {
         let handle = Self::get()
             .num_textures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -184,10 +184,10 @@ impl Bindless {
         handle
     }
 
-    pub fn write_image(image: &impl ImageType, handle: BindlessHandle) {
+    pub fn write_image<F: VkFormat, U: IsStorage>(image: ImageView<F, U>, handle: BindlessHandle) {
         let image_info = [vk::DescriptorImageInfo {
             image_layout: vk::ImageLayout::GENERAL,
-            image_view: image.get_view(),
+            image_view: image.view,
             ..Default::default()
         }];
         let write = vk::WriteDescriptorSet::default()
@@ -200,10 +200,10 @@ impl Bindless {
         unsafe { Ctx::device().update_descriptor_sets(std::slice::from_ref(&write), &[]) };
     }
 
-    pub fn write_texture(texture: &impl ImageType, handle: BindlessHandle) {
+    pub fn write_texture<F: VkFormat, U: IsSampled>(texture: ImageView<F, U>, handle: BindlessHandle) {
         let image_info = [vk::DescriptorImageInfo {
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            image_view: texture.get_view(),
+            image_view: texture.view,
             ..Default::default()
         }];
         let write = vk::WriteDescriptorSet::default()

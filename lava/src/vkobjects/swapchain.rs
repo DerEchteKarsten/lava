@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::{ffi::CStr, marker::PhantomData};
 
 use anyhow::Result;
 use ash::{
@@ -6,11 +6,8 @@ use ash::{
     vk::{self},
 };
 
-use crate::vkobjects::{image::ImageSize, surface::Surface};
+use crate::{image::{Image, format::{Format, SRgb}, slice::ImageView, usage::{ColorAttachment, ColorAttachmentStorage}}, state::Ctx, vkobjects::surface::Surface};
 
-use super::image::Image;
-
-#[derive(Debug)]
 pub struct Swapchain {
     pub resized: bool,
     pub size: [u32; 2],
@@ -18,7 +15,7 @@ pub struct Swapchain {
     pub format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
     pub present_mode: vk::PresentModeKHR,
-    pub images: Vec<Image>,
+    pub images: Vec<ImageView<Format<[u8; 4], SRgb>, ColorAttachmentStorage>>,
 }
 
 impl Swapchain {
@@ -126,14 +123,31 @@ impl Swapchain {
                         .object_name(name);
                     unsafe { debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
                 }
-                Image {
-                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
-                    handle: image,
-                    format: format.format,
-                    size: ImageSize::FullScreen,
-                    view: Image::view(&device, image, format.format),
-                    allocation: None,
-                    bindless_handle: None,
+                let create_info = vk::ImageViewCreateInfo::default()
+                    .components(vk::ComponentMapping{
+                        r: vk::ComponentSwizzle::R,
+                        g: vk::ComponentSwizzle::G,
+                        b: vk::ComponentSwizzle::B,
+                        a: vk::ComponentSwizzle::A,
+                    })
+                    .format(format.format)
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: Self::Format::ASPECTS,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                        base_mip_level: 0,
+                        level_count: 1,
+                    });
+                let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
+                ImageView {
+                    image,
+                    view,
+                    base_mip: 0,
+                    num_mips: 1,
+                    _marker: PhantomData,
+                    _marker2: PhantomData
                 }
             })
             .collect::<Vec<_>>();

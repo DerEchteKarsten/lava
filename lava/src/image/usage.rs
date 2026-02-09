@@ -8,6 +8,8 @@ pub struct Sampled;
 pub struct Storage;
 pub struct ColorAttachment;
 pub struct DepthAttachment;
+pub struct ColorAttachmentStorage;
+pub struct DepthAttachmentStorage;
 pub struct ColorAttachmentSampled;
 pub struct DepthAttachmentSampled;
 pub struct SampledStorage;
@@ -35,6 +37,17 @@ impl UsageSet for DepthAttachmentSampled {
             | vk::ImageUsageFlags::SAMPLED.as_raw(),
     );
 }
+impl UsageSet for ColorAttachmentStorage {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+        vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw(),
+    );
+}
+impl UsageSet for DepthAttachmentStorage {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT.as_raw()
+            | vk::ImageUsageFlags::STORAGE.as_raw(),
+    );
+}
 impl UsageSet for SampledStorage {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw(),
@@ -52,10 +65,12 @@ impl IsSampled for DepthAttachmentSampled {}
 impl IsSampled for SampledStorage {}
 
 impl IsStorage for Storage {}
+impl IsStorage for ColorAttachmentStorage {}
 impl IsStorage for SampledStorage {}
 
 impl IsColorAttachment for ColorAttachment {}
 impl IsColorAttachment for ColorAttachmentSampled {}
+impl IsColorAttachment for ColorAttachmentStorage {}
 
 impl IsDepthAttachment for DepthAttachment {}
 impl IsDepthAttachment for DepthAttachmentSampled {}

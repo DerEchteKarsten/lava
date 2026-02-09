@@ -14,14 +14,7 @@ use ash::vk::{self, BufferCopy, IndexType, Offset3D, PipelineStageFlags2, Shader
 use bytemuck::{Pod, Zeroable, bytes_of};
 
 use crate::{
-    bindless::Bindless,
-    buffer::{CpuBuffer, GpuBuffer, Location, slice::BufferSlice},
-    state::{Ctx, Functions},
-    tracy_span,
-    vkobjects::{
-        image::{Image, ImageType},
-        rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
-    },
+    bindless::Bindless, buffer::{CpuBuffer, GpuBuffer, Location, slice::BufferSlice}, image::{Image, format::VkFormat, slice::{ImageSlice, ImageView}, usage::{IsColorAttachment, IsDepthAttachment, UsageSet}}, state::{Ctx, Functions}, tracy_span, vkobjects::rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline}
 };
 
 pub struct CommandBuffer<'a> {
@@ -449,8 +442,10 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         self
     }
 
-    pub fn color_attachment(mut self, image: &Image, clear: Option<[f32; 4]>) -> Self {
-        self.hash.color_formats.push(image.format);
+    pub fn color_attachment<F: VkFormat, U>(mut self, image: ImageView<F, U>, clear: Option<[f32; 4]>) -> Self 
+        where U: IsColorAttachment 
+    {
+        self.hash.color_formats.push(F::FORMAT);
         self.color_attachments.push((image.view, clear));
         self.resource_states.push((
             ResourceHandle::Image((image.view, image.handle)),
@@ -469,7 +464,9 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         self
     }
 
-    pub fn depth_attachment(mut self, image: &Image) -> Self {
+    pub fn depth_attachment<F: VkFormat, U>(mut self, image: ImageView<F, U>) -> Self 
+        where U: IsDepthAttachment,
+    {
         self.hash.depth_format = image.format;
         self.depth_attachment = image.view;
         self.resource_states.push((
@@ -849,24 +846,24 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn blit_image(&mut self, src: &Image, dst: &Image) {
+    pub fn blit_image<F: VkFormat, U: UsageSet, F2: VkFormat, U2: UsageSet>(&mut self, src: ImageView<F, U>, dst: ImageView<F2, U2>) {
         tracy_span!("blit_image");
         self.barriers(vec![
             (
-                ResourceHandle::Image((src.view, src.handle)),
+                ResourceHandle::Image((src.view, src.image)),
                 ResourceState {
                     access: vk::AccessFlags2::TRANSFER_READ,
                     stages: vk::PipelineStageFlags2::TRANSFER,
-                    aspect: vk::ImageAspectFlags::COLOR,
+                    aspect: F::ASPECTS,
                     layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 },
             ),
             (
-                ResourceHandle::Image((dst.view, dst.handle)),
+                ResourceHandle::Image((dst.view, dst.image)),
                 ResourceState {
                     access: vk::AccessFlags2::TRANSFER_WRITE,
                     stages: vk::PipelineStageFlags2::TRANSFER,
-                    aspect: vk::ImageAspectFlags::COLOR,
+                    aspect: F2::ASPECTS,
                     layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 },
             ),
@@ -952,10 +949,10 @@ impl<'b> CommandBuffer<'b> {
         unsafe { Ctx::device().cmd_copy_buffer(self.handle, src.handle, dst.handle, regions) };
     }
 
-    pub fn copy_buffer_to_image<T: Copy + Pod, L: Location>(
+    pub fn copy_buffer_to_image<T: Copy + Pod, L: Location, F: VkFormat, U: UsageSet>(
         &mut self,
         src: BufferSlice<T, L>,
-        dst: &Image,
+        dst: ImageSlice<F, U>,
     ) {
         tracy_span!("copy_buffer_to_image");
         self.barriers(vec![
@@ -968,28 +965,18 @@ impl<'b> CommandBuffer<'b> {
                 },
             ),
             (
-                ResourceHandle::Image((dst.view, dst.handle)),
+                ResourceHandle::Image((dst.view.view, dst.view.image)),
                 ResourceState {
                     access: vk::AccessFlags2::TRANSFER_WRITE,
                     stages: vk::PipelineStageFlags2::TRANSFER,
-                    aspect: vk::ImageAspectFlags::COLOR,
+                    aspect: F::ASPECTS,
                     layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 },
             ),
         ]);
-        let size = dst.size.size();
         let regions = [vk::BufferImageCopy {
-            image_extent: ash::vk::Extent3D {
-                width: size.x,
-                height: size.y,
-                depth: 1,
-            },
-            image_subresource: ash::vk::ImageSubresourceLayers {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
+            image_extent: dst.extend,
+            image_subresource: dst.subresource(),
             buffer_image_height: 0,
             buffer_offset: src.offset,
             buffer_row_length: 0,
@@ -1062,10 +1049,10 @@ impl<'b> CommandBuffer<'b> {
         }
     }
 
-    pub fn present(&mut self, swapchain_image: &Image) {
+    pub fn present<F: VkFormat, U: UsageSet>(&mut self, swapchain_image: ImageView<F, U>) {
         tracy_span!("present_barriers");
         self.barriers(vec![(
-            ResourceHandle::Image((swapchain_image.view, swapchain_image.handle)),
+            ResourceHandle::Image((swapchain_image.view, swapchain_image.image)),
             ResourceState {
                 access: vk::AccessFlags2::empty(),
                 aspect: vk::ImageAspectFlags::COLOR,
@@ -1089,13 +1076,13 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn transition_layout(&mut self, image: &Image, layout: vk::ImageLayout) {
+    pub fn transition_layout<F: VkFormat, U: UsageSet>(&mut self, image: ImageView<F, U>, layout: vk::ImageLayout) {
         tracy_span!("transition_layout");
         self.barriers(vec![(
-            ResourceHandle::Image((image.view, image.handle)),
+            ResourceHandle::Image((image.view, image.image)),
             ResourceState {
                 access: vk::AccessFlags2::empty(),
-                aspect: vk::ImageAspectFlags::COLOR,
+                aspect: F::ASPECTS,
                 layout,
                 stages: vk::PipelineStageFlags2::TOP_OF_PIPE,
             },
