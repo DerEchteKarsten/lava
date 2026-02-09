@@ -4,7 +4,14 @@ use anyhow::Result;
 use ash::vk::{self};
 use bytemuck::{Pod, Zeroable};
 
-use crate::{image::{format::VkFormat, slice::ImageView, usage::{IsSampled, IsStorage, UsageSet}}, state::Ctx};
+use crate::{
+    image::{
+        format::Format,
+        slice::ImageView,
+        usage::{BindlessImageUsageSet, IsSampled, IsStorage, UsageSet},
+    },
+    state::Ctx,
+};
 
 #[derive(Debug)]
 pub struct Bindless {
@@ -18,11 +25,12 @@ pub struct Bindless {
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 
+const NULL_HANDLE: u32 = !0;
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct BindlessHandle {
-    pub descriptor_set: u32,
-    pub descriptor_index: u32,
+    pub descriptor_index_set0: u32,
+    pub descriptor_index_set1: u32,
 }
 
 impl Bindless {
@@ -160,61 +168,64 @@ impl Bindless {
         Ok(())
     }
 
-    pub fn push_image<F: VkFormat, U: IsStorage>(image: ImageView<F, U>) -> BindlessHandle {
-        let handle = Self::get()
-            .num_images
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let handle = BindlessHandle {
-            descriptor_set: 1,
-            descriptor_index: handle,
+    pub fn push<F: Format, U: UsageSet>(image: ImageView<F, U>) -> Option<BindlessHandle> {
+        let handle = match U::SET {
+            BindlessImageUsageSet::None => return None,
+            BindlessImageUsageSet::Both => BindlessHandle {
+                descriptor_index_set1: Self::get()
+                    .num_images
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                descriptor_index_set0: Self::get()
+                    .num_textures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            },
+            BindlessImageUsageSet::SampledImage => BindlessHandle {
+                descriptor_index_set1: NULL_HANDLE,
+                descriptor_index_set0: Self::get()
+                    .num_textures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            },
+            BindlessImageUsageSet::StorageImage => BindlessHandle {
+                descriptor_index_set1: Self::get()
+                    .num_images
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                descriptor_index_set0: NULL_HANDLE,
+            },
         };
         Self::write_image(image, handle);
-        handle
+        Some(handle)
     }
 
-    pub fn push_texture<F: VkFormat, U: IsSampled>(texture: ImageView<F, U>) -> BindlessHandle {
-        let handle = Self::get()
-            .num_textures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let handle = BindlessHandle {
-            descriptor_set: 0,
-            descriptor_index: handle,
-        };
-        Self::write_texture(texture, handle);
-        handle
-    }
-
-    pub fn write_image<F: VkFormat, U: IsStorage>(image: ImageView<F, U>, handle: BindlessHandle) {
+    pub fn write_image<F: Format, U: UsageSet>(image: ImageView<F, U>, handle: BindlessHandle) {
         let image_info = [vk::DescriptorImageInfo {
-            image_layout: vk::ImageLayout::GENERAL,
+            image_layout: U::PREFERED_LAYOUT,
             image_view: image.view,
             ..Default::default()
         }];
         let write = vk::WriteDescriptorSet::default()
             .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .dst_array_element(handle.descriptor_index)
             .dst_binding(0)
-            .dst_set(Self::get().sets[1])
             .image_info(&image_info);
-        unsafe { Ctx::device().update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+        let mut writes = Vec::new();
+        if handle.descriptor_index_set0 != NULL_HANDLE {
+            writes.push(
+                write
+                    .dst_array_element(handle.descriptor_index_set0)
+                    .dst_set(Self::get().sets[0])
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE),
+            );
+        }
+        if handle.descriptor_index_set1 != NULL_HANDLE {
+            writes.push(
+                write
+                    .dst_array_element(handle.descriptor_index_set1)
+                    .dst_set(Self::get().sets[1])
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE),
+            );
+        }
+        unsafe { Ctx::device().update_descriptor_sets(&writes, &[]) };
     }
 
-    pub fn write_texture<F: VkFormat, U: IsSampled>(texture: ImageView<F, U>, handle: BindlessHandle) {
-        let image_info = [vk::DescriptorImageInfo {
-            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            image_view: texture.view,
-            ..Default::default()
-        }];
-        let write = vk::WriteDescriptorSet::default()
-            .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .dst_array_element(handle.descriptor_index)
-            .dst_binding(1)
-            .dst_set(Self::get().sets[0])
-            .image_info(&image_info);
-        unsafe { Ctx::device().update_descriptor_sets(std::slice::from_ref(&write), &[]) };
-    }
     pub fn bind(cmd: &vk::CommandBuffer) {
         let s = Self::get();
         unsafe {

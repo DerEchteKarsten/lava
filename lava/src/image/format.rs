@@ -1,172 +1,227 @@
 use ash::vk;
 use bytemuck::Pod;
-use std::{any::TypeId, marker::PhantomData};
+use glam::Mat4;
+use std::{
+    any::TypeId,
+    intrinsics::{self, type_id},
+    marker::PhantomData,
+};
 
-pub struct Depth<T: Pod> {
-    value: T
-}
+use crate::{
+    image::{Image, usage::Storage},
+    state::Ctx,
+};
 
-pub struct Stencil<T: Pod> {
-    value: T
-}
-
-
-trait TexelType {
-    type Component: Pod;
-    const NUM_COMPONENT: usize;
-    const ASPECT: vk::ImageAspectFlags;
-}
-
-impl<const N: usize, T: Pod> TexelType for [Depth<T>; N] {
-    const NUM_COMPONENT: usize = N;
-    type Component = T;
-    const ASPECT: vk::ImageAspectFlags = vk::ImageAspectFlags::DEPTH;
-}
-
-impl<const N: usize, T: Pod> TexelType for [Stencil<T>; N] {
-    const NUM_COMPONENT: usize = N;
-    type Component = T;
-    const ASPECT: vk::ImageAspectFlags = vk::ImageAspectFlags::STENCIL;
-}
-
-impl<const N: usize, T: Pod> TexelType for [T; N] {
-    const NUM_COMPONENT: usize = N;
-    type Component = T;
-    const ASPECT: vk::ImageAspectFlags = vk::ImageAspectFlags::COLOR;
-}
-
-trait Encoding {}
-
-pub struct UNorm;
-impl Encoding for UNorm {}
-pub struct SNorm;
-impl Encoding for SNorm {}
-pub struct UInt;
-impl Encoding for UInt {}
-pub struct SInt;
-impl Encoding for SInt {}
-pub struct UScaled;
-impl Encoding for UScaled {}
-pub struct SScaled;
-impl Encoding for SScaled {}
-pub struct Float;
-impl Encoding for Float {}
-pub struct SRgb;
-impl Encoding for SRgb {}
-
-
-pub struct Format<T: TexelType, E: Encoding> {
-    _m1: PhantomData<T>,
-    _m2: PhantomData<E>,
-}
-
-impl<T: TexelType, E: Encoding> VkFormat for Format<T, E> {
-    const ASPECTS: vk::ImageAspectFlags = T::ASPECT;
-    const FORMAT: vk::Format = const {
-        use vk::Format;
-        match (
-            TypeId::of::<T::Component>(),
-            T::NUM_COMPONENT,
-            TypeId::of::<E>(),
-        ) {
-            (TypeId::of::<u8>(), 1, TypeId::of::<UNorm>()) => Format::R8_UNORM,
-            (TypeId::of::<u8>(), 1, TypeId::of::<SNorm>()) => Format::R8_SNORM,
-            (TypeId::of::<u8>(), 1, TypeId::of::<UInt>()) => Format::R8_UINT,
-            (TypeId::of::<u8>(), 1, TypeId::of::<SInt>()) => Format::R8_SINT,
-
-            (TypeId::of::<u8>(), 2, TypeId::of::<UNorm>()) => Format::R8G8_UNORM,
-            (TypeId::of::<u8>(), 2, TypeId::of::<SNorm>()) => Format::R8G8_SNORM,
-            (TypeId::of::<u8>(), 2, TypeId::of::<UInt>()) => Format::R8G8_UINT,
-            (TypeId::of::<u8>(), 2, TypeId::of::<SInt>()) => Format::R8G8_SINT,
-
-            (TypeId::of::<u8>(), 3, TypeId::of::<UNorm>()) => Format::R8G8B8_UNORM,
-            (TypeId::of::<u8>(), 3, TypeId::of::<SNorm>()) => Format::R8G8B8_SNORM,
-            (TypeId::of::<u8>(), 3, TypeId::of::<UInt>()) => Format::R8G8B8_UINT,
-            (TypeId::of::<u8>(), 3, TypeId::of::<SInt>()) => Format::R8G8B8_SINT,
-
-            (TypeId::of::<u8>(), 4, TypeId::of::<UNorm>()) => Format::R8G8B8A8_UNORM,
-            (TypeId::of::<u8>(), 4, TypeId::of::<SNorm>()) => Format::R8G8B8A8_SNORM,
-            (TypeId::of::<u8>(), 4, TypeId::of::<UInt>()) => Format::R8G8B8A8_UINT,
-            (TypeId::of::<u8>(), 4, TypeId::of::<SInt>()) => Format::R8G8B8A8_SINT,
-
-            // 16-bit UNORM/SNORM/UINT/SINT/FLOAT
-            (TypeId::of::<u16>(), 1, TypeId::of::<UNorm>()) => Format::R16_UNORM,
-            (TypeId::of::<u16>(), 1, TypeId::of::<SNorm>()) => Format::R16_SNORM,
-            (TypeId::of::<u16>(), 1, TypeId::of::<UInt>()) => Format::R16_UINT,
-            (TypeId::of::<u16>(), 1, TypeId::of::<SInt>()) => Format::R16_SINT,
-            (TypeId::of::<u16>(), 1, TypeId::of::<Float>()) => Format::R16_SFLOAT,
-
-            (TypeId::of::<u16>(), 2, TypeId::of::<UNorm>()) => Format::R16G16_UNORM,
-            (TypeId::of::<u16>(), 2, TypeId::of::<SNorm>()) => Format::R16G16_SNORM,
-            (TypeId::of::<u16>(), 2, TypeId::of::<UInt>()) => Format::R16G16_UINT,
-            (TypeId::of::<u16>(), 2, TypeId::of::<SInt>()) => Format::R16G16_SINT,
-            (TypeId::of::<u16>(), 2, TypeId::of::<Float>()) => Format::R16G16_SFLOAT,
-
-            (TypeId::of::<u16>(), 3, TypeId::of::<UNorm>()) => Format::R16G16B16_UNORM,
-            (TypeId::of::<u16>(), 3, TypeId::of::<SNorm>()) => Format::R16G16B16_SNORM,
-            (TypeId::of::<u16>(), 3, TypeId::of::<UInt>()) => Format::R16G16B16_UINT,
-            (TypeId::of::<u16>(), 3, TypeId::of::<SInt>()) => Format::R16G16B16_SINT,
-            (TypeId::of::<u16>(), 3, TypeId::of::<Float>()) => Format::R16G16B16_SFLOAT,
-
-            (TypeId::of::<u16>(), 4, TypeId::of::<UNorm>()) => Format::R16G16B16A16_UNORM,
-            (TypeId::of::<u16>(), 4, TypeId::of::<SNorm>()) => Format::R16G16B16A16_SNORM,
-            (TypeId::of::<u16>(), 4, TypeId::of::<UInt>()) => Format::R16G16B16A16_UINT,
-            (TypeId::of::<u16>(), 4, TypeId::of::<SInt>()) => Format::R16G16B16A16_SINT,
-            (TypeId::of::<u16>(), 4, TypeId::of::<Float>()) => Format::R16G16B16A16_SFLOAT,
-
-            // 32-bit floats / ints
-            (TypeId::of::<f32>(), 1, TypeId::of::<Float>()) => Format::R32_SFLOAT,
-            (TypeId::of::<f32>(), 2, TypeId::of::<Float>()) => Format::R32G32_SFLOAT,
-            (TypeId::of::<f32>(), 3, TypeId::of::<Float>()) => Format::R32G32B32_SFLOAT,
-            (TypeId::of::<f32>(), 4, TypeId::of::<Float>()) => Format::R32G32B32A32_SFLOAT,
-
-            (TypeId::of::<u32>(), 1, TypeId::of::<UInt>()) => Format::R32_UINT,
-            (TypeId::of::<u32>(), 2, TypeId::of::<UInt>()) => Format::R32G32_UINT,
-            (TypeId::of::<u32>(), 3, TypeId::of::<UInt>()) => Format::R32G32B32_UINT,
-            (TypeId::of::<u32>(), 4, TypeId::of::<UInt>()) => Format::R32G32B32A32_UINT,
-
-            (TypeId::of::<i32>(), 1, TypeId::of::<SInt>()) => Format::R32_SINT,
-            (TypeId::of::<i32>(), 2, TypeId::of::<SInt>()) => Format::R32G32_SINT,
-            (TypeId::of::<i32>(), 3, TypeId::of::<SInt>()) => Format::R32G32B32_SINT,
-            (TypeId::of::<i32>(), 4, TypeId::of::<SInt>()) => Format::R32G32B32A32_SINT,
-
-            // 64-bit floats / ints
-            (TypeId::of::<f64>(), 1, TypeId::of::<Float>()) => Format::R64_SFLOAT,
-            (TypeId::of::<f64>(), 2, TypeId::of::<Float>()) => Format::R64G64_SFLOAT,
-            (TypeId::of::<f64>(), 3, TypeId::of::<Float>()) => Format::R64G64B64_SFLOAT,
-            (TypeId::of::<f64>(), 4, TypeId::of::<Float>()) => Format::R64G64B64A64_SFLOAT,
-
-            (TypeId::of::<u64>(), 1, TypeId::of::<UInt>()) => Format::R64_UINT,
-            (TypeId::of::<u64>(), 2, TypeId::of::<UInt>()) => Format::R64G64_UINT,
-            (TypeId::of::<u64>(), 3, TypeId::of::<UInt>()) => Format::R64G64B64_UINT,
-            (TypeId::of::<u64>(), 4, TypeId::of::<UInt>()) => Format::R64G64B64A64_UINT,
-
-            (TypeId::of::<i64>(), 1, TypeId::of::<SInt>()) => Format::R64_SINT,
-            (TypeId::of::<i64>(), 2, TypeId::of::<SInt>()) => Format::R64G64_SINT,
-            (TypeId::of::<i64>(), 3, TypeId::of::<SInt>()) => Format::R64G64B64_SINT,
-            (TypeId::of::<i64>(), 4, TypeId::of::<SInt>()) => Format::R64G64B64A64_SINT,
-
-            (TypeId::of::<Depth<f32>>(), 1, TypeId::of::<Float>()) => Format::D32_SFLOAT,
-            (TypeId::of::<Depth<u16>>(), 1, TypeId::of::<UNorm>()) => Format::D16_UNORM,
-            (TypeId::of::<Stencil<u32>>(), 1, TypeId::of::<UInt>()) => Format::S8_UINT,
-            // (TypeId::of::<Depth<u16>>(), 2, TypeId::of::<UNorm>()) => Format::D16_UNORM_S8_UINT,
-            // (TypeId::of::<Depth<u32>>(), 2, TypeId::of::<UNorm>()) => Format::D24_UNORM_S8_UINT,
-            _ => unreachable!(),
-        }
-    };
-    const SWAPCHAIN: bool = false;
-}
-
-pub(crate) struct SwapchainFormat;
-
-impl VkFormat for SwapchainFormat {
-    const FORMAT: vk::Format = vk::Format::UNDEFINED;
-    const ASPECTS: vk::ImageAspectFlags = vk::ImageAspectFlags::COLOR;
-    const SWAPCHAIN: bool = true;
-}
-
-pub(crate) trait VkFormat {
+pub(crate) trait Format: 'static + Copy + Clone {
     const FORMAT: vk::Format;
-    const SWAPCHAIN: bool;
     const ASPECTS: vk::ImageAspectFlags;
+
+    fn format() -> vk::Format {
+        if Self::FORMAT == vk::Format::UNDEFINED {
+            Ctx::swapchain().format
+        } else {
+            Self::FORMAT
+        }
+    }
 }
+
+macro_rules! define_format {
+    ($($struct_name:ident => ($vk_format:ident, $aspect:expr)),* $(,)?) => {
+        $(
+            #[derive(Copy, Clone, Debug)]
+            pub struct $struct_name;
+            impl Format for $struct_name {
+                const FORMAT: vk::Format = vk::Format::$vk_format;
+                const ASPECTS: vk::ImageAspectFlags = $aspect;
+            }
+        )*
+    };
+}
+
+define_format!(
+    Swapchain => (UNDEFINED, vk::ImageAspectFlags::COLOR),
+    R4G4UnormPack8 => (R4G4_UNORM_PACK8, vk::ImageAspectFlags::COLOR),
+    R4G4B4A4UnormPack16 => (R4G4B4A4_UNORM_PACK16, vk::ImageAspectFlags::COLOR),
+    B4G4R4A4UnormPack16 => (B4G4R4A4_UNORM_PACK16, vk::ImageAspectFlags::COLOR),
+    R5G6B5UnormPack16 => (R5G6B5_UNORM_PACK16, vk::ImageAspectFlags::COLOR),
+    B5G6R5UnormPack16 => (B5G6R5_UNORM_PACK16, vk::ImageAspectFlags::COLOR),
+    R5G5B5A1UnormPack16 => (R5G5B5A1_UNORM_PACK16, vk::ImageAspectFlags::COLOR),
+    B5G5R5A1UnormPack16 => (B5G5R5A1_UNORM_PACK16, vk::ImageAspectFlags::COLOR),
+    A1R5G5B5UnormPack16 => (A1R5G5B5_UNORM_PACK16, vk::ImageAspectFlags::COLOR),
+    R8Unorm => (R8_UNORM, vk::ImageAspectFlags::COLOR),
+    R8Snorm => (R8_SNORM, vk::ImageAspectFlags::COLOR),
+    R8Uscaled => (R8_USCALED, vk::ImageAspectFlags::COLOR),
+    R8Sscaled => (R8_SSCALED, vk::ImageAspectFlags::COLOR),
+    R8Uint => (R8_UINT, vk::ImageAspectFlags::COLOR),
+    R8Sint => (R8_SINT, vk::ImageAspectFlags::COLOR),
+    R8Srgb => (R8_SRGB, vk::ImageAspectFlags::COLOR),
+    R8G8Unorm => (R8G8_UNORM, vk::ImageAspectFlags::COLOR),
+    R8G8Snorm => (R8G8_SNORM, vk::ImageAspectFlags::COLOR),
+    R8G8Uscaled => (R8G8_USCALED, vk::ImageAspectFlags::COLOR),
+    R8G8Sscaled => (R8G8_SSCALED, vk::ImageAspectFlags::COLOR),
+    R8G8Uint => (R8G8_UINT, vk::ImageAspectFlags::COLOR),
+    R8G8Sint => (R8G8_SINT, vk::ImageAspectFlags::COLOR),
+    R8G8Srgb => (R8G8_SRGB, vk::ImageAspectFlags::COLOR),
+    R8G8B8Unorm => (R8G8B8_UNORM, vk::ImageAspectFlags::COLOR),
+    R8G8B8Snorm => (R8G8B8_SNORM, vk::ImageAspectFlags::COLOR),
+    R8G8B8Uscaled => (R8G8B8_USCALED, vk::ImageAspectFlags::COLOR),
+    R8G8B8Sscaled => (R8G8B8_SSCALED, vk::ImageAspectFlags::COLOR),
+    R8G8B8Uint => (R8G8B8_UINT, vk::ImageAspectFlags::COLOR),
+    R8G8B8Sint => (R8G8B8_SINT, vk::ImageAspectFlags::COLOR),
+    R8G8B8Srgb => (R8G8B8_SRGB, vk::ImageAspectFlags::COLOR),
+    B8G8R8Unorm => (B8G8R8_UNORM, vk::ImageAspectFlags::COLOR),
+    B8G8R8Snorm => (B8G8R8_SNORM, vk::ImageAspectFlags::COLOR),
+    B8G8R8Uscaled => (B8G8R8_USCALED, vk::ImageAspectFlags::COLOR),
+    B8G8R8Sscaled => (B8G8R8_SSCALED, vk::ImageAspectFlags::COLOR),
+    B8G8R8Uint => (B8G8R8_UINT, vk::ImageAspectFlags::COLOR),
+    B8G8R8Sint => (B8G8R8_SINT, vk::ImageAspectFlags::COLOR),
+    B8G8R8Srgb => (B8G8R8_SRGB, vk::ImageAspectFlags::COLOR),
+    R8G8B8A8Unorm => (R8G8B8A8_UNORM, vk::ImageAspectFlags::COLOR),
+    R8G8B8A8Snorm => (R8G8B8A8_SNORM, vk::ImageAspectFlags::COLOR),
+    R8G8B8A8Uscaled => (R8G8B8A8_USCALED, vk::ImageAspectFlags::COLOR),
+    R8G8B8A8Sscaled => (R8G8B8A8_SSCALED, vk::ImageAspectFlags::COLOR),
+    R8G8B8A8Uint => (R8G8B8A8_UINT, vk::ImageAspectFlags::COLOR),
+    R8G8B8A8Sint => (R8G8B8A8_SINT, vk::ImageAspectFlags::COLOR),
+    R8G8B8A8Srgb => (R8G8B8A8_SRGB, vk::ImageAspectFlags::COLOR),
+    B8G8R8A8Unorm => (B8G8R8A8_UNORM, vk::ImageAspectFlags::COLOR),
+    B8G8R8A8Snorm => (B8G8R8A8_SNORM, vk::ImageAspectFlags::COLOR),
+    B8G8R8A8Uscaled => (B8G8R8A8_USCALED, vk::ImageAspectFlags::COLOR),
+    B8G8R8A8Sscaled => (B8G8R8A8_SSCALED, vk::ImageAspectFlags::COLOR),
+    B8G8R8A8Uint => (B8G8R8A8_UINT, vk::ImageAspectFlags::COLOR),
+    B8G8R8A8Sint => (B8G8R8A8_SINT, vk::ImageAspectFlags::COLOR),
+    B8G8R8A8Srgb => (B8G8R8A8_SRGB, vk::ImageAspectFlags::COLOR),
+    A8B8G8R8UnormPack32 => (A8B8G8R8_UNORM_PACK32, vk::ImageAspectFlags::COLOR),
+    A8B8G8R8SnormPack32 => (A8B8G8R8_SNORM_PACK32, vk::ImageAspectFlags::COLOR),
+    A8B8G8R8UscaledPack32 => (A8B8G8R8_USCALED_PACK32, vk::ImageAspectFlags::COLOR),
+    A8B8G8R8SscaledPack32 => (A8B8G8R8_SSCALED_PACK32, vk::ImageAspectFlags::COLOR),
+    A8B8G8R8UintPack32 => (A8B8G8R8_UINT_PACK32, vk::ImageAspectFlags::COLOR),
+    A8B8G8R8SintPack32 => (A8B8G8R8_SINT_PACK32, vk::ImageAspectFlags::COLOR),
+    A8B8G8R8SrgbPack32 => (A8B8G8R8_SRGB_PACK32, vk::ImageAspectFlags::COLOR),
+    A2R10G10B10UnormPack32 => (A2R10G10B10_UNORM_PACK32, vk::ImageAspectFlags::COLOR),
+    A2R10G10B10SnormPack32 => (A2R10G10B10_SNORM_PACK32, vk::ImageAspectFlags::COLOR),
+    A2R10G10B10UscaledPack32 => (A2R10G10B10_USCALED_PACK32, vk::ImageAspectFlags::COLOR),
+    A2R10G10B10SscaledPack32 => (A2R10G10B10_SSCALED_PACK32, vk::ImageAspectFlags::COLOR),
+    A2R10G10B10UintPack32 => (A2R10G10B10_UINT_PACK32, vk::ImageAspectFlags::COLOR),
+    A2R10G10B10SintPack32 => (A2R10G10B10_SINT_PACK32, vk::ImageAspectFlags::COLOR),
+    A2B10G10R10UnormPack32 => (A2B10G10R10_UNORM_PACK32, vk::ImageAspectFlags::COLOR),
+    A2B10G10R10SnormPack32 => (A2B10G10R10_SNORM_PACK32, vk::ImageAspectFlags::COLOR),
+    A2B10G10R10UscaledPack32 => (A2B10G10R10_USCALED_PACK32, vk::ImageAspectFlags::COLOR),
+    A2B10G10R10SscaledPack32 => (A2B10G10R10_SSCALED_PACK32, vk::ImageAspectFlags::COLOR),
+    A2B10G10R10UintPack32 => (A2B10G10R10_UINT_PACK32, vk::ImageAspectFlags::COLOR),
+    A2B10G10R10SintPack32 => (A2B10G10R10_SINT_PACK32, vk::ImageAspectFlags::COLOR),
+    R16Unorm => (R16_UNORM, vk::ImageAspectFlags::COLOR),
+    R16Snorm => (R16_SNORM, vk::ImageAspectFlags::COLOR),
+    R16Uscaled => (R16_USCALED, vk::ImageAspectFlags::COLOR),
+    R16Sscaled => (R16_SSCALED, vk::ImageAspectFlags::COLOR),
+    R16Uint => (R16_UINT, vk::ImageAspectFlags::COLOR),
+    R16Sint => (R16_SINT, vk::ImageAspectFlags::COLOR),
+    R16Sfloat => (R16_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R16G16Unorm => (R16G16_UNORM, vk::ImageAspectFlags::COLOR),
+    R16G16Snorm => (R16G16_SNORM, vk::ImageAspectFlags::COLOR),
+    R16G16Uscaled => (R16G16_USCALED, vk::ImageAspectFlags::COLOR),
+    R16G16Sscaled => (R16G16_SSCALED, vk::ImageAspectFlags::COLOR),
+    R16G16Uint => (R16G16_UINT, vk::ImageAspectFlags::COLOR),
+    R16G16Sint => (R16G16_SINT, vk::ImageAspectFlags::COLOR),
+    R16G16Sfloat => (R16G16_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R16G16B16Unorm => (R16G16B16_UNORM, vk::ImageAspectFlags::COLOR),
+    R16G16B16Snorm => (R16G16B16_SNORM, vk::ImageAspectFlags::COLOR),
+    R16G16B16Uscaled => (R16G16B16_USCALED, vk::ImageAspectFlags::COLOR),
+    R16G16B16Sscaled => (R16G16B16_SSCALED, vk::ImageAspectFlags::COLOR),
+    R16G16B16Uint => (R16G16B16_UINT, vk::ImageAspectFlags::COLOR),
+    R16G16B16Sint => (R16G16B16_SINT, vk::ImageAspectFlags::COLOR),
+    R16G16B16Sfloat => (R16G16B16_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R16G16B16A16Unorm => (R16G16B16A16_UNORM, vk::ImageAspectFlags::COLOR),
+    R16G16B16A16Snorm => (R16G16B16A16_SNORM, vk::ImageAspectFlags::COLOR),
+    R16G16B16A16Uscaled => (R16G16B16A16_USCALED, vk::ImageAspectFlags::COLOR),
+    R16G16B16A16Sscaled => (R16G16B16A16_SSCALED, vk::ImageAspectFlags::COLOR),
+    R16G16B16A16Uint => (R16G16B16A16_UINT, vk::ImageAspectFlags::COLOR),
+    R16G16B16A16Sint => (R16G16B16A16_SINT, vk::ImageAspectFlags::COLOR),
+    R16G16B16A16Sfloat => (R16G16B16A16_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R32Uint => (R32_UINT, vk::ImageAspectFlags::COLOR),
+    R32Sint => (R32_SINT, vk::ImageAspectFlags::COLOR),
+    R32Sfloat => (R32_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R32G32Uint => (R32G32_UINT, vk::ImageAspectFlags::COLOR),
+    R32G32Sint => (R32G32_SINT, vk::ImageAspectFlags::COLOR),
+    R32G32Sfloat => (R32G32_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R32G32B32Uint => (R32G32B32_UINT, vk::ImageAspectFlags::COLOR),
+    R32G32B32Sint => (R32G32B32_SINT, vk::ImageAspectFlags::COLOR),
+    R32G32B32Sfloat => (R32G32B32_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R32G32B32A32Uint => (R32G32B32A32_UINT, vk::ImageAspectFlags::COLOR),
+    R32G32B32A32Sint => (R32G32B32A32_SINT, vk::ImageAspectFlags::COLOR),
+    R32G32B32A32Sfloat => (R32G32B32A32_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R64Uint => (R64_UINT, vk::ImageAspectFlags::COLOR),
+    R64Sint => (R64_SINT, vk::ImageAspectFlags::COLOR),
+    R64Sfloat => (R64_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R64G64Uint => (R64G64_UINT, vk::ImageAspectFlags::COLOR),
+    R64G64Sint => (R64G64_SINT, vk::ImageAspectFlags::COLOR),
+    R64G64Sfloat => (R64G64_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R64G64B64Uint => (R64G64B64_UINT, vk::ImageAspectFlags::COLOR),
+    R64G64B64Sint => (R64G64B64_SINT, vk::ImageAspectFlags::COLOR),
+    R64G64B64Sfloat => (R64G64B64_SFLOAT, vk::ImageAspectFlags::COLOR),
+    R64G64B64A64Uint => (R64G64B64A64_UINT, vk::ImageAspectFlags::COLOR),
+    R64G64B64A64Sint => (R64G64B64A64_SINT, vk::ImageAspectFlags::COLOR),
+    R64G64B64A64Sfloat => (R64G64B64A64_SFLOAT, vk::ImageAspectFlags::COLOR),
+    B10G11R11UfloatPack32 => (B10G11R11_UFLOAT_PACK32, vk::ImageAspectFlags::COLOR),
+    E5B9G9R9UfloatPack32 => (E5B9G9R9_UFLOAT_PACK32, vk::ImageAspectFlags::COLOR),
+    D16Unorm => (D16_UNORM, vk::ImageAspectFlags::DEPTH),
+    X8D24UnormPack32 => (X8_D24_UNORM_PACK32, vk::ImageAspectFlags::DEPTH),
+    D32Sfloat => (D32_SFLOAT, vk::ImageAspectFlags::DEPTH),
+    S8Uint => (S8_UINT, vk::ImageAspectFlags::STENCIL),
+    D16UnormS8Uint => (D16_UNORM_S8_UINT, vk::ImageAspectFlags::from_raw(vk::ImageAspectFlags::DEPTH.as_raw() | vk::ImageAspectFlags::STENCIL.as_raw())),
+    D24UnormS8Uint => (D24_UNORM_S8_UINT, vk::ImageAspectFlags::from_raw(vk::ImageAspectFlags::DEPTH.as_raw() | vk::ImageAspectFlags::STENCIL.as_raw())),
+    D32SfloatS8Uint => (D32_SFLOAT_S8_UINT, vk::ImageAspectFlags::from_raw(vk::ImageAspectFlags::DEPTH.as_raw() | vk::ImageAspectFlags::STENCIL.as_raw())),
+    BC1RgbUnormBlock => (BC1_RGB_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC1RgbSrgbBlock => (BC1_RGB_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC1RgbaUnormBlock => (BC1_RGBA_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC1RgbaSrgbBlock => (BC1_RGBA_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC2UnormBlock => (BC2_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC2SrgbBlock => (BC2_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC3UnormBlock => (BC3_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC3SrgbBlock => (BC3_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC4UnormBlock => (BC4_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC4SnormBlock => (BC4_SNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC5UnormBlock => (BC5_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC5SnormBlock => (BC5_SNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC6HUfloatBlock => (BC6H_UFLOAT_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC6HSfloatBlock => (BC6H_SFLOAT_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC7UnormBlock => (BC7_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    BC7SrgbBlock => (BC7_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ETC2R8G8B8UnormBlock => (ETC2_R8G8B8_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ETC2R8G8B8SrgbBlock => (ETC2_R8G8B8_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ETC2R8G8B8A1UnormBlock => (ETC2_R8G8B8A1_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ETC2R8G8B8A1SrgbBlock => (ETC2_R8G8B8A1_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ETC2R8G8B8A8UnormBlock => (ETC2_R8G8B8A8_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ETC2R8G8B8A8SrgbBlock => (ETC2_R8G8B8A8_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    EACR11UnormBlock => (EAC_R11_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    EACR11SnormBlock => (EAC_R11_SNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    EACR11G11UnormBlock => (EAC_R11G11_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    EACR11G11SnormBlock => (EAC_R11G11_SNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC4X4UnormBlock => (ASTC_4X4_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC4X4SrgbBlock => (ASTC_4X4_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC5X4UnormBlock => (ASTC_5X4_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC5X4SrgbBlock => (ASTC_5X4_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC5X5UnormBlock => (ASTC_5X5_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC5X5SrgbBlock => (ASTC_5X5_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC6X5UnormBlock => (ASTC_6X5_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC6X5SrgbBlock => (ASTC_6X5_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC6X6UnormBlock => (ASTC_6X6_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC6X6SrgbBlock => (ASTC_6X6_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC8X5UnormBlock => (ASTC_8X5_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC8X5SrgbBlock => (ASTC_8X5_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC8X6UnormBlock => (ASTC_8X6_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC8X6SrgbBlock => (ASTC_8X6_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC8X8UnormBlock => (ASTC_8X8_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC8X8SrgbBlock => (ASTC_8X8_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X5UnormBlock => (ASTC_10X5_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X5SrgbBlock => (ASTC_10X5_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X6UnormBlock => (ASTC_10X6_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X6SrgbBlock => (ASTC_10X6_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X8UnormBlock => (ASTC_10X8_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X8SrgbBlock => (ASTC_10X8_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X10UnormBlock => (ASTC_10X10_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC10X10SrgbBlock => (ASTC_10X10_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC12X10UnormBlock => (ASTC_12X10_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC12X10SrgbBlock => (ASTC_12X10_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC12X12UnormBlock => (ASTC_12X12_UNORM_BLOCK, vk::ImageAspectFlags::COLOR),
+    ASTC12X12SrgbBlock => (ASTC_12X12_SRGB_BLOCK, vk::ImageAspectFlags::COLOR),
+);

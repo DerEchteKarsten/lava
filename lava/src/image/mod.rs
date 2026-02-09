@@ -5,13 +5,14 @@ use ash::vk::{self, ComponentSwizzle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 
 use crate::{
-    image::{format::VkFormat, slice::AsImage, usage::UsageSet},
+    bindless::{Bindless, BindlessHandle},
+    image::{format::Format, slice::AsImage, usage::UsageSet},
     state::Ctx,
 };
 
 pub mod format;
-pub mod usage;
 pub mod slice;
+pub mod usage;
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Default)]
 pub enum ImageSize {
@@ -44,23 +45,24 @@ impl ImageSize {
 }
 
 #[derive(Debug)]
-pub struct Image<F: VkFormat, U: UsageSet> {
-    pub handle: vk::Image,
+pub struct Image<F: Format, U: UsageSet> {
+    pub image: vk::Image,
     pub whole_view: vk::ImageView,
     pub allocation: Allocation,
     pub mips: u32,
     pub extent: vk::Extent3D,
+    pub handle: Option<BindlessHandle>,
     _format: PhantomData<F>,
     _usage: PhantomData<U>,
 }
 
-impl<F: VkFormat, U: UsageSet> Image<F, U> {
-    fn new_mipped(size: ImageSize, mips: u32) -> Result<Self> {
+impl<F: Format, U: UsageSet> Image<F, U> {
+    pub fn new_mipped(size: ImageSize, mips: u32) -> Result<Self> {
         let extent = size.size();
         let create_info = vk::ImageCreateInfo {
             array_layers: 1,
             extent,
-            format: F::FORMAT,
+            format: F::format(),
             image_type: vk::ImageType::TYPE_2D,
             initial_layout: vk::ImageLayout::UNDEFINED,
             mip_levels: mips,
@@ -70,7 +72,7 @@ impl<F: VkFormat, U: UsageSet> Image<F, U> {
             usage: U::VK | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
             ..Default::default()
         };
-            
+
         let image = unsafe { Ctx::device().create_image(&create_info, None) }?;
         let requirements = unsafe { Ctx::device().get_image_memory_requirements(image) };
 
@@ -85,23 +87,30 @@ impl<F: VkFormat, U: UsageSet> Image<F, U> {
         let mut s = Self {
             _format: PhantomData,
             _usage: PhantomData,
+            handle: None,
             allocation,
             extent,
-            handle: image,
+            image,
             mips,
             whole_view: vk::ImageView::null(),
         };
-        let view = s.create_new_view(0, mips, vk::ComponentMapping{
-            r: ComponentSwizzle::R,
-            g: ComponentSwizzle::G,
-            b: ComponentSwizzle::B,
-            a: ComponentSwizzle::A,
-        });
+        let view = s.create_new_view(
+            0,
+            mips,
+            vk::ComponentMapping {
+                r: ComponentSwizzle::R,
+                g: ComponentSwizzle::G,
+                b: ComponentSwizzle::B,
+                a: ComponentSwizzle::A,
+            },
+        );
+        s.handle = Bindless::push(view);
+
         s.whole_view = view.view;
         Ok(s)
     }
 
-    fn new(size: ImageSize) -> Result<Self> {
+    pub fn new(size: ImageSize) -> Result<Self> {
         Self::new_mipped(size, 1)
     }
 }

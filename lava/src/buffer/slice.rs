@@ -115,7 +115,7 @@ impl<T: Copy + Pod> BufferSlice<T, CpuBuffer> {
         unsafe {
             let src_ptr = self.cpu_base_ptr as *const T;
             let dst_ptr = other.cpu_base_ptr as *mut T;
-            src_ptr.byte_add(self.offset as usize).copy_to(
+            src_ptr.byte_add(self.offset as usize).copy_to_nonoverlapping(
                 dst_ptr.byte_add(other.offset as usize),
                 self.size as usize / size_of::<T>(),
             );

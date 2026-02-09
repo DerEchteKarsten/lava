@@ -3,49 +3,126 @@ use std::{marker::PhantomData, ops::Range};
 use ash::vk::{self, Offset3D};
 use glam::{UVec2, Vec2};
 
-use crate::{image::{Image, format::VkFormat, usage::UsageSet}, state::Ctx};
+use crate::{
+    bindless::BindlessHandle,
+    image::{
+        Image,
+        format::Format,
+        usage::{IsSampled, IsStorage, UsageSet},
+    },
+    state::Ctx,
+};
 
-#[derive(Clone, Copy)]
-pub struct ImageView<F: VkFormat, U: UsageSet> {
+#[derive(Clone, Copy, Debug)]
+pub struct ImageView<F: Format, U: UsageSet> {
     pub image: vk::Image,
     pub view: vk::ImageView,
     pub base_mip: u32,
     pub num_mips: u32,
+    pub handle: Option<BindlessHandle>,
     pub(crate) _marker: PhantomData<F>,
-    pub(crate) _marker2: PhantomData<U>
+    pub(crate) _marker2: PhantomData<U>,
 }
 
-impl<F: VkFormat, U: UsageSet> ImageView<F, U> {
+pub struct StorageImageViewBinding {
+    pub aspect: vk::ImageAspectFlags,
+    pub prefered_layout: vk::ImageLayout,
+    pub view: vk::ImageView,
+    pub image: vk::Image,
+    pub handle: BindlessHandle,
+}
+
+pub struct SampledImageViewBinding {
+    pub aspect: vk::ImageAspectFlags,
+    pub prefered_layout: vk::ImageLayout,
+    pub view: vk::ImageView,
+    pub image: vk::Image,
+    pub handle: BindlessHandle,
+}
+
+impl<F: Format, U: UsageSet> ImageView<F, U> {
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
-        vk::ImageSubresourceRange { aspect_mask: F::ASPECTS, base_mip_level: self.base_mip, level_count: self.num_mips, base_array_layer: 0, layer_count: 1 }
+        vk::ImageSubresourceRange {
+            aspect_mask: F::ASPECTS,
+            base_mip_level: self.base_mip,
+            level_count: self.num_mips,
+            base_array_layer: 0,
+            layer_count: 1,
+        }
+    }
+    pub fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
+        vk::ImageSubresourceLayers {
+            aspect_mask: F::ASPECTS,
+            mip_level: self.base_mip,
+            base_array_layer: 0,
+            layer_count: 1,
+        }
+    }
+}
+
+impl<F: Format, U: IsStorage> ImageView<F, U> {
+    pub fn as_storage(self) -> StorageImageViewBinding {
+        StorageImageViewBinding {
+            aspect: F::ASPECTS,
+            prefered_layout: U::PREFERED_LAYOUT,
+            view: self.view,
+            image: self.image,
+            handle: self.handle.unwrap(),
+        }
+    }
+}
+
+impl<F: Format, U: IsSampled> ImageView<F, U> {
+    pub fn as_sampled(self) -> SampledImageViewBinding {
+        SampledImageViewBinding {
+            aspect: F::ASPECTS,
+            prefered_layout: U::PREFERED_LAYOUT,
+            view: self.view,
+            image: self.image,
+            handle: self.handle.unwrap(),
+        }
+    }
+}
+
+impl<F: Format, U: IsStorage> Image<F, U> {
+    pub fn as_storage(&self) -> StorageImageViewBinding {
+        self.view().as_storage()
+    }
+}
+impl<F: Format, U: IsSampled> Image<F, U> {
+    pub fn as_sampled(&self) -> SampledImageViewBinding {
+        self.view().as_sampled()
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct ImageSlice<F: VkFormat, U: UsageSet> {
+pub struct ImageSlice<F: Format, U: UsageSet> {
     pub view: ImageView<F, U>,
     pub offset: vk::Offset3D,
     pub extend: vk::Extent3D,
 }
 
-impl<F: VkFormat, U: UsageSet> ImageSlice<F, U> {
-    fn offset(mut self, offset: UVec2) -> ImageSlice<F, U> {
-        self.offset.x += offset.x;
-        self.offset.y += offset.y;
+impl<F: Format, U: UsageSet> ImageSlice<F, U> {
+    pub fn offset(mut self, offset: UVec2) -> ImageSlice<F, U> {
+        self.offset.x += offset.x as i32;
+        self.offset.y += offset.y as i32;
         self
     }
 
-    fn extent(mut self, extend: UVec2) -> ImageSlice<F, U> {
+    pub fn extent(mut self, extend: UVec2) -> ImageSlice<F, U> {
         self.extend.width += extend.x;
         self.extend.height += extend.y;
         self
     }
-    fn subresource_range(&self) -> vk::ImageSubresourceRange {
+    pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         self.view.subresource_range()
+    }
+    pub fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
+        self.view.subresource_layers()
     }
 }
 
-impl<F: VkFormat, U: UsageSet> AsImage for Image<F, U> {
+impl<F: Format, U: UsageSet> AsImage for Image<F, U> {
     type Format = F;
     type Usage = U;
     fn get_ref(&self) -> &Image<Self::Format, Self::Usage> {
@@ -57,7 +134,7 @@ impl<F: VkFormat, U: UsageSet> AsImage for Image<F, U> {
 }
 
 pub trait AsImage {
-    type Format: VkFormat;
+    type Format: Format;
     type Usage: UsageSet;
     fn get_ref(&self) -> &Image<Self::Format, Self::Usage>;
     fn get_mut(&mut self) -> &mut Image<Self::Format, Self::Usage>;
@@ -65,20 +142,26 @@ pub trait AsImage {
     fn view(&self) -> ImageView<Self::Format, Self::Usage> {
         let image = self.get_ref();
         ImageView {
-            image: image.handle,
+            image: image.image,
             view: image.whole_view,
             base_mip: 0,
             num_mips: image.mips,
+            handle: image.handle,
             _marker: PhantomData,
-            _marker2: PhantomData
+            _marker2: PhantomData,
         }
     }
-    fn create_new_view(&self, base_mip: u32, num_mips: u32, swizzel: vk::ComponentMapping) -> ImageView<Self::Format, Self::Usage> {
+    fn create_new_view(
+        &self,
+        base_mip: u32,
+        num_mips: u32,
+        swizzel: vk::ComponentMapping,
+    ) -> ImageView<Self::Format, Self::Usage> {
         let image = self.get_ref();
         let create_info = vk::ImageViewCreateInfo::default()
             .components(swizzel)
-            .format(Self::Format::FORMAT)
-            .image(image.handle)
+            .format(Self::Format::format())
+            .image(image.image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: Self::Format::ASPECTS,
@@ -89,10 +172,11 @@ pub trait AsImage {
             });
         let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
         ImageView {
-            image: image.handle,
+            image: image.image,
             view,
             num_mips,
             base_mip,
+            handle: image.handle,
             _marker: PhantomData,
             _marker2: PhantomData,
         }
@@ -110,6 +194,6 @@ pub trait AsImage {
         self.whole().offset(offset)
     }
     fn extend(&self, extend: UVec2) -> ImageSlice<Self::Format, Self::Usage> {
-        self.whole().extend(extend)
+        self.whole().extent(extend)
     }
 }

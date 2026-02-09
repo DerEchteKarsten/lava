@@ -4,7 +4,7 @@
 #![feature(let_chains)]
 #![feature(const_trait_impl)]
 #![feature(specialization)]
-
+#![feature(core_intrinsics)]
 use crate::{
     bindless::Bindless,
     state::{Ctx, STATE},
@@ -35,8 +35,8 @@ pub fn init(
     Bindless::init()?;
 
     for i in &mut Ctx::swapchain().images {
-        let handle = Bindless::push_image(i);
-        i.bindless_handle = Some(handle);
+        let handle = Bindless::push(i.clone()).unwrap();
+        i.handle = Some(handle);
     }
     Ok(())
 }

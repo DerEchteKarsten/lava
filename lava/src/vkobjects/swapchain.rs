@@ -6,8 +6,16 @@ use ash::{
     vk::{self},
 };
 
-use crate::{image::{Image, format::{Format, SRgb}, slice::ImageView, usage::{ColorAttachment, ColorAttachmentStorage}}, state::Ctx, vkobjects::surface::Surface};
+use crate::{
+    image::{
+        Image, format,
+        slice::ImageView,
+        usage::{ColorAttachment, ColorAttachmentStorage},
+    },
+    vkobjects::surface::Surface,
+};
 
+#[derive(Debug)]
 pub struct Swapchain {
     pub resized: bool,
     pub size: [u32; 2],
@@ -15,7 +23,7 @@ pub struct Swapchain {
     pub format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
     pub present_mode: vk::PresentModeKHR,
-    pub images: Vec<ImageView<Format<[u8; 4], SRgb>, ColorAttachmentStorage>>,
+    pub images: Vec<ImageView<format::Swapchain, ColorAttachmentStorage>>,
 }
 
 impl Swapchain {
@@ -124,7 +132,7 @@ impl Swapchain {
                     unsafe { debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
                 }
                 let create_info = vk::ImageViewCreateInfo::default()
-                    .components(vk::ComponentMapping{
+                    .components(vk::ComponentMapping {
                         r: vk::ComponentSwizzle::R,
                         g: vk::ComponentSwizzle::G,
                         b: vk::ComponentSwizzle::B,
@@ -134,20 +142,21 @@ impl Swapchain {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: Self::Format::ASPECTS,
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_array_layer: 0,
                         layer_count: 1,
                         base_mip_level: 0,
                         level_count: 1,
                     });
-                let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
+                let view = unsafe { device.create_image_view(&create_info, None).unwrap() };
                 ImageView {
+                    handle: None,
                     image,
                     view,
                     base_mip: 0,
                     num_mips: 1,
                     _marker: PhantomData,
-                    _marker2: PhantomData
+                    _marker2: PhantomData,
                 }
             })
             .collect::<Vec<_>>();

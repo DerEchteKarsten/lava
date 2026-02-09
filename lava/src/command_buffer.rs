@@ -14,7 +14,19 @@ use ash::vk::{self, BufferCopy, IndexType, Offset3D, PipelineStageFlags2, Shader
 use bytemuck::{Pod, Zeroable, bytes_of};
 
 use crate::{
-    bindless::Bindless, buffer::{CpuBuffer, GpuBuffer, Location, slice::BufferSlice}, image::{Image, format::VkFormat, slice::{ImageSlice, ImageView}, usage::{IsColorAttachment, IsDepthAttachment, UsageSet}}, state::{Ctx, Functions}, tracy_span, vkobjects::rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline}
+    bindless::Bindless,
+    buffer::{CpuBuffer, GpuBuffer, Location, slice::BufferSlice},
+    image::{
+        Image,
+        format::Format,
+        slice::{ImageSlice, ImageView},
+        usage::{IsColorAttachment, IsDepthAttachment, UsageSet},
+    },
+    state::{Ctx, Functions},
+    tracy_span,
+    vkobjects::rt_pipeline::{
+        RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
+    },
 };
 
 pub struct CommandBuffer<'a> {
@@ -308,10 +320,10 @@ fn create_raster_pipeline(
 }
 
 pub trait Binding: Pod {
-    type CpuBinding<'a>;
-    fn from_cpu_binding<'a>(binding: &Self::CpuBinding<'a>) -> Self;
-    fn resources<'a>(
-        binding: &Self::CpuBinding<'a>,
+    type CpuBinding;
+    fn from_cpu_binding(binding: &Self::CpuBinding) -> Self;
+    fn resources(
+        binding: &Self::CpuBinding,
         stage: ash::vk::PipelineStageFlags2,
     ) -> Vec<(ResourceHandle, ResourceState)>;
 }
@@ -337,17 +349,23 @@ pub struct ResourceState {
     pub aspect: vk::ImageAspectFlags,
 }
 
+#[repr(i32)]
+pub enum Filter {
+    Nearest = 0,
+    Liniear = 1,
+}
+
 pub trait RasterPass {
     type GpuBinding: Binding;
 }
 
-pub struct RasterBuilder<'a, 'b, 'c, S: RasterPass> {
+pub struct RasterBuilder<'a, 'b, S: RasterPass> {
     hash: RasterHash,
     color_attachments: Vec<(vk::ImageView, Option<[f32; 4]>)>,
     depth_attachment: vk::ImageView,
     resource_states: Vec<(ResourceHandle, ResourceState)>,
     cmd_buf: &'a mut CommandBuffer<'b>,
-    binding: Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'c>>,
+    binding: Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -382,7 +400,7 @@ pub enum RasterVertexDispatch {
     },
 }
 
-impl<'a, 'b, 'c, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, 'c, S> {
+impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {
     pub fn draw(
         self,
         dispatch: RasterVertexDispatch,
@@ -409,7 +427,7 @@ impl<'a, 'b, 'c, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, 'c, S> {
     }
 }
 
-impl<'a, 'b, 'c, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, 'c, S> {
+impl<'a, 'b, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, S> {
     pub fn launch(self, x: u32, y: u32, z: u32, width: u32, height: u32, scissors: &[vk::Rect2D]) {
         let pipeline = S::get(&self.hash);
         self.draw_private(pipeline, None, width, height, [x, y, z], scissors);
@@ -432,7 +450,7 @@ impl<'a, 'b, 'c, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, 'c, S> {
     }
 }
 
-impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
+impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
     pub fn backface_culling(mut self, backface_culling: bool) -> Self {
         self.hash.backface_culling = backface_culling;
         self
@@ -442,13 +460,19 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         self
     }
 
-    pub fn color_attachment<F: VkFormat, U>(mut self, image: ImageView<F, U>, clear: Option<[f32; 4]>) -> Self 
-        where U: IsColorAttachment 
+    pub fn color_attachment<F: Format, U>(
+        mut self,
+        image: ImageView<F, U>,
+        clear: Option<[f32; 4]>,
+    ) -> Self
+    where
+        U: IsColorAttachment,
     {
-        self.hash.color_formats.push(F::FORMAT);
+        assert!(F::ASPECTS.contains(vk::ImageAspectFlags::COLOR));
+        self.hash.color_formats.push(F::format());
         self.color_attachments.push((image.view, clear));
         self.resource_states.push((
-            ResourceHandle::Image((image.view, image.handle)),
+            ResourceHandle::Image((image.view, image.image)),
             ResourceState {
                 access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
                     | if clear.is_none() {
@@ -464,13 +488,15 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         self
     }
 
-    pub fn depth_attachment<F: VkFormat, U>(mut self, image: ImageView<F, U>) -> Self 
-        where U: IsDepthAttachment,
+    pub fn depth_attachment<F: Format, U>(mut self, image: ImageView<F, U>) -> Self
+    where
+        U: IsDepthAttachment,
     {
-        self.hash.depth_format = image.format;
+        assert!(F::ASPECTS.contains(vk::ImageAspectFlags::DEPTH));
+        self.hash.depth_format = F::format();
         self.depth_attachment = image.view;
         self.resource_states.push((
-            ResourceHandle::Image((image.view, image.handle)),
+            ResourceHandle::Image((image.view, image.image)),
             ResourceState {
                 access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
                     | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
@@ -642,19 +668,19 @@ impl<'a, 'b, 'c, S: RasterPass> RasterBuilder<'a, 'b, 'c, S> {
         };
     }
 
-    pub fn bind(mut self, b: <<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'c>) -> Self {
+    pub fn bind(mut self, b: <<S as RasterPass>::GpuBinding as Binding>::CpuBinding) -> Self {
         self.binding = Some(b);
         self
     }
 }
 
-pub struct ComputeBuilder<'a, 'b, 'c, S: ComputePass> {
+pub struct ComputeBuilder<'a, 'b, S: ComputePass> {
     cmd_buffer: &'a mut CommandBuffer<'b>,
-    binding: Option<<<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'c>>,
+    binding: Option<<<S as ComputePass>::GpuBinding as Binding>::CpuBinding>,
 }
 
-impl<'a, 'b, 'c, S: ComputePass> ComputeBuilder<'a, 'b, 'c, S> {
-    pub fn bind(mut self, b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'c>) -> Self {
+impl<'a, 'b, S: ComputePass> ComputeBuilder<'a, 'b, S> {
+    pub fn bind(mut self, b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding) -> Self {
         self.binding = Some(b);
         self
     }
@@ -737,16 +763,13 @@ impl<'a, 'b, 'c, S: ComputePass> ComputeBuilder<'a, 'b, 'c, S> {
     }
 }
 
-pub struct RayTracingBuilder<'a, 'b, 'c, S: RayTracingPass> {
-    binding: Option<<<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding<'c>>,
+pub struct RayTracingBuilder<'a, 'b, S: RayTracingPass> {
+    binding: Option<<<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding>,
     cmd_buffer: &'a mut CommandBuffer<'b>,
 }
 
-impl<'a, 'b, 'c, S: RayTracingPass> RayTracingBuilder<'a, 'b, 'c, S> {
-    pub fn bind(
-        mut self,
-        b: <<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding<'c>,
-    ) -> Self {
+impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
+    pub fn bind(mut self, b: <<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding) -> Self {
         self.binding = Some(b);
         self
     }
@@ -846,11 +869,16 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn blit_image<F: VkFormat, U: UsageSet, F2: VkFormat, U2: UsageSet>(&mut self, src: ImageView<F, U>, dst: ImageView<F2, U2>) {
+    pub fn blit_image<F: Format, U: UsageSet, F2: Format, U2: UsageSet>(
+        &mut self,
+        src: ImageSlice<F, U>,
+        dst: ImageSlice<F2, U2>,
+        filter: Filter,
+    ) {
         tracy_span!("blit_image");
         self.barriers(vec![
             (
-                ResourceHandle::Image((src.view, src.image)),
+                ResourceHandle::Image((src.view.view, src.view.image)),
                 ResourceState {
                     access: vk::AccessFlags2::TRANSFER_READ,
                     stages: vk::PipelineStageFlags2::TRANSFER,
@@ -859,7 +887,7 @@ impl<'b> CommandBuffer<'b> {
                 },
             ),
             (
-                ResourceHandle::Image((dst.view, dst.image)),
+                ResourceHandle::Image((dst.view.view, dst.view.image)),
                 ResourceState {
                     access: vk::AccessFlags2::TRANSFER_WRITE,
                     stages: vk::PipelineStageFlags2::TRANSFER,
@@ -868,47 +896,46 @@ impl<'b> CommandBuffer<'b> {
                 },
             ),
         ]);
-        let src_size = src.size.size();
-        let dst_size = dst.size.size();
+
         let regions = [vk::ImageBlit {
             src_offsets: [
-                vk::Offset3D::default(),
+                src.offset,
                 vk::Offset3D {
-                    x: src_size.x as i32,
-                    y: src_size.y as i32,
+                    x: src.extend.width as i32,
+                    y: src.extend.height as i32,
                     z: 1,
                 },
             ],
             dst_offsets: [
-                vk::Offset3D::default(),
+                dst.offset,
                 vk::Offset3D {
-                    x: src_size.x as i32,
-                    y: src_size.y as i32,
+                    x: dst.extend.width as i32,
+                    y: dst.extend.height as i32,
                     z: 1,
                 },
             ],
             src_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: F::ASPECTS,
                 base_array_layer: 0,
                 layer_count: 1,
-                mip_level: 0,
+                mip_level: src.view.base_mip,
             },
             dst_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: F2::ASPECTS,
                 base_array_layer: 0,
                 layer_count: 1,
-                mip_level: 0,
+                mip_level: src.view.base_mip,
             },
         }];
         unsafe {
             Ctx::device().cmd_blit_image(
                 self.handle,
-                src.handle,
+                src.view.image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst.handle,
+                dst.view.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &regions,
-                vk::Filter::LINEAR,
+                vk::Filter::from_raw(filter as i32),
             );
         }
     }
@@ -949,7 +976,7 @@ impl<'b> CommandBuffer<'b> {
         unsafe { Ctx::device().cmd_copy_buffer(self.handle, src.handle, dst.handle, regions) };
     }
 
-    pub fn copy_buffer_to_image<T: Copy + Pod, L: Location, F: VkFormat, U: UsageSet>(
+    pub fn copy_buffer_to_image<T: Copy + Pod, L: Location, F: Format, U: UsageSet>(
         &mut self,
         src: BufferSlice<T, L>,
         dst: ImageSlice<F, U>,
@@ -976,7 +1003,7 @@ impl<'b> CommandBuffer<'b> {
         ]);
         let regions = [vk::BufferImageCopy {
             image_extent: dst.extend,
-            image_subresource: dst.subresource(),
+            image_subresource: dst.subresource_layers(),
             buffer_image_height: 0,
             buffer_offset: src.offset,
             buffer_row_length: 0,
@@ -986,7 +1013,7 @@ impl<'b> CommandBuffer<'b> {
             Ctx::device().cmd_copy_buffer_to_image(
                 self.handle,
                 src.handle,
-                dst.handle,
+                dst.view.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &regions,
             )
@@ -1019,7 +1046,7 @@ impl<'b> CommandBuffer<'b> {
         res
     }
 
-    pub fn raster<'a, 'c, S: RasterPass>(&'a mut self) -> RasterBuilder<'a, 'b, 'c, S> {
+    pub fn raster<'a, S: RasterPass>(&'a mut self) -> RasterBuilder<'a, 'b, S> {
         RasterBuilder {
             cmd_buf: self,
             color_attachments: Vec::new(),
@@ -1036,20 +1063,20 @@ impl<'b> CommandBuffer<'b> {
         }
     }
 
-    pub fn compute<'a, 'c, S: ComputePass>(&'a mut self) -> ComputeBuilder<'a, 'b, 'c, S> {
+    pub fn compute<'a, S: ComputePass>(&'a mut self) -> ComputeBuilder<'a, 'b, S> {
         ComputeBuilder {
             cmd_buffer: self,
             binding: None,
         }
     }
-    pub fn raytrace<'a, 'c, S: RayTracingPass>(&'a mut self) -> RayTracingBuilder<'a, 'b, 'c, S> {
+    pub fn raytrace<'a, S: RayTracingPass>(&'a mut self) -> RayTracingBuilder<'a, 'b, S> {
         RayTracingBuilder {
             binding: None,
             cmd_buffer: self,
         }
     }
 
-    pub fn present<F: VkFormat, U: UsageSet>(&mut self, swapchain_image: ImageView<F, U>) {
+    pub fn present<F: Format, U: UsageSet>(&mut self, swapchain_image: ImageView<F, U>) {
         tracy_span!("present_barriers");
         self.barriers(vec![(
             ResourceHandle::Image((swapchain_image.view, swapchain_image.image)),
@@ -1062,7 +1089,7 @@ impl<'b> CommandBuffer<'b> {
         )]);
     }
 
-    fn push_constants<'a, B: Binding>(&mut self, binding: &B::CpuBinding<'a>) {
+    fn push_constants<'a, B: Binding>(&mut self, binding: &B::CpuBinding) {
         let binding = B::from_cpu_binding(binding);
         let constants = bytes_of(&binding);
         unsafe {
@@ -1076,7 +1103,11 @@ impl<'b> CommandBuffer<'b> {
         };
     }
 
-    pub fn transition_layout<F: VkFormat, U: UsageSet>(&mut self, image: ImageView<F, U>, layout: vk::ImageLayout) {
+    pub fn transition_layout<F: Format, U: UsageSet>(
+        &mut self,
+        image: ImageView<F, U>,
+        layout: vk::ImageLayout,
+    ) {
         tracy_span!("transition_layout");
         self.barriers(vec![(
             ResourceHandle::Image((image.view, image.image)),

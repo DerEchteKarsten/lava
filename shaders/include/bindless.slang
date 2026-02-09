@@ -13,93 +13,93 @@ __generic<E : ITexelElement, Shape : __ITextureShape, int isArray, int isMS, int
 };
 
 public struct Image<T : IImageDescriptor & __IDynamicResourceCastable> {
-    uint32_t DescriptorSet;
+    uint32_t pad;
     uint32_t DescriptorIndex;
-    __init(uint32_t DescriptorSet, uint32_t DescriptorIndex)
+    __init(uint32_t i)
     {
-        DescriptorSet = DescriptorSet;
-        DescriptorIndex = DescriptorIndex;
+        pad = 0;
+        DescriptorIndex = i;
     }
+}
 
-    public property bool IsNull { get { return DescriptorIndex == ~0; } }
+public struct Texture<T : IImageDescriptor & __IDynamicResourceCastable> {
+    uint32_t DescriptorIndex;
+    uint32_t pad;
+    __init(uint32_t i)
+    {
+        pad = 0;
+        DescriptorIndex = i;
+    }
 }
 
 public struct MutImage<T : IImageDescriptor & __IDynamicResourceCastable> {
-    uint32_t DescriptorSet;
+    uint32_t pad;
     uint32_t DescriptorIndex;
+    __init(uint32_t i)
+    {
+        pad = 0;
+        DescriptorIndex = i;
+    }
+}
 
-    public property bool IsNull { get { return DescriptorIndex == ~0; } }
+public struct MutTexture<T : IImageDescriptor & __IDynamicResourceCastable> {
+    uint32_t DescriptorIndex;
+    uint32_t pad;
+    __init(uint32_t i)
+    {
+        pad = 0;
+        DescriptorIndex = i;
+    }
 }
 
 __generic<E : ITexelElement, Shape : __ITextureShape, let format : int>
-public extension Image<_Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>> {
-    typealias ReadTextureType = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>;
-    typealias WriteTextureType = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
+public extension Image<_Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>> {
+    typealias T = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
 
     [ForceInline]
     public E Load(vector<uint, Shape.dimensions> pos) {
-        if (DescriptorSet == 0) {
-            return TextureHeap[DescriptorIndex].asOpaqueDescriptor<ReadTextureType>()[pos];
-        } else {
-            return RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<WriteTextureType>()[pos];
-        }
-    }
-    [ForceInline]
-    public E Sample(vector<float, Shape.dimensions> pos) {
-        return TextureHeap[DescriptorIndex].asOpaqueDescriptor<ReadTextureType>().Sample(SamplerHeap[0], pos);
+        return RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<T>()[pos];
     }
 }
 
 __generic<E : ITexelElement, Shape : __ITextureShape, let format : int>
 public extension MutImage<_Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>> {
-    typealias ReadTextureType = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>;
-    typealias WriteTextureType = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
+    typealias T = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, format>;
 
     [ForceInline]
     public E Load(vector<uint, Shape.dimensions> pos) {
-        if (DescriptorSet == 0) {
-            return TextureHeap[DescriptorIndex].asOpaqueDescriptor<ReadTextureType>()[pos];
-        } else {
-            return RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<WriteTextureType>()[pos];
-        };
+        return RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<T>()[pos];
     }
+
     [ForceInline]
     public void Store(vector<uint, Shape.dimensions> pos, E value) {
-        if (DescriptorSet == 0) {
-            printf("Attempting to write to a readonly image!");
-        } else {
-            RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<WriteTextureType>()[pos] = value;
-        }
+        RWTextureHeap[DescriptorIndex].asOpaqueDescriptor<T>().Store(pos, value);
     }
 }
 
-#define DESTRUCT_VEC1(var) var.x
-#define DESTRUCT_VEC2(var) var.x, var.y
-#define DESTRUCT_VEC3(var) var.x, var.y, var.z
+__generic<E : ITexelElement, Shape : __ITextureShape, let format : int>
+public extension Texture<_Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>> {
+    typealias T = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, format>;
 
-#define DEF_TEXTURE_SIZE_EXT(shape, isArray, dim)                                                                                                                                                       \
-    __generic<T : ITexelElement, let access : int, let isShadow : int, let isCombined : int, let format : int> \
-    public extension _Texture<T, shape, isArray, 0, 0, access, isShadow, isCombined, format> {                                                                                                                                                                                                   \
-        public property uint##dim Size {                                                                                                                                                                                               \
-            get {                                                                                                                                                                                       \
-                uint##dim res;                                                                                                                                                                          \
-                GetDimensions(DESTRUCT_VEC##dim(res));                                                                                                                                                  \
-                return res;                                                                                                                                                                             \
-            }                                                                                                                                                                                           \
-        }                                                                                                                                                                                               \
+    [ForceInline]
+    public E Load(vector<uint, Shape.dimensions> pos) {
+        return TextureHeap[DescriptorIndex].asOpaqueDescriptor<T>()[pos];
     }
 
-public typealias Image2D<F : ITexelElement = float4> = Image<Texture2D<F>>;
-public typealias Image3D<F : ITexelElement = float4> = Image<Texture3D<F>>;
+    [ForceInline]
+    public E Sample(vector<float, Shape.dimensions> pos) {
+        return TextureHeap[DescriptorIndex].asOpaqueDescriptor<T>().Sample(SamplerHeap[0], pos);
+    }
+}
+
+public typealias Image2D<F : ITexelElement = float4> = Image<RWTexture2D<F>>;
+public typealias Image3D<F : ITexelElement = float4> = Image<RWTexture3D<F>>;
 
 public typealias MutImage2D<F : ITexelElement = float4> = MutImage<RWTexture2D<F>>;
 public typealias MutImage3D<F : ITexelElement = float4> = MutImage<RWTexture3D<F>>;
 
-DEF_TEXTURE_SIZE_EXT(__Shape2D, 0, 2);
-DEF_TEXTURE_SIZE_EXT(__Shape2D, 1, 3);
-DEF_TEXTURE_SIZE_EXT(__Shape3D, 0, 3);
-
-DEF_TEXTURE_SIZE_EXT(__ShapeCube, 0, 2);
+public typealias Tex2D<F : ITexelElement = float4> = Texture<Texture2D<F>>;
+public typealias Tex3D<F : ITexelElement = float4> = Texture<Texture3D<F>>;
 
 public struct Buf<T> {
     public T *val;

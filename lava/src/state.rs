@@ -28,9 +28,9 @@ use crate::{
     bindless::{Bindless, BindlessHandle},
     buffer::{Buffer, GpuBuffer, Location},
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
+    image::{format, slice::ImageView, usage::ColorAttachmentStorage},
     vkobjects::{
-        image::Image, physical_device::PhysicalDevice, queue::Queue, surface::Surface,
-        swapchain::Swapchain,
+        physical_device::PhysicalDevice, queue::Queue, surface::Surface, swapchain::Swapchain,
     },
 };
 
@@ -263,7 +263,13 @@ impl Ctx {
         }
     }
 
-    pub fn record_frame<'a, F: FnMut(&mut CommandBuffer, &Image) -> Result<()>>(
+    pub fn record_frame<
+        'a,
+        F: FnMut(
+            &mut CommandBuffer,
+            ImageView<format::Swapchain, ColorAttachmentStorage>,
+        ) -> Result<()>,
+    >(
         func: &mut F,
     ) -> Result<()> {
         tracy_span!("Next Frame");
@@ -292,14 +298,10 @@ impl Ctx {
         };
 
         {
-            let img =
-                std::mem::replace(&mut Ctx::swapchain().images[image_index as usize], unsafe {
-                    std::mem::zeroed()
-                });
+            let img = Ctx::swapchain().images[image_index as usize];
             cmd.begin();
-            func(&mut cmd, &img)?;
+            func(&mut cmd, img)?;
             cmd.end();
-            Ctx::swapchain().images[image_index as usize] = img;
         }
 
         let waits = [vk::SemaphoreSubmitInfo {
@@ -400,11 +402,11 @@ impl Ctx {
 
             for (i, image) in swapchain.images.iter_mut().enumerate() {
                 let handle = BindlessHandle {
-                    descriptor_index: i as u32,
-                    descriptor_set: 1,
+                    descriptor_index_set1: i as u32,
+                    descriptor_index_set0: 0,
                 };
-                Bindless::write_image(image, handle);
-                image.bindless_handle = Some(handle);
+                Bindless::write_image(image.clone(), handle);
+                image.handle = Some(handle);
             }
 
             s.swapchain.set(swapchain).unwrap();
