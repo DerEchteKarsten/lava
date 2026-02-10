@@ -1,5 +1,14 @@
 use std::{
-    cell::{Cell, LazyCell}, collections::HashMap, ffi::{c_char, c_void}, fmt::{Debug, write}, mem::MaybeUninit, sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, atomic::{AtomicU32, AtomicU64, Ordering}}, time::Instant
+    cell::{Cell, LazyCell, UnsafeCell},
+    collections::HashMap,
+    ffi::{c_char, c_void},
+    fmt::{Debug, write},
+    mem::MaybeUninit,
+    sync::{
+        Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard,
+        atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 use anyhow::{Result, anyhow};
@@ -25,7 +34,10 @@ use crate::{
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     image::{format, slice::ImageView, usage::ColorAttachmentStorage},
     vkobjects::{
-        physical_device::PhysicalDevice, queue::Queue, surface::Surface, swapchain::Swapchain,
+        physical_device::PhysicalDevice,
+        queue::{Binary, CommandBufferMemory, CommandPool, Queue, Semaphore, Timeline},
+        surface::Surface,
+        swapchain::Swapchain,
     },
 };
 
@@ -45,38 +57,34 @@ macro_rules! tracy_span {
     };
 }
 
-#[derive(Debug)]
-pub struct Frame {
-    fence: vk::Fence,               // fence-per-frame for CPU recycling
-    image_available: vk::Semaphore,
-    render_finished: vk::Semaphore, 
-    pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-}
-
 pub struct Ctx {
     features: Features,
     device: Device,
     physical_device: PhysicalDevice,
-    present: Present,
 
-    graphics_queue_familie: u32,
-    transfer_queue_familie: u32,
-    present_queue_familie: u32,
-    num_graphics_queues: AtomicU32,
-    num_transfer_queues: AtomicU32,
-    num_present_queues: AtomicU32,
+    frame_counter: Cell<u64>,
+
+    surface: Surface,
+    swapchain: UnsafeCell<Swapchain>,
+    swpachain_needs_resizing: Cell<Option<(u32, u32)>>,
+
+    timeline: Semaphore<Timeline>,
+    command_buffers: [CommandBufferMemory; FRAMES_IN_FLIGHT],
+    pools: [CommandPool; FRAMES_IN_FLIGHT],
+    image_available: [Semaphore<Binary>; FRAMES_IN_FLIGHT],
+    render_finished: [Semaphore<Binary>; FRAMES_IN_FLIGHT],
+
+    pub(crate) gfx_queue_familie: u32,
+    pub(crate) queues: Mutex<Vec<vk::Queue>>,
 
     allocator: Mutex<Allocator>,
+    #[cfg(debug_assertions)]
     printf: Mutex<HashMap<String, usize>>,
     delay_deletion: Mutex<Vec<(Buffer<u8>, u64)>>,
 }
 
 thread_local! {
-    static RESOURCE_STATES: HashMap<ResourceHandle, ResourceState> = HashMap::new(); 
-    static QUEUE: Queue = Queue::new(Ctx::get().graphics_queue_familie, Ctx::get().num_graphics_queues.fetch_add(1, Ordering::Relaxed)).unwrap();
-    static TRANSFER: Queue = Queue::new(Ctx::get().transfer_queue_familie, Ctx::get().num_transfer_queues.fetch_add(1, Ordering::Relaxed)).unwrap();
-    static PRESENT: Queue = Queue::new(Ctx::get().present_queue_familie, Ctx::get().num_present_queues.fetch_add(1, Ordering::Relaxed)).unwrap();
+    static QUEUE: Queue = Queue::new().unwrap();
 }
 
 impl Debug for Ctx {
@@ -84,41 +92,25 @@ impl Debug for Ctx {
         write(
             f,
             format_args!(
-                "device: there, physical_device: {:?}, present: {:?}, queue: {:?}, transfer_queue: {:?}, present_queue: {:?}, allocator: {:?}",
-                self.physical_device,
-                self.present,
-                self.graphics_queue_familie,
-                self.transfer_queue_familie,
-                self.present_queue_familie,
-                self.allocator
+                "device: there, physical_device: {:?}, allocator: {:?}",
+                self.physical_device, self.allocator
             ),
         )
     }
 }
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-#[derive(Debug)]
-pub struct Present {
-    frame_counter: AtomicU64,
-    surface: Surface,
-    swapchain: RwLock<Swapchain>,
-    swpachain_needs_resizing: Mutex<Option<(u32, u32)>>,
-    timeline: vk::Semaphore,
-    frames: [Frame; FRAMES_IN_FLIGHT],
-}
-
 impl Ctx {
     pub fn get() -> &'static Self {
-        STATE.get()
+        STATE
+            .get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
     }
     pub fn resize_swapchain(width: u32, height: u32) {
-        *(Ctx::get()
-            .present
+        Ctx::get()
             .swpachain_needs_resizing
-            .lock()
-            .unwrap()) = Some((width, height));
+            .set(Some((width, height)));
     }
     pub fn device() -> &'static Device {
         &Ctx::get().device
@@ -126,13 +118,11 @@ impl Ctx {
     pub fn physical_device() -> &'static PhysicalDevice {
         &Ctx::get().physical_device
     }
-    pub fn queue<F: FnOnce(&Queue)>(func: F){
+    pub fn queue<F: FnOnce(&Queue)>(func: F) {
         QUEUE.with(func);
     }
     pub fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        Ctx::get().allocator
-            .lock()
-            .unwrap()
+        Ctx::get().allocator.lock().unwrap()
     }
     pub fn delay_deletion<T: Copy + Pod, L: Location + 'static>(buff: Buffer<T, L>) {
         Ctx::get()
@@ -146,78 +136,45 @@ impl Ctx {
             .get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
-            .present
             .surface
     }
-    pub fn swapchain<'a>() -> RwLockReadGuard<'a, Swapchain> {
-        Ctx::get()
-            .present
-            .swapchain
-            .read()
-            .unwrap()
-    }
     pub fn window_width() -> u32 {
-        Ctx::get()
-            .present
-            .swapchain
-            .read()
-            .unwrap()
-            .size[0]
+        unsafe { (*Ctx::get().swapchain.get()).size[0] }
     }
     pub fn window_height() -> u32 {
-        Ctx::get()
-            .present
-            .swapchain
-            .read()
-            .unwrap()
-            .size[1]
+        unsafe { (*Ctx::get().swapchain.get()).size[1] }
     }
 
     pub fn features() -> Features {
-        Ctx::get()
-            .features
-            .clone()
+        Ctx::get().features.clone()
     }
 
     pub fn current_frame() -> u64 {
-        Ctx::get()
-            .present
-            .frame_counter
-            .load(std::sync::atomic::Ordering::Relaxed)
+        Ctx::get().frame_counter.get()
     }
 
     pub fn frame_in_flight() -> usize {
-        Ctx::get()
-            .present
-            .frame_counter
-            .load(std::sync::atomic::Ordering::Relaxed) as usize
-            % FRAMES_IN_FLIGHT
+        Ctx::get().frame_counter.get() as usize % FRAMES_IN_FLIGHT
+    }
+
+    pub(crate) fn swapchain() -> vk::SwapchainKHR {
+        unsafe { Ctx::get().swapchain.get().as_ref().unwrap() }.handle
     }
 
     pub fn start_frame() {
-        tracy_span!("StartFrame");
-        let ctx = STATE.get().unwrap();
+        tracy_span!("Wait for Semaphore");
+        let next_frame = Ctx::current_frame() + 1;
+        let next_frame_in_flight = next_frame as usize % FRAMES_IN_FLIGHT;
 
-        let s = &ctx.present;
-        let frame = s
-            .frame_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        let frame_in_flight = frame % FRAMES_IN_FLIGHT as u64;
-        let f = &s.frames[frame_in_flight as usize];
-        unsafe {
-            tracy_span!("Wait for Fences");
-            Ctx::device()
-                .wait_for_fences(&[f.fence], true, u64::MAX)
-                .unwrap();
-            let state = Ctx::get();
-            let mut lock = state.delay_deletion.lock().unwrap();
-            lock.retain(|(_, last_used)| (last_used + FRAMES_IN_FLIGHT as u64) >= frame);
-            Ctx::device().reset_fences(&[f.fence]).unwrap();
-            Ctx::device()
-                .reset_command_pool(f.pool, vk::CommandPoolResetFlags::empty())
-                .unwrap();
+        Ctx::get().timeline.block_until_value(next_frame);
+
+        {
+            let mut lock = Ctx::get().delay_deletion.lock().unwrap();
+            lock.retain(|(_, last_used)| (last_used + FRAMES_IN_FLIGHT as u64) >= next_frame);
         }
+        Ctx::get().pools[next_frame_in_flight].reset();
+
+        Ctx::get().frame_counter.set(next_frame);
     }
 
     pub fn record_frame<
@@ -229,74 +186,33 @@ impl Ctx {
     >(
         func: &mut F,
     ) -> Result<()> {
-        tracy_span!("Next Frame");
-        let ctx = STATE.get().unwrap();
+        tracy_span!("Acquire next Image");
+        
+        let image_index = Swapchain::aquire_image(&Ctx::get().image_available[Ctx::frame_in_flight()]);
 
-        let s = &ctx.present;
-        let frame = s.frame_counter.load(std::sync::atomic::Ordering::Relaxed);
-        let frame_in_flight = frame % FRAMES_IN_FLIGHT as u64;
-        let f = &s.frames[frame_in_flight as usize];
-        let (image_index, _suboptimal) = unsafe {
-            tracy_span!("Acquire next Image");
-            Functions::swapchain().acquire_next_image(
-                s.swapchain.read().unwrap().handle,
-                u64::MAX,
-                f.image_available,
-                vk::Fence::null(),
-            )
-        }
-        .unwrap();
+        let img =
+            unsafe { Ctx::get().swapchain.get().as_ref().unwrap() }.images[image_index as usize];
 
-        let mut resource_cache = ctx.resource_cache.lock().unwrap();
+        Ctx::queue(|queue| {
+            queue.execute_command(
+                &Ctx::get().command_buffers[Ctx::frame_in_flight()],
+                None,
+                &[
+                    Ctx::get().timeline.info(Ctx::current_frame() - 1),
+                    Ctx::get().image_available[Ctx::frame_in_flight()].info()
+                ],
+                &[
+                    Ctx::get().timeline.info(Ctx::current_frame()),
+                    Ctx::get().render_finished[Ctx::frame_in_flight()].info(),
+                ],
+                |cmd| {
+                    func(cmd, img);
+                },
+            );
+            queue.present(image_index, &[&Ctx::get().render_finished[Ctx::frame_in_flight()]]).unwrap();
+        });
 
-        let mut cmd = CommandBuffer {
-            handle: f.cmd,
-            resource_hashes: &mut resource_cache,
-        };
-
-        {
-            let img = Ctx::swapchain().images[image_index as usize];
-            cmd.begin();
-            func(&mut cmd, img)?;
-            cmd.end();
-        }
-
-        let waits = [vk::SemaphoreSubmitInfo {
-            semaphore: f.image_available,
-            stage_mask: vk::PipelineStageFlags2::TOP_OF_PIPE,
-            ..Default::default()
-        }];
-
-        let cb_info = vk::CommandBufferSubmitInfo::default().command_buffer(f.cmd);
-        let sig_render_finished = vk::SemaphoreSubmitInfo {
-            semaphore: f.render_finished,
-            stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
-            ..Default::default()
-        };
-
-        let sig_graphics_timeline = vk::SemaphoreSubmitInfo {
-            semaphore: s.timeline,
-            value: frame as u64,
-            stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
-            ..Default::default()
-        };
-
-        let signals = [sig_render_finished, sig_graphics_timeline];
-
-        let submit = vk::SubmitInfo2::default()
-            .wait_semaphore_infos(&waits)
-            .command_buffer_infos(std::slice::from_ref(&cb_info))
-            .signal_semaphore_infos(&signals);
-
-        unsafe {
-            tracy_span!("Queue Submit");
-            Ctx::device().queue_submit2(
-                Ctx::queue().handle,
-                std::slice::from_ref(&submit),
-                f.fence,
-            )?;
-        }
-
+        #[cfg(debug_assertions)]
         {
             let lock = STATE.get().unwrap().printf.lock().unwrap();
             let mut messages = lock.iter().collect::<Vec<_>>();
@@ -307,9 +223,8 @@ impl Ctx {
                     log::info!("    {}x: {}", *value, *message);
                 }
             }
+            lock.drain();
         }
-
-        STATE.get().unwrap().printf.lock().unwrap().drain();
 
         let mut needs_recreation = s.swpachain_needs_resizing.lock().unwrap().is_some();
         let swapchains = [s.swapchain.lock().unwrap().handle];
@@ -590,6 +505,7 @@ impl Ctx {
             device,
             present,
             features: features.clone(),
+            #[cfg(debug_assertions)]
             printf: Mutex::new(HashMap::new()),
             resource_cache: Mutex::new(HashMap::new()),
             delay_deletion: Mutex::new(Vec::new()),
@@ -645,19 +561,22 @@ unsafe extern "system" fn vulkan_debug_callback(
         use vk::DebugUtilsMessageSeverityFlagsEXT as Flag;
         if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
             let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
-            let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-            if let Some(s) = STATE.get()
-                && split.len() > 1
+            #[cfg(debug_assertions)]
             {
-                let printf_message = split[1..]
-                    .iter()
-                    .map(|s| s.chars())
-                    .flatten()
-                    .collect::<String>();
-                if printf_message.len() != 0 {
-                    *(s.printf.lock().unwrap().entry(printf_message).or_insert(0)) += 1;
+                let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
+                if let Some(s) = STATE.get()
+                    && split.len() > 1
+                {
+                    let printf_message = split[1..]
+                        .iter()
+                        .map(|s| s.chars())
+                        .flatten()
+                        .collect::<String>();
+                    if printf_message.len() != 0 {
+                        *(s.printf.lock().unwrap().entry(printf_message).or_insert(0)) += 1;
+                    }
+                    return vk::FALSE;
                 }
-                return vk::FALSE;
             }
 
             match flag {

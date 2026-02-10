@@ -29,10 +29,11 @@ use crate::{
     },
 };
 
-pub struct CommandBuffer<'a> {
+#[derive(Debug)]
+pub struct CommandBuffer {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) last_stage: vk::PipelineStageFlags2,
-    pub(crate) resource_hashes: &'a mut HashMap<ResourceHandle, ResourceState>,
+    pub(crate) resource_hashes: HashMap<ResourceHandle, ResourceState>,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Default)]
@@ -360,12 +361,12 @@ pub trait RasterPass {
     type GpuBinding: Binding;
 }
 
-pub struct RasterBuilder<'a, 'b, S: RasterPass> {
+pub struct RasterBuilder<'a, S: RasterPass> {
     hash: RasterHash,
     color_attachments: Vec<(vk::ImageView, Option<[f32; 4]>)>,
     depth_attachment: vk::ImageView,
     resource_states: Vec<(ResourceHandle, ResourceState)>,
-    cmd_buf: &'a mut CommandBuffer<'b>,
+    cmd_buf: &'a mut CommandBuffer,
     binding: Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding>,
 }
 
@@ -401,7 +402,7 @@ pub enum RasterVertexDispatch {
     },
 }
 
-impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {
+impl<'a, S: RasterVertexShaderPass> RasterBuilder<'a, S> {
     pub fn draw(
         self,
         dispatch: RasterVertexDispatch,
@@ -428,7 +429,7 @@ impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {
     }
 }
 
-impl<'a, 'b, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, S> {
+impl<'a, S: RasterMeshShaderPass> RasterBuilder<'a, S> {
     pub fn launch(self, x: u32, y: u32, z: u32, width: u32, height: u32, scissors: &[vk::Rect2D]) {
         let pipeline = S::get(&self.hash);
         self.draw_private(pipeline, None, width, height, [x, y, z], scissors);
@@ -451,7 +452,7 @@ impl<'a, 'b, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, S> {
     }
 }
 
-impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
+impl<'a, S: RasterPass> RasterBuilder<'a, S> {
     pub fn backface_culling(mut self, backface_culling: bool) -> Self {
         self.hash.backface_culling = backface_culling;
         self
@@ -675,12 +676,12 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
     }
 }
 
-pub struct ComputeBuilder<'a, 'b, S: ComputePass> {
-    cmd_buffer: &'a mut CommandBuffer<'b>,
+pub struct ComputeBuilder<'a, S: ComputePass> {
+    cmd_buffer: &'a mut CommandBuffer,
     binding: Option<<<S as ComputePass>::GpuBinding as Binding>::CpuBinding>,
 }
 
-impl<'a, 'b, S: ComputePass> ComputeBuilder<'a, 'b, S> {
+impl<'a, S: ComputePass> ComputeBuilder<'a, S> {
     pub fn bind(mut self, b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding) -> Self {
         self.binding = Some(b);
         self
@@ -764,12 +765,12 @@ impl<'a, 'b, S: ComputePass> ComputeBuilder<'a, 'b, S> {
     }
 }
 
-pub struct RayTracingBuilder<'a, 'b, S: RayTracingPass> {
+pub struct RayTracingBuilder<'a, S: RayTracingPass> {
     binding: Option<<<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding>,
-    cmd_buffer: &'a mut CommandBuffer<'b>,
+    cmd_buffer: &'a mut CommandBuffer,
 }
 
-impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
+impl<'a, S: RayTracingPass> RayTracingBuilder<'a, S> {
     pub fn bind(mut self, b: <<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding) -> Self {
         self.binding = Some(b);
         self
@@ -819,7 +820,7 @@ impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
     }
 }
 
-impl<'b> CommandBuffer<'b> {
+impl CommandBuffer {
     pub fn fill_buffer<T: Copy + Pod, L: Location>(
         &mut self,
         buffer: &BufferSlice<T, L>,
@@ -946,7 +947,7 @@ impl<'b> CommandBuffer<'b> {
         &mut self,
         src: BufferSlice<T, L>,
         dst: BufferSlice<T, B>,
-    ) { 
+    ) {
         self.copy_buffer_regions(src, dst, &[src.region(dst)]);
     }
 
@@ -1042,7 +1043,7 @@ impl<'b> CommandBuffer<'b> {
         res
     }
 
-    pub fn raster<'a, S: RasterPass>(&'a mut self) -> RasterBuilder<'a, 'b, S> {
+    pub fn raster<'a, S: RasterPass>(&'a mut self) -> RasterBuilder<'a, S> {
         self.last_stage = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
         RasterBuilder {
             cmd_buf: self,
@@ -1060,14 +1061,14 @@ impl<'b> CommandBuffer<'b> {
         }
     }
 
-    pub fn compute<'a, S: ComputePass>(&'a mut self) -> ComputeBuilder<'a, 'b, S> {
+    pub fn compute<'a, S: ComputePass>(&'a mut self) -> ComputeBuilder<S> {
         self.last_stage = vk::PipelineStageFlags2::COMPUTE_SHADER;
         ComputeBuilder {
             cmd_buffer: self,
             binding: None,
         }
     }
-    pub fn raytrace<'a, S: RayTracingPass>(&'a mut self) -> RayTracingBuilder<'a, 'b, S> {
+    pub fn raytrace<'a, S: RayTracingPass>(&'a mut self) -> RayTracingBuilder<S> {
         self.last_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         RayTracingBuilder {
             binding: None,

@@ -12,7 +12,11 @@ use crate::{
         slice::ImageView,
         usage::{ColorAttachment, ColorAttachmentStorage},
     },
-    vkobjects::surface::Surface,
+    state::{Ctx, Functions},
+    vkobjects::{
+        queue::{Binary, Semaphore},
+        surface::Surface,
+    },
 };
 
 #[derive(Debug)]
@@ -171,4 +175,17 @@ impl Swapchain {
             size: [extent.width, extent.height],
         })
     }
+
+    pub fn aquire_image(wait_on: &Semaphore<Binary>) -> u32 {
+        let (image_index, _suboptimal) = unsafe {
+            Functions::swapchain().acquire_next_image(
+                Ctx::swapchain(),
+                u64::MAX,
+                wait_on.handle,
+                vk::Fence::null(),
+            )
+        }
+        .unwrap();
+        image_index
+    } 
 }
