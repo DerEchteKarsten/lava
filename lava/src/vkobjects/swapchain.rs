@@ -111,7 +111,7 @@ impl Swapchain {
 
             builder
                 .pre_transform(surface.capabilities.current_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
                 .present_mode(present_mode)
                 .clipped(true)
         };

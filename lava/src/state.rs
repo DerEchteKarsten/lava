@@ -1,10 +1,5 @@
 use std::{
-    collections::HashMap,
-    ffi::{c_char, c_void},
-    fmt::{Debug, write},
-    mem::MaybeUninit,
-    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU64},
-    time::Instant,
+    cell::{Cell, LazyCell}, collections::HashMap, ffi::{c_char, c_void}, fmt::{Debug, write}, mem::MaybeUninit, sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, atomic::{AtomicU32, AtomicU64, Ordering}}, time::Instant
 };
 
 use anyhow::{Result, anyhow};
@@ -53,8 +48,8 @@ macro_rules! tracy_span {
 #[derive(Debug)]
 pub struct Frame {
     fence: vk::Fence,               // fence-per-frame for CPU recycling
-    image_available: vk::Semaphore, // binary, signaled by acquire
-    render_finished: vk::Semaphore, // binary, waited by present
+    image_available: vk::Semaphore,
+    render_finished: vk::Semaphore, 
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
 }
@@ -64,13 +59,24 @@ pub struct Ctx {
     device: Device,
     physical_device: PhysicalDevice,
     present: Present,
-    pub(crate) resource_cache: Mutex<HashMap<ResourceHandle, ResourceState>>,
-    queue: Queue,
-    transfer_queue: Option<Queue>,
-    present_queue: Option<Queue>,
+
+    graphics_queue_familie: u32,
+    transfer_queue_familie: u32,
+    present_queue_familie: u32,
+    num_graphics_queues: AtomicU32,
+    num_transfer_queues: AtomicU32,
+    num_present_queues: AtomicU32,
+
     allocator: Mutex<Allocator>,
     printf: Mutex<HashMap<String, usize>>,
     delay_deletion: Mutex<Vec<(Buffer<u8>, u64)>>,
+}
+
+thread_local! {
+    static RESOURCE_STATES: HashMap<ResourceHandle, ResourceState> = HashMap::new(); 
+    static QUEUE: Queue = Queue::new(Ctx::get().graphics_queue_familie, Ctx::get().num_graphics_queues.fetch_add(1, Ordering::Relaxed)).unwrap();
+    static TRANSFER: Queue = Queue::new(Ctx::get().transfer_queue_familie, Ctx::get().num_transfer_queues.fetch_add(1, Ordering::Relaxed)).unwrap();
+    static PRESENT: Queue = Queue::new(Ctx::get().present_queue_familie, Ctx::get().num_present_queues.fetch_add(1, Ordering::Relaxed)).unwrap();
 }
 
 impl Debug for Ctx {
@@ -81,9 +87,9 @@ impl Debug for Ctx {
                 "device: there, physical_device: {:?}, present: {:?}, queue: {:?}, transfer_queue: {:?}, present_queue: {:?}, allocator: {:?}",
                 self.physical_device,
                 self.present,
-                self.queue,
-                self.transfer_queue,
-                self.present_queue,
+                self.graphics_queue_familie,
+                self.transfer_queue_familie,
+                self.present_queue_familie,
                 self.allocator
             ),
         )
@@ -95,72 +101,41 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 pub struct Present {
     frame_counter: AtomicU64,
     surface: Surface,
-    swapchain: Mutex<Swapchain>,
+    swapchain: RwLock<Swapchain>,
     swpachain_needs_resizing: Mutex<Option<(u32, u32)>>,
     timeline: vk::Semaphore,
     frames: [Frame; FRAMES_IN_FLIGHT],
 }
 
 impl Ctx {
-    pub fn resize_swapchain(width: u32, height: u32) {
-        *(STATE
-            .get()
+    pub fn get() -> &'static Self {
+        STATE.get()
             .ok_or(anyhow!("Vulkan Context was not Initilized"))
             .unwrap()
+    }
+    pub fn resize_swapchain(width: u32, height: u32) {
+        *(Ctx::get()
             .present
             .swpachain_needs_resizing
             .lock()
             .unwrap()) = Some((width, height));
     }
     pub fn device() -> &'static Device {
-        &STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
-            .device
+        &Ctx::get().device
     }
     pub fn physical_device() -> &'static PhysicalDevice {
-        &STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
-            .physical_device
+        &Ctx::get().physical_device
     }
-    pub fn queue() -> &'static Queue {
-        &STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
-            .queue
-    }
-    pub fn transfer_queue() -> &'static Queue {
-        let state = STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap();
-        state.transfer_queue.as_ref().unwrap_or(&state.queue)
-    }
-    pub fn present_queue() -> &'static Queue {
-        let state = STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap();
-        state.present_queue.as_ref().unwrap_or(&state.queue)
+    pub fn queue<F: FnOnce(&Queue)>(func: F){
+        QUEUE.with(func);
     }
     pub fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
-            .allocator
+        Ctx::get().allocator
             .lock()
             .unwrap()
     }
     pub fn delay_deletion<T: Copy + Pod, L: Location + 'static>(buff: Buffer<T, L>) {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+        Ctx::get()
             .delay_deletion
             .lock()
             .unwrap()
@@ -174,63 +149,45 @@ impl Ctx {
             .present
             .surface
     }
-    pub fn swapchain<'a>() -> MutexGuard<'a, Swapchain> {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+    pub fn swapchain<'a>() -> RwLockReadGuard<'a, Swapchain> {
+        Ctx::get()
             .present
             .swapchain
-            .lock()
+            .read()
             .unwrap()
     }
     pub fn window_width() -> u32 {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+        Ctx::get()
             .present
             .swapchain
-            .lock()
+            .read()
             .unwrap()
             .size[0]
     }
     pub fn window_height() -> u32 {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+        Ctx::get()
             .present
             .swapchain
-            .lock()
+            .read()
             .unwrap()
             .size[1]
     }
 
     pub fn features() -> Features {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+        Ctx::get()
             .features
             .clone()
     }
 
     pub fn current_frame() -> u64 {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+        Ctx::get()
             .present
             .frame_counter
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn frame_in_flight() -> usize {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+        Ctx::get()
             .present
             .frame_counter
             .load(std::sync::atomic::Ordering::Relaxed) as usize
@@ -253,7 +210,7 @@ impl Ctx {
             Ctx::device()
                 .wait_for_fences(&[f.fence], true, u64::MAX)
                 .unwrap();
-            let state = STATE.get().unwrap();
+            let state = Ctx::get();
             let mut lock = state.delay_deletion.lock().unwrap();
             lock.retain(|(_, last_used)| (last_used + FRAMES_IN_FLIGHT as u64) >= frame);
             Ctx::device().reset_fences(&[f.fence]).unwrap();
@@ -282,7 +239,7 @@ impl Ctx {
         let (image_index, _suboptimal) = unsafe {
             tracy_span!("Acquire next Image");
             Functions::swapchain().acquire_next_image(
-                s.swapchain.lock().unwrap().handle,
+                s.swapchain.read().unwrap().handle,
                 u64::MAX,
                 f.image_available,
                 vk::Fence::null(),

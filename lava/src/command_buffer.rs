@@ -31,6 +31,7 @@ use crate::{
 
 pub struct CommandBuffer<'a> {
     pub(crate) handle: vk::CommandBuffer,
+    pub(crate) last_stage: vk::PipelineStageFlags2,
     pub(crate) resource_hashes: &'a mut HashMap<ResourceHandle, ResourceState>,
 }
 
@@ -833,7 +834,7 @@ impl<'b> CommandBuffer<'b> {
                 ..Default::default()
             },
         )]);
-
+        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
         unsafe {
             Ctx::device().cmd_fill_buffer(
                 self.handle,
@@ -858,7 +859,7 @@ impl<'b> CommandBuffer<'b> {
                 ..Default::default()
             },
         )]);
-
+        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
         unsafe {
             Ctx::device().cmd_update_buffer(
                 self.handle,
@@ -896,6 +897,7 @@ impl<'b> CommandBuffer<'b> {
                 },
             ),
         ]);
+        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
 
         let regions = [vk::ImageBlit {
             src_offsets: [
@@ -944,7 +946,7 @@ impl<'b> CommandBuffer<'b> {
         &mut self,
         src: BufferSlice<T, L>,
         dst: BufferSlice<T, B>,
-    ) {
+    ) { 
         self.copy_buffer_regions(src, dst, &[src.region(dst)]);
     }
 
@@ -973,6 +975,7 @@ impl<'b> CommandBuffer<'b> {
                 },
             ),
         ]);
+        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
         unsafe { Ctx::device().cmd_copy_buffer(self.handle, src.handle, dst.handle, regions) };
     }
 
@@ -1009,6 +1012,7 @@ impl<'b> CommandBuffer<'b> {
             buffer_row_length: 0,
             image_offset: Offset3D { x: 0, y: 0, z: 0 },
         }];
+        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
         unsafe {
             Ctx::device().cmd_copy_buffer_to_image(
                 self.handle,
@@ -1032,14 +1036,6 @@ impl<'b> CommandBuffer<'b> {
             );
         }
         self.copy_buffer(buffer, staging);
-        self.barriers(vec![(
-            ResourceHandle::Buffer(staging.handle),
-            ResourceState {
-                access: vk::AccessFlags2::HOST_READ,
-                stages: vk::PipelineStageFlags2::HOST,
-                ..Default::default()
-            },
-        )]);
         let res = vec![unsafe { std::mem::zeroed::<T>() }; buffer.len()];
         let slice = BufferSlice::from(res.as_slice());
         staging.num_bytes(buffer.size).mem_copy_to(slice);
@@ -1047,6 +1043,7 @@ impl<'b> CommandBuffer<'b> {
     }
 
     pub fn raster<'a, S: RasterPass>(&'a mut self) -> RasterBuilder<'a, 'b, S> {
+        self.last_stage = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
         RasterBuilder {
             cmd_buf: self,
             color_attachments: Vec::new(),
@@ -1064,12 +1061,14 @@ impl<'b> CommandBuffer<'b> {
     }
 
     pub fn compute<'a, S: ComputePass>(&'a mut self) -> ComputeBuilder<'a, 'b, S> {
+        self.last_stage = vk::PipelineStageFlags2::COMPUTE_SHADER;
         ComputeBuilder {
             cmd_buffer: self,
             binding: None,
         }
     }
     pub fn raytrace<'a, S: RayTracingPass>(&'a mut self) -> RayTracingBuilder<'a, 'b, S> {
+        self.last_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         RayTracingBuilder {
             binding: None,
             cmd_buffer: self,
