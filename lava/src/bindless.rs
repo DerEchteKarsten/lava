@@ -25,7 +25,7 @@ pub struct Bindless {
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 
-const NULL_HANDLE: u32 = !0;
+pub const NULL_HANDLE: u32 = !0;
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct BindlessHandle {
@@ -157,7 +157,7 @@ impl Bindless {
 
         BINDLESS
             .set(Self {
-                num_images: AtomicU32::new(0),
+                num_images: AtomicU32::new(Ctx::num_swapchain_images()),
                 num_textures: AtomicU32::new(0),
                 layout,
                 layouts,

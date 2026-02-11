@@ -156,8 +156,8 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
         }
     }
 
-    pub fn new(usage: BufferUsageFlags, size: usize) -> Result<Self> {
-        Self::with_alignment(usage, (size * size_of::<T>()) as u64, None)
+    pub fn new(size: usize) -> Result<Self> {
+        Self::with_alignment(BufferUsageFlags::STORAGE, (size * size_of::<T>()) as u64, None)
     }
 
     pub fn len(&self) -> usize {

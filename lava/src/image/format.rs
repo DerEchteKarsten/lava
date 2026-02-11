@@ -18,7 +18,7 @@ pub(crate) trait Format: 'static + Copy + Clone {
 
     fn format() -> vk::Format {
         if Self::FORMAT == vk::Format::UNDEFINED {
-            Ctx::swapchain().format
+            Ctx::swapchain_format()
         } else {
             Self::FORMAT
         }

@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, LazyCell, UnsafeCell},
+    cell::{Cell, LazyCell, OnceCell, UnsafeCell},
     collections::HashMap,
     ffi::{c_char, c_void},
     fmt::{Debug, write},
@@ -34,7 +34,7 @@ use crate::{
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     image::{format, slice::ImageView, usage::ColorAttachmentStorage},
     vkobjects::{
-        physical_device::PhysicalDevice,
+        physical_device::{PhysicalDevice, QueueFamily},
         queue::{Binary, CommandBufferMemory, CommandPool, Queue, Semaphore, Timeline},
         surface::Surface,
         swapchain::Swapchain,
@@ -57,6 +57,11 @@ macro_rules! tracy_span {
     };
 }
 
+unsafe impl Sync for Ctx {}
+struct TrustMeBro(UnsafeCell<Option<Ctx>>);
+unsafe impl Sync for TrustMeBro {}
+
+
 pub struct Ctx {
     features: Features,
     device: Device,
@@ -66,13 +71,13 @@ pub struct Ctx {
 
     surface: Surface,
     swapchain: UnsafeCell<Swapchain>,
-    swpachain_needs_resizing: Cell<Option<(u32, u32)>>,
+    pub(crate) swpachain_needs_resizing: Cell<Option<(u32, u32)>>,
 
-    timeline: Semaphore<Timeline>,
-    command_buffers: [CommandBufferMemory; FRAMES_IN_FLIGHT],
-    pools: [CommandPool; FRAMES_IN_FLIGHT],
-    image_available: [Semaphore<Binary>; FRAMES_IN_FLIGHT],
-    render_finished: [Semaphore<Binary>; FRAMES_IN_FLIGHT],
+    pub(crate) timeline: Semaphore<Timeline>,
+    pub(crate) command_buffers: [CommandBufferMemory; FRAMES_IN_FLIGHT],
+    pub(crate) pools: [CommandPool; FRAMES_IN_FLIGHT],
+    pub(crate) image_available: [Semaphore<Binary>; FRAMES_IN_FLIGHT],
+    pub(crate) render_finished: [Semaphore<Binary>; FRAMES_IN_FLIGHT],
 
     pub(crate) gfx_queue_familie: u32,
     pub(crate) queues: Mutex<Vec<vk::Queue>>,
@@ -99,43 +104,61 @@ impl Debug for Ctx {
     }
 }
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+pub(crate) static STATE: TrustMeBro = TrustMeBro(UnsafeCell::new(None));
 
 impl Ctx {
-    pub fn get() -> &'static Self {
-        STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+    pub(crate) fn get() -> &'static Self {
+        unsafe { STATE
+                    .0
+                    .get()
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .ok_or(anyhow!("Vulkan Context was not Initilized"))
+                    .unwrap() }
     }
-    pub fn resize_swapchain(width: u32, height: u32) {
+    pub(crate) fn get_mut() -> &'static mut Self {
+        unsafe { STATE
+                    .0
+                    .get()
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .ok_or(anyhow!("Vulkan Context was not Initilized"))
+                    .unwrap() }
+    }
+    pub(crate) fn num_swapchain_images() -> u32 {
+        unsafe { Ctx::get().swapchain.get().as_ref().unwrap() }.images.len() as u32
+    }
+    pub(crate) fn is_init() -> bool {
+        unsafe { STATE.0.get().as_ref().unwrap().is_some() }
+    }
+    pub(crate) fn resize_swapchain(width: u32, height: u32) {
         Ctx::get()
             .swpachain_needs_resizing
             .set(Some((width, height)));
     }
-    pub fn device() -> &'static Device {
+    pub(crate) fn device() -> &'static Device {
         &Ctx::get().device
     }
-    pub fn physical_device() -> &'static PhysicalDevice {
+    pub(crate) fn physical_device() -> &'static PhysicalDevice {
         &Ctx::get().physical_device
     }
-    pub fn queue<F: FnOnce(&Queue)>(func: F) {
-        QUEUE.with(func);
+    pub fn queue<R, F: FnOnce(&Queue) -> R>(func: F) -> R {
+        QUEUE.with(func)
     }
-    pub fn allocator<'a>() -> MutexGuard<'a, Allocator> {
+    pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
         Ctx::get().allocator.lock().unwrap()
     }
-    pub fn delay_deletion<T: Copy + Pod, L: Location + 'static>(buff: Buffer<T, L>) {
+    pub(crate) fn delay_deletion<T: Copy + Pod, L: Location + 'static>(buff: Buffer<T, L>) {
         Ctx::get()
             .delay_deletion
             .lock()
             .unwrap()
             .push((buff.cast_owned(), Ctx::current_frame()));
     }
-    pub fn surface() -> &'static Surface {
-        &STATE
-            .get()
-            .ok_or(anyhow!("Vulkan Context was not Initilized"))
-            .unwrap()
+    pub(crate) fn surface() -> &'static Surface {
+        &Ctx::get()
             .surface
     }
     pub fn window_width() -> u32 {
@@ -145,7 +168,7 @@ impl Ctx {
         unsafe { (*Ctx::get().swapchain.get()).size[1] }
     }
 
-    pub fn features() -> Features {
+    pub(crate) fn features() -> Features {
         Ctx::get().features.clone()
     }
 
@@ -159,6 +182,9 @@ impl Ctx {
 
     pub(crate) fn swapchain() -> vk::SwapchainKHR {
         unsafe { Ctx::get().swapchain.get().as_ref().unwrap() }.handle
+    }
+    pub(crate) fn swapchain_format() -> vk::Format {
+        unsafe { Ctx::get().swapchain.get().as_ref().unwrap() }.format
     }
 
     pub fn start_frame() {
@@ -178,7 +204,6 @@ impl Ctx {
     }
 
     pub fn record_frame<
-        'a,
         F: FnMut(
             &mut CommandBuffer,
             ImageView<format::Swapchain, ColorAttachmentStorage>,
@@ -208,13 +233,13 @@ impl Ctx {
                 |cmd| {
                     func(cmd, img);
                 },
-            );
+            ).unwrap();
             queue.present(image_index, &[&Ctx::get().render_finished[Ctx::frame_in_flight()]]).unwrap();
         });
 
         #[cfg(debug_assertions)]
         {
-            let lock = STATE.get().unwrap().printf.lock().unwrap();
+            let mut lock = Ctx::get().printf.lock().unwrap();
             let mut messages = lock.iter().collect::<Vec<_>>();
             if messages.len() > 0 {
                 log::info!("Printf output this frame:");
@@ -223,66 +248,11 @@ impl Ctx {
                     log::info!("    {}x: {}", *value, *message);
                 }
             }
-            lock.drain();
+            lock.clear();
         }
 
-        let mut needs_recreation = s.swpachain_needs_resizing.lock().unwrap().is_some();
-        let swapchains = [s.swapchain.lock().unwrap().handle];
-        let indices = [image_index];
-        let wait_sems = [f.render_finished];
-        let present = vk::PresentInfoKHR::default()
-            .wait_semaphores(&wait_sems)
-            .swapchains(&swapchains)
-            .image_indices(&indices);
-        Ctx::swapchain().resized = false;
-        match unsafe {
-            tracy_span!("Present");
-            Functions::swapchain().queue_present(Ctx::present_queue().handle, &present)
-        } {
-            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                needs_recreation = true;
-            }
-            Ok(_) => {}
-            Err(e) => return Err(anyhow!("present failed: {e:?}")),
-        }
-
-        if needs_recreation {
-            tracy_span!("Swapchain Recreation");
-            log::info!("resized swapchain");
-            let size = if let Some(size) = *s.swpachain_needs_resizing.lock().unwrap() {
-                [size.0, size.1]
-            } else {
-                Ctx::swapchain().size
-            };
-            let mut swapchain = Swapchain::new(
-                Ctx::surface(),
-                Ctx::device(),
-                Ctx::queue().family_index,
-                Ctx::present_queue().family_index,
-                Functions::swapchain(),
-                Functions::debug_utils(),
-                Some(s.swapchain.lock().unwrap().handle),
-                Some(size),
-            )
-            .unwrap();
-            swapchain.resized = true;
-
-            unsafe {
-                Ctx::device().device_wait_idle().unwrap();
-                Functions::swapchain().destroy_swapchain(Ctx::swapchain().handle, None);
-            };
-
-            for (i, image) in swapchain.images.iter_mut().enumerate() {
-                let handle = BindlessHandle {
-                    descriptor_index_set1: i as u32,
-                    descriptor_index_set0: 0,
-                };
-                Bindless::write_image(image.clone(), handle);
-                image.handle = Some(handle);
-            }
-
-            s.swapchain.set(swapchain).unwrap();
-            s.swpachain_needs_resizing.set(None).unwrap();
+        if let Some(size) = Ctx::get().swpachain_needs_resizing.take() {
+            unsafe { Ctx::get().swapchain.get().as_mut() }.unwrap().recreate([size.0, size.1]);
         }
         Ok(())
     }
@@ -293,11 +263,8 @@ impl Ctx {
         enable_validation: bool,
         enable_gpu_assited_validation: bool,
     ) -> Result<()> {
-        if STATE.get().is_some() {
-            return Ok(());
-        }
+        unsafe { *(STATE.0.get().as_mut().unwrap()) = Some(std::mem::MaybeUninit::uninit().assume_init()) };
         let entry = unsafe { Entry::load()? };
-
         let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let layer_names = unsafe {
             [CStr::from_bytes_with_nul_unchecked(
@@ -384,15 +351,14 @@ impl Ctx {
                 &mut features,
             )?;
 
-        let mut queue_families = vec![graphics_queue_family.index];
-        if let Some(present_queue_family) = &present_queue_family {
-            queue_families.push(present_queue_family.index);
+        if let Some(pre) = present_queue_family {
+            assert!(pre == graphics_queue_family);
         }
-        if let Some(transfer_queue_family) = &transfer_queue_family {
-            queue_families.push(transfer_queue_family.index);
+        if let Some(tra) = transfer_queue_family {
+            assert!(tra == graphics_queue_family);
         }
 
-        let device = create_device(queue_families, &physical_device, &features, &instance)?;
+        let device = create_device(graphics_queue_family.index, &physical_device, &features, &instance)?;
         let mut debug_utils = None;
         if features.device_debug_utils {
             debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
@@ -410,44 +376,8 @@ impl Ctx {
                 ..Default::default()
             },
             buffer_device_address: true,
-            allocation_sizes: AllocationSizes::new(64, 64),
+            allocation_sizes: AllocationSizes::default(),
         })?;
-
-        let mut frames: [Frame; FRAMES_IN_FLIGHT] = unsafe { MaybeUninit::zeroed().assume_init() };
-        for i in 0..FRAMES_IN_FLIGHT {
-            let create_info = vk::SemaphoreCreateInfo::default();
-            let image_availible_semaphore =
-                unsafe { device.create_semaphore(&create_info, None).unwrap() };
-            let render_finished_semaphore =
-                unsafe { device.create_semaphore(&create_info, None).unwrap() };
-            let fence = unsafe {
-                device.create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )?
-            };
-            let pool = unsafe {
-                device.create_command_pool(
-                    &vk::CommandPoolCreateInfo {
-                        queue_family_index: graphics_queue_family.index,
-                        ..Default::default()
-                    },
-                    None,
-                )?
-            };
-            let allocate_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(pool)
-                .command_buffer_count(1)
-                .level(vk::CommandBufferLevel::PRIMARY);
-            let cmd = unsafe { device.allocate_command_buffers(&allocate_info) }.unwrap()[0];
-            frames[i] = Frame {
-                image_available: image_availible_semaphore,
-                render_finished: render_finished_semaphore,
-                fence,
-                pool,
-                cmd,
-            }
-        }
 
         let surface = Some(Surface::new(
             surface,
@@ -455,62 +385,8 @@ impl Ctx {
             &surface_fn.as_ref().unwrap(),
         ));
 
-        let mut info = vk::SemaphoreTypeCreateInfo {
-            semaphore_type: vk::SemaphoreType::TIMELINE,
-            initial_value: 0,
-            ..Default::default()
-        };
-        let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
+        Ctx::get_mut().device = device;
 
-        let present = Present {
-            swpachain_needs_resizing: Mutex::new(None),
-            swapchain: Mutex::new(Swapchain::new(
-                &surface.as_ref().unwrap(),
-                &device,
-                graphics_queue_family.index,
-                present_queue_family
-                    .as_ref()
-                    .map(|e| e.index)
-                    .unwrap_or(graphics_queue_family.index),
-                &swapchain_fn,
-                debug_utils.as_ref(),
-                None,
-                None,
-            )?),
-            frame_counter: AtomicU64::new(0),
-            timeline: unsafe {
-                device.create_semaphore(
-                    &vk::SemaphoreCreateInfo::default().push_next(&mut info),
-                    None,
-                )?
-            },
-            surface: surface.unwrap(),
-            frames,
-        };
-
-        let ctx = Self {
-            allocator: Mutex::new(allocator),
-            queue: Queue::new(&device, graphics_queue_family.index)?,
-            present_queue: if let Some(present) = present_queue_family {
-                Some(Queue::new(&device, present.index).unwrap())
-            } else {
-                None
-            },
-            transfer_queue: if let Some(transfer) = transfer_queue_family {
-                Some(Queue::new(&device, transfer.index).unwrap())
-            } else {
-                None
-            },
-            physical_device: physical_device,
-            device,
-            present,
-            features: features.clone(),
-            #[cfg(debug_assertions)]
-            printf: Mutex::new(HashMap::new()),
-            resource_cache: Mutex::new(HashMap::new()),
-            delay_deletion: Mutex::new(Vec::new()),
-        };
-        STATE.set(ctx).unwrap();
         FUNCTIONS
             .set(Functions {
                 mesh: if features.mesh {
@@ -537,19 +413,38 @@ impl Ctx {
                 } else {
                     None
                 },
+                swapchain: ash::khr::swapchain::Device::new(&instance, &Self::device()),
                 instance,
                 entry,
                 surface: surface_fn,
-                swapchain: swapchain_fn,
                 debug_utils: instance_debug_utils,
                 device_debug_utils: debug_utils,
             })
             .unwrap();
+        Ctx::get_mut().allocator = Mutex::new(allocator);
+        Ctx::get_mut().queues = Mutex::new((0..graphics_queue_family.num_queues).map(|i| {
+            unsafe { Ctx::device().get_device_queue(graphics_queue_family.index, i as u32) }
+        }).collect());
+        Ctx::get_mut().pools = Ctx::queue(|queue| {
+            (0..FRAMES_IN_FLIGHT).map(|_| queue.create_pool()).collect::<Vec<_>>().try_into().unwrap()
+        });
+        Ctx::get_mut().command_buffers = (0..FRAMES_IN_FLIGHT).map(|i| Ctx::get().pools[i].create_command_buffer()).collect::<Vec<_>>().try_into().unwrap();
+        Ctx::get_mut().features = features;
+        Ctx::get_mut().delay_deletion = Mutex::new(Vec::new());
+        Ctx::get_mut().frame_counter = Cell::new(0);
+        Ctx::get_mut().gfx_queue_familie = graphics_queue_family.index;
+        Ctx::get_mut().image_available = Default::default();
+        Ctx::get_mut().physical_device = physical_device;
+        Ctx::get_mut().printf = Mutex::new(HashMap::new());
+        Ctx::get_mut().render_finished = Default::default();
+        Ctx::get_mut().surface = surface.unwrap();
+        Ctx::get_mut().swapchain = UnsafeCell::new(Swapchain::new(graphics_queue_family.index, graphics_queue_family.index, None, None).unwrap());
+        Ctx::get_mut().swpachain_needs_resizing = Cell::new(None);
+        Ctx::get_mut().timeline = Default::default();
         Ok(())
     }
 }
 
-pub(crate) static STATE: OnceLock<Ctx> = OnceLock::new();
 
 unsafe extern "system" fn vulkan_debug_callback(
     flag: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -564,8 +459,7 @@ unsafe extern "system" fn vulkan_debug_callback(
             #[cfg(debug_assertions)]
             {
                 let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-                if let Some(s) = STATE.get()
-                    && split.len() > 1
+                if Ctx::is_init() && split.len() > 1
                 {
                     let printf_message = split[1..]
                         .iter()
@@ -573,7 +467,7 @@ unsafe extern "system" fn vulkan_debug_callback(
                         .flatten()
                         .collect::<String>();
                     if printf_message.len() != 0 {
-                        *(s.printf.lock().unwrap().entry(printf_message).or_insert(0)) += 1;
+                        *(Ctx::get().printf.lock().unwrap().entry(printf_message).or_insert(0)) += 1;
                     }
                     return vk::FALSE;
                 }
@@ -791,23 +685,17 @@ fn get() -> &'static Functions {
 }
 
 pub(super) fn create_device(
-    mut queue_families: Vec<u32>,
+    queue_familie: u32,
     physical_device: &PhysicalDevice,
     features: &Features,
     instance: &ash::Instance,
 ) -> Result<ash::Device> {
     let queue_priorities = [1.0f32];
-    let queue_create_infos = {
-        queue_families.dedup();
-        queue_families
-            .iter()
-            .map(|index| {
-                vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(*index)
-                    .queue_priorities(&queue_priorities)
-            })
-            .collect::<Vec<_>>()
-    };
+    let queue_create_infos = [
+        vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_familie)
+            .queue_priorities(&queue_priorities)
+    ];
 
     let required_extensions = features.extensions();
     let device_extensions_as_ptr = required_extensions

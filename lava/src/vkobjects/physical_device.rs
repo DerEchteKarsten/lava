@@ -5,9 +5,16 @@ use ash::vk;
 
 use crate::state::Features;
 
+impl PartialEq for QueueFamily {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct QueueFamily {
     pub index: u32,
+    pub num_queues: u32,
     pub handel: vk::QueueFamilyProperties,
     pub supports_present: bool,
 }
@@ -88,6 +95,7 @@ impl PhysicalDevice {
                 };
 
                 QueueFamily {
+                    num_queues: p.queue_count,
                     index: index as _,
                     handel: p,
                     supports_present: present_support,

@@ -1,8 +1,9 @@
 use ash::vk::{self};
 use async_std::sync::Mutex;
-use bytemuck::Pod;
+use bytemuck::{Pod, Zeroable};
 use std::default;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use crate::FRAMES_IN_FLIGHT;
@@ -38,6 +39,21 @@ impl SubAllocator for ArenaAllocator {
     fn deallocate<T: Pod + Copy, L: Location>(&mut self, slice: BufferSlice<T, L>) {
         self.ptr -= slice.size;
     }
+}
+
+pub struct RingBuffer<T: Copy + Pod + Sync, L: Location> {
+    head: AtomicU64,
+    tail: AtomicU64,
+    slice: BufferSlice<T, L>,
+}
+
+impl<T: Copy + Pod + Sync, L: Location> RingBuffer<T, L> {
+    pub fn new(buffer: BufferSlice<T, L>) -> Self {
+        RingBuffer { head: AtomicU64::new(0), tail: AtomicU64::new(0), slice: buffer}
+    }
+    pub fn read(&self, size: u64) -> BufferSlice<T, L> {
+        self.head.fetch_add(size, Ordering::)
+    } 
 }
 
 #[derive(Clone)]

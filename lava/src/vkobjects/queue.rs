@@ -3,8 +3,8 @@ use std::{
     u64,
 };
 
-use anyhow::Result;
-use ash::vk;
+use anyhow::{Result, anyhow};
+use ash::{prelude::VkResult, vk};
 
 use crate::{
     command_buffer::CommandBuffer,
@@ -18,13 +18,19 @@ pub struct Semaphore<T: SemaphoreType + ?Sized> {
     marker: PhantomData<T>,
 }
 
+impl<T: SemaphoreType> Default for Semaphore<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: SemaphoreType + ?Sized> Drop for Semaphore<T> {
     fn drop(&mut self) {
         unsafe { Ctx::device().destroy_semaphore(self.handle, None) };
     }
 }
 
-enum SemaphoreInfo {
+pub enum SemaphoreInfo {
     Timeline(vk::Semaphore, u64),
     Binary(vk::Semaphore),
 }
@@ -114,7 +120,9 @@ impl Fence {
         let handle = unsafe { Ctx::device().create_fence(&create_info, None) }.unwrap();
         Self { handle }
     }
-
+    pub fn reset(&self) {
+        unsafe { Ctx::device().reset_fences(&[self.handle]) }.unwrap();
+    }
     pub fn wait(&self) {
         unsafe { Ctx::device().wait_for_fences(&[self.handle], true, u64::MAX) }.unwrap();
     }
@@ -141,11 +149,11 @@ impl CommandPool {
         }
         .unwrap();
     }
-    pub fn create_command_buffer(&self, pool: &CommandPool) -> CommandBufferMemory {
+    pub fn create_command_buffer(&self) -> CommandBufferMemory {
         let allocate_info = vk::CommandBufferAllocateInfo {
             level: vk::CommandBufferLevel::PRIMARY,
             command_buffer_count: 1,
-            command_pool: pool.handle,
+            command_pool: self.handle,
             ..Default::default()
         };
         let handle = unsafe {
@@ -166,6 +174,7 @@ impl Drop for CommandPool {
     }
 }
 
+#[derive(Debug)]
 pub struct CommandBufferMemory {
     pool: vk::CommandPool,
     handle: vk::CommandBuffer,
@@ -209,7 +218,7 @@ impl Queue {
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
         buffer: &CommandBufferMemory,
-        fence: Option<Fence>,
+        fence: Option<&Fence>,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
         executor: F,
@@ -261,12 +270,18 @@ impl Queue {
             .swapchains(&sc)
             .image_indices(&ii)
             .wait_semaphores(waits.as_slice());
-        unsafe { Functions::swapchain().queue_present(self.handle, &present_info)? };
-        Ok(())
+        match unsafe { Functions::swapchain().queue_present(self.handle, &present_info) } {
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                Ctx::get().swpachain_needs_resizing.set(Some((Ctx::window_width(), Ctx::window_height())));
+                Ok(())
+            },
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow!("present failed: {e:?}")), 
+        }
     }
 }
 
-struct FenceFuture {
+pub struct FenceFuture {
     fence: vk::Fence,
 }
 

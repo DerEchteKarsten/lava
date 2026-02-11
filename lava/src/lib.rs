@@ -33,16 +33,11 @@ pub fn init(
         enable_gpu_assited_validation,
     )?;
     Bindless::init()?;
-
-    for i in &mut Ctx::swapchain().images {
-        let handle = Bindless::push(i.clone()).unwrap();
-        i.handle = Some(handle);
-    }
     Ok(())
 }
 
 pub fn is_init() -> bool {
-    STATE.get().is_some()
+    Ctx::is_init()
 }
 
 pub fn destroy() {

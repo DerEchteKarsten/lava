@@ -7,21 +7,16 @@ use ash::{
 };
 
 use crate::{
-    image::{
-        Image, format,
-        slice::ImageView,
-        usage::{ColorAttachment, ColorAttachmentStorage},
-    },
-    state::{Ctx, Functions},
-    vkobjects::{
+    FRAMES_IN_FLIGHT, bindless::{Bindless, BindlessHandle, NULL_HANDLE}, image::{
+        Image, format, slice::{AsImage, ImageView}, usage::{ColorAttachment, ColorAttachmentStorage}
+    }, state::{Ctx, Functions}, tracy_span, vkobjects::{
         queue::{Binary, Semaphore},
         surface::Surface,
-    },
+    }
 };
 
 #[derive(Debug)]
 pub struct Swapchain {
-    pub resized: bool,
     pub size: [u32; 2],
     pub handle: vk::SwapchainKHR,
     pub format: vk::Format,
@@ -32,17 +27,13 @@ pub struct Swapchain {
 
 impl Swapchain {
     pub fn new(
-        surface: &Surface,
-        device: &Device,
         graphics_queue: u32,
         present_queue: u32,
-        swapchain_fn: &ash::khr::swapchain::Device,
-        debug_utils: Option<&ash::ext::debug_utils::Device>,
         old: Option<vk::SwapchainKHR>,
         size: Option<[u32; 2]>,
     ) -> Result<Self> {
         let format = {
-            let formats = &surface.formats;
+            let formats = &Ctx::surface().formats;
             if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
                 vk::SurfaceFormatKHR {
                     format: vk::Format::B8G8R8A8_UNORM,
@@ -60,7 +51,7 @@ impl Swapchain {
         };
 
         let present_mode = {
-            if surface
+            if Ctx::surface()
                 .present_modes
                 .contains(&vk::PresentModeKHR::IMMEDIATE)
             {
@@ -76,20 +67,20 @@ impl Swapchain {
                     width: size[0],
                     height: size[1],
                 }
-            } else if surface.capabilities.current_extent.width != std::u32::MAX {
-                surface.capabilities.current_extent
+            } else if Ctx::surface().capabilities.current_extent.width != std::u32::MAX {
+                Ctx::surface().capabilities.current_extent
             } else {
-                surface.capabilities.min_image_extent
+                Ctx::surface().capabilities.min_image_extent
             }
         };
 
-        let image_count = surface.capabilities.min_image_count;
+        let image_count = Ctx::surface().capabilities.min_image_count;
 
         let families_indices = [graphics_queue as u32, present_queue as u32];
 
         let create_info = {
             let mut builder = vk::SwapchainCreateInfoKHR::default()
-                .surface(surface.handle)
+                .surface(Ctx::surface().handle)
                 .min_image_count(image_count)
                 .image_format(format.format)
                 .image_color_space(format.color_space)
@@ -114,20 +105,20 @@ impl Swapchain {
             }
 
             builder
-                .pre_transform(surface.capabilities.current_transform)
+                .pre_transform(Ctx::surface().capabilities.current_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
                 .present_mode(present_mode)
                 .clipped(true)
         };
 
-        let handle = unsafe { swapchain_fn.create_swapchain(&create_info, None).unwrap() };
-        let images = unsafe { swapchain_fn.get_swapchain_images(handle).unwrap() };
+        let handle = unsafe { Functions::swapchain().create_swapchain(&create_info, None).unwrap() };
+        let images = unsafe { Functions::swapchain().get_swapchain_images(handle).unwrap() };
 
         let images = images
             .into_iter()
             .enumerate()
             .map(|(i, image)| {
-                if let Some(debug_utils) = debug_utils {
+                if let Some(debug_utils) = Functions::debug_utils() {
                     let name = format!("Swapchain Image {}\0", i);
                     let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
                     let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
@@ -152,21 +143,24 @@ impl Swapchain {
                         base_mip_level: 0,
                         level_count: 1,
                     });
-                let view = unsafe { device.create_image_view(&create_info, None).unwrap() };
-                ImageView {
-                    handle: None,
+                let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
+                    
+                
+                let image = ImageView {
+                    handle: Some(BindlessHandle { descriptor_index_set0: NULL_HANDLE, descriptor_index_set1: i as u32 }),
                     image,
                     view,
                     base_mip: 0,
                     num_mips: 1,
                     _marker: PhantomData,
                     _marker2: PhantomData,
-                }
+                };
+                Bindless::write_image(image, image.handle.unwrap());
+                image
             })
             .collect::<Vec<_>>();
 
         Ok(Self {
-            resized: true,
             handle,
             format: format.format,
             color_space: format.color_space,
@@ -188,4 +182,22 @@ impl Swapchain {
         .unwrap();
         image_index
     } 
+
+    pub fn recreate(&mut self, size: [u32; 2]) {
+        tracy_span!("Swapchain Recreation");
+        log::info!("resized swapchain");
+        let swapchain = Swapchain::new(
+            Ctx::get().gfx_queue_familie,
+            Ctx::get().gfx_queue_familie,
+            Some(self.handle),
+            Some(size),
+        )
+        .unwrap();
+
+        unsafe {
+            Ctx::get().timeline.block_until_value(Ctx::current_frame() + FRAMES_IN_FLIGHT as u64 - 1);
+            Functions::swapchain().destroy_swapchain(self.handle, None);
+        };
+        *self = swapchain;
+    }
 }
