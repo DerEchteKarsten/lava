@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     image::{Image, usage::Storage},
-    state::Ctx,
+    state::Ctx, vkobjects::swapchain::FORMAT,
 };
 
 pub(crate) trait Format: 'static + Copy + Clone {
@@ -18,7 +18,7 @@ pub(crate) trait Format: 'static + Copy + Clone {
 
     fn format() -> vk::Format {
         if Self::FORMAT == vk::Format::UNDEFINED {
-            Ctx::swapchain_format()
+            *FORMAT.get().unwrap()
         } else {
             Self::FORMAT
         }

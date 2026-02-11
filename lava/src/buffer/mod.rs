@@ -17,10 +17,9 @@ use gpu_allocator::{
 
 use crate::{buffer::slice::BufferSlice, state::Ctx};
 
-pub mod allocator;
 pub mod slice;
 
-pub trait Location: Copy + Clone {}
+pub trait Location: Copy + Clone + 'static {}
 #[derive(Debug, Clone, Copy)]
 pub struct GpuBuffer;
 #[derive(Debug, Clone, Copy)]
@@ -52,7 +51,7 @@ impl BufferUsageFlags {
 
 pub trait AsBuffer {
     type DataType: Pod + Copy;
-    type Location: Location + 'static;
+    type Location: Location;
     fn get_ref(&self) -> &Buffer<Self::DataType, Self::Location>;
     fn get_mut(&mut self) -> &mut Buffer<Self::DataType, Self::Location>;
 
@@ -91,7 +90,7 @@ impl<T: Copy + Pod, L: Location> Drop for Buffer<T, L> {
     }
 }
 
-impl<T: Pod + Copy, L: Location + 'static> AsBuffer for Buffer<T, L> {
+impl<T: Pod + Copy, L: Location> AsBuffer for Buffer<T, L> {
     type DataType = T;
     type Location = L;
     fn get_ref(&self) -> &Buffer<Self::DataType, Self::Location> {
@@ -102,7 +101,7 @@ impl<T: Pod + Copy, L: Location + 'static> AsBuffer for Buffer<T, L> {
     }
 }
 
-impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
+impl<T: Copy + Pod, L: Location> Buffer<T, L> {
     pub fn with_alignment(
         usage: BufferUsageFlags,
         num_bytes: u64,
@@ -146,18 +145,12 @@ impl<T: Copy + Pod, L: Location + 'static> Buffer<T, L> {
         })
     }
 
-    pub fn assert_size(&mut self, size: u64) {
-        if self.size < size {
-            Ctx::delay_deletion(std::mem::replace(
-                self,
-                Buffer::with_alignment(BufferUsageFlags::STORAGE, size.next_power_of_two(), None)
-                    .unwrap(),
-            ));
-        }
-    }
-
     pub fn new(size: usize) -> Result<Self> {
-        Self::with_alignment(BufferUsageFlags::STORAGE, (size * size_of::<T>()) as u64, None)
+        Self::with_alignment(
+            BufferUsageFlags::STORAGE,
+            (size * size_of::<T>()) as u64,
+            None,
+        )
     }
 
     pub fn len(&self) -> usize {

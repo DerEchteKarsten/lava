@@ -17,7 +17,6 @@ pub mod command_buffer;
 pub mod image;
 pub mod state;
 pub mod vkobjects;
-pub const FRAMES_IN_FLIGHT: usize = 2;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 pub fn init(
@@ -35,6 +34,7 @@ pub fn init(
     Bindless::init()?;
     Ok(())
 }
+
 
 pub fn is_init() -> bool {
     Ctx::is_init()

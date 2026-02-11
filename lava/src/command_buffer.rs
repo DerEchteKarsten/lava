@@ -12,7 +12,8 @@ use std::{
 use anyhow::Result;
 use ash::vk::{self, BufferCopy, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
 use bytemuck::{Pod, Zeroable, bytes_of};
-
+use glam::{IVec2, UVec2, Vec3};
+use glam::Vec2;
 use crate::{
     bindless::Bindless,
     buffer::{CpuBuffer, GpuBuffer, Location, slice::BufferSlice},
@@ -402,51 +403,51 @@ pub enum RasterVertexDispatch {
     },
 }
 
+#[repr(C)]
+pub struct Scissor {
+    offset: IVec2,
+    extent: UVec2,
+}
+
 impl<'a, S: RasterVertexShaderPass> RasterBuilder<'a, S> {
-    pub fn draw(
+    pub fn draw_scissored(
         self,
         dispatch: RasterVertexDispatch,
         width: u32,
         height: u32,
-        scissors: &[vk::Rect2D],
+        scissors: &[Scissor],
     ) {
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, Some(dispatch), width, height, [0, 0, 0], scissors);
+        self.draw_private(pipeline, Some(dispatch), width, height, [0, 0, 0], unsafe { std::mem::transmute(scissors) });
     }
-    pub fn draw_fullscreen(self, dispatch: RasterVertexDispatch) {
-        self.draw(
+    pub fn draw(self, width: u32, height: u32, dispatch: RasterVertexDispatch) {
+        self.draw_scissored(
             dispatch,
-            Ctx::window_width(),
-            Ctx::window_height(),
-            &[vk::Rect2D {
-                extent: vk::Extent2D {
-                    width: Ctx::window_width(),
-                    height: Ctx::window_height(),
-                },
-                offset: vk::Offset2D { x: 0, y: 0 },
+            width,
+            height,
+            &[Scissor {
+                extent: UVec2 { x: width, y: height },
+                offset: IVec2::ZERO,
             }],
         );
     }
 }
 
 impl<'a, S: RasterMeshShaderPass> RasterBuilder<'a, S> {
-    pub fn launch(self, x: u32, y: u32, z: u32, width: u32, height: u32, scissors: &[vk::Rect2D]) {
+    pub fn launch_scissored(self, x: u32, y: u32, z: u32, width: u32, height: u32, scissors: &[Scissor]) {
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, None, width, height, [x, y, z], scissors);
+        self.draw_private(pipeline, None, width, height, [x, y, z], unsafe { std::mem::transmute(scissors) });
     }
-    pub fn launch_fullscrean(self, x: u32, y: u32, z: u32) {
-        self.launch(
+    pub fn launch(self, x: u32, y: u32, z: u32, width: u32, height: u32) {
+        self.launch_scissored(
             x,
             y,
             z,
-            Ctx::window_width(),
-            Ctx::window_height(),
-            &[vk::Rect2D {
-                extent: vk::Extent2D {
-                    width: Ctx::window_width(),
-                    height: Ctx::window_height(),
-                },
-                offset: vk::Offset2D { x: 0, y: 0 },
+            width,
+            height,
+            &[Scissor {
+                extent: UVec2 { x: width, y: height },
+                offset: IVec2::ZERO,
             }],
         );
     }
@@ -743,26 +744,6 @@ impl<'a, S: ComputePass> ComputeBuilder<'a, S> {
     pub fn dispatch(self, x: u32, y: u32, z: u32) {
         self.build::<CpuBuffer>([x, y, z], None);
     }
-    pub fn dispatch_fullscreen(self) {
-        self.build::<CpuBuffer>(
-            [
-                Ctx::window_width().div_ceil(8),
-                Ctx::window_height().div_ceil(8),
-                1,
-            ],
-            None,
-        );
-    }
-    pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
-        self.build::<CpuBuffer>(
-            [
-                Ctx::window_width().div_ceil(x),
-                Ctx::window_height().div_ceil(y),
-                1,
-            ],
-            None,
-        );
-    }
 }
 
 pub struct RayTracingBuilder<'a, S: RayTracingPass> {
@@ -808,15 +789,6 @@ impl<'a, S: RayTracingPass> RayTracingBuilder<'a, S> {
 
     pub fn dispatch(self, x: u32, y: u32) {
         self.build([x, y]);
-    }
-    pub fn dispatch_fullscreen(self) {
-        self.build([Ctx::window_width(), Ctx::window_height()]);
-    }
-    pub fn dispatch_fractional_fullscreen(self, x: u32, y: u32) {
-        self.build([
-            Ctx::window_width().div_ceil(x),
-            Ctx::window_height().div_ceil(y),
-        ]);
     }
 }
 

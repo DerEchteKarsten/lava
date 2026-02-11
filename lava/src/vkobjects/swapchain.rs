@@ -1,4 +1,4 @@
-use std::{ffi::CStr, marker::PhantomData};
+use std::{ffi::CStr, marker::PhantomData, sync::OnceLock};
 
 use anyhow::Result;
 use ash::{
@@ -7,29 +7,33 @@ use ash::{
 };
 
 use crate::{
-    FRAMES_IN_FLIGHT, bindless::{Bindless, BindlessHandle, NULL_HANDLE}, image::{
-        Image, format, slice::{AsImage, ImageView}, usage::{ColorAttachment, ColorAttachmentStorage}
-    }, state::{Ctx, Functions}, tracy_span, vkobjects::{
+    bindless::{Bindless, BindlessHandle, NULL_HANDLE},
+    image::{
+        Image, format,
+        slice::{AsImage, ImageView},
+        usage::{ColorAttachment, ColorAttachmentStorage},
+    },
+    state::{Ctx, Functions},
+    tracy_span,
+    vkobjects::{
         queue::{Binary, Semaphore},
         surface::Surface,
-    }
+    },
 };
+
+pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct Swapchain {
     pub size: [u32; 2],
-    pub handle: vk::SwapchainKHR,
-    pub format: vk::Format,
-    pub color_space: vk::ColorSpaceKHR,
-    pub present_mode: vk::PresentModeKHR,
+    pub(crate) handle: vk::SwapchainKHR,
+    pub(crate) present_mode: vk::PresentModeKHR,
     pub images: Vec<ImageView<format::Swapchain, ColorAttachmentStorage>>,
 }
 
 impl Swapchain {
     pub fn new(
-        graphics_queue: u32,
-        present_queue: u32,
-        old: Option<vk::SwapchainKHR>,
+        old: Option<&Swapchain>,
         size: Option<[u32; 2]>,
     ) -> Result<Self> {
         let format = {
@@ -49,6 +53,8 @@ impl Swapchain {
                     .unwrap_or(&formats[0])
             }
         };
+
+        let _ = FORMAT.set(format.format);
 
         let present_mode = {
             if Ctx::surface()
@@ -76,7 +82,7 @@ impl Swapchain {
 
         let image_count = Ctx::surface().capabilities.min_image_count;
 
-        let families_indices = [graphics_queue as u32, present_queue as u32];
+        let families_indices = [Ctx::gfx_queue_index(), Ctx::present_queue_index()];
 
         let create_info = {
             let mut builder = vk::SwapchainCreateInfoKHR::default()
@@ -92,7 +98,7 @@ impl Swapchain {
                         | vk::ImageUsageFlags::COLOR_ATTACHMENT,
                 );
 
-            builder = if graphics_queue != present_queue {
+            builder = if Ctx::gfx_queue_index() != Ctx::present_queue_index() {
                 builder
                     .image_sharing_mode(vk::SharingMode::CONCURRENT)
                     .queue_family_indices(&families_indices)
@@ -101,7 +107,7 @@ impl Swapchain {
             };
 
             if let Some(old) = old {
-                builder = builder.old_swapchain(old);
+                builder = builder.old_swapchain(old.handle);
             }
 
             builder
@@ -111,7 +117,11 @@ impl Swapchain {
                 .clipped(true)
         };
 
-        let handle = unsafe { Functions::swapchain().create_swapchain(&create_info, None).unwrap() };
+        let handle = unsafe {
+            Functions::swapchain()
+                .create_swapchain(&create_info, None)
+                .unwrap()
+        };
         let images = unsafe { Functions::swapchain().get_swapchain_images(handle).unwrap() };
 
         let images = images
@@ -144,10 +154,9 @@ impl Swapchain {
                         level_count: 1,
                     });
                 let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
-                    
-                
-                let image = ImageView {
-                    handle: Some(BindlessHandle { descriptor_index_set0: NULL_HANDLE, descriptor_index_set1: i as u32 }),
+
+                let mut image = ImageView {
+                    handle: None,
                     image,
                     view,
                     base_mip: 0,
@@ -155,25 +164,30 @@ impl Swapchain {
                     _marker: PhantomData,
                     _marker2: PhantomData,
                 };
-                Bindless::write_image(image, image.handle.unwrap());
+
+                if let Some(old) = old {
+                    let handle = old.images[i].handle.unwrap();
+                    Bindless::write_image(image, handle);
+                }else {
+                    let handle = Bindless::push(image);
+                    image.handle = handle;
+                }
                 image
             })
             .collect::<Vec<_>>();
 
         Ok(Self {
             handle,
-            format: format.format,
-            color_space: format.color_space,
             present_mode,
             images,
             size: [extent.width, extent.height],
         })
     }
 
-    pub fn aquire_image(wait_on: &Semaphore<Binary>) -> u32 {
+    pub fn aquire_image(&self, wait_on: &Semaphore<Binary>) -> u32 {
         let (image_index, _suboptimal) = unsafe {
             Functions::swapchain().acquire_next_image(
-                Ctx::swapchain(),
+                self.handle,
                 u64::MAX,
                 wait_on.handle,
                 vk::Fence::null(),
@@ -181,21 +195,19 @@ impl Swapchain {
         }
         .unwrap();
         image_index
-    } 
+    }
 
     pub fn recreate(&mut self, size: [u32; 2]) {
         tracy_span!("Swapchain Recreation");
         log::info!("resized swapchain");
         let swapchain = Swapchain::new(
-            Ctx::get().gfx_queue_familie,
-            Ctx::get().gfx_queue_familie,
-            Some(self.handle),
+            Some(self),
             Some(size),
         )
         .unwrap();
 
         unsafe {
-            Ctx::get().timeline.block_until_value(Ctx::current_frame() + FRAMES_IN_FLIGHT as u64 - 1);
+            Ctx::device().device_wait_idle();
             Functions::swapchain().destroy_swapchain(self.handle, None);
         };
         *self = swapchain;

@@ -157,7 +157,7 @@ impl Bindless {
 
         BINDLESS
             .set(Self {
-                num_images: AtomicU32::new(Ctx::num_swapchain_images()),
+                num_images: AtomicU32::new(0),
                 num_textures: AtomicU32::new(0),
                 layout,
                 layouts,

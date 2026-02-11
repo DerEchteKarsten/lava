@@ -9,7 +9,7 @@ use ash::{prelude::VkResult, vk};
 use crate::{
     command_buffer::CommandBuffer,
     state::{Ctx, Functions, STATE},
-    vkobjects::physical_device::QueueFamily,
+    vkobjects::{physical_device::QueueFamily, swapchain::Swapchain},
 };
 
 #[derive(Debug)]
@@ -30,6 +30,7 @@ impl<T: SemaphoreType + ?Sized> Drop for Semaphore<T> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum SemaphoreInfo {
     Timeline(vk::Semaphore, u64),
     Binary(vk::Semaphore),
@@ -134,22 +135,21 @@ impl Fence {
 #[derive(Debug)]
 pub struct Queue {
     handle: vk::Queue,
-    _marker: PhantomData<Rc<()>>,
+    familie: u32,
 }
 
 #[derive(Debug)]
 pub struct CommandPool {
     handle: vk::CommandPool,
-    _marker: PhantomData<Rc<()>>,
 }
 impl CommandPool {
-    pub fn reset(&self) {
+    pub fn reset(&mut self) {
         unsafe {
             Ctx::device().reset_command_pool(self.handle, vk::CommandPoolResetFlags::empty())
         }
         .unwrap();
     }
-    pub fn create_command_buffer(&self) -> CommandBufferMemory {
+    pub fn create_command_buffer(&mut self) -> CommandBufferMemory {
         let allocate_info = vk::CommandBufferAllocateInfo {
             level: vk::CommandBufferLevel::PRIMARY,
             command_buffer_count: 1,
@@ -164,7 +164,6 @@ impl CommandPool {
         CommandBufferMemory {
             pool: self.handle,
             handle,
-            _marker: PhantomData,
         }
     }
 }
@@ -178,7 +177,6 @@ impl Drop for CommandPool {
 pub struct CommandBufferMemory {
     pool: vk::CommandPool,
     handle: vk::CommandBuffer,
-    _marker: PhantomData<Rc<()>>,
 }
 
 impl Drop for CommandBufferMemory {
@@ -188,14 +186,10 @@ impl Drop for CommandBufferMemory {
 }
 
 impl Queue {
-    pub fn new() -> Result<Self> {
-        let handle = {
-            let mut queues = Ctx::get().queues.lock().unwrap();
-            queues.pop().unwrap()
-        };
+    pub fn new(familie: u32, idx: u32) -> Result<Self> {
         Ok(Self {
-            handle: handle,
-            _marker: PhantomData,
+            handle: unsafe { Ctx::device().get_device_queue(familie, idx) },
+            familie,
         })
     }
 
@@ -204,20 +198,19 @@ impl Queue {
             handle: unsafe {
                 Ctx::device().create_command_pool(
                     &vk::CommandPoolCreateInfo {
-                        queue_family_index: Ctx::get().gfx_queue_familie,
+                        queue_family_index: self.familie,
                         ..Default::default()
                     },
                     None,
                 )
             }
             .unwrap(),
-            _marker: PhantomData,
         }
     }
 
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
-        buffer: &CommandBufferMemory,
+        buffer: &mut CommandBufferMemory,
         fence: Option<&Fence>,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
@@ -259,24 +252,20 @@ impl Queue {
         }
     }
 
-    pub fn present(&self, image_index: u32, wait_on: &[&Semaphore<Binary>]) -> Result<()> {
-        let sc = [Ctx::swapchain()];
+    pub fn present(&self, swapchain: &Swapchain, image_index: u32, wait_on: &[&Semaphore<Binary>]) -> Result<bool> {
+        let sc = [swapchain.handle];
         let ii = [image_index];
-        let waits: Vec<_> = wait_on
-            .iter()
-            .map(|sem| sem.handle)
-            .collect();
+        let waits: Vec<_> = wait_on.iter().map(|sem| sem.handle).collect();
         let present_info = vk::PresentInfoKHR::default()
             .swapchains(&sc)
             .image_indices(&ii)
             .wait_semaphores(waits.as_slice());
         match unsafe { Functions::swapchain().queue_present(self.handle, &present_info) } {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                Ctx::get().swpachain_needs_resizing.set(Some((Ctx::window_width(), Ctx::window_height())));
-                Ok(())
-            },
-            Ok(_) => Ok(()),
-            Err(e) => Err(anyhow!("present failed: {e:?}")), 
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(e) => Err(anyhow!("present failed: {e:?}")),
         }
     }
 }
