@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     image::{Image, usage::Storage},
-    state::Ctx, vkobjects::swapchain::FORMAT,
+    state::Ctx,
+    vkobjects::swapchain::FORMAT,
 };
 
 pub(crate) trait Format: 'static + Copy + Clone {

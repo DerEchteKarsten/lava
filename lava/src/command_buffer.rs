@@ -9,11 +9,6 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use anyhow::Result;
-use ash::vk::{self, BufferCopy, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
-use bytemuck::{Pod, Zeroable, bytes_of};
-use glam::{IVec2, UVec2, Vec3};
-use glam::Vec2;
 use crate::{
     bindless::Bindless,
     buffer::{CpuBuffer, GpuBuffer, Location, slice::BufferSlice},
@@ -29,6 +24,11 @@ use crate::{
         RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
     },
 };
+use anyhow::Result;
+use ash::vk::{self, BufferCopy, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
+use bytemuck::{Pod, Zeroable, bytes_of};
+use glam::Vec2;
+use glam::{IVec2, UVec2, Vec3};
 
 #[derive(Debug)]
 pub struct CommandBuffer {
@@ -418,7 +418,9 @@ impl<'a, S: RasterVertexShaderPass> RasterBuilder<'a, S> {
         scissors: &[Scissor],
     ) {
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, Some(dispatch), width, height, [0, 0, 0], unsafe { std::mem::transmute(scissors) });
+        self.draw_private(pipeline, Some(dispatch), width, height, [0, 0, 0], unsafe {
+            std::mem::transmute(scissors)
+        });
     }
     pub fn draw(self, width: u32, height: u32, dispatch: RasterVertexDispatch) {
         self.draw_scissored(
@@ -426,7 +428,10 @@ impl<'a, S: RasterVertexShaderPass> RasterBuilder<'a, S> {
             width,
             height,
             &[Scissor {
-                extent: UVec2 { x: width, y: height },
+                extent: UVec2 {
+                    x: width,
+                    y: height,
+                },
                 offset: IVec2::ZERO,
             }],
         );
@@ -434,9 +439,19 @@ impl<'a, S: RasterVertexShaderPass> RasterBuilder<'a, S> {
 }
 
 impl<'a, S: RasterMeshShaderPass> RasterBuilder<'a, S> {
-    pub fn launch_scissored(self, x: u32, y: u32, z: u32, width: u32, height: u32, scissors: &[Scissor]) {
+    pub fn launch_scissored(
+        self,
+        x: u32,
+        y: u32,
+        z: u32,
+        width: u32,
+        height: u32,
+        scissors: &[Scissor],
+    ) {
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, None, width, height, [x, y, z], unsafe { std::mem::transmute(scissors) });
+        self.draw_private(pipeline, None, width, height, [x, y, z], unsafe {
+            std::mem::transmute(scissors)
+        });
     }
     pub fn launch(self, x: u32, y: u32, z: u32, width: u32, height: u32) {
         self.launch_scissored(
@@ -446,7 +461,10 @@ impl<'a, S: RasterMeshShaderPass> RasterBuilder<'a, S> {
             width,
             height,
             &[Scissor {
-                extent: UVec2 { x: width, y: height },
+                extent: UVec2 {
+                    x: width,
+                    y: height,
+                },
                 offset: IVec2::ZERO,
             }],
         );

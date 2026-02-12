@@ -32,10 +32,7 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn new(
-        old: Option<&Swapchain>,
-        size: Option<[u32; 2]>,
-    ) -> Result<Self> {
+    pub fn new(old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = {
             let formats = &Ctx::surface().formats;
             if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
@@ -168,7 +165,7 @@ impl Swapchain {
                 if let Some(old) = old {
                     let handle = old.images[i].handle.unwrap();
                     Bindless::write_image(image, handle);
-                }else {
+                } else {
                     let handle = Bindless::push(image);
                     image.handle = handle;
                 }
@@ -200,11 +197,7 @@ impl Swapchain {
     pub fn recreate(&mut self, size: [u32; 2]) {
         tracy_span!("Swapchain Recreation");
         log::info!("resized swapchain");
-        let swapchain = Swapchain::new(
-            Some(self),
-            Some(size),
-        )
-        .unwrap();
+        let swapchain = Swapchain::new(Some(self), Some(size)).unwrap();
 
         unsafe {
             Ctx::device().device_wait_idle();

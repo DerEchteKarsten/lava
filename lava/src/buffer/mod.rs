@@ -76,7 +76,6 @@ pub trait AsBuffer {
 pub struct Buffer<T: Copy + Pod, L: Location = GpuBuffer> {
     pub handle: vk::Buffer,
     pub address: u64,
-    pub size: u64,
     pub allocation: Allocation,
     _location_marker: PhantomData<L>,
     _type_marker: PhantomData<T>,
@@ -141,8 +140,11 @@ impl<T: Copy + Pod, L: Location> Buffer<T, L> {
             address,
             allocation: allocation,
             handle: buffer,
-            size: num_bytes as u64,
         })
+    }
+
+    pub fn size(&self) -> u64 {
+        self.allocation.size()
     }
 
     pub fn new(size: usize) -> Result<Self> {
@@ -154,7 +156,7 @@ impl<T: Copy + Pod, L: Location> Buffer<T, L> {
     }
 
     pub fn len(&self) -> usize {
-        (self.size / size_of::<T>() as u64) as usize
+        (self.size() / size_of::<T>() as u64) as usize
     }
 
     pub fn cast_owned<B: Copy + Pod, J: Location>(self) -> Buffer<B, J> {

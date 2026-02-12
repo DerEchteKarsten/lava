@@ -46,7 +46,7 @@ impl AccelerationStructure {
         let create_info = vk::AccelerationStructureCreateInfoKHR::default()
             .buffer(buffer.handle)
             .offset(offset)
-            .size(buffer.size)
+            .size(buffer.size())
             .ty(level);
         let handle = unsafe {
             Functions::acceleration_structure()
@@ -72,7 +72,7 @@ impl AccelerationStructure {
         Ok(AccelerationStructure {
             accel: handle,
             ty: level,
-            size: buffer.size,
+            size: buffer.size(),
         })
     }
 }

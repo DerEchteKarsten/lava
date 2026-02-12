@@ -35,7 +35,6 @@ pub fn init(
     Ok(())
 }
 
-
 pub fn is_init() -> bool {
     Ctx::is_init()
 }

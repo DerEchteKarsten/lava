@@ -34,7 +34,9 @@ use crate::{
     image::{format, slice::ImageView, usage::ColorAttachmentStorage},
     vkobjects::{
         physical_device::{PhysicalDevice, QueueFamily},
-        queue::{Binary, CommandBufferMemory, CommandPool, Queue, Semaphore, SemaphoreInfo, Timeline},
+        queue::{
+            Binary, CommandBufferMemory, CommandPool, Queue, Semaphore, SemaphoreInfo, Timeline,
+        },
         surface::Surface,
         swapchain::Swapchain,
     },
@@ -65,7 +67,7 @@ pub struct Ctx {
     device: Device,
     physical_device: PhysicalDevice,
     surface: Surface,
- 
+
     gfx_queue_familie: QueueFamily,
     gfx_queues: Vec<Queue>,
 
@@ -175,7 +177,6 @@ impl Ctx {
 
     pub fn start_frame() {
         tracy_span!("Wait for Semaphore");
-        
     }
 
     #[cfg(debug_assertions)]
@@ -287,7 +288,7 @@ impl Ctx {
                 physical_devices.as_slice(),
                 &mut features,
             )?;
-        
+
         let mut queues = vec![graphics_queue_family.index];
         if let Some(pqf) = &present_queue_family {
             queues.push(pqf.index);
@@ -295,12 +296,7 @@ impl Ctx {
         if let Some(tqf) = &transfer_queue_family {
             queues.push(tqf.index);
         }
-        let device = create_device(
-            queues,
-            &physical_device,
-            &features,
-            &instance,
-        )?;
+        let device = create_device(queues, &physical_device, &features, &instance)?;
         let mut debug_utils = None;
         if features.device_debug_utils {
             debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
@@ -370,18 +366,20 @@ impl Ctx {
             .collect();
         Ctx::get_mut().gfx_queue_familie = graphics_queue_family;
         if let Some(transfer) = transfer_queue_family {
-            Ctx::get_mut().transfer_queues = Some((0..transfer.num_queues)
-                .map(|i| Queue::new(transfer.index, i).unwrap())
-                .collect());
+            Ctx::get_mut().transfer_queues = Some(
+                (0..transfer.num_queues)
+                    .map(|i| Queue::new(transfer.index, i).unwrap())
+                    .collect(),
+            );
             Ctx::get_mut().transfer_queue_familie = Some(transfer);
-        }else {
+        } else {
             Ctx::get_mut().transfer_queues = None;
             Ctx::get_mut().transfer_queue_familie = None;
         }
         if let Some(present) = present_queue_family {
             Ctx::get_mut().present_queue = Some(Queue::new(present.index, 0).unwrap());
             Ctx::get_mut().present_queue_familie = Some(present);
-        }else {
+        } else {
             Ctx::get_mut().present_queue = None;
             Ctx::get_mut().present_queue_familie = None;
         }
@@ -644,9 +642,14 @@ pub(super) fn create_device(
 ) -> Result<ash::Device> {
     let queue_priorities = [1.0f32];
     queue_families.dedup();
-    let queue_create_infos = queue_families.into_iter().map(|i| {vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(i)
-        .queue_priorities(&queue_priorities)}).collect::<Vec<_>>();
+    let queue_create_infos = queue_families
+        .into_iter()
+        .map(|i| {
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(i)
+                .queue_priorities(&queue_priorities)
+        })
+        .collect::<Vec<_>>();
 
     let required_extensions = features.extensions();
     let device_extensions_as_ptr = required_extensions

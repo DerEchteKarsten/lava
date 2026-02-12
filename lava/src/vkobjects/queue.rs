@@ -106,11 +106,12 @@ impl Semaphore<Binary> {
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct Fence {
     handle: vk::Fence,
 }
-impl Drop for Fence {
-    fn drop(&mut self) {
+impl Fence {
+    pub fn destroy(self) {
         unsafe { Ctx::device().destroy_fence(self.handle, None) };
     }
 }
@@ -138,18 +139,18 @@ pub struct Queue {
     familie: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CommandPool {
     handle: vk::CommandPool,
 }
 impl CommandPool {
-    pub fn reset(&mut self) {
+    pub fn reset(&self) {
         unsafe {
             Ctx::device().reset_command_pool(self.handle, vk::CommandPoolResetFlags::empty())
         }
         .unwrap();
     }
-    pub fn create_command_buffer(&mut self) -> CommandBufferMemory {
+    pub fn create_command_buffer(&self) -> CommandBufferMemory {
         let allocate_info = vk::CommandBufferAllocateInfo {
             level: vk::CommandBufferLevel::PRIMARY,
             command_buffer_count: 1,
@@ -166,22 +167,22 @@ impl CommandPool {
             handle,
         }
     }
-}
-impl Drop for CommandPool {
-    fn drop(&mut self) {
+    pub fn destroy(self) {
         unsafe { Ctx::device().destroy_command_pool(self.handle, None) };
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CommandBufferMemory {
     pool: vk::CommandPool,
     handle: vk::CommandBuffer,
 }
 
-impl Drop for CommandBufferMemory {
-    fn drop(&mut self) {
-        unsafe { Ctx::device().free_command_buffers(self.pool, &[self.handle]) };
+impl CommandBufferMemory {
+    pub fn free(self) {
+        unsafe {
+            Ctx::device().free_command_buffers(self.pool, &[self.handle]);
+        }
     }
 }
 
@@ -210,8 +211,8 @@ impl Queue {
 
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
-        buffer: &mut CommandBufferMemory,
-        fence: Option<&Fence>,
+        buffer: CommandBufferMemory,
+        fence: Option<Fence>,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
         executor: F,
@@ -252,7 +253,12 @@ impl Queue {
         }
     }
 
-    pub fn present(&self, swapchain: &Swapchain, image_index: u32, wait_on: &[&Semaphore<Binary>]) -> Result<bool> {
+    pub fn present(
+        &self,
+        swapchain: &Swapchain,
+        image_index: u32,
+        wait_on: &[&Semaphore<Binary>],
+    ) -> Result<bool> {
         let sc = [swapchain.handle];
         let ii = [image_index];
         let waits: Vec<_> = wait_on.iter().map(|sem| sem.handle).collect();
@@ -261,9 +267,7 @@ impl Queue {
             .image_indices(&ii)
             .wait_semaphores(waits.as_slice());
         match unsafe { Functions::swapchain().queue_present(self.handle, &present_info) } {
-            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                Ok(true)
-            }
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
             Ok(false) => Ok(false),
             Err(e) => Err(anyhow!("present failed: {e:?}")),
         }

@@ -28,7 +28,7 @@ pub struct Image<F: Format, U: UsageSet> {
 
 impl<F: Format, U: UsageSet> Image<F, U> {
     pub fn new_mipped(width: u32, height: u32, mips: u32) -> Result<Self> {
-        let extent = vk::Extent3D{
+        let extent = vk::Extent3D {
             width,
             height,
             depth: 1,

@@ -1,7 +1,8 @@
-use std::marker::PhantomData;
-
+use anyhow::{Result, anyhow};
 use ash::vk;
 use bytemuck::Pod;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::buffer::{Buffer, CpuBuffer, GpuBuffer, Location};
 
@@ -30,11 +31,39 @@ impl<T: Copy + Pod> From<&[T]> for BufferSlice<T, CpuBuffer> {
     }
 }
 
+impl<T: Copy + Pod, const N: usize> From<&[T; N]> for BufferSlice<T, CpuBuffer> {
+    fn from(value: &[T; N]) -> Self {
+        BufferSlice {
+            handle: vk::Buffer::null(),
+            size: size_of_val(value) as u64,
+            offset: 0,
+            cpu_base_ptr: value.as_ptr() as usize,
+            gpu_base_ptr: 0,
+            _marker: PhantomData,
+            _location: PhantomData,
+        }
+    }
+}
+
+impl<T: Copy + Pod> From<Arc<[T]>> for BufferSlice<T, CpuBuffer> {
+    fn from(value: Arc<[T]>) -> Self {
+        BufferSlice {
+            handle: vk::Buffer::null(),
+            size: (value.len() * size_of::<T>()) as u64,
+            offset: 0,
+            cpu_base_ptr: value.as_ptr() as usize,
+            gpu_base_ptr: 0,
+            _marker: PhantomData,
+            _location: PhantomData,
+        }
+    }
+}
+
 impl<T: Copy + Pod> From<&Buffer<T>> for BufferSlice<T> {
     fn from(value: &Buffer<T>) -> Self {
         BufferSlice {
             handle: value.handle,
-            size: value.size,
+            size: value.size(),
             offset: 0,
             cpu_base_ptr: 0,
             gpu_base_ptr: value.address,
@@ -48,7 +77,7 @@ impl<T: Copy + Pod> From<&Buffer<T, CpuBuffer>> for BufferSlice<T, CpuBuffer> {
     fn from(value: &Buffer<T, CpuBuffer>) -> Self {
         BufferSlice {
             handle: value.handle,
-            size: value.size,
+            size: value.size(),
             offset: 0,
             gpu_base_ptr: value.address,
             cpu_base_ptr: value.allocation.mapped_ptr().unwrap().as_ptr() as usize,
@@ -112,18 +141,29 @@ impl<T: Copy + Pod, L: Location> BufferSlice<T, L> {
 
 impl<T: Copy + Pod> BufferSlice<T, CpuBuffer> {
     pub fn mem_copy_to(&self, other: BufferSlice<T, CpuBuffer>) {
-        unsafe {
+        if self.size != 0 {
             let src_ptr = self.cpu_base_ptr as *const T;
             let dst_ptr = other.cpu_base_ptr as *mut T;
-            src_ptr
-                .byte_add(self.offset as usize)
-                .copy_to_nonoverlapping(
-                    dst_ptr.byte_add(other.offset as usize),
-                    self.size as usize / size_of::<T>(),
-                );
+            unsafe {
+                src_ptr
+                    .byte_add(self.offset as usize)
+                    .copy_to_nonoverlapping(
+                        dst_ptr.byte_add(other.offset as usize),
+                        self.size as usize / size_of::<T>(),
+                    )
+            };
         };
     }
     pub fn mem_copy_from(&mut self, other: BufferSlice<T, CpuBuffer>) {
         other.mem_copy_to(*self);
+    }
+    pub fn push(&mut self, other: BufferSlice<T, CpuBuffer>) -> Result<()> {
+        if self.size < other.size {
+            return Err(anyhow!("Out of space"));
+        }
+        other.mem_copy_to(*self);
+        self.offset += other.size;
+        self.size -= other.size;
+        Ok(())
     }
 }
