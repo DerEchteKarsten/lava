@@ -31,7 +31,7 @@ use crate::{
     bindless::{Bindless, BindlessHandle},
     buffer::{Buffer, GpuBuffer, Location},
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
-    image::{format, slice::ImageView, usage::ColorAttachmentStorage},
+    image::{format, slice::ImageSlice, usage::ColorAttachmentStorage},
     vkobjects::{
         physical_device::{PhysicalDevice, QueueFamily},
         queue::{

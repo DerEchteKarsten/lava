@@ -24,38 +24,75 @@ pub struct ImageView<F: Format, U: UsageSet> {
     pub(crate) _marker2: PhantomData<U>,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct TypeLessImageView {
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    pub aspect: vk::ImageAspectFlags,
+    pub base_mip: u32,
+    pub num_mips: u32,
+}
+#[derive(Clone, Copy)]
 pub struct StorageImageViewBinding {
     pub aspect: vk::ImageAspectFlags,
     pub prefered_layout: vk::ImageLayout,
     pub view: vk::ImageView,
     pub image: vk::Image,
     pub handle: BindlessHandle,
+    pub base_mip: u32,
+    pub num_mips: u32,
 }
-
+#[derive(Clone, Copy)]
 pub struct SampledImageViewBinding {
     pub aspect: vk::ImageAspectFlags,
     pub prefered_layout: vk::ImageLayout,
     pub view: vk::ImageView,
     pub image: vk::Image,
     pub handle: BindlessHandle,
+    pub base_mip: u32,
+    pub num_mips: u32,
 }
 
-impl<F: Format, U: UsageSet> ImageView<F, U> {
-    pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
+impl Into<TypeLessImageView> for StorageImageViewBinding {
+    fn into(self) -> TypeLessImageView {
+        TypeLessImageView { image: self.image, view: self.view, aspect: self.aspect, base_mip: self.base_mip, num_mips: self.num_mips }
+    }
+}
+
+impl Into<TypeLessImageView> for SampledImageViewBinding {
+    fn into(self) -> TypeLessImageView {
+        TypeLessImageView { image: self.image, view: self.view, aspect: self.aspect, base_mip: self.base_mip, num_mips: self.num_mips }
+    }
+}
+
+impl TypeLessImageView {
+    pub(crate) fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
-            aspect_mask: F::ASPECTS,
+            aspect_mask: self.aspect,
             base_mip_level: self.base_mip,
             level_count: self.num_mips,
             base_array_layer: 0,
             layer_count: 1,
         }
     }
-    pub fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
+    pub(crate) fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
-            aspect_mask: F::ASPECTS,
+            aspect_mask: self.aspect,
             mip_level: self.base_mip,
             base_array_layer: 0,
             layer_count: 1,
+        }
+    }
+}
+
+impl<F: Format, U: UsageSet> Into<TypeLessImageView> for ImageView<F, U> {
+    fn into(self) -> TypeLessImageView {
+        TypeLessImageView {
+            image: self.image,
+            view: self.view,
+            aspect: F::ASPECTS,
+            base_mip: self.base_mip,
+            num_mips: self.num_mips,
         }
     }
 }
@@ -68,6 +105,8 @@ impl<F: Format, U: IsStorage> ImageView<F, U> {
             view: self.view,
             image: self.image,
             handle: self.handle.unwrap(),
+            base_mip: self.base_mip,
+            num_mips: self.num_mips
         }
     }
 }
@@ -80,6 +119,28 @@ impl<F: Format, U: IsSampled> ImageView<F, U> {
             view: self.view,
             image: self.image,
             handle: self.handle.unwrap(),
+            base_mip: self.base_mip,
+            num_mips: self.num_mips
+        }
+    }
+}
+
+impl<F: Format, U: UsageSet> ImageView<F, U> {
+    pub(crate) fn subresource_range(&self) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange {
+            aspect_mask: F::ASPECTS,
+            base_mip_level: self.base_mip,
+            level_count: self.num_mips,
+            base_array_layer: 0,
+            layer_count: 1,
+        }
+    }
+    pub(crate) fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
+        vk::ImageSubresourceLayers {
+            aspect_mask: F::ASPECTS,
+            mip_level: self.base_mip,
+            base_array_layer: 0,
+            layer_count: 1,
         }
     }
 }
@@ -113,12 +174,6 @@ impl<F: Format, U: UsageSet> ImageSlice<F, U> {
         self.extend.width += extend.x;
         self.extend.height += extend.y;
         self
-    }
-    pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
-        self.view.subresource_range()
-    }
-    pub fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
-        self.view.subresource_layers()
     }
 }
 

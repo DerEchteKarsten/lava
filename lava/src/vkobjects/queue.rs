@@ -220,6 +220,7 @@ impl Queue {
         unsafe {
             let mut cmd_buffer = CommandBuffer {
                 handle: buffer.handle,
+                famillie_index: self.familie,
                 last_stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
                 resource_hashes: HashMap::new(),
             };

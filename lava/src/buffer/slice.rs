@@ -6,6 +6,13 @@ use std::sync::Arc;
 
 use crate::buffer::{Buffer, CpuBuffer, GpuBuffer, Location};
 
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub struct BufferView {
+    pub handle: vk::Buffer,
+    pub size: u64,
+    pub offset: u64,
+}
+
 #[derive(Copy, Clone)]
 pub struct BufferSlice<T: Copy + Pod, L: Location = GpuBuffer> {
     pub handle: vk::Buffer,
@@ -15,6 +22,12 @@ pub struct BufferSlice<T: Copy + Pod, L: Location = GpuBuffer> {
     pub(crate) gpu_base_ptr: u64,
     pub(crate) _marker: PhantomData<T>,
     pub(crate) _location: PhantomData<L>,
+}
+
+impl<T: Copy + Pod, L: Location> Into<BufferView> for BufferSlice<T, L> {
+    fn into(self) -> BufferView {
+        BufferView { handle: self.handle, size: self.size, offset: self.offset }
+    }
 }
 
 impl<T: Copy + Pod> From<&[T]> for BufferSlice<T, CpuBuffer> {
@@ -134,7 +147,7 @@ impl<T: Copy + Pod, L: Location> BufferSlice<T, L> {
             size: self.size,
         }
     }
-    pub fn cast_owned<B: Copy + Pod>(self) -> BufferSlice<B, L> {
+    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<B, L> {
         unsafe { std::mem::transmute(self) }
     }
 }
