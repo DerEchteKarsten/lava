@@ -212,6 +212,7 @@ impl Bindless {
                 write
                     .dst_array_element(handle.descriptor_index_set0)
                     .dst_set(Self::get().sets[0])
+                    .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE),
             );
         }

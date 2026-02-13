@@ -7,14 +7,18 @@ use crate::{
     bindless::BindlessHandle,
     image::{
         Image,
-        format::Format,
-        usage::{IsSampled, IsStorage, UsageSet},
+        format::{Format, Undefined},
+        usage::{IsSampled, IsStorage, Unknown, UsageSet},
     },
     state::Ctx,
 };
 
+struct Dynamic<> {
+
+}
+
 #[derive(Clone, Copy, Debug)]
-pub struct ImageView<F: Format, U: UsageSet> {
+pub struct ImageView<F: Format = Undefined, U: UsageSet = Unknown> {
     pub image: vk::Image,
     pub view: vk::ImageView,
     pub base_mip: u32,
@@ -32,6 +36,7 @@ pub struct TypeLessImageView {
     pub base_mip: u32,
     pub num_mips: u32,
 }
+
 #[derive(Clone, Copy)]
 pub struct StorageImageViewBinding {
     pub aspect: vk::ImageAspectFlags,
@@ -143,6 +148,9 @@ impl<F: Format, U: UsageSet> ImageView<F, U> {
             layer_count: 1,
         }
     }
+    pub fn cast<NF: Format, NU: UsageSet>(self) -> ImageView<NF, NU> {
+        unsafe { std::mem::transmute(self) }
+    }
 }
 
 impl<F: Format, U: IsStorage> Image<F, U> {
@@ -157,7 +165,7 @@ impl<F: Format, U: IsSampled> Image<F, U> {
 }
 
 #[derive(Clone, Copy)]
-pub struct ImageSlice<F: Format, U: UsageSet> {
+pub struct ImageSlice<F: Format = Undefined, U: UsageSet = Unknown> {
     pub view: ImageView<F, U>,
     pub offset: vk::Offset3D,
     pub extend: vk::Extent3D,
@@ -174,6 +182,10 @@ impl<F: Format, U: UsageSet> ImageSlice<F, U> {
         self.extend.width += extend.x;
         self.extend.height += extend.y;
         self
+    }
+
+    pub fn cast<NF: Format, NU: UsageSet>(self) -> ImageSlice<NF, NU> {
+        unsafe { std::mem::transmute(self) }
     }
 }
 

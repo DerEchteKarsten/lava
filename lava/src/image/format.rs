@@ -13,7 +13,7 @@ use crate::{
     vkobjects::swapchain::FORMAT,
 };
 
-pub(crate) trait Format: 'static + Copy + Clone {
+pub trait Format: 'static + Copy + Clone {
     const FORMAT: vk::Format;
     const ASPECTS: vk::ImageAspectFlags;
 
@@ -40,6 +40,7 @@ macro_rules! define_format {
 }
 
 define_format!(
+    Undefined => (UNDEFINED, vk::ImageAspectFlags::COLOR),
     Swapchain => (UNDEFINED, vk::ImageAspectFlags::COLOR),
     R4G4UnormPack8 => (R4G4_UNORM_PACK8, vk::ImageAspectFlags::COLOR),
     R4G4B4A4UnormPack16 => (R4G4B4A4_UNORM_PACK16, vk::ImageAspectFlags::COLOR),

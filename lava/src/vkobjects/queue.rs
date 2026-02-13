@@ -8,7 +8,7 @@ use ash::{prelude::VkResult, vk};
 
 use crate::{
     command_buffer::CommandBuffer,
-    state::{Ctx, Functions, STATE},
+    state::{Ctx, Functions},
     vkobjects::{physical_device::QueueFamily, swapchain::Swapchain},
 };
 
@@ -113,6 +113,12 @@ pub struct Fence {
 impl Fence {
     pub fn destroy(self) {
         unsafe { Ctx::device().destroy_fence(self.handle, None) };
+    }
+}
+
+impl Default for Fence {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

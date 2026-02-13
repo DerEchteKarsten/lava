@@ -58,6 +58,11 @@ impl<F: Format, U: UsageSet> Image<F, U> {
             requirements,
         };
         let allocation = Ctx::allocator().allocate(&desc)?;
+        
+        unsafe {
+            Ctx::device().bind_image_memory(image, allocation.memory(), allocation.offset())?
+        };
+
         let mut s = Self {
             _format: PhantomData,
             _usage: PhantomData,

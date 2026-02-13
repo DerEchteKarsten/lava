@@ -7,7 +7,7 @@
 #![feature(core_intrinsics)]
 use crate::{
     bindless::Bindless,
-    state::{Ctx, STATE},
+    state::{Ctx},
 };
 use anyhow::{Ok, Result};
 

@@ -28,7 +28,7 @@ use crate::{
     },
 };
 use anyhow::Result;
-use ash::vk::{self, BufferCopy, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
+use ash::vk::{self, BufferCopy, Extent3D, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
 use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::Vec2;
 use glam::{IVec2, UVec2, Vec3};
@@ -988,7 +988,6 @@ impl CommandBuffer {
                 ResourceState {
                     access: vk::AccessFlags2::TRANSFER_READ,
                     stages: vk::PipelineStageFlags2::TRANSFER,
-                    layout: vk::ImageLayout::UNDEFINED,
                     ..Default::default()
                 },
             ),
@@ -1008,7 +1007,7 @@ impl CommandBuffer {
             buffer_image_height: 0,
             buffer_offset: src.offset,
             buffer_row_length: 0,
-            image_offset: Offset3D { x: 0, y: 0, z: 0 },
+            image_offset: dst.offset,
         }];
         self.last_stage = vk::PipelineStageFlags2::TRANSFER;
         unsafe {
@@ -1162,7 +1161,7 @@ impl CommandBuffer {
                 && !new.access.contains(write_flags);
             let same_layout = prev.layout == new.layout;
             let first_use = prev.stages.contains(vk::PipelineStageFlags2::TOP_OF_PIPE);
-            let same_familie = new.src_familie != vk::QUEUE_FAMILY_EXTERNAL && new.dst_familie != vk::QUEUE_FAMILY_EXTERNAL;
+            let same_familie = (new.src_familie != vk::QUEUE_FAMILY_EXTERNAL && new.dst_familie != vk::QUEUE_FAMILY_EXTERNAL) || new.dst_familie == prev.dst_familie;
 
             let need_barrier = !read_to_read || !same_layout || !first_use || !same_familie;
 

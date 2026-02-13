@@ -1,10 +1,14 @@
 use ash::vk;
 
-pub(crate) trait UsageSet: 'static + Copy + Clone {
+pub trait UsageSet: 'static + Copy + Clone {
     const VK: vk::ImageUsageFlags;
     const SET: BindlessImageUsageSet;
     const PREFERED_LAYOUT: vk::ImageLayout;
 }
+
+
+#[derive(Clone, Copy, Debug)]
+pub struct Unknown;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sampled;
@@ -23,6 +27,13 @@ pub struct DepthAttachmentSampled;
 #[derive(Clone, Copy, Debug)]
 pub struct SampledStorage;
 
+
+impl UsageSet for Unknown {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::empty();
+    const SET: BindlessImageUsageSet = BindlessImageUsageSet::None;
+    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+}
+
 impl UsageSet for Sampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::SampledImage;
@@ -36,19 +47,19 @@ impl UsageSet for Storage {
 impl UsageSet for ColorAttachment {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::COLOR_ATTACHMENT;
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::None;
-    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 }
 impl UsageSet for DepthAttachment {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::None;
-    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 }
 impl UsageSet for ColorAttachmentSampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::SAMPLED.as_raw(),
     );
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::SampledImage;
-    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 }
 impl UsageSet for DepthAttachmentSampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
@@ -56,7 +67,7 @@ impl UsageSet for DepthAttachmentSampled {
             | vk::ImageUsageFlags::SAMPLED.as_raw(),
     );
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::SampledImage;
-    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+    const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 }
 impl UsageSet for ColorAttachmentStorage {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
@@ -73,17 +84,17 @@ impl UsageSet for SampledStorage {
     const PREFERED_LAYOUT: vk::ImageLayout = vk::ImageLayout::GENERAL;
 }
 
-pub(crate) enum BindlessImageUsageSet {
+pub enum BindlessImageUsageSet {
     None,
     StorageImage,
     SampledImage,
     Both,
 }
 
-pub(crate) trait IsSampled: UsageSet {}
-pub(crate) trait IsStorage: UsageSet {}
-pub(crate) trait IsColorAttachment: UsageSet {}
-pub(crate) trait IsDepthAttachment: UsageSet {}
+pub trait IsSampled: UsageSet {}
+pub trait IsStorage: UsageSet {}
+pub trait IsColorAttachment: UsageSet {}
+pub trait IsDepthAttachment: UsageSet {}
 
 impl IsSampled for Sampled {}
 impl IsSampled for ColorAttachmentSampled {}

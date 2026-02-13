@@ -14,11 +14,11 @@ pub struct BufferView {
 }
 
 #[derive(Copy, Clone)]
-pub struct BufferSlice<T: Copy + Pod, L: Location = GpuBuffer> {
+pub struct BufferSlice<T: Copy + Pod = u8, L: Location = GpuBuffer> {
     pub handle: vk::Buffer,
     pub size: u64,
     pub offset: u64,
-    pub(crate) cpu_base_ptr: usize,
+    pub cpu_base_ptr: usize,
     pub(crate) gpu_base_ptr: u64,
     pub(crate) _marker: PhantomData<T>,
     pub(crate) _location: PhantomData<L>,
@@ -58,8 +58,8 @@ impl<T: Copy + Pod, const N: usize> From<&[T; N]> for BufferSlice<T, CpuBuffer> 
     }
 }
 
-impl<T: Copy + Pod> From<Arc<[T]>> for BufferSlice<T, CpuBuffer> {
-    fn from(value: Arc<[T]>) -> Self {
+impl<T: Copy + Pod> From<&Arc<[T]>> for BufferSlice<T, CpuBuffer> {
+    fn from(value: &Arc<[T]>) -> Self {
         BufferSlice {
             handle: vk::Buffer::null(),
             size: (value.len() * size_of::<T>()) as u64,

@@ -59,7 +59,7 @@ macro_rules! tracy_span {
 }
 
 unsafe impl Sync for Ctx {}
-struct TrustMeBro(UnsafeCell<Option<Ctx>>);
+struct TrustMeBro(Option<Ctx>);
 unsafe impl Sync for TrustMeBro {}
 
 pub struct Ctx {
@@ -77,52 +77,34 @@ pub struct Ctx {
     present_queue_familie: Option<QueueFamily>,
     present_queue: Option<Queue>,
 
-    allocator: Mutex<Allocator>,
     #[cfg(debug_assertions)]
     printf: Mutex<HashMap<String, usize>>,
 }
 
-impl Debug for Ctx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write(
-            f,
-            format_args!(
-                "device: there, physical_device: {:?}, allocator: {:?}",
-                self.physical_device, self.allocator
-            ),
-        )
-    }
-}
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-pub(crate) static STATE: TrustMeBro = TrustMeBro(UnsafeCell::new(None));
-
+static mut STATE: TrustMeBro = TrustMeBro(None);
+static mut ALLOCATOR: Option<Mutex<Allocator>> = None;
 impl Ctx {
+    #[allow(static_mut_refs)]
     pub(crate) fn get() -> &'static Self {
-        unsafe {
-            STATE
-                .0
-                .get()
-                .as_ref()
-                .unwrap()
-                .as_ref()
-                .ok_or(anyhow!("Vulkan Context was not Initilized"))
-                .unwrap()
-        }
+        unsafe { STATE
+                    .0
+                    .as_ref()
+                    .ok_or(anyhow!("Vulkan Context was not Initilized"))
+                    .unwrap() }
     }
+    #[allow(static_mut_refs)]
     pub(crate) fn get_mut() -> &'static mut Self {
-        unsafe {
-            STATE
-                .0
-                .get()
-                .as_mut()
-                .unwrap()
-                .as_mut()
-                .ok_or(anyhow!("Vulkan Context was not Initilized"))
-                .unwrap()
-        }
+        unsafe { STATE
+                    .0
+                    .as_mut()
+                    .ok_or(anyhow!("Vulkan Context was not Initilized"))
+                    .unwrap() }
+        
     }
+    #[allow(static_mut_refs)]
     pub(crate) fn is_init() -> bool {
-        unsafe { STATE.0.get().as_ref().unwrap().is_some() }
+        unsafe { STATE.0.is_some() }
     }
     pub(crate) fn device() -> &'static Device {
         &Ctx::get().device
@@ -163,8 +145,9 @@ impl Ctx {
             .map(|e| e.index)
             .unwrap_or(Ctx::get().gfx_queue_familie.index)
     }
+    #[allow(static_mut_refs)]
     pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        Ctx::get().allocator.lock().unwrap()
+        unsafe { ALLOCATOR.as_ref().unwrap().lock().unwrap() }
     }
 
     pub(crate) fn surface() -> &'static Surface {
@@ -200,7 +183,7 @@ impl Ctx {
         enable_gpu_assited_validation: bool,
     ) -> Result<()> {
         unsafe {
-            *(STATE.0.get().as_mut().unwrap()) = Some(std::mem::MaybeUninit::uninit().assume_init())
+            STATE.0 = Some(std::mem::MaybeUninit::zeroed().assume_init())
         };
         let entry = unsafe { Entry::load()? };
         let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
@@ -302,7 +285,7 @@ impl Ctx {
             debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
         }
 
-        let allocator = Allocator::new(&AllocatorCreateDesc {
+        let mut allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
             physical_device: physical_device.handel,
@@ -359,7 +342,7 @@ impl Ctx {
                 device_debug_utils: debug_utils,
             })
             .unwrap();
-        Ctx::get_mut().allocator = Mutex::new(allocator);
+        unsafe { ALLOCATOR = Some(Mutex::new(allocator)) };
 
         Ctx::get_mut().gfx_queues = (0..graphics_queue_family.num_queues)
             .map(|i| Queue::new(graphics_queue_family.index, i).unwrap())
@@ -386,7 +369,10 @@ impl Ctx {
 
         Ctx::get_mut().features = features;
         Ctx::get_mut().physical_device = physical_device;
-        Ctx::get_mut().printf = Mutex::new(HashMap::new());
+        #[cfg(debug_assertions)]
+        {
+            Ctx::get_mut().printf = Mutex::new(HashMap::new());
+        }
         Ctx::get_mut().surface = surface.unwrap();
         Ok(())
     }
