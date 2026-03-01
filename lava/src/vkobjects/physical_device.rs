@@ -278,10 +278,6 @@ impl PhysicalDevice {
         if !unsuported_ext.is_empty() {
             log::info!("Unsuported Extensions: {:#?}", unsuported_ext);
         }
-        assert!(
-            unsuported_ext.is_empty(),
-            "device does not support required extensions"
-        );
         features.device_debug_utils =
             device.supported_features.device_debug_utils && features.debug_utils;
         features.mesh = device.supported_features.mesh;

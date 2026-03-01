@@ -411,9 +411,11 @@ impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
         let mut extensions = vec![
             ash::ext::extended_dynamic_state3::NAME,
-            ash::ext::host_image_copy::NAME,
             // unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_KHR_unified_image_layouts\0") }
         ];
+        if self.rebar {
+            extensions.push(ash::ext::host_image_copy::NAME);
+        }
         if self.present {
             extensions.push(ash::khr::swapchain::NAME);
         }

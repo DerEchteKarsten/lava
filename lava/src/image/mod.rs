@@ -46,7 +46,11 @@ impl<F: Format, U: UsageSet> Image<F, U> {
             usage: U::VK
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
+                | if Ctx::features().rebar {
+                    vk::ImageUsageFlags::HOST_TRANSFER_EXT
+                }else {
+                    vk::ImageUsageFlags::empty()
+                },
             ..Default::default()
         };
 
