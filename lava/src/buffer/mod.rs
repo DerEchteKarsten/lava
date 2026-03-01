@@ -59,10 +59,10 @@ pub trait AsBuffer {
         From::from(self.get_ref())
     }
     fn byte_offset(&self, offset: u64) -> BufferSlice<Self::DataType, Self::Location> {
-        self.whole().byte_offset(offset)
+        self.whole().set_byte_offset(offset)
     }
     fn element_offset(&self, elements: usize) -> BufferSlice<Self::DataType, Self::Location> {
-        self.whole().element_offset(elements)
+        self.whole().set_element_offset(elements)
     }
     fn num_bytes(&self, bytes: u64) -> BufferSlice<Self::DataType, Self::Location> {
         self.whole().num_bytes(bytes)
@@ -119,7 +119,9 @@ impl<T: Copy + Pod, L: Location> Buffer<T, L> {
             (*allocator).allocate(&AllocationCreateDesc {
                 name: "buffer",
                 requirements,
-                location: if TypeId::of::<L>() == TypeId::of::<GpuBuffer>() {
+                location: if TypeId::of::<L>() == TypeId::of::<GpuBuffer>()
+                    && !Ctx::features().rebar
+                {
                     MemoryLocation::GpuOnly
                 } else {
                     MemoryLocation::CpuToGpu

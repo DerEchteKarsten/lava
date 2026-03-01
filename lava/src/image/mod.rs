@@ -43,7 +43,10 @@ impl<F: Format, U: UsageSet> Image<F, U> {
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
-            usage: U::VK | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            usage: U::VK
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::HOST_TRANSFER_EXT,
             ..Default::default()
         };
 
@@ -58,7 +61,7 @@ impl<F: Format, U: UsageSet> Image<F, U> {
             requirements,
         };
         let allocation = Ctx::allocator().allocate(&desc)?;
-        
+
         unsafe {
             Ctx::device().bind_image_memory(image, allocation.memory(), allocation.offset())?
         };

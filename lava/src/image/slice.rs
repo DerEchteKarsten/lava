@@ -13,9 +13,7 @@ use crate::{
     state::Ctx,
 };
 
-struct Dynamic<> {
-
-}
+struct Dynamic {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<F: Format = Undefined, U: UsageSet = Unknown> {
@@ -60,13 +58,25 @@ pub struct SampledImageViewBinding {
 
 impl Into<TypeLessImageView> for StorageImageViewBinding {
     fn into(self) -> TypeLessImageView {
-        TypeLessImageView { image: self.image, view: self.view, aspect: self.aspect, base_mip: self.base_mip, num_mips: self.num_mips }
+        TypeLessImageView {
+            image: self.image,
+            view: self.view,
+            aspect: self.aspect,
+            base_mip: self.base_mip,
+            num_mips: self.num_mips,
+        }
     }
 }
 
 impl Into<TypeLessImageView> for SampledImageViewBinding {
     fn into(self) -> TypeLessImageView {
-        TypeLessImageView { image: self.image, view: self.view, aspect: self.aspect, base_mip: self.base_mip, num_mips: self.num_mips }
+        TypeLessImageView {
+            image: self.image,
+            view: self.view,
+            aspect: self.aspect,
+            base_mip: self.base_mip,
+            num_mips: self.num_mips,
+        }
     }
 }
 
@@ -111,7 +121,7 @@ impl<F: Format, U: IsStorage> ImageView<F, U> {
             image: self.image,
             handle: self.handle.unwrap(),
             base_mip: self.base_mip,
-            num_mips: self.num_mips
+            num_mips: self.num_mips,
         }
     }
 }
@@ -125,13 +135,13 @@ impl<F: Format, U: IsSampled> ImageView<F, U> {
             image: self.image,
             handle: self.handle.unwrap(),
             base_mip: self.base_mip,
-            num_mips: self.num_mips
+            num_mips: self.num_mips,
         }
     }
 }
 
 impl<F: Format, U: UsageSet> ImageView<F, U> {
-    pub(crate) fn subresource_range(&self) -> vk::ImageSubresourceRange {
+    pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
             aspect_mask: F::ASPECTS,
             base_mip_level: self.base_mip,
@@ -140,12 +150,23 @@ impl<F: Format, U: UsageSet> ImageView<F, U> {
             layer_count: 1,
         }
     }
-    pub(crate) fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
+    pub fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
             aspect_mask: F::ASPECTS,
             mip_level: self.base_mip,
             base_array_layer: 0,
             layer_count: 1,
+        }
+    }
+    pub fn region(self, extend: UVec2) -> ImageSlice<F, U> {
+        ImageSlice {
+            view: self,
+            offset: Offset3D { x: 0, y: 0, z: 0 },
+            extend: vk::Extent3D {
+                width: extend.x,
+                height: extend.y,
+                depth: 1,
+            },
         }
     }
     pub fn cast<NF: Format, NU: UsageSet>(self) -> ImageView<NF, NU> {

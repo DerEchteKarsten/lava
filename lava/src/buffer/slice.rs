@@ -4,7 +4,10 @@ use bytemuck::Pod;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::buffer::{Buffer, CpuBuffer, GpuBuffer, Location};
+use crate::{
+    buffer::{Buffer, CpuBuffer, GpuBuffer, Location},
+    state::Ctx,
+};
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 pub struct BufferView {
@@ -26,7 +29,11 @@ pub struct BufferSlice<T: Copy + Pod = u8, L: Location = GpuBuffer> {
 
 impl<T: Copy + Pod, L: Location> Into<BufferView> for BufferSlice<T, L> {
     fn into(self) -> BufferView {
-        BufferView { handle: self.handle, size: self.size, offset: self.offset }
+        BufferView {
+            handle: self.handle,
+            size: self.size,
+            offset: self.offset,
+        }
     }
 }
 
@@ -78,7 +85,11 @@ impl<T: Copy + Pod> From<&Buffer<T>> for BufferSlice<T> {
             handle: value.handle,
             size: value.size(),
             offset: 0,
-            cpu_base_ptr: 0,
+            cpu_base_ptr: if Ctx::features().rebar {
+                value.allocation.mapped_ptr().unwrap().as_ptr() as usize
+            } else {
+                0
+            },
             gpu_base_ptr: value.address,
             _marker: PhantomData,
             _location: PhantomData,
@@ -109,18 +120,28 @@ impl<T: Copy + Pod, L: Location> From<&Buffer<T, L>> for BufferSlice<T, L> {
 impl<T: Copy + Pod, L: Location> BufferSlice<T, L> {
     pub fn add_byte_offset(mut self, offset: u64) -> Self {
         self.offset += offset;
+        self.size = self.size.saturating_sub(offset);
         self
     }
-    pub fn byte_offset(mut self, offset: u64) -> Self {
+    pub fn set_byte_offset(mut self, offset: u64) -> Self {
         self.offset = offset;
         self
     }
-    pub fn element_offset(mut self, offset: usize) -> Self {
-        self.offset = (offset * size_of::<T>()) as u64;
+    pub fn byte_offset(self) -> u64 {
+        self.offset
+    }
+    pub fn element_offset(self) -> usize {
+        self.offset as usize / size_of::<T>()
+    }
+    pub fn set_element_offset(mut self, offset: usize) -> Self {
+        let offset = (offset * size_of::<T>()) as u64;
+        self.offset = offset;
         self
     }
     pub fn add_element_offset(mut self, offset: usize) -> Self {
-        self.offset += (offset * size_of::<T>()) as u64;
+        let offset = (offset * size_of::<T>()) as u64;
+        self.offset += offset;
+        self.size = self.size.saturating_sub(offset);
         self
     }
     pub fn num_elements(mut self, size: usize) -> Self {
@@ -137,6 +158,9 @@ impl<T: Copy + Pod, L: Location> BufferSlice<T, L> {
     pub fn cpu_address(&self) -> usize {
         self.cpu_base_ptr + self.offset as usize
     }
+    pub fn cpu_ptr(&self) -> *mut T {
+        (self.cpu_base_ptr + self.offset as usize) as *mut T
+    }
     pub fn gpu_address(&self) -> u64 {
         self.gpu_base_ptr + self.offset
     }
@@ -147,13 +171,10 @@ impl<T: Copy + Pod, L: Location> BufferSlice<T, L> {
             size: self.size,
         }
     }
-    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<B, L> {
+    pub fn cast<B: Copy + Pod, NL: Location>(self) -> BufferSlice<B, NL> {
         unsafe { std::mem::transmute(self) }
     }
-}
-
-impl<T: Copy + Pod> BufferSlice<T, CpuBuffer> {
-    pub fn mem_copy_to(&self, other: BufferSlice<T, CpuBuffer>) {
+    pub fn mem_copy_to<J: Location>(&self, other: BufferSlice<T, J>) {
         if self.size != 0 {
             let src_ptr = self.cpu_base_ptr as *const T;
             let dst_ptr = other.cpu_base_ptr as *mut T;
@@ -167,16 +188,7 @@ impl<T: Copy + Pod> BufferSlice<T, CpuBuffer> {
             };
         };
     }
-    pub fn mem_copy_from(&mut self, other: BufferSlice<T, CpuBuffer>) {
+    pub fn mem_copy_from<J: Location>(&self, other: BufferSlice<T, J>) {
         other.mem_copy_to(*self);
-    }
-    pub fn push(&mut self, other: BufferSlice<T, CpuBuffer>) -> Result<()> {
-        if self.size < other.size {
-            return Err(anyhow!("Out of space"));
-        }
-        other.mem_copy_to(*self);
-        self.offset += other.size;
-        self.size -= other.size;
-        Ok(())
     }
 }

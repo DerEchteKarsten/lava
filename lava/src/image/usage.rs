@@ -6,7 +6,6 @@ pub trait UsageSet: 'static + Copy + Clone {
     const PREFERED_LAYOUT: vk::ImageLayout;
 }
 
-
 #[derive(Clone, Copy, Debug)]
 pub struct Unknown;
 
@@ -26,7 +25,6 @@ pub struct ColorAttachmentSampled;
 pub struct DepthAttachmentSampled;
 #[derive(Clone, Copy, Debug)]
 pub struct SampledStorage;
-
 
 impl UsageSet for Unknown {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::empty();

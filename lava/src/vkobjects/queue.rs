@@ -1,5 +1,10 @@
 use std::{
-    cell::UnsafeCell, collections::HashMap, marker::PhantomData, rc::Rc, sync::atomic::Ordering,
+    cell::UnsafeCell,
+    collections::HashMap,
+    fmt::Debug,
+    marker::PhantomData,
+    rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
     u64,
 };
 
@@ -7,7 +12,7 @@ use anyhow::{Result, anyhow};
 use ash::{prelude::VkResult, vk};
 
 use crate::{
-    command_buffer::CommandBuffer,
+    command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     state::{Ctx, Functions},
     vkobjects::{physical_device::QueueFamily, swapchain::Swapchain},
 };
@@ -106,12 +111,11 @@ impl Semaphore<Binary> {
     }
 }
 
-#[derive(Copy, Clone)]
 pub struct Fence {
-    handle: vk::Fence,
+    pub(crate) handle: vk::Fence,
 }
-impl Fence {
-    pub fn destroy(self) {
+impl Drop for Fence {
+    fn drop(&mut self) {
         unsafe { Ctx::device().destroy_fence(self.handle, None) };
     }
 }
@@ -139,13 +143,64 @@ impl Fence {
     }
 }
 
-#[derive(Debug)]
-pub struct Queue {
-    handle: vk::Queue,
-    familie: u32,
+trait QueueFamilie: Debug {
+    fn index() -> u32;
+    fn is_free() -> &'static Vec<AtomicBool>;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+pub struct Transfer;
+#[derive(Debug)]
+pub struct Present;
+#[derive(Debug)]
+pub struct Gfx;
+
+impl QueueFamilie for Transfer {
+    fn index() -> u32 {
+        Ctx::transfer_queue_index()
+    }
+    fn is_free() -> &'static Vec<AtomicBool> {
+        Ctx::get()
+            .transfer_queues_in_use
+            .as_ref()
+            .unwrap_or(&Ctx::get().gfx_queues_in_use)
+    }
+}
+impl QueueFamilie for Present {
+    fn index() -> u32 {
+        Ctx::present_queue_index()
+    }
+    fn is_free() -> &'static Vec<AtomicBool> {
+        Ctx::get()
+            .present_queues_in_use
+            .as_ref()
+            .unwrap_or(&Ctx::get().gfx_queues_in_use)
+    }
+}
+impl QueueFamilie for Gfx {
+    fn index() -> u32 {
+        Ctx::gfx_queue_index()
+    }
+    fn is_free() -> &'static Vec<AtomicBool> {
+        &Ctx::get().gfx_queues_in_use
+    }
+}
+
+#[derive(Debug)]
+pub struct Queue<Q: QueueFamilie> {
+    handle: vk::Queue,
+    familie: u32,
+    idx: u32,
+    _marker: PhantomData<Q>,
+}
+
+impl<Q: QueueFamilie> Drop for Queue<Q> {
+    fn drop(&mut self) {
+        Q::is_free()[self.idx as usize].store(false, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
 pub struct CommandPool {
     handle: vk::CommandPool,
 }
@@ -173,7 +228,10 @@ impl CommandPool {
             handle,
         }
     }
-    pub fn destroy(self) {
+}
+
+impl Drop for CommandPool {
+    fn drop(&mut self) {
         unsafe { Ctx::device().destroy_command_pool(self.handle, None) };
     }
 }
@@ -192,11 +250,26 @@ impl CommandBufferMemory {
     }
 }
 
-impl Queue {
-    pub fn new(familie: u32, idx: u32) -> Result<Self> {
+impl<Q: QueueFamilie> Queue<Q> {
+    pub fn new() -> Result<Self> {
+        let mut handle = None;
+        for (i, slot) in Q::is_free().iter().enumerate() {
+            if slot
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                handle = Some((i as u32, unsafe {
+                    Ctx::device().get_device_queue(Q::index(), i as u32)
+                }));
+                break;
+            }
+        }
+        let (idx, handle) = handle.ok_or(anyhow!("All queues used up"))?;
         Ok(Self {
-            handle: unsafe { Ctx::device().get_device_queue(familie, idx) },
-            familie,
+            handle,
+            idx,
+            familie: Q::index(),
+            _marker: PhantomData,
         })
     }
 
@@ -217,18 +290,19 @@ impl Queue {
 
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
-        buffer: CommandBufferMemory,
-        fence: Option<Fence>,
+        resource_state: Option<HashMap<ResourceHandle, ResourceState>>,
+        buffer: &CommandBufferMemory,
+        fence: Option<&Fence>,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
         executor: F,
-    ) -> Result<()> {
+    ) -> Result<HashMap<ResourceHandle, ResourceState>> {
         unsafe {
             let mut cmd_buffer = CommandBuffer {
                 handle: buffer.handle,
                 famillie_index: self.familie,
                 last_stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
-                resource_hashes: HashMap::new(),
+                resource_hashes: resource_state.unwrap_or(HashMap::new()),
             };
 
             cmd_buffer.begin();
@@ -239,11 +313,11 @@ impl Queue {
                 vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
             let wait_infos: Vec<_> = wait_on
                 .iter()
-                .map(|sem| sem.to_vk(cmd_buffer.last_stage))
+                .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
                 .collect();
             let signal_infos: Vec<_> = signal
                 .iter()
-                .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
+                .map(|sem| sem.to_vk(cmd_buffer.last_stage))
                 .collect();
 
             let submit_info = vk::SubmitInfo2::default()
@@ -256,7 +330,7 @@ impl Queue {
                 std::slice::from_ref(&submit_info),
                 fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
             )?;
-            Ok(())
+            Ok(cmd_buffer.resource_hashes)
         }
     }
 

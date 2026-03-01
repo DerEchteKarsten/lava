@@ -16,7 +16,7 @@ use crate::{
     state::{Ctx, Functions},
     tracy_span,
     vkobjects::{
-        queue::{Binary, Semaphore},
+        queue::{Binary, Fence, Semaphore},
         surface::Surface,
     },
 };
@@ -109,7 +109,7 @@ impl Swapchain {
 
             builder
                 .pre_transform(Ctx::surface().capabilities.current_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                 .present_mode(present_mode)
                 .clipped(true)
         };
@@ -165,6 +165,7 @@ impl Swapchain {
                 if let Some(old) = old {
                     let handle = old.images[i].handle.unwrap();
                     Bindless::write_image(image, handle);
+                    image.handle = Some(handle);
                 } else {
                     let handle = Bindless::push(image);
                     image.handle = handle;
@@ -181,13 +182,13 @@ impl Swapchain {
         })
     }
 
-    pub fn aquire_image(&self, wait_on: &Semaphore<Binary>) -> u32 {
+    pub fn aquire_image(&self, wait_on: &Semaphore<Binary>, fence: Option<&Fence>) -> u32 {
         let (image_index, _suboptimal) = unsafe {
             Functions::swapchain().acquire_next_image(
                 self.handle,
                 u64::MAX,
                 wait_on.handle,
-                vk::Fence::null(),
+                fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
             )
         }
         .unwrap();
@@ -200,7 +201,7 @@ impl Swapchain {
         let swapchain = Swapchain::new(Some(self), Some(size)).unwrap();
 
         unsafe {
-            Ctx::device().device_wait_idle();
+            Ctx::device().device_wait_idle().unwrap();
             Functions::swapchain().destroy_swapchain(self.handle, None);
         };
         *self = swapchain;

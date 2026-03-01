@@ -49,6 +49,7 @@ impl QueueFamily {
 pub struct PhysicalDevice {
     pub handel: vk::PhysicalDevice,
     pub name: String,
+    pub mem_properties: vk::PhysicalDeviceMemoryProperties,
     pub device_type: vk::PhysicalDeviceType,
     pub limits: vk::PhysicalDeviceLimits,
     pub queue_families: Vec<QueueFamily>,
@@ -146,7 +147,21 @@ impl PhysicalDevice {
             .push_next(&mut acc_properties);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
 
+        let mem_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let rebar = mem_properties
+            .memory_types
+            .iter()
+            .find(|e| {
+                e.property_flags.contains(
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ) && mem_properties.memory_heaps[e.heap_index as usize].size > 500 * 1024 * 1024
+            })
+            .is_some();
         let features = Features {
+            rebar,
             present: true,
             debug_utils: true,
             device_debug_utils: supported_extensions
@@ -157,6 +172,7 @@ impl PhysicalDevice {
         };
 
         Ok(Self {
+            mem_properties,
             handel: physical_device,
             name,
             device_type,
@@ -257,6 +273,7 @@ impl PhysicalDevice {
         log::info!("Device type: {:?}", device.device_type);
         log::info!("Features are: {:?}", device.supported_features);
         log::info!("Extentions: {:#?}", device.supported_features.extensions());
+        log::info!("Memory properties: {:#?}", device.mem_properties);
         let unsuported_ext = device.unsupports_extensions(&device.supported_features.extensions());
         if !unsuported_ext.is_empty() {
             log::info!("Unsuported Extensions: {:#?}", unsuported_ext);
@@ -269,6 +286,7 @@ impl PhysicalDevice {
             device.supported_features.device_debug_utils && features.debug_utils;
         features.mesh = device.supported_features.mesh;
         features.raytracing = device.supported_features.raytracing;
+        features.rebar = device.supported_features.rebar;
         Ok((device.clone(), graphics.unwrap(), present, transfer_queue))
     }
 }

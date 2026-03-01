@@ -174,21 +174,21 @@ impl Bindless {
             BindlessImageUsageSet::Both => BindlessHandle {
                 descriptor_index_set1: Self::get()
                     .num_images
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    .fetch_add(1, std::sync::atomic::Ordering::Acquire),
                 descriptor_index_set0: Self::get()
                     .num_textures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    .fetch_add(1, std::sync::atomic::Ordering::Acquire),
             },
             BindlessImageUsageSet::SampledImage => BindlessHandle {
                 descriptor_index_set1: NULL_HANDLE,
                 descriptor_index_set0: Self::get()
                     .num_textures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    .fetch_add(1, std::sync::atomic::Ordering::Acquire),
             },
             BindlessImageUsageSet::StorageImage => BindlessHandle {
                 descriptor_index_set1: Self::get()
                     .num_images
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    .fetch_add(1, std::sync::atomic::Ordering::Acquire),
                 descriptor_index_set0: NULL_HANDLE,
             },
         };

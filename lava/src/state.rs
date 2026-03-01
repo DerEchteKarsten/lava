@@ -6,7 +6,7 @@ use std::{
     mem::MaybeUninit,
     sync::{
         Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard,
-        atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -42,6 +42,8 @@ use crate::{
     },
 };
 
+pub use ash::vk as raw_vulkan;
+
 #[cfg(feature = "trace")]
 #[macro_export]
 macro_rules! tracy_span {
@@ -58,72 +60,50 @@ macro_rules! tracy_span {
     };
 }
 
-unsafe impl Sync for Ctx {}
-struct TrustMeBro(Option<Ctx>);
-unsafe impl Sync for TrustMeBro {}
+impl Debug for Ctx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
 
 pub struct Ctx {
     features: Features,
     device: Device,
     physical_device: PhysicalDevice,
     surface: Surface,
+    allocator: Mutex<Allocator>,
 
-    gfx_queue_familie: QueueFamily,
-    gfx_queues: Vec<Queue>,
+    pub(crate) gfx_queue_familie: QueueFamily,
+    pub(crate) gfx_queues_in_use: Vec<AtomicBool>,
 
-    transfer_queue_familie: Option<QueueFamily>,
-    transfer_queues: Option<Vec<Queue>>,
+    pub(crate) transfer_queue_familie: Option<QueueFamily>,
+    pub(crate) transfer_queues_in_use: Option<Vec<AtomicBool>>,
 
-    present_queue_familie: Option<QueueFamily>,
-    present_queue: Option<Queue>,
+    pub(crate) present_queue_familie: Option<QueueFamily>,
+    pub(crate) present_queues_in_use: Option<Vec<AtomicBool>>,
 
     #[cfg(debug_assertions)]
     printf: Mutex<HashMap<String, usize>>,
 }
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-static mut STATE: TrustMeBro = TrustMeBro(None);
-static mut ALLOCATOR: Option<Mutex<Allocator>> = None;
+static STATE: OnceLock<Ctx> = OnceLock::new();
 impl Ctx {
     #[allow(static_mut_refs)]
     pub(crate) fn get() -> &'static Self {
-        unsafe { STATE
-                    .0
-                    .as_ref()
-                    .ok_or(anyhow!("Vulkan Context was not Initilized"))
-                    .unwrap() }
+        STATE.wait()
     }
-    #[allow(static_mut_refs)]
-    pub(crate) fn get_mut() -> &'static mut Self {
-        unsafe { STATE
-                    .0
-                    .as_mut()
-                    .ok_or(anyhow!("Vulkan Context was not Initilized"))
-                    .unwrap() }
-        
-    }
-    #[allow(static_mut_refs)]
-    pub(crate) fn is_init() -> bool {
-        unsafe { STATE.0.is_some() }
-    }
-    pub(crate) fn device() -> &'static Device {
+    pub fn device() -> &'static Device {
         &Ctx::get().device
     }
-    pub(crate) fn physical_device() -> &'static PhysicalDevice {
+    pub fn physical_device() -> &'static PhysicalDevice {
         &Ctx::get().physical_device
-    }
-    pub fn gfx_queue() -> &'static Queue {
-        &Ctx::get().gfx_queues[0]
     }
     pub fn gfx_queue_index() -> u32 {
         Ctx::get().gfx_queue_familie.index
     }
-    pub fn transfer_queue() -> &'static Queue {
-        Ctx::get()
-            .transfer_queues
-            .as_ref()
-            .map(|e| &e[0])
-            .unwrap_or(&Ctx::get().gfx_queues[0])
+    pub fn num_gfx_queues() -> u32 {
+        Ctx::get().gfx_queues_in_use.len() as u32
     }
     pub fn transfer_queue_index() -> u32 {
         Ctx::get()
@@ -132,12 +112,6 @@ impl Ctx {
             .map(|e| e.index)
             .unwrap_or(Ctx::get().gfx_queue_familie.index)
     }
-    pub fn present_queue() -> &'static Queue {
-        Ctx::get()
-            .present_queue
-            .as_ref()
-            .unwrap_or(&Ctx::get().gfx_queues[0])
-    }
     pub fn present_queue_index() -> u32 {
         Ctx::get()
             .present_queue_familie
@@ -145,16 +119,15 @@ impl Ctx {
             .map(|e| e.index)
             .unwrap_or(Ctx::get().gfx_queue_familie.index)
     }
-    #[allow(static_mut_refs)]
-    pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        unsafe { ALLOCATOR.as_ref().unwrap().lock().unwrap() }
+    pub fn allocator<'a>() -> MutexGuard<'a, Allocator> {
+        unsafe { Ctx::get().allocator.lock().unwrap() }
     }
 
     pub(crate) fn surface() -> &'static Surface {
         &Ctx::get().surface
     }
 
-    pub(crate) fn features() -> Features {
+    pub fn features() -> Features {
         Ctx::get().features.clone()
     }
 
@@ -182,15 +155,14 @@ impl Ctx {
         enable_validation: bool,
         enable_gpu_assited_validation: bool,
     ) -> Result<()> {
-        unsafe {
-            STATE.0 = Some(std::mem::MaybeUninit::zeroed().assume_init())
-        };
         let entry = unsafe { Entry::load()? };
         let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let layer_names = unsafe {
-            [CStr::from_bytes_with_nul_unchecked(
-                b"VK_LAYER_KHRONOS_validation\0",
-            )]
+            [
+                CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0"),
+                // CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_timeline_semaphore\0"),
+                // CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_synchronization2\0")
+            ]
         };
         let layers_names_raw: Vec<*const c_char> = layer_names
             .iter()
@@ -266,17 +238,17 @@ impl Ctx {
 
         let physical_devices =
             PhysicalDevice::enumerate_physical_devices(&surface, &instance, surface_fn.as_ref())?;
-        let (physical_device, graphics_queue_family, present_queue_family, transfer_queue_family) =
+        let (physical_device, graphics_queue_family, present_queue_familie, transfer_queue_familie) =
             PhysicalDevice::select_suitable_physical_device(
                 physical_devices.as_slice(),
                 &mut features,
             )?;
 
         let mut queues = vec![graphics_queue_family.index];
-        if let Some(pqf) = &present_queue_family {
+        if let Some(pqf) = &present_queue_familie {
             queues.push(pqf.index);
         }
-        if let Some(tqf) = &transfer_queue_family {
+        if let Some(tqf) = &transfer_queue_familie {
             queues.push(tqf.index);
         }
         let device = create_device(queues, &physical_device, &features, &instance)?;
@@ -293,11 +265,11 @@ impl Ctx {
                 log_allocations: true,
                 log_frees: true,
                 log_leaks_on_shutdown: false,
-                log_memory_information: false,
+                log_memory_information: true,
                 ..Default::default()
             },
             buffer_device_address: true,
-            allocation_sizes: AllocationSizes::default(),
+            allocation_sizes: AllocationSizes::new(256, if features.rebar { 256 } else { 16 }),
         })?;
 
         let surface = Some(Surface::new(
@@ -306,35 +278,29 @@ impl Ctx {
             &surface_fn.as_ref().unwrap(),
         ));
 
-        Ctx::get_mut().device = device;
-
         FUNCTIONS
             .set(Functions {
                 mesh: if features.mesh {
-                    Some(ash::ext::mesh_shader::Device::new(
-                        &instance,
-                        &Self::device(),
-                    ))
+                    Some(ash::ext::mesh_shader::Device::new(&instance, &device))
                 } else {
                     None
                 },
                 raytracing_pipeline: if features.raytracing {
                     Some(ash::khr::ray_tracing_pipeline::Device::new(
-                        &instance,
-                        &Self::device(),
+                        &instance, &device,
                     ))
                 } else {
                     None
                 },
                 acceleration_structure: if features.raytracing {
                     Some(ash::khr::acceleration_structure::Device::new(
-                        &instance,
-                        &Self::device(),
+                        &instance, &device,
                     ))
                 } else {
                     None
                 },
-                swapchain: ash::khr::swapchain::Device::new(&instance, &Self::device()),
+                host_image_copy: ash::ext::host_image_copy::Device::new(&instance, &device),
+                swapchain: ash::khr::swapchain::Device::new(&instance, &device),
                 instance,
                 entry,
                 surface: surface_fn,
@@ -342,38 +308,45 @@ impl Ctx {
                 device_debug_utils: debug_utils,
             })
             .unwrap();
-        unsafe { ALLOCATOR = Some(Mutex::new(allocator)) };
 
-        Ctx::get_mut().gfx_queues = (0..graphics_queue_family.num_queues)
-            .map(|i| Queue::new(graphics_queue_family.index, i).unwrap())
-            .collect();
-        Ctx::get_mut().gfx_queue_familie = graphics_queue_family;
-        if let Some(transfer) = transfer_queue_family {
-            Ctx::get_mut().transfer_queues = Some(
-                (0..transfer.num_queues)
-                    .map(|i| Queue::new(transfer.index, i).unwrap())
+        STATE
+            .set(Ctx {
+                device,
+                allocator: Mutex::new(allocator),
+                gfx_queues_in_use: (0..graphics_queue_family.num_queues)
+                    .map(|_| AtomicBool::new(false))
                     .collect(),
-            );
-            Ctx::get_mut().transfer_queue_familie = Some(transfer);
-        } else {
-            Ctx::get_mut().transfer_queues = None;
-            Ctx::get_mut().transfer_queue_familie = None;
-        }
-        if let Some(present) = present_queue_family {
-            Ctx::get_mut().present_queue = Some(Queue::new(present.index, 0).unwrap());
-            Ctx::get_mut().present_queue_familie = Some(present);
-        } else {
-            Ctx::get_mut().present_queue = None;
-            Ctx::get_mut().present_queue_familie = None;
-        }
+                gfx_queue_familie: graphics_queue_family,
+                transfer_queues_in_use: if let Some(transfer) = &transfer_queue_familie {
+                    Some(
+                        (0..transfer.num_queues)
+                            .map(|_| AtomicBool::new(false))
+                            .collect(),
+                    )
+                } else {
+                    None
+                },
+                transfer_queue_familie,
 
-        Ctx::get_mut().features = features;
-        Ctx::get_mut().physical_device = physical_device;
-        #[cfg(debug_assertions)]
-        {
-            Ctx::get_mut().printf = Mutex::new(HashMap::new());
-        }
-        Ctx::get_mut().surface = surface.unwrap();
+                present_queues_in_use: if let Some(present) = &present_queue_familie {
+                    Some(
+                        (0..present.num_queues)
+                            .map(|_| AtomicBool::new(false))
+                            .collect(),
+                    )
+                } else {
+                    None
+                },
+                present_queue_familie,
+
+                features: features,
+                physical_device: physical_device,
+                #[cfg(debug_assertions)]
+                printf: Mutex::new(HashMap::new()),
+                surface: surface.unwrap(),
+            })
+            .expect("Faild to initilize Vulkan Context");
+
         Ok(())
     }
 }
@@ -391,7 +364,7 @@ unsafe extern "system" fn vulkan_debug_callback(
             #[cfg(debug_assertions)]
             {
                 let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-                if Ctx::is_init() && split.len() > 1 {
+                if STATE.get().is_some() && split.len() > 1 {
                     let printf_message = split[1..]
                         .iter()
                         .map(|s| s.chars())
@@ -427,6 +400,7 @@ unsafe extern "system" fn vulkan_debug_callback(
 
 #[derive(Default, Debug, Clone)]
 pub struct Features {
+    pub rebar: bool,
     pub present: bool,
     pub device_debug_utils: bool,
     pub debug_utils: bool,
@@ -437,6 +411,7 @@ impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
         let mut extensions = vec![
             ash::ext::extended_dynamic_state3::NAME,
+            ash::ext::host_image_copy::NAME,
             // unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_KHR_unified_image_layouts\0") }
         ];
         if self.present {
@@ -533,6 +508,7 @@ impl Features {
 
 pub struct Functions {
     instance: ash::Instance,
+    host_image_copy: ash::ext::host_image_copy::Device,
     entry: ash::Entry,
     swapchain: ash::khr::swapchain::Device,
     surface: Option<ash::khr::surface::Instance>,
@@ -554,6 +530,9 @@ static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 impl Functions {
     pub fn surface() -> Option<&'static ash::khr::surface::Instance> {
         get().surface.as_ref()
+    }
+    pub fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
+        &get().host_image_copy
     }
     pub fn instance() -> &'static ash::Instance {
         &get().instance

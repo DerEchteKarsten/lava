@@ -28,7 +28,9 @@ use crate::{
     },
 };
 use anyhow::Result;
-use ash::vk::{self, BufferCopy, Extent3D, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags};
+use ash::vk::{
+    self, BufferCopy, Extent3D, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags,
+};
 use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::Vec2;
 use glam::{IVec2, UVec2, Vec3};
@@ -174,6 +176,7 @@ pub trait RasterVertexShaderPass: RasterPass {
             .unwrap()
             .entry(hash.clone())
             .or_insert_with(|| {
+                // unsafe { Ctx::device().device_wait_idle().unwrap() };
                 let m_cache = Self::module_cache();
                 let module = m_cache.get_or_init(|| create_module(Self::BYTES));
                 let stages = vec![
@@ -253,7 +256,7 @@ fn create_raster_pipeline(
         .min_sample_shading(1.0)
         .alpha_to_coverage_enable(false)
         .alpha_to_one_enable(false)
-        .sample_mask(&[]);
+        .sample_mask(&[!0]);
 
     let color_blend_attachments = hash
         .color_formats
@@ -295,14 +298,18 @@ fn create_raster_pipeline(
         })
         .front_face(vk::FrontFace::CLOCKWISE)
         .depth_bias_enable(true);
-    let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_bounds_test_enable(false)
-        .depth_compare_op(vk::CompareOp::GREATER)
-        .depth_test_enable(true)
-        .depth_write_enable(true)
-        .min_depth_bounds(1.0)
-        .max_depth_bounds(0.0)
-        .stencil_test_enable(false);
+    let depth_stencil_state = if hash.depth_format != vk::Format::UNDEFINED {
+        vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_bounds_test_enable(false)
+            .depth_compare_op(vk::CompareOp::GREATER)
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .min_depth_bounds(1.0)
+            .max_depth_bounds(0.0)
+            .stencil_test_enable(false)
+    } else {
+        vk::PipelineDepthStencilStateCreateInfo::default()
+    };
 
     create_info = create_info
         .stages(&stages)
@@ -353,13 +360,15 @@ pub struct ResourceState {
     pub stages: vk::PipelineStageFlags2,
     pub access: vk::AccessFlags2,
     pub layout: vk::ImageLayout,
-    pub src_familie: u32,
-    pub dst_familie: u32,
 }
 
 impl Default for ResourceState {
     fn default() -> Self {
-        ResourceState { stages: vk::PipelineStageFlags2::empty(), access: vk::AccessFlags2::empty(), layout: vk::ImageLayout::UNDEFINED, src_familie: vk::QUEUE_FAMILY_IGNORED, dst_familie: vk::QUEUE_FAMILY_IGNORED }
+        ResourceState {
+            stages: vk::PipelineStageFlags2::empty(),
+            access: vk::AccessFlags2::empty(),
+            layout: vk::ImageLayout::UNDEFINED,
+        }
     }
 }
 
@@ -1061,7 +1070,7 @@ impl CommandBuffer {
             ResourceState {
                 access: vk::AccessFlags2::empty(),
                 layout: vk::ImageLayout::PRESENT_SRC_KHR,
-                stages: vk::PipelineStageFlags2::NONE,
+                stages: self.last_stage,
                 ..Default::default()
             },
         )]);
@@ -1081,55 +1090,63 @@ impl CommandBuffer {
         };
     }
 
-    pub fn transition_layout<F: Format, U: UsageSet>(
+    pub fn image_barrier<F: Format, U: UsageSet>(
         &mut self,
-        image: ImageView<F, U>,
-        layout: vk::ImageLayout,
+        resource: ImageView<F, U>,
+        src_access: vk::AccessFlags2,
+        dst_access: vk::AccessFlags2,
+        src_stage: vk::PipelineStageFlags2,
+        dst_stage: vk::PipelineStageFlags2,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        src_index: u32,
+        dst_index: u32,
     ) {
-        tracy_span!("transition_layout");
-        self.barriers(vec![(
-            ResourceHandle::Image(image.into()),
-            ResourceState {
-                access: vk::AccessFlags2::empty(),
-                layout,
-                stages: vk::PipelineStageFlags2::NONE,
-                ..Default::default()
-            },
-        )]);
+        let image_memory_barriers = [vk::ImageMemoryBarrier2 {
+            src_access_mask: src_access,
+            dst_access_mask: dst_access,
+            src_queue_family_index: src_index,
+            dst_queue_family_index: dst_index,
+            src_stage_mask: src_stage,
+            dst_stage_mask: dst_stage,
+            image: resource.image,
+            subresource_range: resource.subresource_range(),
+            old_layout,
+            new_layout,
+            ..Default::default()
+        }];
+        let dependency_info = vk::DependencyInfo::default()
+            .image_memory_barriers(&image_memory_barriers)
+            .dependency_flags(vk::DependencyFlags::BY_REGION);
+        unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
     }
 
-    pub fn aquire_buffer<T: Copy + Pod, L: Location>(
+    pub fn buffer_barrier<T: Copy + Pod, L: Location>(
         &mut self,
-        buffer: BufferSlice<T, L>,
-        src: u32,
+        resource: BufferSlice<T, L>,
+        src_access: vk::AccessFlags2,
+        dst_access: vk::AccessFlags2,
+        src_stage: vk::PipelineStageFlags2,
+        dst_stage: vk::PipelineStageFlags2,
+        src_index: u32,
+        dst_index: u32,
     ) {
-        self.barriers(vec![(
-            ResourceHandle::Buffer(buffer.into()),
-            ResourceState {
-                access: vk::AccessFlags2::empty(),
-                stages: vk::PipelineStageFlags2::NONE,
-                layout: vk::ImageLayout::UNDEFINED,
-                src_familie: src,
-                dst_familie: self.famillie_index,
-            },
-        )]);
-    }
-
-    pub fn release_buffer<T: Copy + Pod, L: Location>(
-        &mut self,
-        buffer: BufferSlice<T, L>,
-        dst: u32,
-    ) {
-        self.barriers(vec![(
-            ResourceHandle::Buffer(buffer.into()),
-            ResourceState {
-                access: vk::AccessFlags2::empty(),
-                stages: vk::PipelineStageFlags2::NONE,
-                layout: vk::ImageLayout::UNDEFINED,
-                src_familie: self.famillie_index,
-                dst_familie: dst,
-            },
-        )]);
+        let buffer_memory_barriers = [vk::BufferMemoryBarrier2 {
+            src_access_mask: src_access,
+            dst_access_mask: dst_access,
+            src_queue_family_index: src_index,
+            dst_queue_family_index: dst_index,
+            src_stage_mask: src_stage,
+            dst_stage_mask: dst_stage,
+            buffer: resource.handle,
+            offset: resource.offset,
+            size: resource.size,
+            ..Default::default()
+        }];
+        let dependency_info = vk::DependencyInfo::default()
+            .buffer_memory_barriers(&buffer_memory_barriers)
+            .dependency_flags(vk::DependencyFlags::BY_REGION);
+        unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
     }
 
     fn barriers(&mut self, resources: Vec<(ResourceHandle, ResourceState)>) {
@@ -1161,9 +1178,8 @@ impl CommandBuffer {
                 && !new.access.contains(write_flags);
             let same_layout = prev.layout == new.layout;
             let first_use = prev.stages.contains(vk::PipelineStageFlags2::TOP_OF_PIPE);
-            let same_familie = (new.src_familie != vk::QUEUE_FAMILY_EXTERNAL && new.dst_familie != vk::QUEUE_FAMILY_EXTERNAL) || new.dst_familie == prev.dst_familie;
 
-            let need_barrier = !read_to_read || !same_layout || !first_use || !same_familie;
+            let need_barrier = !read_to_read || !same_layout || !first_use;
 
             if need_barrier {
                 let src_stage_mask = prev.stages;
@@ -1175,8 +1191,8 @@ impl CommandBuffer {
                             dst_access_mask: new.access,
                             src_stage_mask,
                             dst_stage_mask,
-                            src_queue_family_index: new.src_familie,
-                            dst_queue_family_index: new.dst_familie,
+                            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                             buffer: buffer.handle,
                             offset: buffer.offset,
                             size: buffer.size,
@@ -1188,8 +1204,8 @@ impl CommandBuffer {
                         dst_access_mask: new.access,
                         src_stage_mask,
                         dst_stage_mask,
-                        src_queue_family_index: new.src_familie,
-                        dst_queue_family_index: new.dst_familie,
+                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                         image: image.image,
                         old_layout: prev.layout,
                         new_layout: new.layout,

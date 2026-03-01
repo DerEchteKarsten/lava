@@ -5,11 +5,12 @@
 #![feature(const_trait_impl)]
 #![feature(specialization)]
 #![feature(core_intrinsics)]
-use crate::{
-    bindless::Bindless,
-    state::{Ctx},
-};
+use crate::{bindless::Bindless, state::Ctx};
 use anyhow::{Ok, Result};
+
+pub use ash::vk::Pipeline as VkPipeline;
+pub use ash::vk::ShaderModule as VkShaderModule;
+pub use ash::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
 
 pub mod bindless;
 pub mod buffer;
@@ -33,10 +34,6 @@ pub fn init(
     )?;
     Bindless::init()?;
     Ok(())
-}
-
-pub fn is_init() -> bool {
-    Ctx::is_init()
 }
 
 pub fn destroy() {
