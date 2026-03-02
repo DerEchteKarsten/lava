@@ -49,29 +49,6 @@ impl BufferUsageFlags {
     }
 }
 
-pub trait AsBuffer {
-    type DataType: Pod + Copy;
-    type Location: Location;
-    fn get_ref(&self) -> &Buffer<Self::DataType, Self::Location>;
-    fn get_mut(&mut self) -> &mut Buffer<Self::DataType, Self::Location>;
-
-    fn whole(&self) -> BufferSlice<Self::DataType, Self::Location> {
-        From::from(self.get_ref())
-    }
-    fn byte_offset(&self, offset: u64) -> BufferSlice<Self::DataType, Self::Location> {
-        self.whole().set_byte_offset(offset)
-    }
-    fn element_offset(&self, elements: usize) -> BufferSlice<Self::DataType, Self::Location> {
-        self.whole().set_element_offset(elements)
-    }
-    fn num_bytes(&self, bytes: u64) -> BufferSlice<Self::DataType, Self::Location> {
-        self.whole().num_bytes(bytes)
-    }
-    fn num_elements(&self, elements: usize) -> BufferSlice<Self::DataType, Self::Location> {
-        self.whole().num_elements(elements)
-    }
-}
-
 #[derive(Debug)]
 pub struct Buffer<T: Copy + Pod, L: Location = GpuBuffer> {
     pub handle: vk::Buffer,
@@ -86,17 +63,6 @@ impl<T: Copy + Pod, L: Location> Drop for Buffer<T, L> {
         unsafe { Ctx::device().destroy_buffer(self.handle, None) };
         let alloc = std::mem::take(&mut self.allocation);
         Ctx::allocator().free(alloc).unwrap();
-    }
-}
-
-impl<T: Pod + Copy, L: Location> AsBuffer for Buffer<T, L> {
-    type DataType = T;
-    type Location = L;
-    fn get_ref(&self) -> &Buffer<Self::DataType, Self::Location> {
-        self
-    }
-    fn get_mut(&mut self) -> &mut Buffer<Self::DataType, Self::Location> {
-        self
     }
 }
 

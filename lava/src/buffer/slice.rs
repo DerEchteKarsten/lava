@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
 use ash::vk;
 use bytemuck::Pod;
-use std::marker::PhantomData;
+use core::slice::SlicePattern;
+use std::ops::{Index, Range};
+use std::{marker::PhantomData, slice::SliceIndex};
 use std::sync::Arc;
 
 use crate::{
@@ -79,18 +81,19 @@ impl<T: Copy + Pod> From<&Arc<[T]>> for BufferSlice<T, CpuBuffer> {
     }
 }
 
-impl<T: Copy + Pod> From<&Buffer<T>> for BufferSlice<T> {
-    fn from(value: &Buffer<T>) -> Self {
-        BufferSlice {
-            handle: value.handle,
-            size: value.size(),
-            offset: 0,
+impl<T: Copy + Pod> Index<Range<usize>> for Buffer<T> {
+    type Output = BufferSlice<T>;
+    fn index(&self, index: Range<usize>) -> &Self::Output {
+        &BufferSlice {
+            handle: self.handle,
+            size: self.size(),
+            offset: index.start as u64,
             cpu_base_ptr: if Ctx::features().rebar {
-                value.allocation.mapped_ptr().unwrap().as_ptr() as usize
+                self.allocation.mapped_ptr().unwrap().as_ptr() as usize
             } else {
                 0
             },
-            gpu_base_ptr: value.address,
+            gpu_base_ptr: self.address,
             _marker: PhantomData,
             _location: PhantomData,
         }
