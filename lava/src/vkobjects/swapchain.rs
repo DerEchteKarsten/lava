@@ -24,14 +24,14 @@ use crate::{
 pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 
 #[derive(Debug)]
-pub struct Swapchain {
+pub struct Swapchain<'a> {
     pub size: [u32; 2],
     pub(crate) handle: vk::SwapchainKHR,
     pub(crate) present_mode: vk::PresentModeKHR,
-    pub images: Vec<ImageView<format::Swapchain, ColorAttachmentStorage>>,
+    pub images: Vec<ImageView<'a, format::Swapchain, ColorAttachmentStorage>>,
 }
 
-impl Swapchain {
+impl<'a> Swapchain<'a> {
     pub fn new(old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = {
             let formats = &Ctx::surface().formats;
@@ -160,6 +160,7 @@ impl Swapchain {
                     num_mips: 1,
                     _marker: PhantomData,
                     _marker2: PhantomData,
+                    _marker3: PhantomData
                 };
 
                 if let Some(old) = old {

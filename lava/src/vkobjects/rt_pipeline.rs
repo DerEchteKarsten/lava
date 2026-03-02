@@ -2,7 +2,7 @@ use anyhow::Result;
 use ash::vk;
 
 use crate::{
-    buffer::{AsBuffer, Buffer, BufferUsageFlags, CpuBuffer, slice::BufferSlice},
+    buffer::{Buffer, slice::BufferSlice},
     state::{Ctx, Functions},
 };
 
@@ -118,7 +118,7 @@ impl RaytracingPipeline {
 }
 
 pub struct ShaderBindingTable {
-    pub _buffer: Buffer<u8, CpuBuffer>,
+    pub _buffer: Buffer<u8>,
     pub raygen_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
@@ -176,10 +176,11 @@ impl ShaderBindingTable {
             desc.hit_shader_count,
         ];
 
-        let buffer_usage = BufferUsageFlags::SHADER_BINDING_TABLE;
+        let buffer_usage = vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR;
 
-        let mut buffer = Buffer::with_alignment(
+        let buffer: Buffer<u8> = Buffer::raw(
             buffer_usage,
+            true,
             buffer_size as _,
             Some(
                 Ctx::physical_device()
@@ -211,9 +212,7 @@ impl ShaderBindingTable {
             }
         }
 
-        buffer
-            .whole()
-            .mem_copy_from(BufferSlice::from(stb_data.as_slice()));
+        buffer.range(..).copy_from(stb_data.as_slice());
 
         let raygen_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(buffer.address)

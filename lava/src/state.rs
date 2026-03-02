@@ -29,7 +29,7 @@ use winit::raw_window_handle::{
 
 use crate::{
     bindless::{Bindless, BindlessHandle},
-    buffer::{Buffer, GpuBuffer, Location},
+    buffer::{Buffer},
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     image::{format, slice::ImageSlice, usage::ColorAttachmentStorage},
     vkobjects::{

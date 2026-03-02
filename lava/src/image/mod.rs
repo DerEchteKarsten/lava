@@ -6,7 +6,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 
 use crate::{
     bindless::{Bindless, BindlessHandle},
-    image::{format::Format, slice::AsImage, usage::UsageSet},
+    image::{format::{Format, Undefined}, slice::AsImage, usage::{Unknown, UsageSet}},
     state::Ctx,
 };
 
@@ -15,7 +15,7 @@ pub mod slice;
 pub mod usage;
 
 #[derive(Debug)]
-pub struct Image<F: Format, U: UsageSet> {
+pub struct Image<F: Format = Undefined, U: UsageSet = Unknown> {
     pub image: vk::Image,
     pub whole_view: vk::ImageView,
     pub allocation: Allocation,
@@ -80,23 +80,30 @@ impl<F: Format, U: UsageSet> Image<F, U> {
             mips,
             whole_view: vk::ImageView::null(),
         };
-        let view = s.create_new_view(
-            0,
-            mips,
-            vk::ComponentMapping {
-                r: ComponentSwizzle::R,
-                g: ComponentSwizzle::G,
-                b: ComponentSwizzle::B,
-                a: ComponentSwizzle::A,
-            },
-        );
-        s.handle = Bindless::push(view);
-
-        s.whole_view = view.view;
+        let (handle, view) = {
+            let view = s.create_new_view(
+                0,
+                mips,
+                vk::ComponentMapping {
+                    r: ComponentSwizzle::R,
+                    g: ComponentSwizzle::G,
+                    b: ComponentSwizzle::B,
+                    a: ComponentSwizzle::A,
+                },
+            );
+            let handle = Bindless::push(view);
+            (handle, view.view)
+        };
+        s.handle = handle;
+        s.whole_view = view;
         Ok(s)
     }
 
     pub fn new(width: u32, height: u32) -> Result<Self> {
         Self::new_mipped(width, height, 1)
+    }
+
+    pub fn cast<NF: Format, NU: UsageSet>(self) -> Image::<NF, NU> {
+        unsafe { std::mem::transmute(self) }
     }
 }

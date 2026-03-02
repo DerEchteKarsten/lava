@@ -1,197 +1,130 @@
 use anyhow::{Result, anyhow};
 use ash::vk;
 use bytemuck::Pod;
-use core::slice::SlicePattern;
-use std::ops::{Index, Range};
+use std::ops::{Bound, Index, Range, RangeBounds};
 use std::{marker::PhantomData, slice::SliceIndex};
 use std::sync::Arc;
 
 use crate::{
-    buffer::{Buffer, CpuBuffer, GpuBuffer, Location},
+    buffer::{Buffer},
     state::Ctx,
 };
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
-pub struct BufferView {
-    pub handle: vk::Buffer,
-    pub size: u64,
-    pub offset: u64,
-}
-
 #[derive(Copy, Clone)]
-pub struct BufferSlice<T: Copy + Pod = u8, L: Location = GpuBuffer> {
+pub struct BufferSlice<'a, T: Copy + Pod> {
     pub handle: vk::Buffer,
     pub size: u64,
-    pub offset: u64,
-    pub cpu_base_ptr: usize,
-    pub(crate) gpu_base_ptr: u64,
+    pub cpu_ptr: usize,
+    pub gpu_ptr: u64,
+    pub base_address: u64,
     pub(crate) _marker: PhantomData<T>,
-    pub(crate) _location: PhantomData<L>,
+    pub(crate) _lifetime: PhantomData<&'a ()>
 }
 
-impl<T: Copy + Pod, L: Location> Into<BufferView> for BufferSlice<T, L> {
-    fn into(self) -> BufferView {
-        BufferView {
+impl<T: Copy + Pod> Buffer<T> {
+    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
+        let start_offset = match index.start_bound() {
+            std::ops::Bound::Unbounded => 0,
+            std::ops::Bound::Excluded(size) => ((size + 1) * size_of::<T>()) as u64,
+            std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
+        };
+        BufferSlice {
             handle: self.handle,
-            size: self.size,
-            offset: self.offset,
-        }
-    }
-}
-
-impl<T: Copy + Pod> From<&[T]> for BufferSlice<T, CpuBuffer> {
-    fn from(value: &[T]) -> Self {
-        BufferSlice {
-            handle: vk::Buffer::null(),
-            size: size_of_val(value) as u64,
-            offset: 0,
-            cpu_base_ptr: value.as_ptr() as usize,
-            gpu_base_ptr: 0,
-            _marker: PhantomData,
-            _location: PhantomData,
-        }
-    }
-}
-
-impl<T: Copy + Pod, const N: usize> From<&[T; N]> for BufferSlice<T, CpuBuffer> {
-    fn from(value: &[T; N]) -> Self {
-        BufferSlice {
-            handle: vk::Buffer::null(),
-            size: size_of_val(value) as u64,
-            offset: 0,
-            cpu_base_ptr: value.as_ptr() as usize,
-            gpu_base_ptr: 0,
-            _marker: PhantomData,
-            _location: PhantomData,
-        }
-    }
-}
-
-impl<T: Copy + Pod> From<&Arc<[T]>> for BufferSlice<T, CpuBuffer> {
-    fn from(value: &Arc<[T]>) -> Self {
-        BufferSlice {
-            handle: vk::Buffer::null(),
-            size: (value.len() * size_of::<T>()) as u64,
-            offset: 0,
-            cpu_base_ptr: value.as_ptr() as usize,
-            gpu_base_ptr: 0,
-            _marker: PhantomData,
-            _location: PhantomData,
-        }
-    }
-}
-
-impl<T: Copy + Pod> Index<Range<usize>> for Buffer<T> {
-    type Output = BufferSlice<T>;
-    fn index(&self, index: Range<usize>) -> &Self::Output {
-        &BufferSlice {
-            handle: self.handle,
-            size: self.size(),
-            offset: index.start as u64,
-            cpu_base_ptr: if Ctx::features().rebar {
-                self.allocation.mapped_ptr().unwrap().as_ptr() as usize
-            } else {
-                0
+            size: match index.end_bound() {
+                std::ops::Bound::Unbounded => self.size(),
+                std::ops::Bound::Excluded(size) => ((size-1) * size_of::<T>()) as u64,
+                std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
             },
-            gpu_base_ptr: self.address,
+            cpu_ptr: self.allocation.mapped_ptr().map(|e| e.as_ptr() as usize).unwrap_or(0) + start_offset as usize,
+            gpu_ptr: self.address + start_offset,
+            base_address: self.address,
             _marker: PhantomData,
-            _location: PhantomData,
+            _lifetime: PhantomData,
         }
-    }
-}
-
-impl<T: Copy + Pod> From<&Buffer<T, CpuBuffer>> for BufferSlice<T, CpuBuffer> {
-    fn from(value: &Buffer<T, CpuBuffer>) -> Self {
+    } 
+    pub fn byte_range<'a, R: RangeBounds<u64>>(&'a self, index: R) -> BufferSlice<'a, T> {
+        let start_offset = match index.start_bound() {
+            std::ops::Bound::Unbounded => 0,
+            std::ops::Bound::Excluded(size) => size + 1,
+            std::ops::Bound::Included(size) => *size
+        };
         BufferSlice {
-            handle: value.handle,
-            size: value.size(),
-            offset: 0,
-            gpu_base_ptr: value.address,
-            cpu_base_ptr: value.allocation.mapped_ptr().unwrap().as_ptr() as usize,
+            handle: self.handle,
+            size: match index.end_bound() {
+                std::ops::Bound::Unbounded => self.size(),
+                std::ops::Bound::Excluded(size) => size-1,
+                std::ops::Bound::Included(size) => *size
+            },
+            cpu_ptr: self.allocation.mapped_ptr().map(|e| e.as_ptr() as usize).unwrap_or(0) + start_offset as usize,
+            gpu_ptr: self.address + start_offset,
+            base_address: self.address,
             _marker: PhantomData,
-            _location: PhantomData,
+            _lifetime: PhantomData,
+        }
+    } 
+}
+
+impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
+    pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
+        let start_offset = match index.start_bound() {
+            std::ops::Bound::Unbounded => 0,
+            std::ops::Bound::Excluded(size) => ((size + 1) * size_of::<T>()) as u64,
+            std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
+        };
+        BufferSlice {
+            handle: self.handle,
+            size: match index.end_bound() {
+                std::ops::Bound::Unbounded => self.size,
+                std::ops::Bound::Excluded(size) => ((size-1) * size_of::<T>()) as u64,
+                std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
+            },
+            cpu_ptr: self.cpu_ptr + start_offset as usize,
+            gpu_ptr: self.gpu_ptr + start_offset,
+            base_address: self.base_address,
+            _marker: PhantomData,
+            _lifetime: PhantomData,
         }
     }
-}
-
-impl<T: Copy + Pod, L: Location> From<&Buffer<T, L>> for BufferSlice<T, L> {
-    default fn from(value: &Buffer<T, L>) -> Self {
-        unreachable!()
-    }
-}
-
-impl<T: Copy + Pod, L: Location> BufferSlice<T, L> {
-    pub fn add_byte_offset(mut self, offset: u64) -> Self {
-        self.offset += offset;
-        self.size = self.size.saturating_sub(offset);
-        self
-    }
-    pub fn set_byte_offset(mut self, offset: u64) -> Self {
-        self.offset = offset;
-        self
-    }
-    pub fn byte_offset(self) -> u64 {
-        self.offset
-    }
-    pub fn element_offset(self) -> usize {
-        self.offset as usize / size_of::<T>()
-    }
-    pub fn set_element_offset(mut self, offset: usize) -> Self {
-        let offset = (offset * size_of::<T>()) as u64;
-        self.offset = offset;
-        self
-    }
-    pub fn add_element_offset(mut self, offset: usize) -> Self {
-        let offset = (offset * size_of::<T>()) as u64;
-        self.offset += offset;
-        self.size = self.size.saturating_sub(offset);
-        self
-    }
-    pub fn num_elements(mut self, size: usize) -> Self {
-        self.size = (size * size_of::<T>()) as u64;
-        self
-    }
-    pub fn num_bytes(mut self, size: u64) -> Self {
-        self.size = size;
-        self
+    pub fn byte_range<R: RangeBounds<u64>>(self, index: R) -> BufferSlice<'a, T> {
+        let start_offset = match index.start_bound() {
+            std::ops::Bound::Unbounded => 0,
+            std::ops::Bound::Excluded(size) => size + 1,
+            std::ops::Bound::Included(size) => *size
+        };
+        BufferSlice {
+            handle: self.handle,
+            size: match index.end_bound() {
+                std::ops::Bound::Unbounded => self.size,
+                std::ops::Bound::Excluded(size) => size-1,
+                std::ops::Bound::Included(size) => *size
+            },
+            cpu_ptr: self.cpu_ptr + start_offset as usize,
+            gpu_ptr: self.gpu_ptr + start_offset,
+            base_address: self.base_address,
+            _marker: PhantomData,
+            _lifetime: PhantomData,
+        }
     }
     pub fn len(&self) -> usize {
         self.size as usize / size_of::<T>()
     }
-    pub fn cpu_address(&self) -> usize {
-        self.cpu_base_ptr + self.offset as usize
+    pub fn ptr(&self) -> *mut T {
+        self.cpu_ptr as *mut T
     }
-    pub fn cpu_ptr(&self) -> *mut T {
-        (self.cpu_base_ptr + self.offset as usize) as *mut T
-    }
-    pub fn gpu_address(&self) -> u64 {
-        self.gpu_base_ptr + self.offset
-    }
-    pub fn region<B: Location>(&self, other: BufferSlice<T, B>) -> vk::BufferCopy {
+    pub fn region<'b>(&self, other: BufferSlice<'b, T>) -> vk::BufferCopy {
         vk::BufferCopy {
-            src_offset: self.offset,
-            dst_offset: other.offset,
+            src_offset: self.offset(),
+            dst_offset: other.offset(),
             size: self.size,
         }
     }
-    pub fn cast<B: Copy + Pod, NL: Location>(self) -> BufferSlice<B, NL> {
+    pub fn offset(&self) -> u64 {
+        self.gpu_ptr - self.base_address 
+    }
+    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B> {
         unsafe { std::mem::transmute(self) }
     }
-    pub fn mem_copy_to<J: Location>(&self, other: BufferSlice<T, J>) {
-        if self.size != 0 {
-            let src_ptr = self.cpu_base_ptr as *const T;
-            let dst_ptr = other.cpu_base_ptr as *mut T;
-            unsafe {
-                src_ptr
-                    .byte_add(self.offset as usize)
-                    .copy_to_nonoverlapping(
-                        dst_ptr.byte_add(other.offset as usize),
-                        self.size as usize / size_of::<T>(),
-                    )
-            };
-        };
-    }
-    pub fn mem_copy_from<J: Location>(&self, other: BufferSlice<T, J>) {
-        other.mem_copy_to(*self);
+    pub fn copy_from(self, slice: &[T]) {
+        unsafe { self.ptr().copy_from(slice.as_ptr(), slice.len()) };
     }
 }
