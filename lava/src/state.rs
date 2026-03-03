@@ -465,6 +465,7 @@ impl Features {
             .vulkan_memory_model(true)
             .vulkan_memory_model_device_scope(true)
             .storage_buffer8_bit_access(true)
+            .shader_buffer_int64_atomics(true)
             .shader_int8(true);
         *vk13 = vk13
             .dynamic_rendering(true)

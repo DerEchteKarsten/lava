@@ -1002,7 +1002,7 @@ impl CommandBuffer {
                 },
             ),
             (
-                src.into(),
+                dst.into(),
                 ResourceState {
                     access: vk::AccessFlags2::TRANSFER_WRITE,
                     stages: vk::PipelineStageFlags2::TRANSFER,
@@ -1198,10 +1198,12 @@ impl CommandBuffer {
             let read_flags = vk::AccessFlags2::SHADER_STORAGE_READ
                 | vk::AccessFlags2::SHADER_SAMPLED_READ
                 | vk::AccessFlags2::COLOR_ATTACHMENT_READ
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ;
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::TRANSFER_READ;
             let write_flags = vk::AccessFlags2::SHADER_STORAGE_WRITE
                 | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                | vk::AccessFlags2::TRANSFER_WRITE;
             let read_to_read = prev.access.contains(read_flags)
                 && !prev.access.contains(write_flags)
                 && new.access.contains(read_flags)

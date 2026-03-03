@@ -77,7 +77,7 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
                 std::ops::Bound::Unbounded => self.size,
                 std::ops::Bound::Excluded(size) => ((size-1) * size_of::<T>()) as u64,
                 std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
-            },
+            }  - start_offset,
             cpu_ptr: self.cpu_ptr + start_offset as usize,
             gpu_ptr: self.gpu_ptr + start_offset,
             base_address: self.base_address,

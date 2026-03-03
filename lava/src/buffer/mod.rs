@@ -84,7 +84,7 @@ impl<T: Copy + Pod> Buffer<T> {
 
     pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
         Self::raw(
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER, 
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS, 
             cpu_writable,
             (size * size_of::<T>()) as u64,
             None,
