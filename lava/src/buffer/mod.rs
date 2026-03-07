@@ -2,7 +2,7 @@ use std::{
     any::TypeId,
     fmt::Debug,
     marker::PhantomData,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Index, IndexMut},
     sync::{Arc, Mutex, RwLock},
 };
 
@@ -26,11 +26,47 @@ pub struct Buffer<T: Copy + Pod> {
     _type_marker: PhantomData<T>,
 }
 
+impl<T: Copy + Pod> Index<usize> for Buffer<T> {
+    type Output = T;
+    fn index(&self, index: usize) -> &Self::Output {
+        unsafe { self.range(..).ptr().add(index).as_ref() }.unwrap()
+    }
+}
+
+
+impl<T: Copy + Pod> IndexMut<usize> for Buffer<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        unsafe { self.range(..).ptr().add(index).as_mut() }.unwrap()
+    }
+}
+
+
+impl<'a, T: Copy + Pod> Index<usize> for BufferSlice<'a, T> {
+    type Output = T;
+    fn index(&self, index: usize) -> &Self::Output {
+        unsafe { self.ptr().add(index).as_ref() }.unwrap()
+    }
+}
+
+
+impl<'a, T: Copy + Pod> IndexMut<usize> for BufferSlice<'a, T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {    
+        unsafe { self.ptr().add(index).as_mut() }.unwrap()
+    }
+}
+
+
 impl<T: Copy + Pod> Drop for Buffer<T> {
     fn drop(&mut self) {
         unsafe { Ctx::device().destroy_buffer(self.handle, None) };
         let alloc = std::mem::take(&mut self.allocation);
         Ctx::allocator().free(alloc).unwrap();
+    }
+}
+
+impl<'a, T: Copy+Pod> Into<BufferSlice<'a, T>> for &'a Buffer<T> {
+    fn into(self) -> BufferSlice<'a, T> {
+        self.range(..)
     }
 }
 

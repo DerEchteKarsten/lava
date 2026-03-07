@@ -82,8 +82,10 @@ pub struct Ctx {
     pub(crate) present_queue_familie: Option<QueueFamily>,
     pub(crate) present_queues_in_use: Option<Vec<AtomicBool>>,
 
+    // #[cfg(debug_assertions)]
+    // printf: Mutex<HashMap<String, usize>>,
     #[cfg(debug_assertions)]
-    printf: Mutex<HashMap<String, usize>>,
+    last_message: Mutex<(u32, String)>,
 }
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -137,16 +139,28 @@ impl Ctx {
 
     #[cfg(debug_assertions)]
     pub fn log_debug_printf_output() {
-        let mut lock = Ctx::get().printf.lock().unwrap();
-        let mut messages = lock.iter().collect::<Vec<_>>();
-        if messages.len() > 0 {
-            log::info!("Printf output this frame:");
-            messages.sort_by(|(_, a), (_, b)| b.cmp(a));
-            for (message, value) in messages {
-                log::info!("    {}x: {}", *value, *message);
+        // let mut lock = Ctx::get().printf.lock().unwrap();
+        // let mut messages = lock.iter().collect::<Vec<_>>();
+        // if messages.len() > 0 {
+        //     log::info!("Printf output this frame:");
+        //     messages.sort_by(|(_, a), (_, b)| b.cmp(a));
+        //     for (message, value) in messages {
+        //         log::info!("    {}x: {}", *value, *message);
+        //     }
+        // }
+        // lock.clear();
+
+        let mut last_message = Ctx::get().last_message.lock().unwrap();
+        if last_message.1.len() != 0 {
+            if last_message.0 == 1 {
+                log::info!("{}", last_message.1);
+            }else {
+                log::info!("{}x {}", last_message.0, last_message.1);
             }
+            last_message.1 = String::new();
+            last_message.0 = 1;
+            log::info!("---------");
         }
-        lock.clear();
     }
 
     pub(super) fn init(
@@ -341,8 +355,9 @@ impl Ctx {
 
                 features: features,
                 physical_device: physical_device,
+                // printf: Mutex::new(HashMap::new()),
                 #[cfg(debug_assertions)]
-                printf: Mutex::new(HashMap::new()),
+                last_message: Mutex::new((0, String::new())),
                 surface: surface.unwrap(),
             })
             .expect("Faild to initilize Vulkan Context");
@@ -371,12 +386,20 @@ unsafe extern "system" fn vulkan_debug_callback(
                         .flatten()
                         .collect::<String>();
                     if printf_message.len() != 0 {
-                        *(Ctx::get()
-                            .printf
-                            .lock()
-                            .unwrap()
-                            .entry(printf_message)
-                            .or_insert(0)) += 1;
+                        let mut last_message = Ctx::get().last_message.lock().unwrap();
+                        if printf_message == last_message.1 {
+                            last_message.0 += 1;
+                        }else {
+                            if last_message.1.len() != 0 {
+                                if last_message.0 == 1 {
+                                    log::info!("{}", last_message.1);
+                                }else {
+                                    log::info!("{}x {}", last_message.0, last_message.1);
+                                }
+                            }
+                            last_message.0 = 1;
+                            last_message.1 = printf_message;
+                        }
                     }
                     return vk::FALSE;
                 }

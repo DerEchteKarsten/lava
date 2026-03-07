@@ -10,6 +10,15 @@ use crate::{
     state::Ctx,
 };
 
+impl<'a, T: Pod+Copy> IntoIterator for BufferSlice<'a, T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct BufferSlice<'a, T: Copy + Pod> {
     pub handle: vk::Buffer,
@@ -32,8 +41,8 @@ impl<T: Copy + Pod> Buffer<T> {
             handle: self.handle,
             size: match index.end_bound() {
                 std::ops::Bound::Unbounded => self.size(),
-                std::ops::Bound::Excluded(size) => ((size-1) * size_of::<T>()) as u64,
-                std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
+                std::ops::Bound::Excluded(size) => (size * size_of::<T>()) as u64,
+                std::ops::Bound::Included(size) => ((size + 1) * size_of::<T>()) as u64
             },
             cpu_ptr: self.allocation.mapped_ptr().map(|e| e.as_ptr() as usize).unwrap_or(0) + start_offset as usize,
             gpu_ptr: self.address + start_offset,
@@ -126,5 +135,8 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     }
     pub fn copy_from(self, slice: &[T]) {
         unsafe { self.ptr().copy_from(slice.as_ptr(), slice.len()) };
+    }
+    pub fn as_slice(self) -> &'a [T] {
+        unsafe { std::slice::from_raw_parts(self.ptr(), self.len()) }
     }
 }
