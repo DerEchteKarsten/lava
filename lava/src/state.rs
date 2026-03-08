@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 use ash::{
     Device, Entry,
     ext::debug_utils,
-    vk::{self, Handle},
+    vk::{self, Handle, make_api_version},
 };
 use bytemuck::Pod;
 use gpu_allocator::{
@@ -170,7 +170,7 @@ impl Ctx {
         enable_gpu_assited_validation: bool,
     ) -> Result<()> {
         let entry = unsafe { Entry::load()? };
-        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+        let app_info = vk::ApplicationInfo::default().api_version(make_api_version(0, 1, 4, 0));
         let layer_names = unsafe {
             [
                 CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0"),

@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use ash::vk;
 use bytemuck::Pod;
+use gpu_allocator::vulkan::Allocation;
 use std::ops::{Bound, Index, Range, RangeBounds};
 use std::{marker::PhantomData, slice::SliceIndex};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ impl<'a, T: Pod+Copy> IntoIterator for BufferSlice<'a, T> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct BufferSlice<'a, T: Copy + Pod> {
     pub handle: vk::Buffer,
     pub size: u64,
@@ -30,89 +31,43 @@ pub struct BufferSlice<'a, T: Copy + Pod> {
     pub(crate) _lifetime: PhantomData<&'a ()>
 }
 
-impl<T: Copy + Pod> Buffer<T> {
-    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
-        let start_offset = match index.start_bound() {
+
+fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(handle: vk::Buffer, index: R, cpu_ptr: usize, size: u64, address: u64, base_address: u64) -> BufferSlice<'a, T> {
+    let start_offset = match index.start_bound() {
             std::ops::Bound::Unbounded => 0,
             std::ops::Bound::Excluded(size) => ((size + 1) * size_of::<T>()) as u64,
             std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
         };
-        BufferSlice {
-            handle: self.handle,
-            size: match index.end_bound() {
-                std::ops::Bound::Unbounded => self.size(),
-                std::ops::Bound::Excluded(size) => (size * size_of::<T>()) as u64,
-                std::ops::Bound::Included(size) => ((size + 1) * size_of::<T>()) as u64
-            },
-            cpu_ptr: self.allocation.mapped_ptr().map(|e| e.as_ptr() as usize).unwrap_or(0) + start_offset as usize,
-            gpu_ptr: self.address + start_offset,
-            base_address: self.address,
-            _marker: PhantomData,
-            _lifetime: PhantomData,
-        }
+    BufferSlice {
+        handle: handle,
+        size: match index.end_bound() {
+            std::ops::Bound::Unbounded => size,
+            std::ops::Bound::Excluded(size) => (size * size_of::<T>()) as u64,
+            std::ops::Bound::Included(size) => ((size + 1) * size_of::<T>()) as u64
+        }  - start_offset,
+        cpu_ptr: if cpu_ptr == 0 {0}else{cpu_ptr + start_offset as usize},
+        gpu_ptr: address + start_offset,
+        base_address,
+        _marker: PhantomData,
+        _lifetime: PhantomData,
+    }
+}
+
+impl<T: Copy + Pod> Buffer<T> {
+    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
+        new_slice(self.handle, index, self.allocation.mapped_ptr().map(|e| e.as_ptr() as usize).unwrap_or(0), self.size(), self.address, self.address)
     } 
-    pub fn byte_range<'a, R: RangeBounds<u64>>(&'a self, index: R) -> BufferSlice<'a, T> {
-        let start_offset = match index.start_bound() {
-            std::ops::Bound::Unbounded => 0,
-            std::ops::Bound::Excluded(size) => size + 1,
-            std::ops::Bound::Included(size) => *size
-        };
-        BufferSlice {
-            handle: self.handle,
-            size: match index.end_bound() {
-                std::ops::Bound::Unbounded => self.size(),
-                std::ops::Bound::Excluded(size) => size-1,
-                std::ops::Bound::Included(size) => *size
-            },
-            cpu_ptr: self.allocation.mapped_ptr().map(|e| e.as_ptr() as usize).unwrap_or(0) + start_offset as usize,
-            gpu_ptr: self.address + start_offset,
-            base_address: self.address,
-            _marker: PhantomData,
-            _lifetime: PhantomData,
-        }
+    pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
+        new_slice::<u8, R>(self.handle, index.into(), self.allocation.mapped_ptr().map(|e| e.as_ptr() as usize).unwrap_or(0), self.size(), self.address, self.address).cast()
     } 
 }
 
 impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
-        let start_offset = match index.start_bound() {
-            std::ops::Bound::Unbounded => 0,
-            std::ops::Bound::Excluded(size) => ((size + 1) * size_of::<T>()) as u64,
-            std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
-        };
-        BufferSlice {
-            handle: self.handle,
-            size: match index.end_bound() {
-                std::ops::Bound::Unbounded => self.size,
-                std::ops::Bound::Excluded(size) => ((size-1) * size_of::<T>()) as u64,
-                std::ops::Bound::Included(size) => (size * size_of::<T>()) as u64
-            }  - start_offset,
-            cpu_ptr: self.cpu_ptr + start_offset as usize,
-            gpu_ptr: self.gpu_ptr + start_offset,
-            base_address: self.base_address,
-            _marker: PhantomData,
-            _lifetime: PhantomData,
-        }
+        new_slice(self.handle, index, self.cpu_ptr, self.size, self.gpu_ptr, self.base_address)
     }
-    pub fn byte_range<R: RangeBounds<u64>>(self, index: R) -> BufferSlice<'a, T> {
-        let start_offset = match index.start_bound() {
-            std::ops::Bound::Unbounded => 0,
-            std::ops::Bound::Excluded(size) => size + 1,
-            std::ops::Bound::Included(size) => *size
-        };
-        BufferSlice {
-            handle: self.handle,
-            size: match index.end_bound() {
-                std::ops::Bound::Unbounded => self.size,
-                std::ops::Bound::Excluded(size) => size-1,
-                std::ops::Bound::Included(size) => *size
-            },
-            cpu_ptr: self.cpu_ptr + start_offset as usize,
-            gpu_ptr: self.gpu_ptr + start_offset,
-            base_address: self.base_address,
-            _marker: PhantomData,
-            _lifetime: PhantomData,
-        }
+    pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
+        new_slice::<u8, R>(self.handle, index, self.cpu_ptr, self.size, self.gpu_ptr, self.base_address).cast()
     }
     pub fn len(&self) -> usize {
         self.size as usize / size_of::<T>()
