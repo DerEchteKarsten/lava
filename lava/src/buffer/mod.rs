@@ -33,13 +33,11 @@ impl<T: Copy + Pod> Index<usize> for Buffer<T> {
     }
 }
 
-
 impl<T: Copy + Pod> IndexMut<usize> for Buffer<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         unsafe { self.range(..).ptr().add(index).as_mut() }.unwrap()
     }
 }
-
 
 impl<'a, T: Copy + Pod> Index<usize> for BufferSlice<'a, T> {
     type Output = T;
@@ -48,13 +46,11 @@ impl<'a, T: Copy + Pod> Index<usize> for BufferSlice<'a, T> {
     }
 }
 
-
 impl<'a, T: Copy + Pod> IndexMut<usize> for BufferSlice<'a, T> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {    
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         unsafe { self.ptr().add(index).as_mut() }.unwrap()
     }
 }
-
 
 impl<T: Copy + Pod> Drop for Buffer<T> {
     fn drop(&mut self) {
@@ -64,7 +60,7 @@ impl<T: Copy + Pod> Drop for Buffer<T> {
     }
 }
 
-impl<'a, T: Copy+Pod> Into<BufferSlice<'a, T>> for &'a Buffer<T> {
+impl<'a, T: Copy + Pod> Into<BufferSlice<'a, T>> for &'a Buffer<T> {
     fn into(self) -> BufferSlice<'a, T> {
         self.range(..)
     }
@@ -89,9 +85,7 @@ impl<T: Copy + Pod> Buffer<T> {
             (*allocator).allocate(&AllocationCreateDesc {
                 name: "buffer",
                 requirements,
-                location: if cpu_writable
-                    || Ctx::features().rebar
-                {
+                location: if cpu_writable || Ctx::features().rebar {
                     MemoryLocation::CpuToGpu
                 } else {
                     MemoryLocation::GpuOnly
@@ -120,7 +114,11 @@ impl<T: Copy + Pod> Buffer<T> {
 
     pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
         Self::raw(
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS, 
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             cpu_writable,
             (size * size_of::<T>()) as u64,
             None,

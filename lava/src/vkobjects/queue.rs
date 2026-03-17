@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     marker::PhantomData,
+    mem::ManuallyDrop,
     rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
     u64,
@@ -32,6 +33,37 @@ impl<T: SemaphoreType> Default for Semaphore<T> {
 impl<T: SemaphoreType + ?Sized> Drop for Semaphore<T> {
     fn drop(&mut self) {
         unsafe { Ctx::device().destroy_semaphore(self.handle, None) };
+    }
+}
+
+pub struct Event {
+    pub(crate) handle: vk::Event,
+}
+
+impl Event {
+    pub fn new() -> Self {
+        let create_info = vk::EventCreateInfo::default();
+        Self {
+            handle: unsafe { Ctx::device().create_event(&create_info, None).unwrap() },
+        }
+    }
+    pub fn wait(&self) {
+        loop {
+            if unsafe { Ctx::device().get_event_status(self.handle).unwrap() } {
+                unsafe { Ctx::device().set_event(self.handle).unwrap() };
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+    pub fn set(&self) {
+        unsafe { Ctx::device().set_event(self.handle).unwrap() }
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        unsafe { Ctx::device().destroy_event(self.handle, None) };
     }
 }
 
@@ -236,14 +268,14 @@ impl Drop for CommandPool {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct CommandBufferMemory {
     pool: vk::CommandPool,
     handle: vk::CommandBuffer,
 }
 
-impl CommandBufferMemory {
-    pub fn free(self) {
+impl Drop for CommandBufferMemory {
+    fn drop(&mut self) {
         unsafe {
             Ctx::device().free_command_buffers(self.pool, &[self.handle]);
         }
@@ -300,7 +332,6 @@ impl<Q: QueueFamilie> Queue<Q> {
         unsafe {
             let mut cmd_buffer = CommandBuffer {
                 handle: buffer.handle,
-                famillie_index: self.familie,
                 last_stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
                 resource_hashes: resource_state.unwrap_or(HashMap::new()),
             };
@@ -330,6 +361,7 @@ impl<Q: QueueFamilie> Queue<Q> {
                 std::slice::from_ref(&submit_info),
                 fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
             )?;
+
             Ok(cmd_buffer.resource_hashes)
         }
     }

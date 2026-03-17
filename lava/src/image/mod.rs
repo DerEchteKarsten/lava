@@ -6,7 +6,11 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 
 use crate::{
     bindless::{Bindless, BindlessHandle},
-    image::{format::{Format, Undefined}, slice::AsImage, usage::{Unknown, UsageSet}},
+    image::{
+        format::{Format, Undefined},
+        slice::AsImage,
+        usage::{Unknown, UsageSet},
+    },
     state::Ctx,
 };
 
@@ -48,7 +52,7 @@ impl<F: Format, U: UsageSet> Image<F, U> {
                 | vk::ImageUsageFlags::TRANSFER_DST
                 | if Ctx::features().rebar {
                     vk::ImageUsageFlags::HOST_TRANSFER_EXT
-                }else {
+                } else {
                     vk::ImageUsageFlags::empty()
                 },
             ..Default::default()
@@ -103,7 +107,7 @@ impl<F: Format, U: UsageSet> Image<F, U> {
         Self::new_mipped(width, height, 1)
     }
 
-    pub fn cast<NF: Format, NU: UsageSet>(self) -> Image::<NF, NU> {
+    pub fn cast<NF: Format, NU: UsageSet>(self) -> Image<NF, NU> {
         unsafe { std::mem::transmute(self) }
     }
 }

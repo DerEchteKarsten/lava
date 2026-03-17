@@ -160,7 +160,7 @@ impl<'a> Swapchain<'a> {
                     num_mips: 1,
                     _marker: PhantomData,
                     _marker2: PhantomData,
-                    _marker3: PhantomData
+                    _marker3: PhantomData,
                 };
 
                 if let Some(old) = old {

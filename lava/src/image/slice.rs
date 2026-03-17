@@ -24,7 +24,7 @@ pub struct ImageView<'a, F: Format = Undefined, U: UsageSet = Unknown> {
     pub handle: Option<BindlessHandle>,
     pub(crate) _marker: PhantomData<F>,
     pub(crate) _marker2: PhantomData<U>,
-    pub(crate) _marker3: PhantomData<&'a()>,
+    pub(crate) _marker3: PhantomData<&'a ()>,
 }
 
 #[derive(Clone, Copy)]
@@ -36,7 +36,7 @@ pub struct StorageImageViewBinding<'a> {
     pub handle: BindlessHandle,
     pub base_mip: u32,
     pub num_mips: u32,
-    marker: PhantomData<&'a ()>
+    marker: PhantomData<&'a ()>,
 }
 #[derive(Clone, Copy)]
 pub struct SampledImageViewBinding<'a> {
@@ -47,7 +47,7 @@ pub struct SampledImageViewBinding<'a> {
     pub handle: BindlessHandle,
     pub base_mip: u32,
     pub num_mips: u32,
-    marker: PhantomData<&'a ()>
+    marker: PhantomData<&'a ()>,
 }
 
 impl<'a, F: Format, U: IsStorage> ImageView<'a, F, U> {
@@ -177,7 +177,7 @@ pub trait AsImage {
             handle: image.handle,
             _marker: PhantomData,
             _marker2: PhantomData,
-            _marker3: PhantomData
+            _marker3: PhantomData,
         }
     }
     fn create_new_view<'a>(
@@ -208,7 +208,7 @@ pub trait AsImage {
             handle: image.handle,
             _marker: PhantomData,
             _marker2: PhantomData,
-            _marker3: PhantomData
+            _marker3: PhantomData,
         }
     }
 

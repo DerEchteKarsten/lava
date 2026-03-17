@@ -5,8 +5,11 @@ use std::{
     ffi::CStr,
     fmt::Debug,
     marker::PhantomData,
+    mem::ManuallyDrop,
     ops::{Index, IndexMut},
     sync::{Mutex, OnceLock},
+    thread::JoinHandle,
+    time::Duration,
 };
 
 use crate::{
@@ -20,8 +23,9 @@ use crate::{
     },
     state::{Ctx, Functions},
     tracy_span,
-    vkobjects::rt_pipeline::{
-        RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
+    vkobjects::{
+        queue::{Event, Semaphore, Timeline},
+        rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
     },
 };
 use anyhow::Result;
@@ -36,7 +40,6 @@ use glam::{IVec2, UVec2, Vec3};
 pub struct CommandBuffer {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) last_stage: vk::PipelineStageFlags2,
-    pub(crate) famillie_index: u32,
     pub(crate) resource_hashes: HashMap<ResourceHandle, ResourceState>,
 }
 
@@ -360,31 +363,49 @@ pub enum ResourceHandle {
     },
 }
 
-impl<'a, F:Format, U:UsageSet> Into<ResourceHandle> for ImageView<'a, F, U> {
+impl<'a, F: Format, U: UsageSet> Into<ResourceHandle> for ImageView<'a, F, U> {
     fn into(self) -> ResourceHandle {
-        ResourceHandle::Image { image: self.image, view: self.view, aspect: F::ASPECTS, base_mip: self.base_mip, num_mips: self.num_mips}
+        ResourceHandle::Image {
+            image: self.image,
+            view: self.view,
+            aspect: F::ASPECTS,
+            base_mip: self.base_mip,
+            num_mips: self.num_mips,
+        }
     }
 }
 
 impl<'a> Into<ResourceHandle> for SampledImageViewBinding<'a> {
     fn into(self) -> ResourceHandle {
-        ResourceHandle::Image { image: self.image, view: self.view, aspect: self.aspect, base_mip: self.base_mip, num_mips: self.num_mips }
+        ResourceHandle::Image {
+            image: self.image,
+            view: self.view,
+            aspect: self.aspect,
+            base_mip: self.base_mip,
+            num_mips: self.num_mips,
+        }
     }
 }
 
 impl<'a> Into<ResourceHandle> for StorageImageViewBinding<'a> {
     fn into(self) -> ResourceHandle {
-        ResourceHandle::Image { image: self.image, view: self.view, aspect: self.aspect, base_mip: self.base_mip, num_mips: self.num_mips}
+        ResourceHandle::Image {
+            image: self.image,
+            view: self.view,
+            aspect: self.aspect,
+            base_mip: self.base_mip,
+            num_mips: self.num_mips,
+        }
     }
 }
 
 impl<'a, T: Copy + Pod> Into<ResourceHandle> for BufferSlice<'a, T> {
     fn into(self) -> ResourceHandle {
-        ResourceHandle::Buffer { buffer: self.handle }
+        ResourceHandle::Buffer {
+            buffer: self.handle,
+        }
     }
 }
-
-
 
 #[derive(Clone, Copy, Debug)]
 pub struct ResourceState {
@@ -419,7 +440,8 @@ pub struct RasterBuilder<'CommandBufferRef, 'CommandBufferResources, S: RasterPa
     depth_attachment: vk::ImageView,
     resource_states: Vec<(ResourceHandle, ResourceState)>,
     cmd_buf: &'CommandBufferRef mut CommandBuffer,
-    binding: Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>>,
+    binding:
+        Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>>,
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -747,11 +769,17 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
 
 pub struct ComputeBuilder<'CommandBufferRef, 'CommandBufferResources, S: ComputePass> {
     cmd_buffer: &'CommandBufferRef mut CommandBuffer,
-    binding: Option<<<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>>,
+    binding:
+        Option<<<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>>,
 }
 
-impl<'CommandBufferRef, 'CommandBufferResources, S: ComputePass> ComputeBuilder<'CommandBufferRef, 'CommandBufferResources, S> {
-    pub fn bind(mut self, b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>) -> Self {
+impl<'CommandBufferRef, 'CommandBufferResources, S: ComputePass>
+    ComputeBuilder<'CommandBufferRef, 'CommandBufferResources, S>
+{
+    pub fn bind(
+        mut self,
+        b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>,
+    ) -> Self {
         self.binding = Some(b);
         self
     }
@@ -806,7 +834,10 @@ impl<'CommandBufferRef, 'CommandBufferResources, S: ComputePass> ComputeBuilder<
         }
     }
 
-    pub fn dispatch_indirect(self, buffer: BufferSlice<'CommandBufferResources, DrawIndirectCommand>) {
+    pub fn dispatch_indirect(
+        self,
+        buffer: BufferSlice<'CommandBufferResources, DrawIndirectCommand>,
+    ) {
         self.build([0, 0, 0], Some(buffer));
     }
 
@@ -820,8 +851,11 @@ pub struct RayTracingBuilder<'a, 'b, S: RayTracingPass> {
     cmd_buffer: &'a mut CommandBuffer,
 }
 
-impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a,'b, S> {
-    pub fn bind(mut self, b: <<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding<'b>) -> Self {
+impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
+    pub fn bind(
+        mut self,
+        b: <<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding<'b>,
+    ) -> Self {
         self.binding = Some(b);
         self
     }
@@ -862,11 +896,7 @@ impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a,'b, S> {
 }
 
 impl CommandBuffer {
-    pub fn fill_buffer<'a, T: Copy + Pod>(
-        &'a mut self,
-        buffer: BufferSlice<'a, T>,
-        data: u32,
-    ) {
+    pub fn fill_buffer<'a, T: Copy + Pod>(&'a mut self, buffer: BufferSlice<'a, T>, data: u32) {
         tracy_span!("fill_buffer");
         self.barriers(vec![(
             buffer.into(),
@@ -888,11 +918,7 @@ impl CommandBuffer {
             )
         };
     }
-    pub fn update_buffer<'a, T: Copy + Pod>(
-        &mut self,
-        buffer: BufferSlice<'a, T>,
-        data: &T,
-    ) {
+    pub fn update_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: &T) {
         tracy_span!("update_buffer_element");
         self.barriers(vec![(
             buffer.into(),
@@ -1085,7 +1111,7 @@ impl CommandBuffer {
             binding: None,
         }
     }
-    pub fn raytrace<'a, 'c: 'a,  S: RayTracingPass>(&'c mut self) -> RayTracingBuilder<'a, 'c, S>{
+    pub fn raytrace<'a, 'c: 'a, S: RayTracingPass>(&'c mut self) -> RayTracingBuilder<'a, 'c, S> {
         self.last_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         RayTracingBuilder {
             binding: None,
@@ -1150,6 +1176,104 @@ impl CommandBuffer {
             .dependency_flags(vk::DependencyFlags::BY_REGION);
         unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
     }
+
+    // pub fn execute_in_place<'a>(
+    //     &'a mut self,
+    //     gpu_done_event: &Event,
+    //     cpu_done_event: &Event,
+    //     f: impl FnOnce() + Send + 'a,
+    // ) {
+    //     struct EventCallback {
+    //         gpu_event: vk::Event,
+    //         cpu_event: vk::Event,
+    //         callback: Box<dyn FnOnce() + Send + 'static>,
+    //     }
+    //     struct Thread {
+    //         sender: std::sync::mpsc::Sender<EventCallback>,
+    //     }
+
+    //     static THREAD: OnceLock<Thread> = OnceLock::new();
+
+    //     let thread = THREAD.get_or_init(|| {
+    //         let (sender, receiver) = std::sync::mpsc::channel::<EventCallback>();
+
+    //         std::thread::spawn(move || {
+    //             let mut events = Vec::new();
+    //             loop {
+    //                 if events.is_empty() {
+    //                     events.push(receiver.recv().unwrap())
+    //                 } else {
+    //                     if let Ok(e) = receiver.try_recv() {
+    //                         events.push(e);
+    //                     }
+    //                 };
+    //                 let mut i = 0;
+    //                 while i < events.len() {
+    //                     if (unsafe { Ctx::device().get_event_status(events[i].gpu_event) }).unwrap()
+    //                     {
+    //                         let EventCallback {
+    //                             callback,
+    //                             cpu_event,
+    //                             gpu_event,
+    //                         } = events.swap_remove(i);
+    //                         callback();
+    //                         unsafe { Ctx::device().set_event(cpu_event).unwrap() };
+    //                         unsafe { Ctx::device().reset_event(gpu_event).unwrap() };
+    //                     } else {
+    //                         i += 1;
+    //                     }
+    //                 }
+    //                 std::thread::yield_now();
+    //             }
+    //         });
+
+    //         Thread { sender }
+    //     });
+
+    //     thread
+    //         .sender
+    //         .send(EventCallback {
+    //             cpu_event: cpu_done_event.handle,
+    //             gpu_event: gpu_done_event.handle,
+    //             callback: unsafe {
+    //                 std::mem::transmute(Box::new(f) as Box<dyn FnOnce() + Send + 'a>)
+    //             },
+    //         })
+    //         .unwrap();
+
+    //     let mem = vk::MemoryBarrier2 {
+    //         src_access_mask: vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ,
+    //         src_stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
+    //         dst_access_mask: vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE,
+    //         dst_stage_mask: vk::PipelineStageFlags2::HOST,
+    //         ..Default::default()
+    //     };
+    //     let mem2 = vk::MemoryBarrier2 {
+    //         src_access_mask: vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE,
+    //         src_stage_mask: vk::PipelineStageFlags2::HOST,
+    //         dst_access_mask: vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+    //         dst_stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
+    //         ..Default::default()
+    //     };
+    //     unsafe {
+    //         Ctx::device().cmd_set_event2(
+    //             self.handle,
+    //             gpu_done_event.handle,
+    //             &vk::DependencyInfo::default()
+    //                 .memory_barriers(&[mem]),
+    //         );
+    //         Ctx::device().cmd_wait_events2(
+    //             self.handle,
+    //             &[cpu_done_event.handle],
+    //             &[vk::DependencyInfo::default().memory_barriers(&[mem2])],
+    //         );
+    //         Ctx::device().cmd_reset_event2(
+    //             self.handle,
+    //             cpu_done_event.handle,
+    //             vk::PipelineStageFlags2::ALL_COMMANDS,
+    //         );
+    //     }
+    // }
 
     pub fn buffer_barrier<T: Copy + Pod>(
         &mut self,
@@ -1217,7 +1341,7 @@ impl CommandBuffer {
                 let src_stage_mask = prev.stages;
                 let dst_stage_mask = new.stages;
                 match resource {
-                    ResourceHandle::Buffer{ buffer, .. } => {
+                    ResourceHandle::Buffer { buffer, .. } => {
                         buffer_barriers.push(vk::BufferMemoryBarrier2 {
                             src_access_mask: prev.access,
                             dst_access_mask: new.access,
@@ -1231,7 +1355,13 @@ impl CommandBuffer {
                             ..Default::default()
                         })
                     }
-                    ResourceHandle::Image { image, view, aspect, base_mip, num_mips } => image_barriers.push(vk::ImageMemoryBarrier2 {
+                    ResourceHandle::Image {
+                        image,
+                        view,
+                        aspect,
+                        base_mip,
+                        num_mips,
+                    } => image_barriers.push(vk::ImageMemoryBarrier2 {
                         src_access_mask: prev.access,
                         dst_access_mask: new.access,
                         src_stage_mask,
