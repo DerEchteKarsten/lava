@@ -476,10 +476,11 @@ pub enum RasterVertexDispatch<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Scissor {
-    offset: IVec2,
-    extent: UVec2,
+    pub offset: IVec2,
+    pub extent: UVec2,
 }
 
 impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {

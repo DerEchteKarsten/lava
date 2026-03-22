@@ -27,6 +27,8 @@ use winit::raw_window_handle::{
     HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle,
 };
 
+use tracing as log;
+
 use crate::{
     bindless::{Bindless, BindlessHandle},
     buffer::Buffer,
@@ -355,15 +357,14 @@ unsafe extern "system" fn vulkan_debug_callback(
             #[cfg(debug_assertions)]
             {
                 let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-                if STATE.get().is_some() && split.len() > 1 {
+                if split.len() > 1 {
                     let printf_message = split[1..]
                         .iter()
                         .map(|s| s.chars())
                         .flatten()
                         .collect::<String>();
-                    if printf_message.len() != 0 {
-                        Ctx::get().messages.lock().unwrap().push(printf_message);
-                    }
+                    let _span = tracing::info_span!("schedule", name = "Printf").entered();
+                    log::info!("{}", printf_message);
                     return vk::FALSE;
                 }
             }

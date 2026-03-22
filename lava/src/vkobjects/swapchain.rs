@@ -198,7 +198,6 @@ impl<'a> Swapchain<'a> {
 
     pub fn recreate(&mut self, size: [u32; 2]) {
         tracy_span!("Swapchain Recreation");
-        log::info!("resized swapchain");
         let swapchain = Swapchain::new(Some(self), Some(size)).unwrap();
 
         unsafe {
