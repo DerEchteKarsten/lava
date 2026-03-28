@@ -265,12 +265,12 @@ fn create_raster_pipeline(
             vk::PipelineColorBlendAttachmentState::default()
                 .blend_enable(true)
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .alpha_blend_op(vk::BlendOp::ADD)
-                .color_blend_op(vk::BlendOp::ADD)
-                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .alpha_blend_op(vk::BlendOp::ADD)
         })
         .collect::<Vec<_>>();
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
@@ -438,6 +438,7 @@ pub struct RasterBuilder<'CommandBufferRef, 'CommandBufferResources, S: RasterPa
     hash: RasterHash,
     color_attachments: Vec<(vk::ImageView, Option<[f32; 4]>)>,
     depth_attachment: vk::ImageView,
+    clear_depth: bool,
     resource_states: Vec<(ResourceHandle, ResourceState)>,
     cmd_buf: &'CommandBufferRef mut CommandBuffer,
     binding:
@@ -554,7 +555,6 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         self.hash.wire_frame = wire_frame;
         self
     }
-
     pub fn color_attachment<F: Format, U>(
         mut self,
         image: ImageView<'b, F, U>,
@@ -583,13 +583,14 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         self
     }
 
-    pub fn depth_attachment<F: Format, U>(mut self, image: ImageView<'b, F, U>) -> Self
+    pub fn depth_attachment<F: Format, U>(mut self, image: ImageView<'b, F, U>, clear: bool) -> Self
     where
         U: IsDepthAttachment,
     {
         assert!(F::ASPECTS.contains(vk::ImageAspectFlags::DEPTH));
         self.hash.depth_format = F::format();
         self.depth_attachment = image.view;
+        self.clear_depth = clear;
         self.resource_states.push((
             image.into(),
             ResourceState {
@@ -679,20 +680,24 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
             )
             .view_mask(0);
 
-        let render_info1;
+        let mut render_info1;
 
         if self.depth_attachment != vk::ImageView::null() {
             render_info1 = vk::RenderingAttachmentInfo::default()
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .image_view(self.depth_attachment)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 0.0,
-                        stencil: 0,
-                    },
-                })
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE);
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .load_op(vk::AttachmentLoadOp::LOAD);
+            if self.clear_depth {
+                render_info1 = render_info1
+                    .clear_value(vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: 0.0,
+                            stencil: 0,
+                        },
+                    })
+                    .load_op(vk::AttachmentLoadOp::CLEAR);
+            }
             rendering_info = rendering_info.depth_attachment(&render_info1);
         }
 
@@ -1090,6 +1095,7 @@ impl CommandBuffer {
     pub fn raster<'a, 'c: 'a, S: RasterPass>(&'c mut self) -> RasterBuilder<'a, 'c, S> {
         self.last_stage = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
         RasterBuilder {
+            clear_depth: false,
             cmd_buf: self,
             color_attachments: Vec::new(),
             depth_attachment: vk::ImageView::null(),
