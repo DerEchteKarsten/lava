@@ -90,7 +90,7 @@ pub trait ComputePass {
     fn get() -> vk::Pipeline {
         Self::cache()
             .get_or_init(|| {
-                tracy_span!("create compute pipeline");
+                let _span = tracy_span!("create compute pipeline");
                 let (module, stage) =
                     create_shader_stage(Self::ENTRY, Self::BYTES, vk::ShaderStageFlags::COMPUTE);
                 let create_info = vk::ComputePipelineCreateInfo::default()
@@ -120,7 +120,7 @@ pub trait RayTracingPass {
 
     fn get<'a>() -> &'a RaytracingPipeline {
         Self::cache().get_or_init(|| {
-            tracy_span!("create raytracing pipeline");
+            let _span = tracy_span!("create raytracing pipeline");
             let module = create_module(Self::BYTES);
             let raygen = make_shader_stage(Self::RAYGEN, vk::ShaderStageFlags::RAYGEN_KHR, module);
             let hit = make_shader_stage(Self::HIT, vk::ShaderStageFlags::CLOSEST_HIT_KHR, module);
@@ -229,7 +229,7 @@ fn create_raster_pipeline(
     stages: &[vk::PipelineShaderStageCreateInfo<'_>],
     hash: &RasterHash,
 ) -> vk::Pipeline {
-    tracy_span!("create raster pipeline");
+    let _span = tracy_span!("create raster pipeline");
 
     let mut create_info = vk::GraphicsPipelineCreateInfo::default();
     let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -436,9 +436,10 @@ pub trait RasterPass {
 
 pub struct RasterBuilder<'CommandBufferRef, 'CommandBufferResources, S: RasterPass> {
     hash: RasterHash,
-    color_attachments: Vec<(vk::ImageView, Option<[f32; 4]>)>,
+    color_attachments: Vec<(vk::ImageView, Option<vk::ClearValue>)>,
     depth_attachment: vk::ImageView,
-    clear_depth: bool,
+    clear_depth: Option<vk::ClearValue>,
+    write_depth: bool,
     resource_states: Vec<(ResourceHandle, ResourceState)>,
     cmd_buf: &'CommandBufferRef mut CommandBuffer,
     binding:
@@ -484,64 +485,81 @@ pub struct Scissor {
     pub extent: UVec2,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Viewport {
+    pub offset: IVec2,
+    pub extent: UVec2,
+}
+
 impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {
-    pub fn draw_scissored(
+    pub fn draw_with_dynstates(
         self,
         dispatch: RasterVertexDispatch<'b>,
-        width: u32,
-        height: u32,
+        total_extent: UVec2,
         scissors: &[Scissor],
+        viewport: Viewport,
     ) {
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, Some(dispatch), width, height, [0, 0, 0], unsafe {
-            std::mem::transmute(scissors)
-        });
+        self.draw_private(
+            pipeline,
+            Some(dispatch),
+            total_extent,
+            [0, 0, 0],
+            unsafe { std::mem::transmute(scissors) },
+            viewport,
+        );
     }
-    pub fn draw(self, width: u32, height: u32, dispatch: RasterVertexDispatch<'b>) {
-        self.draw_scissored(
+    pub fn draw(self, total_extent: UVec2, dispatch: RasterVertexDispatch<'b>) {
+        self.draw_with_dynstates(
             dispatch,
-            width,
-            height,
+            total_extent,
             &[Scissor {
-                extent: UVec2 {
-                    x: width,
-                    y: height,
-                },
+                extent: total_extent,
                 offset: IVec2::ZERO,
             }],
+            Viewport {
+                extent: total_extent,
+                offset: IVec2::ZERO,
+            },
         );
     }
 }
 
 impl<'a, 'b, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, S> {
-    pub fn launch_scissored(
+    pub fn launch_with_dynstates(
         self,
         x: u32,
         y: u32,
         z: u32,
-        width: u32,
-        height: u32,
+        extend: UVec2,
         scissors: &[Scissor],
+        viewport: Viewport,
     ) {
         let pipeline = S::get(&self.hash);
-        self.draw_private(pipeline, None, width, height, [x, y, z], unsafe {
-            std::mem::transmute(scissors)
-        });
+        self.draw_private(
+            pipeline,
+            None,
+            extend,
+            [x, y, z],
+            unsafe { std::mem::transmute(scissors) },
+            viewport,
+        );
     }
-    pub fn launch(self, x: u32, y: u32, z: u32, width: u32, height: u32) {
-        self.launch_scissored(
+    pub fn launch(self, x: u32, y: u32, z: u32, extent: UVec2) {
+        self.launch_with_dynstates(
             x,
             y,
             z,
-            width,
-            height,
+            extent,
             &[Scissor {
-                extent: UVec2 {
-                    x: width,
-                    y: height,
-                },
+                extent,
                 offset: IVec2::ZERO,
             }],
+            Viewport {
+                extent,
+                offset: IVec2::ZERO,
+            },
         );
     }
 }
@@ -558,19 +576,21 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
     pub fn color_attachment<F: Format, U>(
         mut self,
         image: ImageView<'b, F, U>,
-        clear: Option<[f32; 4]>,
+        clear: Option<[F::Texel; 4]>,
     ) -> Self
     where
         U: IsColorAttachment,
     {
         assert!(F::ASPECTS.contains(vk::ImageAspectFlags::COLOR));
         self.hash.color_formats.push(F::format());
-        self.color_attachments.push((image.view, clear));
+        let no_clear = clear.is_none();
+        self.color_attachments
+            .push((image.view, clear.map(|e| F::clear_value(e))));
         self.resource_states.push((
             image.into(),
             ResourceState {
                 access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                    | if clear.is_none() {
+                    | if no_clear {
                         vk::AccessFlags2::COLOR_ATTACHMENT_READ
                     } else {
                         vk::AccessFlags2::empty()
@@ -583,14 +603,20 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         self
     }
 
-    pub fn depth_attachment<F: Format, U>(mut self, image: ImageView<'b, F, U>, clear: bool) -> Self
+    pub fn depth_attachment<F: Format, U>(
+        mut self,
+        image: ImageView<'b, F, U>,
+        clear: Option<[F::Texel; 4]>,
+        write: bool,
+    ) -> Self
     where
         U: IsDepthAttachment,
     {
         assert!(F::ASPECTS.contains(vk::ImageAspectFlags::DEPTH));
         self.hash.depth_format = F::format();
         self.depth_attachment = image.view;
-        self.clear_depth = clear;
+        self.clear_depth = clear.map(|e| F::clear_value(e));
+        self.write_depth = write;
         self.resource_states.push((
             image.into(),
             ResourceState {
@@ -609,12 +635,12 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         mut self,
         pipeline: vk::Pipeline,
         dispatch: Option<RasterVertexDispatch<'b>>,
-        width: u32,
-        height: u32,
+        total_extent: UVec2,
         launch: [u32; 3],
         scissors: &[vk::Rect2D],
+        viewport: Viewport,
     ) {
-        tracy_span!("draw");
+        let _span = tracy_span!("draw");
         let buffers = if let Some(dispatch) = &dispatch {
             match dispatch {
                 RasterVertexDispatch::DrawIndirect { buffer } => vec![buffer.clone()],
@@ -658,13 +684,9 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .image_view(e.0)
                     .store_op(vk::AttachmentStoreOp::STORE);
-                if let Some(clear_color) = e.1 {
-                    ret.clear_value(vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: clear_color,
-                        },
-                    })
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                if let Some(clear_value) = e.1 {
+                    ret.clear_value(clear_value)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
                 } else {
                     ret.load_op(vk::AttachmentLoadOp::LOAD)
                 }
@@ -673,11 +695,13 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         let mut rendering_info = vk::RenderingInfo::default()
             .color_attachments(color_attachments.as_slice())
             .layer_count(1)
-            .render_area(
-                vk::Rect2D::default()
-                    .offset(vk::Offset2D { x: 0, y: 0 })
-                    .extent(vk::Extent2D { width, height }),
-            )
+            .render_area(vk::Rect2D {
+                extent: vk::Extent2D {
+                    height: total_extent.y,
+                    width: total_extent.x,
+                },
+                offset: vk::Offset2D { x: 0, y: 0 },
+            })
             .view_mask(0);
 
         let mut render_info1;
@@ -686,17 +710,15 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
             render_info1 = vk::RenderingAttachmentInfo::default()
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .image_view(self.depth_attachment)
-                .store_op(vk::AttachmentStoreOp::STORE)
+                .store_op(vk::AttachmentStoreOp::NONE)
                 .load_op(vk::AttachmentLoadOp::LOAD);
-            if self.clear_depth {
+            if let Some(clear_value) = self.clear_depth {
                 render_info1 = render_info1
-                    .clear_value(vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: 0.0,
-                            stencil: 0,
-                        },
-                    })
+                    .clear_value(clear_value)
                     .load_op(vk::AttachmentLoadOp::CLEAR);
+            }
+            if self.write_depth {
+                render_info1 = render_info1.store_op(vk::AttachmentStoreOp::STORE);
             }
             rendering_info = rendering_info.depth_attachment(&render_info1);
         }
@@ -713,10 +735,10 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
                 self.cmd_buf.handle,
                 0,
                 &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: width as f32,
-                    height: height as f32,
+                    x: viewport.offset.x as f32,
+                    y: viewport.offset.y as f32,
+                    width: viewport.extent.x as f32,
+                    height: viewport.extent.y as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -795,7 +817,7 @@ impl<'CommandBufferRef, 'CommandBufferResources, S: ComputePass>
         dispatch: [u32; 3],
         indirect_buffer: Option<BufferSlice<'CommandBufferResources, DrawIndirectCommand>>,
     ) {
-        tracy_span!("compute");
+        let _span = tracy_span!("compute");
         let mut resources = S::GpuBinding::resources(
             self.binding.as_ref().unwrap(),
             vk::PipelineStageFlags2::COMPUTE_SHADER,
@@ -903,7 +925,7 @@ impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
 
 impl CommandBuffer {
     pub fn fill_buffer<'a, T: Copy + Pod>(&'a mut self, buffer: BufferSlice<'a, T>, data: u32) {
-        tracy_span!("fill_buffer");
+        let _span = tracy_span!("fill_buffer");
         self.barriers(vec![(
             buffer.into(),
             ResourceState {
@@ -924,8 +946,34 @@ impl CommandBuffer {
             )
         };
     }
+    pub fn clear_image<'a, F: Format, U: UsageSet>(
+        &'a mut self,
+        image: ImageView<'a, F, U>,
+        clear_color: [F::Texel; 4],
+    ) {
+        let _span = tracy_span!("fill_buffer");
+        self.barriers(vec![(
+            image.into(),
+            ResourceState {
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                stages: vk::PipelineStageFlags2::TRANSFER,
+                layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                ..Default::default()
+            },
+        )]);
+        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
+        unsafe {
+            Ctx::device().cmd_clear_color_image(
+                self.handle,
+                image.image,
+                vk::ImageLayout::UNDEFINED,
+                &F::clear_value(clear_color).color,
+                &[image.subresource_range()],
+            )
+        };
+    }
     pub fn update_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: &T) {
-        tracy_span!("update_buffer_element");
+        let _span = tracy_span!("update_buffer_element");
         self.barriers(vec![(
             buffer.into(),
             ResourceState {
@@ -952,7 +1000,7 @@ impl CommandBuffer {
         dst: ImageSlice<'a, F2, U2>,
         filter: Filter,
     ) {
-        tracy_span!("blit_image");
+        let _span = tracy_span!("blit_image");
         self.barriers(vec![
             (
                 src.view.into(),
@@ -1022,7 +1070,7 @@ impl CommandBuffer {
         dst: BufferSlice<'a, T>,
         regions: &[BufferCopy],
     ) {
-        tracy_span!("copy_buffer");
+        let _span = tracy_span!("copy_buffer");
         self.barriers(vec![
             (
                 src.into(),
@@ -1052,7 +1100,7 @@ impl CommandBuffer {
         src: BufferSlice<'a, T>,
         dst: ImageSlice<'a, F, U>,
     ) {
-        tracy_span!("copy_buffer_to_image");
+        let _span = tracy_span!("copy_buffer_to_image");
         self.barriers(vec![
             (
                 src.into(),
@@ -1095,7 +1143,8 @@ impl CommandBuffer {
     pub fn raster<'a, 'c: 'a, S: RasterPass>(&'c mut self) -> RasterBuilder<'a, 'c, S> {
         self.last_stage = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
         RasterBuilder {
-            clear_depth: false,
+            write_depth: true,
+            clear_depth: None,
             cmd_buf: self,
             color_attachments: Vec::new(),
             depth_attachment: vk::ImageView::null(),
@@ -1127,7 +1176,7 @@ impl CommandBuffer {
     }
 
     pub fn present<'a, F: Format, U: UsageSet>(&'a mut self, swapchain_image: ImageView<'a, F, U>) {
-        tracy_span!("present_barriers");
+        let _span = tracy_span!("present_barriers");
         self.barriers(vec![(
             swapchain_image.into(),
             ResourceState {
@@ -1311,7 +1360,7 @@ impl CommandBuffer {
     }
 
     fn barriers(&mut self, resources: Vec<(ResourceHandle, ResourceState)>) {
-        tracy_span!("barriers");
+        let _span = tracy_span!("barriers");
         let mut image_barriers = Vec::new();
         let mut buffer_barriers = Vec::new();
         for (resource, new) in resources {

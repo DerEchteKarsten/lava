@@ -5,6 +5,7 @@ use ash::{
     Device,
     vk::{self},
 };
+use glam::UVec2;
 
 use crate::{
     bindless::{Bindless, BindlessHandle, NULL_HANDLE},
@@ -25,14 +26,14 @@ pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct Swapchain<'a> {
-    pub size: [u32; 2],
+    pub size: UVec2,
     pub(crate) handle: vk::SwapchainKHR,
     pub(crate) present_mode: vk::PresentModeKHR,
     pub images: Vec<ImageView<'a, format::Swapchain, ColorAttachmentStorage>>,
 }
 
 impl<'a> Swapchain<'a> {
-    pub fn new(old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
+    pub fn new(old: Option<&Swapchain>, size: Option<UVec2>) -> Result<Self> {
         let format = {
             let formats = &Ctx::surface().formats;
             if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
@@ -179,7 +180,7 @@ impl<'a> Swapchain<'a> {
             handle,
             present_mode,
             images,
-            size: [extent.width, extent.height],
+            size: UVec2::from_array([extent.width, extent.height]),
         })
     }
 
@@ -196,8 +197,8 @@ impl<'a> Swapchain<'a> {
         image_index
     }
 
-    pub fn recreate(&mut self, size: [u32; 2]) {
-        tracy_span!("Swapchain Recreation");
+    pub fn recreate(&mut self, size: UVec2) {
+        let _span = tracy_span!("Swapchain Recreation");
         let swapchain = Swapchain::new(Some(self), Some(size)).unwrap();
 
         unsafe {

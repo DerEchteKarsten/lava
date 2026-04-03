@@ -133,10 +133,6 @@ impl Ctx {
         Ctx::get().features.clone()
     }
 
-    pub fn start_frame() {
-        tracy_span!("Wait for Semaphore");
-    }
-
     #[cfg(debug_assertions)]
     pub fn log_debug_printf_output() -> Vec<String> {
         Ctx::get().messages.lock().unwrap().drain(..).collect()
