@@ -1,7 +1,7 @@
 use std::sync::{OnceLock, atomic::AtomicU32};
 
 use anyhow::Result;
-use ash::vk::{self};
+use ash::vk::{self, CompareOp, SamplerMipmapMode};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
@@ -42,8 +42,17 @@ impl Bindless {
     }
     pub fn init() -> Result<()> {
         let mut layouts = [vk::DescriptorSetLayout::default(); 2];
-        let sci = vk::SamplerCreateInfo::default();
-        let samplers = [unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap()];
+        let sci2 = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(SamplerMipmapMode::NEAREST)
+            .unnormalized_coordinates(false);
+        let sci = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(SamplerMipmapMode::LINEAR)
+            .unnormalized_coordinates(false);
+        let samplers = [unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap(), unsafe { Ctx::device().create_sampler(&sci2, None) }.unwrap()];
         let descriptor_binding_flags = [
             vk::DescriptorBindingFlags::empty(),
             vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
@@ -212,7 +221,7 @@ impl Bindless {
                 write
                     .dst_array_element(handle.descriptor_index_set0)
                     .dst_set(Self::get().sets[0])
-                    .dst_binding(1)
+                    .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE),
             );
         }

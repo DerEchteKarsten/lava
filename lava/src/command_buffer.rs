@@ -256,7 +256,8 @@ fn create_raster_pipeline(
         .min_sample_shading(1.0)
         .alpha_to_coverage_enable(false)
         .alpha_to_one_enable(false)
-        .sample_mask(&[!0]);
+        .sample_mask(&[]);
+
 
     let color_blend_attachments = hash
         .color_formats

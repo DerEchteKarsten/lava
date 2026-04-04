@@ -1,5 +1,5 @@
 #pragma once
-#define NUM_SAMPLERS 1
+#define NUM_SAMPLERS 2
 [vk::binding(0, 0)] SamplerState SamplerHeap[];
 [vk::binding(NUM_SAMPLERS, 0)] __DynamicResource TextureHeap[];
 [vk::binding(0, 1)] __DynamicResource RWTextureHeap[];
