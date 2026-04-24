@@ -258,7 +258,6 @@ fn create_raster_pipeline(
         .alpha_to_one_enable(false)
         .sample_mask(&[]);
 
-
     let color_blend_attachments = hash
         .color_formats
         .iter()
@@ -470,6 +469,10 @@ pub enum RasterVertexDispatch<'a> {
         vertex_count: u32,
         instance_count: u32,
     },
+    DrawIndexed {
+        index_buffer: BufferSlice<'a, u32>,
+        instance_count: u32,
+    },
     DrawIndirect {
         buffer: BufferSlice<'a, DrawIndirectCommand>,
     },
@@ -649,6 +652,18 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
                     buffer,
                     count_buffer,
                 } => vec![buffer.clone().cast(), count_buffer.clone().cast()],
+                RasterVertexDispatch::DrawIndexed { index_buffer, .. } => {
+                    self.resource_states.push((
+                        index_buffer.clone().into(),
+                        ResourceState {
+                            access: vk::AccessFlags2::INDEX_READ,
+                            layout: vk::ImageLayout::UNDEFINED,
+                            stages: vk::PipelineStageFlags2::INDEX_INPUT,
+                            ..Default::default()
+                        },
+                    ));
+                    vec![]
+                }
                 _ => vec![],
             }
         } else {
@@ -777,6 +792,26 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
                         u32::MAX,
                         size_of::<vk::DrawIndirectCommand>() as u32,
                     ),
+
+                    RasterVertexDispatch::DrawIndexed {
+                        index_buffer,
+                        instance_count,
+                    } => {
+                        Ctx::device().cmd_bind_index_buffer(
+                            self.cmd_buf.handle,
+                            index_buffer.handle,
+                            index_buffer.offset(),
+                            IndexType::UINT32,
+                        );
+                        Ctx::device().cmd_draw_indexed(
+                            self.cmd_buf.handle,
+                            index_buffer.len() as u32,
+                            instance_count,
+                            0,
+                            0,
+                            0,
+                        )
+                    }
                 }
             } else {
                 Functions::mesh().unwrap().cmd_draw_mesh_tasks(
@@ -967,7 +1002,7 @@ impl CommandBuffer {
             Ctx::device().cmd_clear_color_image(
                 self.handle,
                 image.image,
-                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &F::clear_value(clear_color).color,
                 &[image.subresource_range()],
             )

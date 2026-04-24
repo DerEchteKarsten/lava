@@ -1,7 +1,7 @@
 use std::sync::{OnceLock, atomic::AtomicU32};
 
 use anyhow::Result;
-use ash::vk::{self, CompareOp, SamplerMipmapMode};
+use ash::vk::{self, BorderColor, CompareOp, SamplerAddressMode, SamplerMipmapMode};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
@@ -46,13 +46,26 @@ impl Bindless {
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST)
             .mipmap_mode(SamplerMipmapMode::NEAREST)
-            .unnormalized_coordinates(false);
+            .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
+            .border_color(BorderColor::FLOAT_OPAQUE_WHITE)
+            .anisotropy_enable(false)
+            .compare_enable(false);
+        
         let sci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(SamplerMipmapMode::LINEAR)
-            .unnormalized_coordinates(false);
-        let samplers = [unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap(), unsafe { Ctx::device().create_sampler(&sci2, None) }.unwrap()];
+            .border_color(BorderColor::FLOAT_OPAQUE_WHITE)
+            .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
+            .mipmap_mode(SamplerMipmapMode::NEAREST);
+        
+        let samplers = [
+            unsafe { Ctx::device().create_sampler(&sci2, None) }.unwrap(),
+            unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap(),
+        ];
         let descriptor_binding_flags = [
             vk::DescriptorBindingFlags::empty(),
             vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
