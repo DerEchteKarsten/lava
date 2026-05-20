@@ -52,7 +52,7 @@ impl Bindless {
             .border_color(BorderColor::FLOAT_OPAQUE_WHITE)
             .anisotropy_enable(false)
             .compare_enable(false);
-        
+
         let sci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -61,7 +61,7 @@ impl Bindless {
             .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
             .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
             .mipmap_mode(SamplerMipmapMode::NEAREST);
-        
+
         let samplers = [
             unsafe { Ctx::device().create_sampler(&sci2, None) }.unwrap(),
             unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap(),
