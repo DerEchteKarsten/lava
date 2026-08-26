@@ -1,40 +1,28 @@
 use std::{
-    any,
-    cell::{LazyCell, OnceCell},
+    cell::LazyCell,
     collections::HashMap,
     ffi::CStr,
     fmt::Debug,
-    marker::PhantomData,
-    mem::ManuallyDrop,
-    ops::{Index, IndexMut},
     sync::{Mutex, OnceLock},
-    thread::JoinHandle,
-    time::Duration,
 };
 
 use crate::{
     bindless::Bindless,
     buffer::slice::BufferSlice,
     image::{
-        Image,
         format::Format,
         slice::{ImageSlice, ImageView, SampledImageViewBinding, StorageImageViewBinding},
         usage::{IsColorAttachment, IsDepthAttachment, UsageSet},
     },
     state::{Ctx, Functions},
     tracy_span,
-    vkobjects::{
-        queue::{Event, Semaphore, Timeline},
-        rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
-    },
+    vkobjects::rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
 };
-use anyhow::Result;
 use ash::vk::{
-    self, BufferCopy, Extent3D, IndexType, Offset3D, PipelineStageFlags2, ShaderStageFlags,
+    self, BufferCopy, IndexType,
 };
 use bytemuck::{Pod, Zeroable, bytes_of};
-use glam::Vec2;
-use glam::{IVec2, UVec2, Vec3};
+use glam::{IVec2, UVec2};
 
 #[derive(Debug)]
 pub struct CommandBuffer {
@@ -1449,7 +1437,7 @@ impl CommandBuffer {
                     }
                     ResourceHandle::Image {
                         image,
-                        view,
+                        view: _,
                         aspect,
                         base_mip,
                         num_mips,

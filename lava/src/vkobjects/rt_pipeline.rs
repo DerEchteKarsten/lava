@@ -2,7 +2,7 @@ use anyhow::Result;
 use ash::vk;
 
 use crate::{
-    buffer::{Buffer, slice::BufferSlice},
+    buffer::Buffer,
     state::{Ctx, Functions},
 };
 

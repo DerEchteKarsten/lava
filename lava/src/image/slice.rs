@@ -1,7 +1,7 @@
-use std::{marker::PhantomData, ops::Range};
+use std::marker::PhantomData;
 
 use ash::vk::{self, Offset3D};
-use glam::{UVec2, Vec2};
+use glam::UVec2;
 
 use crate::{
     bindless::BindlessHandle,

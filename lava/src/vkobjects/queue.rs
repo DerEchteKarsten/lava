@@ -1,21 +1,18 @@
 use std::{
-    cell::UnsafeCell,
     collections::HashMap,
     fmt::Debug,
     marker::PhantomData,
-    mem::ManuallyDrop,
-    rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
     u64,
 };
 
 use anyhow::{Result, anyhow};
-use ash::{prelude::VkResult, vk};
+use ash::vk;
 
 use crate::{
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
     state::{Ctx, Functions},
-    vkobjects::{physical_device::QueueFamily, swapchain::Swapchain},
+    vkobjects::swapchain::Swapchain,
 };
 
 #[derive(Debug)]
@@ -395,7 +392,7 @@ impl Future for FenceFuture {
     type Output = ();
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         if unsafe { Ctx::device().get_fence_status(self.fence).unwrap() } {
             std::task::Poll::Ready(())

@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, ops::Range};
+use std::marker::PhantomData;
 
 use anyhow::Result;
 use ash::vk::{self, ComponentSwizzle};

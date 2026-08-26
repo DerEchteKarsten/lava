@@ -37,7 +37,7 @@ impl AccelerationStructure {
         level: vk::AccelerationStructureTypeKHR,
         as_geometry: &[vk::AccelerationStructureGeometryKHR],
         as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
-        max_primitive_counts: &[u32],
+        _max_primitive_counts: &[u32],
         offset: u64,
         scratch_buffer: &mut Buffer<u8>,
         buffer: &Buffer<u8>,

@@ -1,14 +1,14 @@
 use std::sync::{OnceLock, atomic::AtomicU32};
 
 use anyhow::Result;
-use ash::vk::{self, BorderColor, CompareOp, SamplerAddressMode, SamplerMipmapMode};
+use ash::vk::{self, BorderColor, SamplerAddressMode, SamplerMipmapMode};
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
     image::{
         format::Format,
         slice::ImageView,
-        usage::{BindlessImageUsageSet, IsSampled, IsStorage, UsageSet},
+        usage::{BindlessImageUsageSet, UsageSet},
     },
     state::Ctx,
 };

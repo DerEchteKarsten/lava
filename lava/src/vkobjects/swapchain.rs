@@ -1,25 +1,19 @@
 use std::{ffi::CStr, marker::PhantomData, sync::OnceLock};
 
 use anyhow::Result;
-use ash::{
-    Device,
-    vk::{self},
-};
+use ash::vk::{self};
 use glam::UVec2;
 
 use crate::{
-    bindless::{Bindless, BindlessHandle, NULL_HANDLE},
+    bindless::Bindless,
     image::{
-        Image, format,
-        slice::{AsImage, ImageView},
-        usage::{ColorAttachment, ColorAttachmentStorage},
+        format,
+        slice::ImageView,
+        usage::ColorAttachmentStorage,
     },
     state::{Ctx, Functions},
     tracy_span,
-    vkobjects::{
-        queue::{Binary, Fence, Semaphore},
-        surface::Surface,
-    },
+    vkobjects::queue::{Binary, Fence, Semaphore},
 };
 
 pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();

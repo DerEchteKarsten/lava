@@ -1,48 +1,30 @@
 use std::{
-    cell::{Cell, LazyCell, OnceCell, UnsafeCell},
-    collections::HashMap,
     ffi::{c_char, c_void},
-    fmt::{Debug, write},
-    mem::MaybeUninit,
+    fmt::Debug,
     sync::{
-        Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard,
-        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
+        Mutex, MutexGuard, OnceLock,
+        atomic::AtomicBool,
     },
-    time::Instant,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use ash::{
     Device, Entry,
     ext::debug_utils,
     vk::{self, Handle, make_api_version},
 };
-use bytemuck::Pod;
 use gpu_allocator::{
     AllocationSizes, AllocatorDebugSettings,
     vulkan::{Allocator, AllocatorCreateDesc},
 };
 use std::ffi::CStr;
-use winit::raw_window_handle::{
-    HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle,
-};
 
 use tracing as log;
 
-use crate::{
-    bindless::{Bindless, BindlessHandle},
-    buffer::Buffer,
-    command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
-    image::{format, slice::ImageSlice, usage::ColorAttachmentStorage},
-    vkobjects::{
+use crate::vkobjects::{
         physical_device::{PhysicalDevice, QueueFamily},
-        queue::{
-            Binary, CommandBufferMemory, CommandPool, Queue, Semaphore, SemaphoreInfo, Timeline,
-        },
         surface::Surface,
-        swapchain::Swapchain,
-    },
-};
+    };
 
 pub use ash::vk as raw_vulkan;
 
@@ -63,7 +45,7 @@ macro_rules! tracy_span {
 }
 
 impl Debug for Ctx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
     }
 }
@@ -246,7 +228,7 @@ impl Ctx {
             debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
         }
 
-        let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
             physical_device: physical_device.handel,

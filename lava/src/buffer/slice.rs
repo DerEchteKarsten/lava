@@ -1,12 +1,9 @@
-use anyhow::{Result, anyhow};
 use ash::vk;
 use bytemuck::Pod;
-use gpu_allocator::vulkan::Allocation;
-use std::ops::{Bound, Index, Range, RangeBounds};
-use std::sync::Arc;
-use std::{marker::PhantomData, slice::SliceIndex};
+use std::ops::RangeBounds;
+use std::marker::PhantomData;
 
-use crate::{buffer::Buffer, state::Ctx};
+use crate::buffer::Buffer;
 
 impl<'a, T: Pod + Copy> IntoIterator for BufferSlice<'a, T> {
     type Item = &'a T;

@@ -1,17 +1,6 @@
 use ash::vk;
-use bytemuck::Pod;
-use glam::Mat4;
-use std::{
-    any::TypeId,
-    intrinsics::{self, type_id},
-    marker::PhantomData,
-};
 
-use crate::{
-    image::{Image, usage::Storage},
-    state::Ctx,
-    vkobjects::swapchain::FORMAT,
-};
+use crate::vkobjects::swapchain::FORMAT;
 
 pub trait Format: 'static + Copy + Clone {
     const FORMAT: vk::Format;
