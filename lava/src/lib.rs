@@ -1,10 +1,4 @@
-#![feature(int_roundings)]
-#![feature(f16)]
-#![feature(lock_value_accessors)]
-#![feature(let_chains)]
 #![feature(const_trait_impl)]
-#![feature(specialization)]
-#![feature(core_intrinsics)]
 
 use crate::{bindless::Bindless, state::Ctx};
 use anyhow::{Ok, Result};

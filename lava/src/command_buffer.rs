@@ -15,12 +15,11 @@ use crate::{
         usage::{IsColorAttachment, IsDepthAttachment, UsageSet},
     },
     state::{Ctx, Functions},
-    tracy_span,
-    vkobjects::rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
+    vkobjects::rt_pipeline::{
+        RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
+    },
 };
-use ash::vk::{
-    self, BufferCopy, IndexType,
-};
+use ash::vk::{self, BufferCopy, IndexType};
 use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::{IVec2, UVec2};
 
@@ -78,7 +77,7 @@ pub trait ComputePass {
     fn get() -> vk::Pipeline {
         Self::cache()
             .get_or_init(|| {
-                let _span = tracy_span!("create compute pipeline");
+                let _span = tracing::info_span!("create compute pipeline");
                 let (module, stage) =
                     create_shader_stage(Self::ENTRY, Self::BYTES, vk::ShaderStageFlags::COMPUTE);
                 let create_info = vk::ComputePipelineCreateInfo::default()
@@ -108,7 +107,7 @@ pub trait RayTracingPass {
 
     fn get<'a>() -> &'a RaytracingPipeline {
         Self::cache().get_or_init(|| {
-            let _span = tracy_span!("create raytracing pipeline");
+            let _span = tracing::info_span!("create raytracing pipeline");
             let module = create_module(Self::BYTES);
             let raygen = make_shader_stage(Self::RAYGEN, vk::ShaderStageFlags::RAYGEN_KHR, module);
             let hit = make_shader_stage(Self::HIT, vk::ShaderStageFlags::CLOSEST_HIT_KHR, module);
@@ -217,7 +216,7 @@ fn create_raster_pipeline(
     stages: &[vk::PipelineShaderStageCreateInfo<'_>],
     hash: &RasterHash,
 ) -> vk::Pipeline {
-    let _span = tracy_span!("create raster pipeline");
+    let _span = tracing::info_span!("create raster pipeline");
 
     let mut create_info = vk::GraphicsPipelineCreateInfo::default();
     let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -422,16 +421,16 @@ pub trait RasterPass {
     type GpuBinding: Binding;
 }
 
-pub struct RasterBuilder<'CommandBufferRef, 'CommandBufferResources, S: RasterPass> {
+pub struct RasterBuilder<'command_buffer_ref, 'command_buffer_resources, S: RasterPass> {
     hash: RasterHash,
     color_attachments: Vec<(vk::ImageView, Option<vk::ClearValue>)>,
     depth_attachment: vk::ImageView,
     clear_depth: Option<vk::ClearValue>,
     write_depth: bool,
     resource_states: Vec<(ResourceHandle, ResourceState)>,
-    cmd_buf: &'CommandBufferRef mut CommandBuffer,
+    cmd_buf: &'command_buffer_ref mut CommandBuffer,
     binding:
-        Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>>,
+        Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'command_buffer_resources>>,
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -632,7 +631,7 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         scissors: &[vk::Rect2D],
         viewport: Viewport,
     ) {
-        let _span = tracy_span!("draw");
+        let _span = tracing::info_span!("draw");
         let buffers = if let Some(dispatch) = &dispatch {
             match dispatch {
                 RasterVertexDispatch::DrawIndirect { buffer } => vec![buffer.clone()],
@@ -819,18 +818,18 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
     }
 }
 
-pub struct ComputeBuilder<'CommandBufferRef, 'CommandBufferResources, S: ComputePass> {
-    cmd_buffer: &'CommandBufferRef mut CommandBuffer,
+pub struct ComputeBuilder<'command_buffer_ref, 'command_buffer_resources, S: ComputePass> {
+    cmd_buffer: &'command_buffer_ref mut CommandBuffer,
     binding:
-        Option<<<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>>,
+        Option<<<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'command_buffer_resources>>,
 }
 
-impl<'CommandBufferRef, 'CommandBufferResources, S: ComputePass>
-    ComputeBuilder<'CommandBufferRef, 'CommandBufferResources, S>
+impl<'command_buffer_ref, 'command_buffer_resources, S: ComputePass>
+    ComputeBuilder<'command_buffer_ref, 'command_buffer_resources, S>
 {
     pub fn bind(
         mut self,
-        b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'CommandBufferResources>,
+        b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'command_buffer_resources>,
     ) -> Self {
         self.binding = Some(b);
         self
@@ -839,9 +838,9 @@ impl<'CommandBufferRef, 'CommandBufferResources, S: ComputePass>
     fn build(
         self,
         dispatch: [u32; 3],
-        indirect_buffer: Option<BufferSlice<'CommandBufferResources, DrawIndirectCommand>>,
+        indirect_buffer: Option<BufferSlice<'command_buffer_resources, DrawIndirectCommand>>,
     ) {
-        let _span = tracy_span!("compute");
+        let _span = tracing::info_span!("compute");
         let mut resources = S::GpuBinding::resources(
             self.binding.as_ref().unwrap(),
             vk::PipelineStageFlags2::COMPUTE_SHADER,
@@ -888,7 +887,7 @@ impl<'CommandBufferRef, 'CommandBufferResources, S: ComputePass>
 
     pub fn dispatch_indirect(
         self,
-        buffer: BufferSlice<'CommandBufferResources, DrawIndirectCommand>,
+        buffer: BufferSlice<'command_buffer_resources, DrawIndirectCommand>,
     ) {
         self.build([0, 0, 0], Some(buffer));
     }
@@ -949,7 +948,7 @@ impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
 
 impl CommandBuffer {
     pub fn fill_buffer<'a, T: Copy + Pod>(&'a mut self, buffer: BufferSlice<'a, T>, data: u32) {
-        let _span = tracy_span!("fill_buffer");
+        let _span = tracing::info_span!("fill_buffer");
         self.barriers(vec![(
             buffer.into(),
             ResourceState {
@@ -975,7 +974,7 @@ impl CommandBuffer {
         image: ImageView<'a, F, U>,
         clear_color: [F::Texel; 4],
     ) {
-        let _span = tracy_span!("fill_buffer");
+        let _span = tracing::info_span!("fill_buffer");
         self.barriers(vec![(
             image.into(),
             ResourceState {
@@ -997,7 +996,7 @@ impl CommandBuffer {
         };
     }
     pub fn update_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: &T) {
-        let _span = tracy_span!("update_buffer_element");
+        let _span = tracing::info_span!("update_buffer_element");
         self.barriers(vec![(
             buffer.into(),
             ResourceState {
@@ -1024,7 +1023,7 @@ impl CommandBuffer {
         dst: ImageSlice<'a, F2, U2>,
         filter: Filter,
     ) {
-        let _span = tracy_span!("blit_image");
+        let _span = tracing::info_span!("blit_image");
         self.barriers(vec![
             (
                 src.view.into(),
@@ -1094,7 +1093,7 @@ impl CommandBuffer {
         dst: BufferSlice<'a, T>,
         regions: &[BufferCopy],
     ) {
-        let _span = tracy_span!("copy_buffer");
+        let _span = tracing::info_span!("copy_buffer");
         self.barriers(vec![
             (
                 src.into(),
@@ -1124,7 +1123,7 @@ impl CommandBuffer {
         src: BufferSlice<'a, T>,
         dst: ImageSlice<'a, F, U>,
     ) {
-        let _span = tracy_span!("copy_buffer_to_image");
+        let _span = tracing::info_span!("copy_buffer_to_image");
         self.barriers(vec![
             (
                 src.into(),
@@ -1200,7 +1199,7 @@ impl CommandBuffer {
     }
 
     pub fn present<'a, F: Format, U: UsageSet>(&'a mut self, swapchain_image: ImageView<'a, F, U>) {
-        let _span = tracy_span!("present_barriers");
+        let _span = tracing::info_span!("present_barriers");
         self.barriers(vec![(
             swapchain_image.into(),
             ResourceState {
@@ -1384,7 +1383,7 @@ impl CommandBuffer {
     }
 
     fn barriers(&mut self, resources: Vec<(ResourceHandle, ResourceState)>) {
-        let _span = tracy_span!("barriers");
+        let _span = tracing::info_span!("barriers");
         let mut image_barriers = Vec::new();
         let mut buffer_barriers = Vec::new();
         for (resource, new) in resources {

@@ -6,13 +6,8 @@ use glam::UVec2;
 
 use crate::{
     bindless::Bindless,
-    image::{
-        format,
-        slice::ImageView,
-        usage::ColorAttachmentStorage,
-    },
+    image::{format, slice::ImageView, usage::ColorAttachmentStorage},
     state::{Ctx, Functions},
-    tracy_span,
     vkobjects::queue::{Binary, Fence, Semaphore},
 };
 
@@ -22,7 +17,6 @@ pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 pub struct Swapchain<'a> {
     pub size: UVec2,
     pub(crate) handle: vk::SwapchainKHR,
-    pub(crate) present_mode: vk::PresentModeKHR,
     pub images: Vec<ImageView<'a, format::Swapchain, ColorAttachmentStorage>>,
 }
 
@@ -65,7 +59,7 @@ impl<'a> Swapchain<'a> {
                     width: size[0],
                     height: size[1],
                 }
-            } else if Ctx::surface().capabilities.current_extent.width != std::u32::MAX {
+            } else if Ctx::surface().capabilities.current_extent.width != u32::MAX {
                 Ctx::surface().capabilities.current_extent
             } else {
                 Ctx::surface().capabilities.min_image_extent
@@ -172,7 +166,6 @@ impl<'a> Swapchain<'a> {
 
         Ok(Self {
             handle,
-            present_mode,
             images,
             size: UVec2::from_array([extent.width, extent.height]),
         })
@@ -192,7 +185,7 @@ impl<'a> Swapchain<'a> {
     }
 
     pub fn recreate(&mut self, size: UVec2) {
-        let _span = tracy_span!("Swapchain Recreation");
+        let _span = tracing::info_span!("Swapchain Recreation");
         let swapchain = Swapchain::new(Some(self), Some(size)).unwrap();
 
         unsafe {

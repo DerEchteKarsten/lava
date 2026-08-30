@@ -1,10 +1,7 @@
 use std::{
     ffi::{c_char, c_void},
     fmt::Debug,
-    sync::{
-        Mutex, MutexGuard, OnceLock,
-        atomic::AtomicBool,
-    },
+    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicBool},
 };
 
 use anyhow::Result;
@@ -19,30 +16,12 @@ use gpu_allocator::{
 };
 use std::ffi::CStr;
 
-use tracing as log;
-
 use crate::vkobjects::{
-        physical_device::{PhysicalDevice, QueueFamily},
-        surface::Surface,
-    };
+    physical_device::{PhysicalDevice, QueueFamily},
+    surface::Surface,
+};
 
 pub use ash::vk as raw_vulkan;
-
-#[cfg(feature = "trace")]
-#[macro_export]
-macro_rules! tracy_span {
-    ($name:expr) => {
-        tracy_client::span!($name)
-    };
-}
-
-#[cfg(not(feature = "trace"))]
-#[macro_export]
-macro_rules! tracy_span {
-    ($name:expr) => {
-        ()
-    };
-}
 
 impl Debug for Ctx {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,7 +83,7 @@ impl Ctx {
             .unwrap_or(Ctx::get().gfx_queue_familie.index)
     }
     pub fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        unsafe { Ctx::get().allocator.lock().unwrap() }
+        Ctx::get().allocator.lock().unwrap()
     }
 
     pub(crate) fn surface() -> &'static Surface {
@@ -341,22 +320,23 @@ unsafe extern "system" fn vulkan_debug_callback(
                         .map(|s| s.chars())
                         .flatten()
                         .collect::<String>();
-                    let _span = tracing::info_span!("schedule", name = "Printf").entered();
-                    log::info!("{}", printf_message);
+                    tracing::info!("{}", printf_message);
                     return vk::FALSE;
                 }
             }
 
-            match flag {
-                Flag::VERBOSE => log::info!("{:?} - {}", typ, message),
-                Flag::INFO => {
-                    log::info!("{:?} - {}", typ, message)
-                }
-                Flag::WARNING => log::warn!("{}", message),
-                Flag::ERROR => log::error!("{}", message),
-                _ => {
-                    log::info!("{}", message)
-                }
+            let typ = format!("{:?}", typ);
+            let flags = format!("{:?}", flag);
+            if flag.contains(Flag::ERROR) {
+                tracing::error!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
+            } else if flag.contains(Flag::WARNING) {
+                tracing::warn!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
+            } else if flag.contains(Flag::INFO) {
+                tracing::info!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
+            } else if flag.contains(Flag::VERBOSE) {
+                tracing::trace!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
+            } else {
+                tracing::info!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
             }
         }
     }

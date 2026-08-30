@@ -1,12 +1,12 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
+    future::Future,
     marker::PhantomData,
     sync::atomic::{AtomicBool, Ordering},
-    u64,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use ash::vk;
 
 use crate::{
@@ -79,7 +79,7 @@ impl SemaphoreInfo {
     }
 }
 
-trait SemaphoreType {
+pub trait SemaphoreType {
     fn create() -> Semaphore<Self>;
 }
 
@@ -172,7 +172,7 @@ impl Fence {
     }
 }
 
-trait QueueFamilie: Debug {
+pub trait QueueFamilie: Debug {
     fn index() -> u32;
     fn is_free() -> &'static Vec<AtomicBool>;
 }

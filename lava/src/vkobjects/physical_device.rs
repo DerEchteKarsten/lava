@@ -2,7 +2,6 @@ use std::ffi::CStr;
 
 use anyhow::Result;
 use ash::vk;
-use tracing as log;
 
 use crate::state::Features;
 
@@ -270,18 +269,9 @@ impl PhysicalDevice {
                         || device.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU)
             })
             .ok_or_else(|| anyhow::anyhow!("Could not find a suitable device"))?;
-        log::info!("Using device: {}", device.name);
-        log::info!("Device type: {:?}", device.device_type);
-        log::info!("Features are: {:?}", device.supported_features);
-        log::info!("Extentions: {:#?}", device.supported_features.extensions());
-        log::info!("Memory properties: {:#?}", device.mem_properties);
-        log::info!(
-            "Pushconstant size: {}",
-            device.limits.max_push_constants_size
-        );
         let unsuported_ext = device.unsupports_extensions(&device.supported_features.extensions());
         if !unsuported_ext.is_empty() {
-            log::info!("Unsuported Extensions: {:#?}", unsuported_ext);
+            tracing::error!("Unsuported Extensions: {:#?}", unsuported_ext);
         }
         features.device_debug_utils =
             device.supported_features.device_debug_utils && features.debug_utils;

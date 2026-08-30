@@ -13,8 +13,6 @@ use crate::{
     state::Ctx,
 };
 
-struct Dynamic {}
-
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<'a, F: Format = Undefined, U: UsageSet = Unknown> {
     pub image: vk::Image,
