@@ -10,7 +10,7 @@ use crate::{
         format::{Format, Undefined},
         usage::{IsSampled, IsStorage, Unknown, UsageSet},
     },
-    state::Ctx,
+    state::{Ctx, Functions},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -137,7 +137,7 @@ impl<'a, F: Format, U: UsageSet> ImageSlice<'a, F, U> {
         self
     }
 
-    pub fn extent(mut self, extend: UVec2) -> ImageSlice<'a, F, U> {
+    pub fn grow(mut self, extend: UVec2) -> ImageSlice<'a, F, U> {
         self.extend.width += extend.x;
         self.extend.height += extend.y;
         self
@@ -145,6 +145,25 @@ impl<'a, F: Format, U: UsageSet> ImageSlice<'a, F, U> {
 
     pub fn cast<NF: Format, NU: UsageSet>(self) -> ImageSlice<'a, NF, NU> {
         unsafe { std::mem::transmute(self) }
+    }
+
+    pub fn copy_from(&self, data: &[u8]) {
+        let regions = [vk::MemoryToImageCopyEXT::default()
+            .host_pointer(data.as_ptr().cast())
+            .image_extent(self.extend)
+            .image_offset(self.offset)
+            .image_subresource(self.view.subresource_layers())
+            .memory_image_height(self.extend.height)
+            .memory_row_length(self.extend.width)];
+        let copy_memory_to_image_info = vk::CopyMemoryToImageInfoEXT::default()
+            .dst_image(self.view.image)
+            .dst_image_layout(vk::ImageLayout::UNDEFINED)
+            .regions(&regions);
+        unsafe {
+            Functions::host_image_copy()
+                .copy_memory_to_image(&copy_memory_to_image_info)
+                .unwrap()
+        };
     }
 }
 
@@ -222,6 +241,6 @@ pub trait AsImage {
         self.whole().offset(offset)
     }
     fn extend<'a>(&'a self, extend: UVec2) -> ImageSlice<'a, Self::Format, Self::Usage> {
-        self.whole().extent(extend)
+        self.whole().grow(extend)
     }
 }

@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     ffi::CStr,
     fmt::Debug,
+    panic::Location,
     sync::{Mutex, OnceLock},
 };
 
@@ -14,7 +15,7 @@ use crate::{
         slice::{ImageSlice, ImageView, SampledImageViewBinding, StorageImageViewBinding},
         usage::{IsColorAttachment, IsDepthAttachment, UsageSet},
     },
-    state::{Ctx, Functions},
+    state::{CALLSITE, Ctx, Functions},
     vkobjects::rt_pipeline::{
         RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
     },
@@ -22,6 +23,7 @@ use crate::{
 use ash::vk::{self, BufferCopy, IndexType};
 use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::{IVec2, UVec2};
+use lava_macros::validation_trace;
 
 #[derive(Debug)]
 pub struct CommandBuffer {
@@ -484,6 +486,7 @@ pub struct Viewport {
 }
 
 impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {
+    #[validation_trace]
     pub fn draw_with_dynstates(
         self,
         dispatch: RasterVertexDispatch<'b>,
@@ -501,6 +504,7 @@ impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {
             viewport,
         );
     }
+    #[validation_trace]
     pub fn draw(self, total_extent: UVec2, dispatch: RasterVertexDispatch<'b>) {
         self.draw_with_dynstates(
             dispatch,
@@ -518,6 +522,7 @@ impl<'a, 'b, S: RasterVertexShaderPass> RasterBuilder<'a, 'b, S> {
 }
 
 impl<'a, 'b, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, S> {
+    #[validation_trace]
     pub fn launch_with_dynstates(
         self,
         x: u32,
@@ -537,6 +542,8 @@ impl<'a, 'b, S: RasterMeshShaderPass> RasterBuilder<'a, 'b, S> {
             viewport,
         );
     }
+
+    #[validation_trace]
     pub fn launch(self, x: u32, y: u32, z: u32, extent: UVec2) {
         self.launch_with_dynstates(
             x,
@@ -811,7 +818,6 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
             Ctx::device().cmd_end_rendering(self.cmd_buf.handle);
         };
     }
-
     pub fn bind(mut self, b: <<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'b>) -> Self {
         self.binding = Some(b);
         self
@@ -827,6 +833,7 @@ pub struct ComputeBuilder<'command_buffer_ref, 'command_buffer_resources, S: Com
 impl<'command_buffer_ref, 'command_buffer_resources, S: ComputePass>
     ComputeBuilder<'command_buffer_ref, 'command_buffer_resources, S>
 {
+    #[validation_trace]
     pub fn bind(
         mut self,
         b: <<S as ComputePass>::GpuBinding as Binding>::CpuBinding<'command_buffer_resources>,
@@ -885,6 +892,7 @@ impl<'command_buffer_ref, 'command_buffer_resources, S: ComputePass>
         }
     }
 
+    #[validation_trace]
     pub fn dispatch_indirect(
         self,
         buffer: BufferSlice<'command_buffer_resources, DrawIndirectCommand>,
@@ -892,6 +900,7 @@ impl<'command_buffer_ref, 'command_buffer_resources, S: ComputePass>
         self.build([0, 0, 0], Some(buffer));
     }
 
+    #[validation_trace]
     pub fn dispatch(self, x: u32, y: u32, z: u32) {
         self.build([x, y, z], None);
     }
@@ -903,6 +912,7 @@ pub struct RayTracingBuilder<'a, 'b, S: RayTracingPass> {
 }
 
 impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
+    #[validation_trace]
     pub fn bind(
         mut self,
         b: <<S as RayTracingPass>::GpuBinding as Binding>::CpuBinding<'b>,
@@ -941,12 +951,14 @@ impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
         };
     }
 
+    #[validation_trace]
     pub fn dispatch(self, x: u32, y: u32) {
         self.build([x, y]);
     }
 }
 
 impl CommandBuffer {
+    #[validation_trace]
     pub fn fill_buffer<'a, T: Copy + Pod>(&'a mut self, buffer: BufferSlice<'a, T>, data: u32) {
         let _span = tracing::info_span!("fill_buffer");
         self.barriers(vec![(
@@ -969,6 +981,7 @@ impl CommandBuffer {
             )
         };
     }
+    #[validation_trace]
     pub fn clear_image<'a, F: Format, U: UsageSet>(
         &'a mut self,
         image: ImageView<'a, F, U>,
@@ -995,6 +1008,7 @@ impl CommandBuffer {
             )
         };
     }
+    #[validation_trace]
     pub fn update_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: &T) {
         let _span = tracing::info_span!("update_buffer_element");
         self.barriers(vec![(
@@ -1016,6 +1030,7 @@ impl CommandBuffer {
             )
         };
     }
+    #[validation_trace]
 
     pub fn blit_image<'a, F: Format, U: UsageSet, F2: Format, U2: UsageSet>(
         &mut self,
@@ -1078,6 +1093,7 @@ impl CommandBuffer {
             );
         }
     }
+    #[validation_trace]
 
     pub fn copy_buffer<'a, T: Copy + Pod>(
         &mut self,
@@ -1086,6 +1102,7 @@ impl CommandBuffer {
     ) {
         self.copy_buffer_regions(src, dst, &[src.region(dst)]);
     }
+    #[validation_trace]
 
     pub fn copy_buffer_regions<'a, T: Copy + Pod>(
         &mut self,
@@ -1117,6 +1134,7 @@ impl CommandBuffer {
         self.last_stage = vk::PipelineStageFlags2::TRANSFER;
         unsafe { Ctx::device().cmd_copy_buffer(self.handle, src.handle, dst.handle, regions) };
     }
+    #[validation_trace]
 
     pub fn copy_buffer_to_image<'a, T: Copy + Pod, F: Format, U: UsageSet>(
         &mut self,
@@ -1163,6 +1181,7 @@ impl CommandBuffer {
         };
     }
 
+    #[validation_trace]
     pub fn raster<'a, 'c: 'a, S: RasterPass>(&'c mut self) -> RasterBuilder<'a, 'c, S> {
         self.last_stage = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
         RasterBuilder {
@@ -1183,6 +1202,7 @@ impl CommandBuffer {
         }
     }
 
+    #[validation_trace]
     pub fn compute<'a, 'c: 'a, S: ComputePass>(&'c mut self) -> ComputeBuilder<'a, 'c, S> {
         self.last_stage = vk::PipelineStageFlags2::COMPUTE_SHADER;
         ComputeBuilder {
@@ -1190,6 +1210,7 @@ impl CommandBuffer {
             binding: None,
         }
     }
+    #[validation_trace]
     pub fn raytrace<'a, 'c: 'a, S: RayTracingPass>(&'c mut self) -> RayTracingBuilder<'a, 'c, S> {
         self.last_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         RayTracingBuilder {
@@ -1197,7 +1218,7 @@ impl CommandBuffer {
             cmd_buffer: self,
         }
     }
-
+    #[validation_trace]
     pub fn present<'a, F: Format, U: UsageSet>(&'a mut self, swapchain_image: ImageView<'a, F, U>) {
         let _span = tracing::info_span!("present_barriers");
         self.barriers(vec![(
@@ -1225,6 +1246,7 @@ impl CommandBuffer {
         };
     }
 
+    #[validation_trace]
     pub fn image_barrier<F: Format, U: UsageSet>(
         &mut self,
         resource: ImageView<F, U>,
@@ -1353,7 +1375,7 @@ impl CommandBuffer {
     //         );
     //     }
     // }
-
+    #[validation_trace]
     pub fn buffer_barrier<T: Copy + Pod>(
         &mut self,
         resource: BufferSlice<T>,

@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell,
     ffi::{c_char, c_void},
     fmt::Debug,
+    panic::{self, Location},
     sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicBool},
 };
 
@@ -14,6 +16,7 @@ use gpu_allocator::{
     AllocationSizes, AllocatorDebugSettings,
     vulkan::{Allocator, AllocatorCreateDesc},
 };
+use lava_macros::validation_trace;
 use std::ffi::CStr;
 
 use crate::vkobjects::{
@@ -56,10 +59,10 @@ impl Ctx {
     pub(crate) fn get() -> &'static Self {
         STATE.wait()
     }
-    pub fn device() -> &'static Device {
+    pub(crate) fn device() -> &'static Device {
         &Ctx::get().device
     }
-    pub fn physical_device() -> &'static PhysicalDevice {
+    pub(crate) fn physical_device() -> &'static PhysicalDevice {
         &Ctx::get().physical_device
     }
     pub fn gfx_queue_index() -> u32 {
@@ -68,7 +71,7 @@ impl Ctx {
     pub fn num_gfx_queues() -> u32 {
         Ctx::get().gfx_queues_in_use.len() as u32
     }
-    pub fn transfer_queue_index() -> u32 {
+    pub(crate) fn transfer_queue_index() -> u32 {
         Ctx::get()
             .transfer_queue_familie
             .as_ref()
@@ -82,7 +85,7 @@ impl Ctx {
             .map(|e| e.index)
             .unwrap_or(Ctx::get().gfx_queue_familie.index)
     }
-    pub fn allocator<'a>() -> MutexGuard<'a, Allocator> {
+    pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
         Ctx::get().allocator.lock().unwrap()
     }
 
@@ -90,12 +93,12 @@ impl Ctx {
         &Ctx::get().surface
     }
 
-    pub fn features() -> Features {
+    pub(crate) fn features() -> Features {
         Ctx::get().features.clone()
     }
 
     #[cfg(debug_assertions)]
-    pub fn log_debug_printf_output() -> Vec<String> {
+    pub(crate) fn log_debug_printf_output() -> Vec<String> {
         Ctx::get().messages.lock().unwrap().drain(..).collect()
     }
 
@@ -301,6 +304,10 @@ impl Ctx {
     }
 }
 
+thread_local! {
+    pub static CALLSITE: Cell<Option<Location<'static>>> = Cell::new(None);
+}
+
 unsafe extern "system" fn vulkan_debug_callback(
     flag: vk::DebugUtilsMessageSeverityFlagsEXT,
     typ: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -308,7 +315,6 @@ unsafe extern "system" fn vulkan_debug_callback(
     _: *mut c_void,
 ) -> vk::Bool32 {
     unsafe {
-        use vk::DebugUtilsMessageSeverityFlagsEXT as Flag;
         if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
             let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
             #[cfg(debug_assertions)]
@@ -324,19 +330,12 @@ unsafe extern "system" fn vulkan_debug_callback(
                     return vk::FALSE;
                 }
             }
-
-            let typ = format!("{:?}", typ);
-            let flags = format!("{:?}", flag);
-            if flag.contains(Flag::ERROR) {
-                tracing::error!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
-            } else if flag.contains(Flag::WARNING) {
-                tracing::warn!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
-            } else if flag.contains(Flag::INFO) {
-                tracing::info!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
-            } else if flag.contains(Flag::VERBOSE) {
-                tracing::trace!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
+            let flags = flag.as_raw() as u64;
+            let typ = typ.as_raw() as u64;
+            if let Some(loc) = CALLSITE.get() {
+                tracing::error!(target: "vulkan-validation", flags = flags, typ = typ, validation_location = format!("{}", loc), "{}", message);
             } else {
-                tracing::info!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message)
+                tracing::error!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message);
             }
         }
     }
@@ -476,38 +475,39 @@ impl Debug for Functions {
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 
 impl Functions {
-    pub fn surface() -> Option<&'static ash::khr::surface::Instance> {
+    pub(crate) fn surface() -> Option<&'static ash::khr::surface::Instance> {
         get().surface.as_ref()
     }
-    pub fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
+    pub(crate) fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
         &get().host_image_copy
     }
-    pub fn instance() -> &'static ash::Instance {
+    pub(crate) fn instance() -> &'static ash::Instance {
         &get().instance
     }
-    pub fn entry() -> &'static ash::Entry {
+    pub(crate) fn entry() -> &'static ash::Entry {
         &get().entry
     }
-    pub fn swapchain() -> &'static ash::khr::swapchain::Device {
+    pub(crate) fn swapchain() -> &'static ash::khr::swapchain::Device {
         &get().swapchain
     }
-    pub fn debug_utils() -> Option<&'static ash::ext::debug_utils::Device> {
+    pub(crate) fn debug_utils() -> Option<&'static ash::ext::debug_utils::Device> {
         get().device_debug_utils.as_ref()
     }
-    pub fn instance_debug_utils() -> Option<&'static ash::ext::debug_utils::Instance> {
+    pub(crate) fn instance_debug_utils() -> Option<&'static ash::ext::debug_utils::Instance> {
         get().debug_utils.as_ref()
     }
-    pub fn mesh() -> Option<&'static ash::ext::mesh_shader::Device> {
+    pub(crate) fn mesh() -> Option<&'static ash::ext::mesh_shader::Device> {
         get().mesh.as_ref()
     }
-    pub fn raytracing_pipeline() -> Option<&'static ash::khr::ray_tracing_pipeline::Device> {
+    pub(crate) fn raytracing_pipeline() -> Option<&'static ash::khr::ray_tracing_pipeline::Device> {
         get().raytracing_pipeline.as_ref()
     }
-    pub fn acceleration_structure() -> Option<&'static ash::khr::acceleration_structure::Device> {
+    pub(crate) fn acceleration_structure()
+    -> Option<&'static ash::khr::acceleration_structure::Device> {
         get().acceleration_structure.as_ref()
     }
 
-    pub fn set_debug_name<T>(name: &str, object: T)
+    pub(crate) fn set_debug_name<T>(name: &str, object: T)
     where
         T: Handle,
     {
@@ -521,7 +521,7 @@ impl Functions {
         }
     }
 
-    pub fn cmd_start_label(cmd: &vk::CommandBuffer, name: &str) {
+    pub(crate) fn cmd_start_label(cmd: &vk::CommandBuffer, name: &str) {
         if let Some(debug_utils) = Self::debug_utils() {
             let name = format!("{}\0", name);
             let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
@@ -529,7 +529,7 @@ impl Functions {
             unsafe { debug_utils.cmd_begin_debug_utils_label(*cmd, &name_info) };
         }
     }
-    pub fn cmd_insert_label(cmd: &vk::CommandBuffer, name: &str) {
+    pub(crate) fn cmd_insert_label(cmd: &vk::CommandBuffer, name: &str) {
         if let Some(debug_utils) = Self::debug_utils() {
             let name = format!("{}\0", name);
             let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
@@ -537,7 +537,7 @@ impl Functions {
             unsafe { debug_utils.cmd_insert_debug_utils_label(*cmd, &name_info) };
         }
     }
-    pub fn cmd_end_label(cmd: &vk::CommandBuffer) {
+    pub(crate) fn cmd_end_label(cmd: &vk::CommandBuffer) {
         if let Some(debug_utils) = Self::debug_utils() {
             unsafe { debug_utils.cmd_end_debug_utils_label(*cmd) };
         }
@@ -547,6 +547,7 @@ fn get() -> &'static Functions {
     FUNCTIONS.get().unwrap()
 }
 
+#[validation_trace]
 pub(super) fn create_device(
     mut queue_families: Vec<u32>,
     physical_device: &PhysicalDevice,

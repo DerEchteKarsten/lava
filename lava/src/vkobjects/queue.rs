@@ -6,12 +6,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ash::vk;
+use lava_macros::validation_trace;
 
 use crate::{
     command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
-    state::{Ctx, Functions},
+    state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
 
@@ -38,12 +39,14 @@ pub struct Event {
 }
 
 impl Event {
+    #[validation_trace]
     pub fn new() -> Self {
         let create_info = vk::EventCreateInfo::default();
         Self {
             handle: unsafe { Ctx::device().create_event(&create_info, None).unwrap() },
         }
     }
+    #[validation_trace]
     pub fn wait(&self) {
         loop {
             if unsafe { Ctx::device().get_event_status(self.handle).unwrap() } {
@@ -53,6 +56,7 @@ impl Event {
             std::thread::yield_now();
         }
     }
+    #[validation_trace]
     pub fn set(&self) {
         unsafe { Ctx::device().set_event(self.handle).unwrap() }
     }
@@ -115,12 +119,14 @@ impl SemaphoreType for Binary {
 }
 
 impl<T: SemaphoreType> Semaphore<T> {
+    #[validation_trace]
     pub fn new() -> Self {
         T::create()
     }
 }
 
 impl Semaphore<Timeline> {
+    #[validation_trace]
     pub fn block_until_value(&self, value: u64) {
         let binding = [self.handle];
         let values = [value];
@@ -129,12 +135,14 @@ impl Semaphore<Timeline> {
             .values(&values);
         unsafe { Ctx::device().wait_semaphores(&wait_info, u64::MAX).unwrap() }
     }
+    #[validation_trace]
     pub fn info(&self, value: u64) -> SemaphoreInfo {
         SemaphoreInfo::Timeline(self.handle, value)
     }
 }
 
 impl Semaphore<Binary> {
+    #[validation_trace]
     pub fn info(&self) -> SemaphoreInfo {
         SemaphoreInfo::Binary(self.handle)
     }
@@ -156,14 +164,17 @@ impl Default for Fence {
 }
 
 impl Fence {
+    #[validation_trace]
     pub fn new() -> Self {
         let create_info = vk::FenceCreateInfo::default();
         let handle = unsafe { Ctx::device().create_fence(&create_info, None) }.unwrap();
         Self { handle }
     }
+    #[validation_trace]
     pub fn reset(&self) {
         unsafe { Ctx::device().reset_fences(&[self.handle]) }.unwrap();
     }
+    #[validation_trace]
     pub fn wait(&self) {
         unsafe { Ctx::device().wait_for_fences(&[self.handle], true, u64::MAX) }.unwrap();
     }
@@ -234,12 +245,14 @@ pub struct CommandPool {
     handle: vk::CommandPool,
 }
 impl CommandPool {
+    #[validation_trace]
     pub fn reset(&self) {
         unsafe {
             Ctx::device().reset_command_pool(self.handle, vk::CommandPoolResetFlags::empty())
         }
         .unwrap();
     }
+    #[validation_trace]
     pub fn create_command_buffer(&self) -> CommandBufferMemory {
         let allocate_info = vk::CommandBufferAllocateInfo {
             level: vk::CommandBufferLevel::PRIMARY,
@@ -280,6 +293,7 @@ impl Drop for CommandBufferMemory {
 }
 
 impl<Q: QueueFamilie> Queue<Q> {
+    #[validation_trace]
     pub fn new() -> Result<Self> {
         let mut handle = None;
         for (i, slot) in Q::is_free().iter().enumerate() {
@@ -301,7 +315,7 @@ impl<Q: QueueFamilie> Queue<Q> {
             _marker: PhantomData,
         })
     }
-
+    #[validation_trace]
     pub fn create_pool(&self) -> CommandPool {
         CommandPool {
             handle: unsafe {
@@ -317,6 +331,7 @@ impl<Q: QueueFamilie> Queue<Q> {
         }
     }
 
+    #[validation_trace]
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
         resource_state: Option<HashMap<ResourceHandle, ResourceState>>,
@@ -334,7 +349,9 @@ impl<Q: QueueFamilie> Queue<Q> {
             };
 
             cmd_buffer.begin();
+            let prev = CALLSITE.replace(None);
             executor(&mut cmd_buffer);
+            CALLSITE.set(prev);
             cmd_buffer.end();
 
             let cmd_buffer_submit_info =
@@ -363,6 +380,7 @@ impl<Q: QueueFamilie> Queue<Q> {
         }
     }
 
+    #[validation_trace]
     pub fn present(
         &self,
         swapchain: &Swapchain,

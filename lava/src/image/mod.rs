@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use anyhow::Result;
 use ash::vk::{self, ComponentSwizzle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
+use lava_macros::validation_trace;
 
 use crate::{
     bindless::{Bindless, BindlessHandle},
@@ -31,6 +32,7 @@ pub struct Image<F: Format = Undefined, U: UsageSet = Unknown> {
 }
 
 impl<F: Format, U: UsageSet> Image<F, U> {
+    #[validation_trace]
     pub fn new_mipped(width: u32, height: u32, mips: u32) -> Result<Self> {
         let extent = vk::Extent3D {
             width,
@@ -103,6 +105,7 @@ impl<F: Format, U: UsageSet> Image<F, U> {
         Ok(s)
     }
 
+    #[validation_trace]
     pub fn new(width: u32, height: u32) -> Result<Self> {
         Self::new_mipped(width, height, 1)
     }

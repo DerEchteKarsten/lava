@@ -10,7 +10,7 @@ pub struct AccelerationStructure {
 }
 
 impl AccelerationStructure {
-    pub fn get_build_size<'a>(
+    pub(crate) fn get_build_size<'a>(
         level: vk::AccelerationStructureTypeKHR,
         as_geometry: &'a [vk::AccelerationStructureGeometryKHR],
         max_primitive_counts: &'a [u32],
@@ -33,7 +33,7 @@ impl AccelerationStructure {
             size_info
         }
     }
-    pub fn new(
+    pub(crate) fn new(
         level: vk::AccelerationStructureTypeKHR,
         as_geometry: &[vk::AccelerationStructureGeometryKHR],
         as_ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],

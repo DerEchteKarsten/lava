@@ -3,6 +3,7 @@ use std::{ffi::CStr, marker::PhantomData, sync::OnceLock};
 use anyhow::Result;
 use ash::vk::{self};
 use glam::UVec2;
+use lava_macros::validation_trace;
 
 use crate::{
     bindless::Bindless,
@@ -21,6 +22,7 @@ pub struct Swapchain<'a> {
 }
 
 impl<'a> Swapchain<'a> {
+    #[validation_trace]
     pub fn new(old: Option<&Swapchain>, size: Option<UVec2>) -> Result<Self> {
         let format = {
             let formats = &Ctx::surface().formats;
@@ -171,6 +173,7 @@ impl<'a> Swapchain<'a> {
         })
     }
 
+    #[validation_trace]
     pub fn aquire_image(&self, wait_on: &Semaphore<Binary>, fence: Option<&Fence>) -> u32 {
         let (image_index, _suboptimal) = unsafe {
             Functions::swapchain().acquire_next_image(
@@ -184,6 +187,7 @@ impl<'a> Swapchain<'a> {
         image_index
     }
 
+    #[validation_trace]
     pub fn recreate(&mut self, size: UVec2) {
         let _span = tracing::info_span!("Swapchain Recreation");
         let swapchain = Swapchain::new(Some(self), Some(size)).unwrap();

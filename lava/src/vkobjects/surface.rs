@@ -11,7 +11,7 @@ pub struct Surface {
 }
 
 impl Surface {
-    pub fn new(
+    pub(crate) fn new(
         surface: vk::SurfaceKHR,
         physical_device: &PhysicalDevice,
         surface_fn: &ash::khr::surface::Instance,

@@ -37,10 +37,10 @@ impl Bindless {
     fn get() -> &'static Self {
         BINDLESS.get().unwrap()
     }
-    pub fn layout() -> vk::PipelineLayout {
+    pub(crate) fn layout() -> vk::PipelineLayout {
         Self::get().layout
     }
-    pub fn init() -> Result<()> {
+    pub(crate) fn init() -> Result<()> {
         let mut layouts = [vk::DescriptorSetLayout::default(); 2];
         let sci2 = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::NEAREST)
@@ -190,7 +190,7 @@ impl Bindless {
         Ok(())
     }
 
-    pub fn push<F: Format, U: UsageSet>(image: ImageView<F, U>) -> Option<BindlessHandle> {
+    pub(crate) fn push<F: Format, U: UsageSet>(image: ImageView<F, U>) -> Option<BindlessHandle> {
         let handle = match U::SET {
             BindlessImageUsageSet::None => return None,
             BindlessImageUsageSet::Both => BindlessHandle {
@@ -218,7 +218,10 @@ impl Bindless {
         Some(handle)
     }
 
-    pub fn write_image<F: Format, U: UsageSet>(image: ImageView<F, U>, handle: BindlessHandle) {
+    pub(crate) fn write_image<F: Format, U: UsageSet>(
+        image: ImageView<F, U>,
+        handle: BindlessHandle,
+    ) {
         let image_info = [vk::DescriptorImageInfo {
             image_layout: U::PREFERED_LAYOUT,
             image_view: image.view,
@@ -249,7 +252,7 @@ impl Bindless {
         unsafe { Ctx::device().update_descriptor_sets(&writes, &[]) };
     }
 
-    pub fn bind(cmd: &vk::CommandBuffer) {
+    pub(crate) fn bind(cmd: &vk::CommandBuffer) {
         let s = Self::get();
         unsafe {
             Ctx::device().cmd_bind_descriptor_sets(
@@ -285,7 +288,7 @@ impl Bindless {
         };
     }
 
-    pub fn destroy() {
+    pub(crate) fn destroy() {
         unsafe {
             let s = Self::get();
             Ctx::device().destroy_pipeline_layout(s.layout, None);

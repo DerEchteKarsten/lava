@@ -37,7 +37,7 @@ pub struct RaytracingPipeline {
 }
 
 impl RaytracingPipeline {
-    pub fn new(
+    pub(crate) fn new(
         pipeline_layout: vk::PipelineLayout,
         shaders_create_info: &[RayTracingShaderCreateInfo],
     ) -> Result<Self> {
@@ -125,7 +125,10 @@ pub struct ShaderBindingTable {
 }
 
 impl ShaderBindingTable {
-    pub fn new(pipeline: &vk::Pipeline, shaders: &RayTracingShaderGroupInfo) -> Result<Self> {
+    pub(crate) fn new(
+        pipeline: &vk::Pipeline,
+        shaders: &RayTracingShaderGroupInfo,
+    ) -> Result<Self> {
         let desc = shaders;
 
         let handle_size = Ctx::physical_device()

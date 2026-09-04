@@ -11,6 +11,7 @@ use gpu_allocator::{
     MemoryLocation,
     vulkan::{Allocation, AllocationCreateDesc},
 };
+use lava_macros::validation_trace;
 
 use crate::{buffer::slice::BufferSlice, state::Ctx};
 
@@ -65,6 +66,7 @@ impl<'a, T: Copy + Pod> Into<BufferSlice<'a, T>> for &'a Buffer<T> {
 }
 
 impl<T: Copy + Pod> Buffer<T> {
+    #[validation_trace]
     pub fn raw(
         usage: vk::BufferUsageFlags,
         cpu_writable: bool,
@@ -110,6 +112,7 @@ impl<T: Copy + Pod> Buffer<T> {
         self.allocation.size()
     }
 
+    #[validation_trace]
     pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
         Self::raw(
             vk::BufferUsageFlags::STORAGE_BUFFER

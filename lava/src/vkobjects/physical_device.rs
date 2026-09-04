@@ -2,6 +2,7 @@ use std::ffi::CStr;
 
 use anyhow::Result;
 use ash::vk;
+use lava_macros::validation_trace;
 
 use crate::state::Features;
 
@@ -65,7 +66,7 @@ pub struct PhysicalDevice {
 }
 
 impl PhysicalDevice {
-    pub fn new(
+    pub(crate) fn new(
         surface: &vk::SurfaceKHR,
         surface_fn: Option<&ash::khr::surface::Instance>,
         instance: &ash::Instance,
@@ -200,7 +201,7 @@ impl PhysicalDevice {
         })
     }
 
-    pub fn unsupports_extensions(&self, extensions: &[&CStr]) -> Vec<String> {
+    pub(crate) fn unsupports_extensions(&self, extensions: &[&CStr]) -> Vec<String> {
         extensions
             .iter()
             .map(|e| e.to_str().unwrap().to_owned())
@@ -208,7 +209,8 @@ impl PhysicalDevice {
             .collect::<Vec<String>>()
     }
 
-    pub fn enumerate_physical_devices(
+    #[validation_trace]
+    pub(crate) fn enumerate_physical_devices(
         surface: &vk::SurfaceKHR,
         instance: &ash::Instance,
         surface_fn: Option<&ash::khr::surface::Instance>,
@@ -228,7 +230,8 @@ impl PhysicalDevice {
         Ok(physical_devices)
     }
 
-    pub fn select_suitable_physical_device(
+    #[validation_trace]
+    pub(crate) fn select_suitable_physical_device(
         devices: &[PhysicalDevice],
         features: &mut Features,
     ) -> Result<(
