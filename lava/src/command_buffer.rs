@@ -1,41 +1,112 @@
 use std::{
-    cell::LazyCell,
+    cell::{Cell, LazyCell},
     collections::HashMap,
     ffi::CStr,
     fmt::Debug,
-    panic::Location,
-    sync::{Mutex, OnceLock},
+    iter,
+    ops::{IntoBounds, RangeBounds},
+    range::Range,
+    sync::{Mutex, OnceLock, RwLock, atomic::AtomicU64},
 };
 
 use crate::{
+    bindings::NUM_RAYTRACING_PIPELINES,
     bindless::Bindless,
     buffer::slice::BufferSlice,
     image::{
         format::Format,
-        slice::{ImageSlice, ImageView, SampledImageViewBinding, StorageImageViewBinding},
+        slice::{ImageSlice, ImageView},
         usage::{IsColorAttachment, IsDepthAttachment, UsageSet},
     },
-    state::{CALLSITE, Ctx, Functions},
-    vkobjects::rt_pipeline::{
-        RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
+    state::{Ctx, Functions},
+    vkobjects::{
+        queue::PendingAccesses,
+        rt_pipeline::{RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline},
     },
 };
-use ash::vk::{self, BufferCopy, IndexType};
+use ash::vk::{self, BufferCopy, Handle, IndexType};
 use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
+use notify::EventHandler;
+use smallvec::SmallVec;
+
+#[derive(Debug)]
+pub(crate) struct BufferAccess {
+    pub(crate) stage: vk::PipelineStageFlags2,
+    pub(crate) access: vk::AccessFlags2,
+    pub(crate) range: Range<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ImageAccess {
+    pub(crate) stage: vk::PipelineStageFlags2,
+    pub(crate) access: vk::AccessFlags2,
+    pub(crate) image: vk::ImageView,
+}
 
 #[derive(Debug)]
 pub struct CommandBuffer {
     pub(crate) handle: vk::CommandBuffer,
-    pub(crate) last_stage: vk::PipelineStageFlags2,
-    pub(crate) resource_hashes: HashMap<ResourceHandle, ResourceState>,
+    pub(crate) pending_accesses: PendingAccesses,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Default)]
 pub struct ShaderHash {
     pub entry: &'static str,
     pub file: &'static str,
+}
+
+pub const SPIRV_PATH: &'static str = concat!(env!("OUT_DIR"), "/shaders.spv");
+pub const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.spv"));
+pub const PIPELINES: Option<PipelineManager> = None;
+
+pub struct PipelineManager {
+    pub module: Mutex<vk::ShaderModule>,
+    pub compute_pipelines: RwLock<[vk::Pipeline; NUM_RAYTRACING_PIPELINES]>,
+    pub raytracing_pipelines: RwLock<[RaytracingPipeline; NUM_RAYTRACING_PIPELINES]>,
+    pub raster_pipelines: RwLock<HashMap<RasterHash, vk::Pipeline>>,
+}
+
+impl PipelineManager {
+    pub fn new() -> Self {
+        let module = create_module(SPIRV);
+
+        Self {
+            module: Mutex::new(module),
+            compute_pipelines,
+            raytracing_pipelines,
+            raster_pipelines: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+struct FileWatcher;
+
+impl EventHandler for FileWatcher {
+    fn handle_event(&mut self, e: notify::Result<notify::Event>) {
+        match e {
+            Ok(_) => {
+                tracing::info!(target: "shader_file_watcher", "Reloading Shaders");
+                match std::fs::read(SPIRV_PATH) {
+                    Ok(spirv) => {
+                        *(PIPELINES.unwrap().module.lock().unwrap()) = create_module(&spirv)
+                    }
+                    Err(e) => tracing::error!(target: "shader_file_watcher", "{}", e),
+                }
+            }
+            Err(e) => {
+                tracing::error!(target: "shader_file_watcher", "{}", e);
+            }
+        };
+    }
+}
+
+pub fn init() {
+    {
+        let config = notify::Config::default();
+        let file_watcher = notify::Watcher::new(FileWatcher, config).unwrap();
+    }
 }
 
 fn create_module(bytes: &[u8]) -> vk::ShaderModule {
@@ -71,72 +142,27 @@ fn make_shader_stage<'a>(
 
 pub trait ComputePass {
     type GpuBinding: Binding;
-    const ENTRY: &'static str;
-    const BYTES: &[u8];
-
-    fn cache() -> &'static OnceLock<vk::Pipeline>;
+    const STATIC_PIPELINE: usize;
 
     fn get() -> vk::Pipeline {
-        Self::cache()
-            .get_or_init(|| {
-                let _span = tracing::info_span!("create compute pipeline");
-                let (module, stage) =
-                    create_shader_stage(Self::ENTRY, Self::BYTES, vk::ShaderStageFlags::COMPUTE);
-                let create_info = vk::ComputePipelineCreateInfo::default()
-                    .layout(Bindless::layout())
-                    .stage(stage);
-                let pipeline = unsafe {
-                    Ctx::device()
-                        .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
-                        .unwrap()
-                }[0];
-                Functions::set_debug_name(Self::ENTRY, pipeline);
-                unsafe { Ctx::device().destroy_shader_module(module, None) };
-                pipeline
-            })
-            .clone()
+        PIPELINES.unwrap().compute_pipelines.read().unwrap()[Self::STATIC_PIPELINE]
     }
 }
-
 pub trait RayTracingPass {
     type GpuBinding: Binding;
-    const RAYGEN: &'static str;
-    const HIT: &'static str;
-    const MISS: &'static str;
-    const BYTES: &[u8];
+    const STATIC_PIPELINE: usize;
 
-    fn cache() -> &'static OnceLock<RaytracingPipeline>;
-
-    fn get<'a>() -> &'a RaytracingPipeline {
-        Self::cache().get_or_init(|| {
-            let _span = tracing::info_span!("create raytracing pipeline");
-            let module = create_module(Self::BYTES);
-            let raygen = make_shader_stage(Self::RAYGEN, vk::ShaderStageFlags::RAYGEN_KHR, module);
-            let hit = make_shader_stage(Self::HIT, vk::ShaderStageFlags::CLOSEST_HIT_KHR, module);
-            let miss = make_shader_stage(Self::RAYGEN, vk::ShaderStageFlags::MISS_KHR, module);
-
-            let pipeline = RaytracingPipeline::new(
-                Bindless::layout(),
-                &[
-                    RayTracingShaderCreateInfo {
-                        group: RayTracingShaderGroup::RayGen,
-                        stages: &[raygen],
-                    },
-                    RayTracingShaderCreateInfo {
-                        group: RayTracingShaderGroup::Hit,
-                        stages: &[hit],
-                    },
-                    RayTracingShaderCreateInfo {
-                        group: RayTracingShaderGroup::Miss,
-                        stages: &[miss],
-                    },
-                ],
-            )
-            .unwrap();
-            Functions::set_debug_name(&Self::RAYGEN, pipeline.pipeline);
-            unsafe { Ctx::device().destroy_shader_module(module, None) };
-            pipeline
-        })
+    fn get() -> (vk::Pipeline, [vk::StridedDeviceAddressRegionKHR; 3]) {
+        let p = &PIPELINES
+            .as_ref()
+            .unwrap()
+            .raytracing_pipelines
+            .read()
+            .unwrap()[Self::STATIC_PIPELINE];
+        (
+            p.pipeline,
+            [p.sbt.raygen_region, p.sbt.miss_region, p.sbt.hit_region],
+        )
     }
 }
 
@@ -144,74 +170,18 @@ pub trait RayTracingPass {
 pub struct RasterHash {
     backface_culling: bool,
     wire_frame: bool,
-    color_formats: Vec<vk::Format>,
+    color_formats: SmallVec<[vk::Format; 4]>,
     depth_format: vk::Format,
     stencil_format: vk::Format,
+    pipeline_index: usize,
 }
 
 pub trait RasterVertexShaderPass: RasterPass {
-    const VERTEX: &'static str;
-    const FRAGMENT: &'static str;
-    const BYTES: &[u8];
-
-    fn module_cache() -> &'static OnceLock<vk::ShaderModule>;
-
-    fn pipeline_cache() -> &'static Mutex<LazyCell<HashMap<RasterHash, vk::Pipeline>>>;
-
-    fn get(hash: &RasterHash) -> vk::Pipeline {
-        let p_cache = Self::pipeline_cache();
-        let mutex = p_cache.lock();
-        mutex
-            .unwrap()
-            .entry(hash.clone())
-            .or_insert_with(|| {
-                // unsafe { Ctx::device().device_wait_idle().unwrap() };
-                let m_cache = Self::module_cache();
-                let module = m_cache.get_or_init(|| create_module(Self::BYTES));
-                let stages = vec![
-                    make_shader_stage(Self::FRAGMENT, vk::ShaderStageFlags::FRAGMENT, *module),
-                    make_shader_stage(Self::VERTEX, vk::ShaderStageFlags::VERTEX, *module),
-                ];
-
-                create_raster_pipeline(&stages, hash)
-            })
-            .clone()
-    }
+    fn get(hash: &RasterHash) -> vk::Pipeline {}
 }
 
 pub trait RasterMeshShaderPass: RasterPass {
-    const MESH: &'static str;
-    const FRAGMENT: &'static str;
-    const TASK: Option<&'static str>;
-    const BYTES: &[u8];
-
-    fn module_cache() -> &'static OnceLock<vk::ShaderModule>;
-    fn pipeline_cache() -> &'static Mutex<LazyCell<HashMap<RasterHash, vk::Pipeline>>>;
-
-    fn get(hash: &RasterHash) -> vk::Pipeline {
-        let pipeline_cache = Self::pipeline_cache();
-        let mutex = pipeline_cache.lock();
-        let module_cache = Self::module_cache();
-        mutex
-            .unwrap()
-            .entry(hash.clone())
-            .or_insert_with(|| {
-                let module = module_cache.get_or_init(|| create_module(Self::BYTES));
-                let mut stages = vec![
-                    make_shader_stage(Self::FRAGMENT, vk::ShaderStageFlags::FRAGMENT, *module),
-                    make_shader_stage(Self::MESH, vk::ShaderStageFlags::MESH_EXT, *module),
-                ];
-                if let Some(hash) = Self::TASK {
-                    stages.push(make_shader_stage(
-                        hash,
-                        vk::ShaderStageFlags::TASK_EXT,
-                        *module,
-                    ));
-                }
-                create_raster_pipeline(&stages, hash)
-            })
-            .clone()
-    }
+    fn get(hash: &RasterHash) -> vk::Pipeline {}
 }
 
 fn create_raster_pipeline(
@@ -324,11 +294,18 @@ fn create_raster_pipeline(
 
 pub trait Binding: Pod {
     type CpuBinding<'a>;
+    const N: usize;
+    const M: usize;
     fn from_cpu_binding<'a>(binding: &Self::CpuBinding<'a>) -> Self;
-    fn resources<'a>(
+    fn buffer_accesses<'a>(
         binding: &Self::CpuBinding<'a>,
-        stage: ash::vk::PipelineStageFlags2,
-    ) -> Vec<(ResourceHandle, ResourceState)>;
+        stage: vk::PipelineStageFlags2,
+    ) -> [BufferAccess; Self::N];
+
+    fn image_accesses<'a>(
+        binding: &Self::CpuBinding<'a>,
+        stage: vk::PipelineStageFlags2,
+    ) -> [ImageAccess; Self::M];
 }
 
 #[derive(Debug)]
@@ -336,81 +313,6 @@ pub enum PushConstant {
     BindlessImage(u64),
     BufferPointer(u64),
     Constants(Vec<u8>),
-}
-
-#[derive(Clone, Hash, PartialEq, Eq, Debug)]
-pub enum ResourceHandle {
-    Buffer {
-        buffer: vk::Buffer,
-    },
-    Image {
-        image: vk::Image,
-        view: vk::ImageView,
-        aspect: vk::ImageAspectFlags,
-        base_mip: u32,
-        num_mips: u32,
-    },
-}
-
-impl<'a, F: Format, U: UsageSet> Into<ResourceHandle> for ImageView<'a, F, U> {
-    fn into(self) -> ResourceHandle {
-        ResourceHandle::Image {
-            image: self.image,
-            view: self.view,
-            aspect: F::ASPECTS,
-            base_mip: self.base_mip,
-            num_mips: self.num_mips,
-        }
-    }
-}
-
-impl<'a> Into<ResourceHandle> for SampledImageViewBinding<'a> {
-    fn into(self) -> ResourceHandle {
-        ResourceHandle::Image {
-            image: self.image,
-            view: self.view,
-            aspect: self.aspect,
-            base_mip: self.base_mip,
-            num_mips: self.num_mips,
-        }
-    }
-}
-
-impl<'a> Into<ResourceHandle> for StorageImageViewBinding<'a> {
-    fn into(self) -> ResourceHandle {
-        ResourceHandle::Image {
-            image: self.image,
-            view: self.view,
-            aspect: self.aspect,
-            base_mip: self.base_mip,
-            num_mips: self.num_mips,
-        }
-    }
-}
-
-impl<'a, T: Copy + Pod> Into<ResourceHandle> for BufferSlice<'a, T> {
-    fn into(self) -> ResourceHandle {
-        ResourceHandle::Buffer {
-            buffer: self.handle,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ResourceState {
-    pub stages: vk::PipelineStageFlags2,
-    pub access: vk::AccessFlags2,
-    pub layout: vk::ImageLayout,
-}
-
-impl Default for ResourceState {
-    fn default() -> Self {
-        ResourceState {
-            stages: vk::PipelineStageFlags2::empty(),
-            access: vk::AccessFlags2::empty(),
-            layout: vk::ImageLayout::UNDEFINED,
-        }
-    }
 }
 
 #[repr(i32)]
@@ -421,15 +323,17 @@ pub enum Filter {
 
 pub trait RasterPass {
     type GpuBinding: Binding;
+    const PIPELINE_INDEX: usize;
 }
 
 pub struct RasterBuilder<'command_buffer_ref, 'command_buffer_resources, S: RasterPass> {
     hash: RasterHash,
-    color_attachments: Vec<(vk::ImageView, Option<vk::ClearValue>)>,
+    color_attachments: SmallVec<[(vk::ImageView, Option<vk::ClearValue>); 2]>,
+    color_accesses: SmallVec<[ImageAccess; 2]>,
     depth_attachment: vk::ImageView,
+    depth_access: Option<ImageAccess>,
     clear_depth: Option<vk::ClearValue>,
     write_depth: bool,
-    resource_states: Vec<(ResourceHandle, ResourceState)>,
     cmd_buf: &'command_buffer_ref mut CommandBuffer,
     binding:
         Option<<<S as RasterPass>::GpuBinding as Binding>::CpuBinding<'command_buffer_resources>>,
@@ -584,20 +488,16 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         let no_clear = clear.is_none();
         self.color_attachments
             .push((image.view, clear.map(|e| F::clear_value(e))));
-        self.resource_states.push((
-            image.into(),
-            ResourceState {
-                access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                    | if no_clear {
-                        vk::AccessFlags2::COLOR_ATTACHMENT_READ
-                    } else {
-                        vk::AccessFlags2::empty()
-                    },
-                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                stages: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                ..Default::default()
-            },
-        ));
+        self.color_accesses.push(ImageAccess {
+            access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                | if no_clear {
+                    vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                } else {
+                    vk::AccessFlags2::empty()
+                },
+            stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            image: image.view,
+        });
         self
     }
 
@@ -615,22 +515,22 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         self.depth_attachment = image.view;
         self.clear_depth = clear.map(|e| F::clear_value(e));
         self.write_depth = write;
-        self.resource_states.push((
-            image.into(),
-            ResourceState {
-                access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
-                layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                stages: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                ..Default::default()
-            },
-        ));
+        self.depth_access = Some(ImageAccess {
+            access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | if self.write_depth {
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                } else {
+                    vk::AccessFlags2::empty()
+                },
+            stage: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            image: image.view,
+        });
         self
     }
 
     fn draw_private(
-        mut self,
+        self,
         pipeline: vk::Pipeline,
         dispatch: Option<RasterVertexDispatch<'b>>,
         total_extent: UVec2,
@@ -639,50 +539,64 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
         viewport: Viewport,
     ) {
         let _span = tracing::info_span!("draw");
-        let buffers = if let Some(dispatch) = &dispatch {
-            match dispatch {
-                RasterVertexDispatch::DrawIndirect { buffer } => vec![buffer.clone()],
-                RasterVertexDispatch::DrawIndirectCount {
-                    buffer,
-                    count_buffer,
-                } => vec![buffer.clone().cast(), count_buffer.clone().cast()],
-                RasterVertexDispatch::DrawIndexed { index_buffer, .. } => {
-                    self.resource_states.push((
-                        index_buffer.clone().into(),
-                        ResourceState {
-                            access: vk::AccessFlags2::INDEX_READ,
-                            layout: vk::ImageLayout::UNDEFINED,
-                            stages: vk::PipelineStageFlags2::INDEX_INPUT,
-                            ..Default::default()
-                        },
-                    ));
-                    vec![]
-                }
-                _ => vec![],
-            }
-        } else {
-            vec![]
-        };
 
-        for buffer in buffers {
-            self.resource_states.push((
-                buffer.into(),
-                ResourceState {
-                    access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
-                    layout: vk::ImageLayout::UNDEFINED,
-                    stages: vk::PipelineStageFlags2::DRAW_INDIRECT,
-                    ..Default::default()
-                },
-            ));
-        }
         let stage = if dispatch.is_some() {
             vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::VERTEX_SHADER
         } else {
             vk::PipelineStageFlags2::MESH_SHADER_EXT
         };
-        let mut shader_resouces = S::GpuBinding::resources(self.binding.as_ref().unwrap(), stage);
-        self.resource_states.append(&mut shader_resouces);
-        self.cmd_buf.barriers(self.resource_states);
+        let image_accesses = S::GpuBinding::image_accesses(self.binding, stage);
+        let buffer_accesses = S::GpuBinding::buffer_accesses(self.binding, stage);
+
+        let mut access1 = None;
+        let mut access2 = None;
+
+        if let Some(dispatch) = &dispatch {
+            match dispatch {
+                RasterVertexDispatch::DrawIndirect { buffer } => {
+                    access1 = Some(BufferAccess {
+                        access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                        stage: vk::PipelineStageFlags2::DRAW_INDIRECT,
+                        range: buffer.get_range(),
+                    });
+                }
+                RasterVertexDispatch::DrawIndirectCount {
+                    buffer,
+                    count_buffer,
+                } => {
+                    access1 = Some(BufferAccess {
+                        access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                        stage: vk::PipelineStageFlags2::DRAW_INDIRECT,
+                        range: buffer.get_range(),
+                    });
+                    access2 = Some(BufferAccess {
+                        access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                        stage: vk::PipelineStageFlags2::DRAW_INDIRECT,
+                        range: count_buffer.get_range(),
+                    });
+                }
+                RasterVertexDispatch::DrawIndexed { index_buffer, .. } => {
+                    access1 = Some(BufferAccess {
+                        access: vk::AccessFlags2::INDEX_READ,
+                        stage: vk::PipelineStageFlags2::INDEX_INPUT,
+                        range: index_buffer.get_range(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        self.cmd_buf.flush_pending(
+            image_accesses
+                .iter()
+                .chain(self.color_accesses.iter())
+                .chain(self.depth_access.iter()),
+            buffer_accesses
+                .iter()
+                .chain(access1.iter())
+                .chain(access2.iter()),
+        );
+
         self.cmd_buf
             .push_constants::<S::GpuBinding>(self.binding.as_ref().unwrap());
 
@@ -691,7 +605,7 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
             .iter()
             .map(|e| {
                 let ret = vk::RenderingAttachmentInfo::default()
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image_layout(vk::ImageLayout::GENERAL)
                     .image_view(e.0)
                     .store_op(vk::AttachmentStoreOp::STORE);
                 if let Some(clear_value) = e.1 {
@@ -718,7 +632,7 @@ impl<'a, 'b, S: RasterPass> RasterBuilder<'a, 'b, S> {
 
         if self.depth_attachment != vk::ImageView::null() {
             render_info1 = vk::RenderingAttachmentInfo::default()
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .image_layout(vk::ImageLayout::GENERAL)
                 .image_view(self.depth_attachment)
                 .store_op(vk::AttachmentStoreOp::NONE)
                 .load_op(vk::AttachmentLoadOp::LOAD);
@@ -848,22 +762,24 @@ impl<'command_buffer_ref, 'command_buffer_resources, S: ComputePass>
         indirect_buffer: Option<BufferSlice<'command_buffer_resources, DrawIndirectCommand>>,
     ) {
         let _span = tracing::info_span!("compute");
-        let mut resources = S::GpuBinding::resources(
+        let buffer_access = S::GpuBinding::buffer_accesses(
             self.binding.as_ref().unwrap(),
             vk::PipelineStageFlags2::COMPUTE_SHADER,
         );
-        if let Some(indirect) = indirect_buffer {
-            resources.push((
-                indirect.into(),
-                ResourceState {
-                    access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
-                    stages: vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    layout: vk::ImageLayout::UNDEFINED,
-                    ..Default::default()
-                },
-            ));
-        }
-        self.cmd_buffer.barriers(resources);
+        let image_access = S::GpuBinding::image_accesses(
+            self.binding.as_ref().unwrap(),
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+        );
+
+        let access1 = indirect_buffer.map(|b| BufferAccess {
+            access: vk::AccessFlags2::INDIRECT_COMMAND_READ,
+            stage: vk::PipelineStageFlags2::DRAW_INDIRECT,
+            range: b.get_range(),
+        });
+        self.cmd_buffer.flush_pending(
+            image_access.iter(),
+            buffer_access.iter().chain(access1.iter()),
+        );
         self.cmd_buffer
             .push_constants::<S::GpuBinding>(self.binding.as_ref().unwrap());
 
@@ -921,28 +837,38 @@ impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
         self
     }
 
-    fn build(self, dispatch: [u32; 2]) {
-        let resources = S::GpuBinding::resources(
+    fn build(self, dispatch: [u32; 2])
+    where
+        [(); Self::N],
+        [(); Self::M],
+    {
+        let image_accesses = S::GpuBinding::image_accesses(
             self.binding.as_ref().unwrap(),
             vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
         );
-        self.cmd_buffer.barriers(resources);
+        let buffer_accesses = S::GpuBinding::buffer_accesses(
+            self.binding.as_ref().unwrap(),
+            vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+        );
+
+        self.cmd_buffer
+            .flush_pending(image_accesses.iter(), buffer_accesses.iter());
         self.cmd_buffer
             .push_constants::<S::GpuBinding>(self.binding.as_ref().unwrap());
 
-        let pipeline = S::get();
+        let (pipeline, sbt) = S::get();
         unsafe {
             Ctx::device().cmd_bind_pipeline(
                 self.cmd_buffer.handle,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
-                pipeline.pipeline,
+                pipeline,
             );
             let call_region = vk::StridedDeviceAddressRegionKHR::default();
             Functions::raytracing_pipeline().unwrap().cmd_trace_rays(
                 self.cmd_buffer.handle,
-                &pipeline.sbt.raygen_region,
-                &pipeline.sbt.miss_region,
-                &pipeline.sbt.hit_region,
+                &sbt[0],
+                &sbt[1],
+                &sbt[2],
                 &call_region,
                 dispatch[0],
                 dispatch[1],
@@ -959,18 +885,16 @@ impl<'a, 'b, S: RayTracingPass> RayTracingBuilder<'a, 'b, S> {
 
 impl CommandBuffer {
     #[validation_trace]
-    pub fn fill_buffer<'a, T: Copy + Pod>(&'a mut self, buffer: BufferSlice<'a, T>, data: u32) {
+    pub fn fill_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: u32) {
         let _span = tracing::info_span!("fill_buffer");
-        self.barriers(vec![(
-            buffer.into(),
-            ResourceState {
+        self.flush_pending(
+            std::iter::empty(),
+            std::iter::once(&BufferAccess {
                 access: vk::AccessFlags2::TRANSFER_WRITE,
-                stages: vk::PipelineStageFlags2::TRANSFER,
-                layout: vk::ImageLayout::UNDEFINED,
-                ..Default::default()
-            },
-        )]);
-        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: buffer.get_range(),
+            }),
+        );
         unsafe {
             Ctx::device().cmd_fill_buffer(
                 self.handle,
@@ -987,22 +911,20 @@ impl CommandBuffer {
         image: ImageView<'a, F, U>,
         clear_color: [F::Texel; 4],
     ) {
-        let _span = tracing::info_span!("fill_buffer");
-        self.barriers(vec![(
-            image.into(),
-            ResourceState {
+        let _span = tracing::info_span!("clear_image");
+        self.flush_pending(
+            std::iter::once(&ImageAccess {
                 access: vk::AccessFlags2::TRANSFER_WRITE,
-                stages: vk::PipelineStageFlags2::TRANSFER,
-                layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                ..Default::default()
-            },
-        )]);
-        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                image: image.view,
+            }),
+            std::iter::empty(),
+        );
         unsafe {
             Ctx::device().cmd_clear_color_image(
                 self.handle,
                 image.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::GENERAL,
                 &F::clear_value(clear_color).color,
                 &[image.subresource_range()],
             )
@@ -1011,16 +933,14 @@ impl CommandBuffer {
     #[validation_trace]
     pub fn update_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: &T) {
         let _span = tracing::info_span!("update_buffer_element");
-        self.barriers(vec![(
-            buffer.into(),
-            ResourceState {
+        self.flush_pending(
+            iter::empty(),
+            iter::once(&BufferAccess {
+                stage: vk::PipelineStageFlags2::TRANSFER,
                 access: vk::AccessFlags2::TRANSFER_WRITE,
-                stages: vk::PipelineStageFlags2::TRANSFER,
-                layout: vk::ImageLayout::UNDEFINED,
-                ..Default::default()
-            },
-        )]);
-        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
+                range: buffer.get_range(),
+            }),
+        );
         unsafe {
             Ctx::device().cmd_update_buffer(
                 self.handle,
@@ -1039,27 +959,22 @@ impl CommandBuffer {
         filter: Filter,
     ) {
         let _span = tracing::info_span!("blit_image");
-        self.barriers(vec![
-            (
-                src.view.into(),
-                ResourceState {
+        self.flush_pending(
+            [
+                ImageAccess {
                     access: vk::AccessFlags2::TRANSFER_READ,
-                    stages: vk::PipelineStageFlags2::TRANSFER,
-                    layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    ..Default::default()
+                    stage: vk::PipelineStageFlags2::TRANSFER,
+                    image: src.view.view,
                 },
-            ),
-            (
-                dst.view.into(),
-                ResourceState {
+                ImageAccess {
                     access: vk::AccessFlags2::TRANSFER_WRITE,
-                    stages: vk::PipelineStageFlags2::TRANSFER,
-                    layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    ..Default::default()
+                    stage: vk::PipelineStageFlags2::TRANSFER,
+                    image: dst.view.view,
                 },
-            ),
-        ]);
-        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
+            ]
+            .iter(),
+            iter::empty(),
+        );
 
         let regions = [vk::ImageBlit {
             src_offsets: [
@@ -1078,16 +993,16 @@ impl CommandBuffer {
                     z: 1,
                 },
             ],
-            src_subresource: src.view.subresource_layers(),
-            dst_subresource: dst.view.subresource_layers(),
+            src_subresource: src.view.subresource_layers(src.view.mip_range.start),
+            dst_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
         }];
         unsafe {
             Ctx::device().cmd_blit_image(
                 self.handle,
                 src.view.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
                 dst.view.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::GENERAL,
                 &regions,
                 vk::Filter::from_raw(filter as i32),
             );
@@ -1111,71 +1026,58 @@ impl CommandBuffer {
         regions: &[BufferCopy],
     ) {
         let _span = tracing::info_span!("copy_buffer");
-        self.barriers(vec![
-            (
-                src.into(),
-                ResourceState {
+        self.flush_pending(
+            iter::empty(),
+            [
+                BufferAccess {
                     access: vk::AccessFlags2::TRANSFER_READ,
-                    stages: vk::PipelineStageFlags2::TRANSFER,
-                    layout: vk::ImageLayout::UNDEFINED,
-                    ..Default::default()
+                    stage: vk::PipelineStageFlags2::TRANSFER,
+                    range: src.get_range(),
                 },
-            ),
-            (
-                dst.into(),
-                ResourceState {
+                BufferAccess {
                     access: vk::AccessFlags2::TRANSFER_WRITE,
-                    stages: vk::PipelineStageFlags2::TRANSFER,
-                    layout: vk::ImageLayout::UNDEFINED,
-                    ..Default::default()
+                    stage: vk::PipelineStageFlags2::TRANSFER,
+                    range: dst.get_range(),
                 },
-            ),
-        ]);
-        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
+            ]
+            .iter(),
+        );
         unsafe { Ctx::device().cmd_copy_buffer(self.handle, src.handle, dst.handle, regions) };
     }
-    #[validation_trace]
 
+    #[validation_trace]
     pub fn copy_buffer_to_image<'a, T: Copy + Pod, F: Format, U: UsageSet>(
         &mut self,
         src: BufferSlice<'a, T>,
         dst: ImageSlice<'a, F, U>,
     ) {
         let _span = tracing::info_span!("copy_buffer_to_image");
-        self.barriers(vec![
-            (
-                src.into(),
-                ResourceState {
-                    access: vk::AccessFlags2::TRANSFER_READ,
-                    stages: vk::PipelineStageFlags2::TRANSFER,
-                    ..Default::default()
-                },
-            ),
-            (
-                dst.view.into(),
-                ResourceState {
-                    access: vk::AccessFlags2::TRANSFER_WRITE,
-                    stages: vk::PipelineStageFlags2::TRANSFER,
-                    layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    ..Default::default()
-                },
-            ),
-        ]);
+        self.flush_pending(
+            iter::once(&ImageAccess {
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                image: dst.view.view,
+            }),
+            iter::once(&BufferAccess {
+                access: vk::AccessFlags2::TRANSFER_READ,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: src.get_range(),
+            }),
+        );
         let regions = [vk::BufferImageCopy {
             image_extent: dst.extend,
-            image_subresource: dst.view.subresource_layers(),
+            image_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
             buffer_image_height: 0,
             buffer_offset: src.offset(),
             buffer_row_length: 0,
             image_offset: dst.offset,
         }];
-        self.last_stage = vk::PipelineStageFlags2::TRANSFER;
         unsafe {
             Ctx::device().cmd_copy_buffer_to_image(
                 self.handle,
                 src.handle,
                 dst.view.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::GENERAL,
                 &regions,
             )
         };
@@ -1183,28 +1085,28 @@ impl CommandBuffer {
 
     #[validation_trace]
     pub fn raster<'a, 'c: 'a, S: RasterPass>(&'c mut self) -> RasterBuilder<'a, 'c, S> {
-        self.last_stage = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
         RasterBuilder {
             write_depth: true,
             clear_depth: None,
             cmd_buf: self,
-            color_attachments: Vec::new(),
+            color_accesses: SmallVec::new(),
+            color_attachments: SmallVec::new(),
             depth_attachment: vk::ImageView::null(),
-            resource_states: Vec::new(),
             binding: None,
             hash: RasterHash {
                 backface_culling: true,
-                color_formats: Vec::new(),
+                color_formats: SmallVec::new(),
                 depth_format: vk::Format::UNDEFINED,
                 stencil_format: vk::Format::UNDEFINED,
                 wire_frame: false,
+                pipeline_index: S::PIPELINE_INDEX,
             },
+            depth_access: None,
         }
     }
 
     #[validation_trace]
     pub fn compute<'a, 'c: 'a, S: ComputePass>(&'c mut self) -> ComputeBuilder<'a, 'c, S> {
-        self.last_stage = vk::PipelineStageFlags2::COMPUTE_SHADER;
         ComputeBuilder {
             cmd_buffer: self,
             binding: None,
@@ -1212,7 +1114,6 @@ impl CommandBuffer {
     }
     #[validation_trace]
     pub fn raytrace<'a, 'c: 'a, S: RayTracingPass>(&'c mut self) -> RayTracingBuilder<'a, 'c, S> {
-        self.last_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         RayTracingBuilder {
             binding: None,
             cmd_buffer: self,
@@ -1221,15 +1122,14 @@ impl CommandBuffer {
     #[validation_trace]
     pub fn present<'a, F: Format, U: UsageSet>(&'a mut self, swapchain_image: ImageView<'a, F, U>) {
         let _span = tracing::info_span!("present_barriers");
-        self.barriers(vec![(
-            swapchain_image.into(),
-            ResourceState {
+        self.flush_pending(
+            iter::once(&ImageAccess {
                 access: vk::AccessFlags2::empty(),
-                layout: vk::ImageLayout::PRESENT_SRC_KHR,
-                stages: self.last_stage,
-                ..Default::default()
-            },
-        )]);
+                stage: vk::PipelineStageFlags2::empty(),
+                image: swapchain_image.view,
+            }),
+            iter::empty(),
+        );
     }
 
     fn push_constants<'b, B: Binding>(&mut self, binding: &B::CpuBinding<'b>) {
@@ -1246,252 +1146,77 @@ impl CommandBuffer {
         };
     }
 
-    #[validation_trace]
-    pub fn image_barrier<F: Format, U: UsageSet>(
+    pub(crate) fn flush_pending<'a>(
         &mut self,
-        resource: ImageView<F, U>,
-        src_access: vk::AccessFlags2,
-        dst_access: vk::AccessFlags2,
-        src_stage: vk::PipelineStageFlags2,
-        dst_stage: vk::PipelineStageFlags2,
-        old_layout: vk::ImageLayout,
-        new_layout: vk::ImageLayout,
-        src_index: u32,
-        dst_index: u32,
+        image_acceses: impl Iterator<Item = &'a ImageAccess> + Clone,
+        buffer_acceses: impl Iterator<Item = &'a BufferAccess> + Clone,
     ) {
-        let image_memory_barriers = [vk::ImageMemoryBarrier2 {
-            src_access_mask: src_access,
-            dst_access_mask: dst_access,
-            src_queue_family_index: src_index,
-            dst_queue_family_index: dst_index,
-            src_stage_mask: src_stage,
-            dst_stage_mask: dst_stage,
-            image: resource.image,
-            subresource_range: resource.subresource_range(),
-            old_layout,
-            new_layout,
-            ..Default::default()
-        }];
-        let dependency_info = vk::DependencyInfo::default()
-            .image_memory_barriers(&image_memory_barriers)
-            .dependency_flags(vk::DependencyFlags::BY_REGION);
-        unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
-    }
+        let mut src_stage = vk::PipelineStageFlags2::NONE;
+        let mut dst_stage = vk::PipelineStageFlags2::NONE;
+        let mut src_access = vk::AccessFlags2::empty();
+        let mut dst_access = vk::AccessFlags2::empty();
 
-    // pub fn execute_in_place<'a>(
-    //     &'a mut self,
-    //     gpu_done_event: &Event,
-    //     cpu_done_event: &Event,
-    //     f: impl FnOnce() + Send + 'a,
-    // ) {
-    //     struct EventCallback {
-    //         gpu_event: vk::Event,
-    //         cpu_event: vk::Event,
-    //         callback: Box<dyn FnOnce() + Send + 'static>,
-    //     }
-    //     struct Thread {
-    //         sender: std::sync::mpsc::Sender<EventCallback>,
-    //     }
+        for buffer_access in buffer_acceses.clone() {
+            let is_write = buffer_access.access.contains(all_write_access());
+            let is_read = buffer_access.access.contains(all_read_access());
 
-    //     static THREAD: OnceLock<Thread> = OnceLock::new();
-
-    //     let thread = THREAD.get_or_init(|| {
-    //         let (sender, receiver) = std::sync::mpsc::channel::<EventCallback>();
-
-    //         std::thread::spawn(move || {
-    //             let mut events = Vec::new();
-    //             loop {
-    //                 if events.is_empty() {
-    //                     events.push(receiver.recv().unwrap())
-    //                 } else {
-    //                     if let Ok(e) = receiver.try_recv() {
-    //                         events.push(e);
-    //                     }
-    //                 };
-    //                 let mut i = 0;
-    //                 while i < events.len() {
-    //                     if (unsafe { Ctx::device().get_event_status(events[i].gpu_event) }).unwrap()
-    //                     {
-    //                         let EventCallback {
-    //                             callback,
-    //                             cpu_event,
-    //                             gpu_event,
-    //                         } = events.swap_remove(i);
-    //                         callback();
-    //                         unsafe { Ctx::device().set_event(cpu_event).unwrap() };
-    //                         unsafe { Ctx::device().reset_event(gpu_event).unwrap() };
-    //                     } else {
-    //                         i += 1;
-    //                     }
-    //                 }
-    //                 std::thread::yield_now();
-    //             }
-    //         });
-
-    //         Thread { sender }
-    //     });
-
-    //     thread
-    //         .sender
-    //         .send(EventCallback {
-    //             cpu_event: cpu_done_event.handle,
-    //             gpu_event: gpu_done_event.handle,
-    //             callback: unsafe {
-    //                 std::mem::transmute(Box::new(f) as Box<dyn FnOnce() + Send + 'a>)
-    //             },
-    //         })
-    //         .unwrap();
-
-    //     let mem = vk::MemoryBarrier2 {
-    //         src_access_mask: vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_READ,
-    //         src_stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
-    //         dst_access_mask: vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE,
-    //         dst_stage_mask: vk::PipelineStageFlags2::HOST,
-    //         ..Default::default()
-    //     };
-    //     let mem2 = vk::MemoryBarrier2 {
-    //         src_access_mask: vk::AccessFlags2::HOST_READ | vk::AccessFlags2::HOST_WRITE,
-    //         src_stage_mask: vk::PipelineStageFlags2::HOST,
-    //         dst_access_mask: vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
-    //         dst_stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS,
-    //         ..Default::default()
-    //     };
-    //     unsafe {
-    //         Ctx::device().cmd_set_event2(
-    //             self.handle,
-    //             gpu_done_event.handle,
-    //             &vk::DependencyInfo::default()
-    //                 .memory_barriers(&[mem]),
-    //         );
-    //         Ctx::device().cmd_wait_events2(
-    //             self.handle,
-    //             &[cpu_done_event.handle],
-    //             &[vk::DependencyInfo::default().memory_barriers(&[mem2])],
-    //         );
-    //         Ctx::device().cmd_reset_event2(
-    //             self.handle,
-    //             cpu_done_event.handle,
-    //             vk::PipelineStageFlags2::ALL_COMMANDS,
-    //         );
-    //     }
-    // }
-    #[validation_trace]
-    pub fn buffer_barrier<T: Copy + Pod>(
-        &mut self,
-        resource: BufferSlice<T>,
-        src_access: vk::AccessFlags2,
-        dst_access: vk::AccessFlags2,
-        src_stage: vk::PipelineStageFlags2,
-        dst_stage: vk::PipelineStageFlags2,
-        src_index: u32,
-        dst_index: u32,
-    ) {
-        let buffer_memory_barriers = [vk::BufferMemoryBarrier2 {
-            src_access_mask: src_access,
-            dst_access_mask: dst_access,
-            src_queue_family_index: src_index,
-            dst_queue_family_index: dst_index,
-            src_stage_mask: src_stage,
-            dst_stage_mask: dst_stage,
-            buffer: resource.handle,
-            offset: resource.offset(),
-            size: resource.size,
-            ..Default::default()
-        }];
-        let dependency_info = vk::DependencyInfo::default()
-            .buffer_memory_barriers(&buffer_memory_barriers)
-            .dependency_flags(vk::DependencyFlags::BY_REGION);
-        unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
-    }
-
-    fn barriers(&mut self, resources: Vec<(ResourceHandle, ResourceState)>) {
-        let _span = tracing::info_span!("barriers");
-        let mut image_barriers = Vec::new();
-        let mut buffer_barriers = Vec::new();
-        for (resource, new) in resources {
-            let prev = self
-                .resource_hashes
-                .get(&resource)
-                .copied()
-                .unwrap_or(ResourceState {
-                    stages: vk::PipelineStageFlags2::TOP_OF_PIPE,
-                    access: vk::AccessFlags2::NONE,
-                    layout: vk::ImageLayout::UNDEFINED,
-                    ..Default::default()
-                });
-
-            let read_flags = vk::AccessFlags2::SHADER_STORAGE_READ
-                | vk::AccessFlags2::SHADER_SAMPLED_READ
-                | vk::AccessFlags2::COLOR_ATTACHMENT_READ
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                | vk::AccessFlags2::TRANSFER_READ;
-            let write_flags = vk::AccessFlags2::SHADER_STORAGE_WRITE
-                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-                | vk::AccessFlags2::TRANSFER_WRITE;
-            let read_to_read = prev.access.contains(read_flags)
-                && !prev.access.contains(write_flags)
-                && new.access.contains(read_flags)
-                && !new.access.contains(write_flags);
-            let same_layout = prev.layout == new.layout;
-            let first_use = prev.stages.contains(vk::PipelineStageFlags2::TOP_OF_PIPE);
-
-            let need_barrier = !read_to_read || !same_layout || !first_use;
-
-            if need_barrier {
-                let src_stage_mask = prev.stages;
-                let dst_stage_mask = new.stages;
-                match resource {
-                    ResourceHandle::Buffer { buffer, .. } => {
-                        buffer_barriers.push(vk::BufferMemoryBarrier2 {
-                            src_access_mask: prev.access,
-                            dst_access_mask: new.access,
-                            src_stage_mask,
-                            dst_stage_mask,
-                            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                            buffer: buffer,
-                            offset: 0,
-                            size: vk::WHOLE_SIZE,
-                            ..Default::default()
-                        })
-                    }
-                    ResourceHandle::Image {
-                        image,
-                        view: _,
-                        aspect,
-                        base_mip,
-                        num_mips,
-                    } => image_barriers.push(vk::ImageMemoryBarrier2 {
-                        src_access_mask: prev.access,
-                        dst_access_mask: new.access,
-                        src_stage_mask,
-                        dst_stage_mask,
-                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        image: image,
-                        old_layout: prev.layout,
-                        new_layout: new.layout,
-                        subresource_range: vk::ImageSubresourceRange {
-                            aspect_mask: aspect,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                            base_mip_level: base_mip,
-                            level_count: num_mips,
-                        },
-                        ..Default::default()
-                    }),
-                };
+            if is_write {
+                for pending in self
+                    .pending_accesses
+                    .buffer_reads
+                    .iter()
+                    .filter(|r| !r.range.intersect(buffer_access.range).is_empty())
+                {
+                    src_stage |= pending.stage;
+                    dst_stage |= buffer_access.stage;
+                }
             }
-            self.resource_hashes.insert(resource.clone(), new.clone());
+            for w in self
+                .pending_accesses
+                .buffer_writes
+                .iter()
+                .filter(|w| !w.range.intersect(buffer_access.range).is_empty())
+            {
+                if is_read || is_write {
+                    src_stage |= w.stage;
+                    src_access |= w.access;
+                    dst_stage |= buffer_access.stage;
+                    dst_access |= buffer_access.access;
+                }
+            }
         }
-        if !image_barriers.is_empty() || !buffer_barriers.is_empty() {
-            let dependency_info = vk::DependencyInfo::default()
-                .buffer_memory_barriers(&buffer_barriers)
-                .image_memory_barriers(&image_barriers)
-                .dependency_flags(vk::DependencyFlags::BY_REGION);
-            unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &dependency_info) };
+
+        for image_access in image_acceses {
+            let is_write = image_access.access.intersects(all_write_access());
+            let is_read = image_access.access.intersects(all_read_access());
+
+            if is_write {
+                for pending in self
+                    .pending_accesses
+                    .image_reads
+                    .iter()
+                    .filter(|r| r.image == image_access.image)
+                {
+                    src_stage |= pending.stage;
+                    dst_stage |= image_access.stage;
+                }
+            }
+            for w in self
+                .pending_accesses
+                .image_writes
+                .iter()
+                .filter(|r| r.image == image_access.image)
+            {
+                if is_read || is_write {
+                    src_stage |= w.stage;
+                    src_access |= w.access;
+                    dst_stage |= image_access.stage;
+                    dst_access |= image_access.access;
+                }
+            }
         }
+
+        let mut info = vk::DependencyInfo::default();
     }
 
     pub(crate) fn begin(&mut self) {
@@ -1503,4 +1228,52 @@ impl CommandBuffer {
     pub(crate) fn end(&mut self) {
         unsafe { Ctx::device().end_command_buffer(self.handle) }.unwrap();
     }
+}
+
+fn all_write_access() -> vk::AccessFlags2 {
+    vk::AccessFlags2::SHADER_WRITE
+        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+        | vk::AccessFlags2::TRANSFER_WRITE
+        | vk::AccessFlags2::HOST_WRITE
+        | vk::AccessFlags2::MEMORY_WRITE
+        | vk::AccessFlags2::SHADER_STORAGE_WRITE
+        | vk::AccessFlags2::TRANSFORM_FEEDBACK_WRITE_EXT
+        | vk::AccessFlags2::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT
+        | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR
+        | vk::AccessFlags2::COMMAND_PREPROCESS_WRITE_NV
+        | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR
+        | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR
+        | vk::AccessFlags2::MICROMAP_WRITE_EXT
+        | vk::AccessFlags2::OPTICAL_FLOW_WRITE_NV
+}
+
+fn all_read_access() -> vk::AccessFlags2 {
+    vk::AccessFlags2::INDIRECT_COMMAND_READ
+        | vk::AccessFlags2::INDEX_READ
+        | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
+        | vk::AccessFlags2::UNIFORM_READ
+        | vk::AccessFlags2::INPUT_ATTACHMENT_READ
+        | vk::AccessFlags2::SHADER_READ
+        | vk::AccessFlags2::COLOR_ATTACHMENT_READ
+        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+        | vk::AccessFlags2::TRANSFER_READ
+        | vk::AccessFlags2::HOST_READ
+        | vk::AccessFlags2::MEMORY_READ
+        | vk::AccessFlags2::SHADER_SAMPLED_READ
+        | vk::AccessFlags2::SHADER_STORAGE_READ
+        | vk::AccessFlags2::SHADER_BINDING_TABLE_READ_KHR
+        | vk::AccessFlags2::TRANSFORM_FEEDBACK_COUNTER_READ_EXT
+        | vk::AccessFlags2::CONDITIONAL_RENDERING_READ_EXT
+        | vk::AccessFlags2::COLOR_ATTACHMENT_READ_NONCOHERENT_EXT
+        | vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
+        | vk::AccessFlags2::FRAGMENT_DENSITY_MAP_READ_EXT
+        | vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR
+        | vk::AccessFlags2::COMMAND_PREPROCESS_READ_NV
+        | vk::AccessFlags2::DESCRIPTOR_BUFFER_READ_EXT
+        | vk::AccessFlags2::INVOCATION_MASK_READ_HUAWEI
+        | vk::AccessFlags2::VIDEO_DECODE_READ_KHR
+        | vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
+        | vk::AccessFlags2::MICROMAP_READ_EXT
+        | vk::AccessFlags2::OPTICAL_FLOW_READ_NV
 }

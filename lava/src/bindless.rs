@@ -223,7 +223,7 @@ impl Bindless {
         handle: BindlessHandle,
     ) {
         let image_info = [vk::DescriptorImageInfo {
-            image_layout: U::PREFERED_LAYOUT,
+            image_layout: vk::ImageLayout::GENERAL,
             image_view: image.view,
             ..Default::default()
         }];

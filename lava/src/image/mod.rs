@@ -20,20 +20,19 @@ pub mod slice;
 pub mod usage;
 
 #[derive(Debug)]
-pub struct Image<F: Format = Undefined, U: UsageSet = Unknown> {
+pub struct Image<const M: u32 = 1, F: Format = Undefined, U: UsageSet = Unknown> {
     pub image: vk::Image,
     pub whole_view: vk::ImageView,
     pub allocation: Allocation,
-    pub mips: u32,
     pub extent: vk::Extent3D,
     pub handle: Option<BindlessHandle>,
     _format: PhantomData<F>,
     _usage: PhantomData<U>,
 }
 
-impl<F: Format, U: UsageSet> Image<F, U> {
+impl<const M: u32, F: Format, U: UsageSet> Image<M, F, U> {
     #[validation_trace]
-    pub fn new_mipped(width: u32, height: u32, mips: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32) -> Result<Self> {
         let extent = vk::Extent3D {
             width,
             height,
@@ -44,8 +43,7 @@ impl<F: Format, U: UsageSet> Image<F, U> {
             extent,
             format: F::format(),
             image_type: vk::ImageType::TYPE_2D,
-            initial_layout: vk::ImageLayout::UNDEFINED,
-            mip_levels: mips,
+            mip_levels: M,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
@@ -57,6 +55,7 @@ impl<F: Format, U: UsageSet> Image<F, U> {
                 } else {
                     vk::ImageUsageFlags::empty()
                 },
+            initial_layout: vk::ImageLayout::GENERAL,
             ..Default::default()
         };
 
@@ -83,13 +82,11 @@ impl<F: Format, U: UsageSet> Image<F, U> {
             allocation,
             extent,
             image,
-            mips,
             whole_view: vk::ImageView::null(),
         };
         let (handle, view) = {
             let view = s.create_new_view(
-                0,
-                mips,
+                (0..M).into(),
                 vk::ComponentMapping {
                     r: ComponentSwizzle::R,
                     g: ComponentSwizzle::G,
@@ -105,12 +102,7 @@ impl<F: Format, U: UsageSet> Image<F, U> {
         Ok(s)
     }
 
-    #[validation_trace]
-    pub fn new(width: u32, height: u32) -> Result<Self> {
-        Self::new_mipped(width, height, 1)
-    }
-
-    pub fn cast<NF: Format, NU: UsageSet>(self) -> Image<NF, NU> {
+    pub fn cast<NF: Format, NU: UsageSet>(self) -> Image<M, NF, NU> {
         unsafe { std::mem::transmute(self) }
     }
 }

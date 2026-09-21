@@ -4,6 +4,7 @@ use anyhow::Result;
 use ash::vk::{self};
 use glam::UVec2;
 use lava_macros::validation_trace;
+use smallvec::SmallVec;
 
 use crate::{
     bindless::Bindless,
@@ -18,7 +19,7 @@ pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 pub struct Swapchain<'a> {
     pub size: UVec2,
     pub(crate) handle: vk::SwapchainKHR,
-    pub images: Vec<ImageView<'a, format::Swapchain, ColorAttachmentStorage>>,
+    pub images: SmallVec<[ImageView<'a, format::Swapchain, ColorAttachmentStorage>; 5]>,
 }
 
 impl<'a> Swapchain<'a> {
@@ -147,8 +148,7 @@ impl<'a> Swapchain<'a> {
                     handle: None,
                     image,
                     view,
-                    base_mip: 0,
-                    num_mips: 1,
+                    mip_range: (0..1).into(),
                     _marker: PhantomData,
                     _marker2: PhantomData,
                     _marker3: PhantomData,
@@ -164,7 +164,7 @@ impl<'a> Swapchain<'a> {
                 }
                 image
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[ImageView<'_, format::Swapchain, ColorAttachmentStorage>; 5]>>();
 
         Ok(Self {
             handle,

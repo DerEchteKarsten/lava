@@ -1,7 +1,8 @@
 use ash::vk;
 use bytemuck::Pod;
-use std::ops::RangeBounds;
 use std::marker::PhantomData;
+use std::ops::RangeBounds;
+use std::range::Range;
 
 use crate::buffer::Buffer;
 
@@ -88,6 +89,9 @@ impl<T: Copy + Pod> Buffer<T> {
 }
 
 impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
+    pub fn get_range(&self) -> Range<u64> {
+        (self.gpu_ptr..(self.gpu_ptr + self.size)).into()
+    }
     pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
         new_slice(
             self.handle,

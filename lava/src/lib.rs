@@ -1,5 +1,7 @@
 #![feature(const_trait_impl)]
-
+#![feature(range_into_bounds)]
+#![feature(range_bounds_is_empty)]
+#![feature(generic_const_exprs)]
 use std::panic::Location;
 
 use crate::state::CALLSITE;
@@ -10,6 +12,7 @@ pub use ash::vk::Pipeline as VkPipeline;
 pub use ash::vk::ShaderModule as VkShaderModule;
 pub use ash::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
 
+pub mod bindings;
 pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;

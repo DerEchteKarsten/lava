@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, range::Range};
 
 use ash::vk::{self, Offset3D};
 use glam::UVec2;
@@ -17,81 +17,27 @@ use crate::{
 pub struct ImageView<'a, F: Format = Undefined, U: UsageSet = Unknown> {
     pub image: vk::Image,
     pub view: vk::ImageView,
-    pub base_mip: u32,
-    pub num_mips: u32,
+    pub mip_range: Range<u32>,
     pub handle: Option<BindlessHandle>,
     pub(crate) _marker: PhantomData<F>,
     pub(crate) _marker2: PhantomData<U>,
     pub(crate) _marker3: PhantomData<&'a ()>,
 }
 
-#[derive(Clone, Copy)]
-pub struct StorageImageViewBinding<'a> {
-    pub aspect: vk::ImageAspectFlags,
-    pub prefered_layout: vk::ImageLayout,
-    pub view: vk::ImageView,
-    pub image: vk::Image,
-    pub handle: BindlessHandle,
-    pub base_mip: u32,
-    pub num_mips: u32,
-    marker: PhantomData<&'a ()>,
-}
-#[derive(Clone, Copy)]
-pub struct SampledImageViewBinding<'a> {
-    pub aspect: vk::ImageAspectFlags,
-    pub prefered_layout: vk::ImageLayout,
-    pub view: vk::ImageView,
-    pub image: vk::Image,
-    pub handle: BindlessHandle,
-    pub base_mip: u32,
-    pub num_mips: u32,
-    marker: PhantomData<&'a ()>,
-}
-
-impl<'a, F: Format, U: IsStorage> ImageView<'a, F, U> {
-    pub fn as_storage(self) -> StorageImageViewBinding<'a> {
-        StorageImageViewBinding {
-            aspect: F::ASPECTS,
-            prefered_layout: U::PREFERED_LAYOUT,
-            view: self.view,
-            image: self.image,
-            handle: self.handle.unwrap(),
-            base_mip: self.base_mip,
-            num_mips: self.num_mips,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<'a, F: Format, U: IsSampled> ImageView<'a, F, U> {
-    pub fn as_sampled(self) -> SampledImageViewBinding<'a> {
-        SampledImageViewBinding {
-            aspect: F::ASPECTS,
-            prefered_layout: U::PREFERED_LAYOUT,
-            view: self.view,
-            image: self.image,
-            handle: self.handle.unwrap(),
-            base_mip: self.base_mip,
-            num_mips: self.num_mips,
-            marker: PhantomData,
-        }
-    }
-}
-
 impl<'a, F: Format, U: UsageSet> ImageView<'a, F, U> {
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
             aspect_mask: F::ASPECTS,
-            base_mip_level: self.base_mip,
-            level_count: self.num_mips,
+            base_mip_level: self.mip_range.start,
+            level_count: self.mip_range.end - self.mip_range.start,
             base_array_layer: 0,
             layer_count: 1,
         }
     }
-    pub fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
+    pub fn subresource_layers(&self, mip_level: u32) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
             aspect_mask: F::ASPECTS,
-            mip_level: self.base_mip,
+            mip_level: mip_level,
             base_array_layer: 0,
             layer_count: 1,
         }
@@ -109,17 +55,6 @@ impl<'a, F: Format, U: UsageSet> ImageView<'a, F, U> {
     }
     pub fn cast<NF: Format, NU: UsageSet>(self) -> ImageView<'a, NF, NU> {
         unsafe { std::mem::transmute(self) }
-    }
-}
-
-impl<F: Format, U: IsStorage> Image<F, U> {
-    pub fn as_storage<'a>(&'a self) -> StorageImageViewBinding<'a> {
-        self.view().as_storage()
-    }
-}
-impl<F: Format, U: IsSampled> Image<F, U> {
-    pub fn as_sampled<'a>(&'a self) -> SampledImageViewBinding<'a> {
-        self.view().as_sampled()
     }
 }
 
@@ -147,12 +82,12 @@ impl<'a, F: Format, U: UsageSet> ImageSlice<'a, F, U> {
         unsafe { std::mem::transmute(self) }
     }
 
-    pub fn copy_from(&self, data: &[u8]) {
+    pub fn copy_from(&self, data: &[u8], mip_level: u32) {
         let regions = [vk::MemoryToImageCopyEXT::default()
             .host_pointer(data.as_ptr().cast())
             .image_extent(self.extend)
             .image_offset(self.offset)
-            .image_subresource(self.view.subresource_layers())
+            .image_subresource(self.view.subresource_layers(mip_level))
             .memory_image_height(self.extend.height)
             .memory_row_length(self.extend.width)];
         let copy_memory_to_image_info = vk::CopyMemoryToImageInfoEXT::default()
@@ -167,30 +102,36 @@ impl<'a, F: Format, U: UsageSet> ImageSlice<'a, F, U> {
     }
 }
 
-impl<F: Format, U: UsageSet> AsImage for Image<F, U> {
+impl<const M: u32, F: Format, U: UsageSet> AsImage<M> for Image<M, F, U> {
     type Format = F;
     type Usage = U;
-    fn get_ref(&self) -> &Image<Self::Format, Self::Usage> {
+
+    fn mip_range(&self) -> Range<u32> {
+        (0..M).into()
+    }
+    fn get_ref(&self) -> &Image<M, Self::Format, Self::Usage> {
         self
     }
-    fn get_mut(&mut self) -> &mut Image<Self::Format, Self::Usage> {
+    fn get_mut(&mut self) -> &mut Image<M, Self::Format, Self::Usage> {
         self
     }
 }
 
-pub trait AsImage {
+pub trait AsImage<const M: u32> {
     type Format: Format;
     type Usage: UsageSet;
-    fn get_ref(&self) -> &Image<Self::Format, Self::Usage>;
-    fn get_mut(&mut self) -> &mut Image<Self::Format, Self::Usage>;
 
-    fn view<'a>(&'a self) -> ImageView<'a, Self::Format, Self::Usage> {
+    fn mip_range(&self) -> Range<u32>;
+    fn get_ref(&self) -> &Image<M, Self::Format, Self::Usage>;
+    fn get_mut(&mut self) -> &mut Image<M, Self::Format, Self::Usage>;
+
+    fn whole_view<'a>(&'a self) -> ImageView<'a, Self::Format, Self::Usage> {
+        let mip_range = self.mip_range();
         let image = self.get_ref();
         ImageView {
             image: image.image,
             view: image.whole_view,
-            base_mip: 0,
-            num_mips: image.mips,
+            mip_range: mip_range,
             handle: image.handle,
             _marker: PhantomData,
             _marker2: PhantomData,
@@ -199,8 +140,7 @@ pub trait AsImage {
     }
     fn create_new_view<'a>(
         &'a self,
-        base_mip: u32,
-        num_mips: u32,
+        mip_range: Range<u32>,
         swizzel: vk::ComponentMapping,
     ) -> ImageView<'a, Self::Format, Self::Usage> {
         let image = self.get_ref();
@@ -213,15 +153,14 @@ pub trait AsImage {
                 aspect_mask: Self::Format::ASPECTS,
                 base_array_layer: 0,
                 layer_count: 1,
-                base_mip_level: base_mip,
-                level_count: num_mips,
+                base_mip_level: mip_range.start,
+                level_count: mip_range.end - mip_range.start,
             });
         let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
         ImageView {
             image: image.image,
             view,
-            num_mips,
-            base_mip,
+            mip_range: mip_range,
             handle: image.handle,
             _marker: PhantomData,
             _marker2: PhantomData,
@@ -232,7 +171,7 @@ pub trait AsImage {
     fn whole<'a>(&'a self) -> ImageSlice<'a, Self::Format, Self::Usage> {
         let image = self.get_ref();
         ImageSlice {
-            view: self.view(),
+            view: self.whole_view(),
             extend: image.extent,
             offset: Offset3D::default(),
         }

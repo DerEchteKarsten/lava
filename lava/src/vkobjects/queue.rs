@@ -9,9 +9,10 @@ use std::{
 use anyhow::{Result, anyhow};
 use ash::vk;
 use lava_macros::validation_trace;
+use smallvec::SmallVec;
 
 use crate::{
-    command_buffer::{CommandBuffer, ResourceHandle, ResourceState},
+    command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -292,6 +293,14 @@ impl Drop for CommandBufferMemory {
     }
 }
 
+#[derive(Debug)]
+pub struct PendingAccesses {
+    pub(crate) buffer_reads: SmallVec<[BufferAccess; 8]>,
+    pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
+    pub(crate) buffer_writes: SmallVec<[BufferAccess; 8]>,
+    pub(crate) image_writes: SmallVec<[ImageAccess; 8]>,
+}
+
 impl<Q: QueueFamilie> Queue<Q> {
     #[validation_trace]
     pub fn new() -> Result<Self> {
@@ -334,18 +343,17 @@ impl<Q: QueueFamilie> Queue<Q> {
     #[validation_trace]
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
-        resource_state: Option<HashMap<ResourceHandle, ResourceState>>,
+        pending: PendingAccesses,
         buffer: &CommandBufferMemory,
         fence: Option<&Fence>,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
         executor: F,
-    ) -> Result<HashMap<ResourceHandle, ResourceState>> {
+    ) -> Result<PendingAccesses> {
         unsafe {
             let mut cmd_buffer = CommandBuffer {
                 handle: buffer.handle,
-                last_stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
-                resource_hashes: resource_state.unwrap_or(HashMap::new()),
+                pending_accesses: pending,
             };
 
             cmd_buffer.begin();
@@ -356,14 +364,25 @@ impl<Q: QueueFamilie> Queue<Q> {
 
             let cmd_buffer_submit_info =
                 vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
-            let wait_infos: Vec<_> = wait_on
+            let wait_infos: SmallVec<[_; 1]> = wait_on
                 .iter()
                 .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
                 .collect();
-            let signal_infos: Vec<_> = signal
-                .iter()
-                .map(|sem| sem.to_vk(cmd_buffer.last_stage))
-                .collect();
+            let mut last_stage = vk::PipelineStageFlags2::empty();
+            for i in &cmd_buffer.pending_accesses.image_reads {
+                last_stage |= i.stage;
+            }
+            for i in &cmd_buffer.pending_accesses.image_writes {
+                last_stage |= i.stage;
+            }
+            for i in &cmd_buffer.pending_accesses.buffer_reads {
+                last_stage |= i.stage;
+            }
+            for i in &cmd_buffer.pending_accesses.buffer_writes {
+                last_stage |= i.stage;
+            }
+            let signal_infos: SmallVec<[_; 1]> =
+                signal.iter().map(|sem| sem.to_vk(last_stage)).collect();
 
             let submit_info = vk::SubmitInfo2::default()
                 .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info))
@@ -376,7 +395,7 @@ impl<Q: QueueFamilie> Queue<Q> {
                 fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
             )?;
 
-            Ok(cmd_buffer.resource_hashes)
+            Ok(cmd_buffer.pending_accesses)
         }
     }
 
