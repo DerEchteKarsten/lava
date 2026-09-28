@@ -1,7 +1,6 @@
 #![feature(const_trait_impl)]
 #![feature(range_into_bounds)]
 #![feature(range_bounds_is_empty)]
-#![feature(generic_const_exprs)]
 use std::panic::Location;
 
 use crate::state::CALLSITE;
@@ -34,6 +33,7 @@ pub fn init(
         enable_gpu_assited_validation,
     )?;
     Bindless::init()?;
+    command_buffer::init();
     Ok(())
 }
 

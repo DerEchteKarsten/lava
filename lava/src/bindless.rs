@@ -8,7 +8,7 @@ use crate::{
     image::{
         format::Format,
         slice::ImageView,
-        usage::{BindlessImageUsageSet, UsageSet},
+        usage::{BindlessImageUsageSet, ImageUsage},
     },
     state::Ctx,
 };
@@ -190,7 +190,7 @@ impl Bindless {
         Ok(())
     }
 
-    pub(crate) fn push<F: Format, U: UsageSet>(image: ImageView<F, U>) -> Option<BindlessHandle> {
+    pub(crate) fn push<F: Format, U: ImageUsage>(image: ImageView<F, U>) -> Option<BindlessHandle> {
         let handle = match U::SET {
             BindlessImageUsageSet::None => return None,
             BindlessImageUsageSet::Both => BindlessHandle {
@@ -218,7 +218,7 @@ impl Bindless {
         Some(handle)
     }
 
-    pub(crate) fn write_image<F: Format, U: UsageSet>(
+    pub(crate) fn write_image<F: Format, U: ImageUsage>(
         image: ImageView<F, U>,
         handle: BindlessHandle,
     ) {

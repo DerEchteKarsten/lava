@@ -1,6 +1,6 @@
 use ash::vk;
 
-pub trait UsageSet: 'static + Copy + Clone {
+pub trait ImageUsage: 'static + Copy + Clone {
     const VK: vk::ImageUsageFlags;
     const SET: BindlessImageUsageSet;
 }
@@ -25,47 +25,47 @@ pub struct DepthAttachmentSampled;
 #[derive(Clone, Copy, Debug)]
 pub struct SampledStorage;
 
-impl UsageSet for Unknown {
+impl ImageUsage for Unknown {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::empty();
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::None;
 }
 
-impl UsageSet for Sampled {
+impl ImageUsage for Sampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::SampledImage;
 }
-impl UsageSet for Storage {
+impl ImageUsage for Storage {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::STORAGE;
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::StorageImage;
 }
-impl UsageSet for ColorAttachment {
+impl ImageUsage for ColorAttachment {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::COLOR_ATTACHMENT;
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::None;
 }
-impl UsageSet for DepthAttachment {
+impl ImageUsage for DepthAttachment {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::None;
 }
-impl UsageSet for ColorAttachmentSampled {
+impl ImageUsage for ColorAttachmentSampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::SAMPLED.as_raw(),
     );
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::SampledImage;
 }
-impl UsageSet for DepthAttachmentSampled {
+impl ImageUsage for DepthAttachmentSampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT.as_raw()
             | vk::ImageUsageFlags::SAMPLED.as_raw(),
     );
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::SampledImage;
 }
-impl UsageSet for ColorAttachmentStorage {
+impl ImageUsage for ColorAttachmentStorage {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw(),
     );
     const SET: BindlessImageUsageSet = BindlessImageUsageSet::StorageImage;
 }
-impl UsageSet for SampledStorage {
+impl ImageUsage for SampledStorage {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw(),
     );
@@ -79,10 +79,10 @@ pub enum BindlessImageUsageSet {
     Both,
 }
 
-pub trait IsSampled: UsageSet {}
-pub trait IsStorage: UsageSet {}
-pub trait IsColorAttachment: UsageSet {}
-pub trait IsDepthAttachment: UsageSet {}
+pub trait IsSampled: ImageUsage {}
+pub trait IsStorage: ImageUsage {}
+pub trait IsColorAttachment: ImageUsage {}
+pub trait IsDepthAttachment: ImageUsage {}
 
 impl IsSampled for Sampled {}
 impl IsSampled for ColorAttachmentSampled {}

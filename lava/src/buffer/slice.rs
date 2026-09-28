@@ -4,9 +4,12 @@ use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::range::Range;
 
-use crate::buffer::Buffer;
+use crate::buffer::{
+    Buffer,
+    usage::{BufferUsage, Storage},
+};
 
-impl<'a, T: Pod + Copy> IntoIterator for BufferSlice<'a, T> {
+impl<'a, T: Pod + Copy, U: BufferUsage> IntoIterator for BufferSlice<'a, T, U> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
 
@@ -16,24 +19,25 @@ impl<'a, T: Pod + Copy> IntoIterator for BufferSlice<'a, T> {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct BufferSlice<'a, T: Copy + Pod> {
+pub struct BufferSlice<'a, T: Copy + Pod, U: BufferUsage = Storage> {
     pub handle: vk::Buffer,
     pub size: u64,
     pub cpu_ptr: usize,
     pub gpu_ptr: u64,
     pub base_address: u64,
     pub(crate) _marker: PhantomData<T>,
+    pub(crate) _usage: PhantomData<U>,
     pub(crate) _lifetime: PhantomData<&'a ()>,
 }
 
-fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
+fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
     handle: vk::Buffer,
     index: R,
     cpu_ptr: usize,
     size: u64,
     address: u64,
     base_address: u64,
-) -> BufferSlice<'a, T> {
+) -> BufferSlice<'a, T, U> {
     let start_offset = match index.start_bound() {
         std::ops::Bound::Unbounded => 0,
         std::ops::Bound::Excluded(size) => ((size + 1) * size_of::<T>()) as u64,
@@ -54,12 +58,13 @@ fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
         gpu_ptr: address + start_offset,
         base_address,
         _marker: PhantomData,
+        _usage: PhantomData,
         _lifetime: PhantomData,
     }
 }
 
-impl<T: Copy + Pod> Buffer<T> {
-    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
+impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
+    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T, U> {
         new_slice(
             self.handle,
             index,
@@ -72,8 +77,8 @@ impl<T: Copy + Pod> Buffer<T> {
             self.address,
         )
     }
-    pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
-        new_slice::<u8, R>(
+    pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, u8, U> {
+        new_slice::<u8, R, U>(
             self.handle,
             index.into(),
             self.allocation
@@ -88,11 +93,11 @@ impl<T: Copy + Pod> Buffer<T> {
     }
 }
 
-impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
+impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     pub fn get_range(&self) -> Range<u64> {
         (self.gpu_ptr..(self.gpu_ptr + self.size)).into()
     }
-    pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
+    pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T, U> {
         new_slice(
             self.handle,
             index,
@@ -102,8 +107,8 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
             self.base_address,
         )
     }
-    pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
-        new_slice::<u8, R>(
+    pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, u8, U> {
+        new_slice::<u8, R, U>(
             self.handle,
             index,
             self.cpu_ptr,
@@ -119,7 +124,7 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     pub fn ptr(&self) -> *mut T {
         self.cpu_ptr as *mut T
     }
-    pub fn region<'b>(&self, other: BufferSlice<'b, T>) -> vk::BufferCopy {
+    pub fn region<'b, U2: BufferUsage>(&self, other: BufferSlice<'b, T, U2>) -> vk::BufferCopy {
         vk::BufferCopy {
             src_offset: self.offset(),
             dst_offset: other.offset(),
@@ -129,7 +134,12 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     pub fn offset(&self) -> u64 {
         self.gpu_ptr - self.base_address
     }
-    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B> {
+    pub fn cast<B: Copy + Pod, U2: BufferUsage>(self) -> BufferSlice<'a, B, U2> {
+        unsafe { std::mem::transmute(self) }
+    }
+    /// Reinterprets this slice as a different buffer usage without changing the
+    /// underlying element type. Useful when a buffer is used in multiple roles.
+    pub fn cast_usage<U2: BufferUsage>(self) -> BufferSlice<'a, T, U2> {
         unsafe { std::mem::transmute(self) }
     }
     pub fn copy_from(self, slice: &[T]) {

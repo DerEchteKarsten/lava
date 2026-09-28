@@ -2,19 +2,20 @@ use std::{marker::PhantomData, range::Range};
 
 use ash::vk::{self, Offset3D};
 use glam::UVec2;
+use lava_macros::validation_trace;
 
 use crate::{
     bindless::BindlessHandle,
     image::{
         Image,
         format::{Format, Undefined},
-        usage::{IsSampled, IsStorage, Unknown, UsageSet},
+        usage::{ImageUsage, IsSampled, IsStorage, Unknown},
     },
     state::{Ctx, Functions},
 };
 
 #[derive(Clone, Copy, Debug)]
-pub struct ImageView<'a, F: Format = Undefined, U: UsageSet = Unknown> {
+pub struct ImageView<'a, F: Format = Undefined, U: ImageUsage = Unknown> {
     pub image: vk::Image,
     pub view: vk::ImageView,
     pub mip_range: Range<u32>,
@@ -24,7 +25,7 @@ pub struct ImageView<'a, F: Format = Undefined, U: UsageSet = Unknown> {
     pub(crate) _marker3: PhantomData<&'a ()>,
 }
 
-impl<'a, F: Format, U: UsageSet> ImageView<'a, F, U> {
+impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
             aspect_mask: F::ASPECTS,
@@ -53,19 +54,19 @@ impl<'a, F: Format, U: UsageSet> ImageView<'a, F, U> {
             },
         }
     }
-    pub fn cast<NF: Format, NU: UsageSet>(self) -> ImageView<'a, NF, NU> {
+    pub fn cast<NF: Format, NU: ImageUsage>(self) -> ImageView<'a, NF, NU> {
         unsafe { std::mem::transmute(self) }
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct ImageSlice<'a, F: Format = Undefined, U: UsageSet = Unknown> {
+pub struct ImageSlice<'a, F: Format = Undefined, U: ImageUsage = Unknown> {
     pub view: ImageView<'a, F, U>,
     pub offset: vk::Offset3D,
     pub extend: vk::Extent3D,
 }
 
-impl<'a, F: Format, U: UsageSet> ImageSlice<'a, F, U> {
+impl<'a, F: Format, U: ImageUsage> ImageSlice<'a, F, U> {
     pub fn offset(mut self, offset: UVec2) -> ImageSlice<'a, F, U> {
         self.offset.x += offset.x as i32;
         self.offset.y += offset.y as i32;
@@ -78,10 +79,11 @@ impl<'a, F: Format, U: UsageSet> ImageSlice<'a, F, U> {
         self
     }
 
-    pub fn cast<NF: Format, NU: UsageSet>(self) -> ImageSlice<'a, NF, NU> {
+    pub fn cast<NF: Format, NU: ImageUsage>(self) -> ImageSlice<'a, NF, NU> {
         unsafe { std::mem::transmute(self) }
     }
 
+    #[validation_trace]
     pub fn copy_from(&self, data: &[u8], mip_level: u32) {
         let regions = [vk::MemoryToImageCopyEXT::default()
             .host_pointer(data.as_ptr().cast())
@@ -102,7 +104,7 @@ impl<'a, F: Format, U: UsageSet> ImageSlice<'a, F, U> {
     }
 }
 
-impl<const M: u32, F: Format, U: UsageSet> AsImage<M> for Image<M, F, U> {
+impl<const M: u32, F: Format, U: ImageUsage> AsImage<M> for Image<M, F, U> {
     type Format = F;
     type Usage = U;
 
@@ -119,7 +121,7 @@ impl<const M: u32, F: Format, U: UsageSet> AsImage<M> for Image<M, F, U> {
 
 pub trait AsImage<const M: u32> {
     type Format: Format;
-    type Usage: UsageSet;
+    type Usage: ImageUsage;
 
     fn mip_range(&self) -> Range<u32>;
     fn get_ref(&self) -> &Image<M, Self::Format, Self::Usage>;

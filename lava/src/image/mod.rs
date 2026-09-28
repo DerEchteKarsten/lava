@@ -10,7 +10,7 @@ use crate::{
     image::{
         format::{Format, Undefined},
         slice::AsImage,
-        usage::{Unknown, UsageSet},
+        usage::{ImageUsage, Unknown},
     },
     state::Ctx,
 };
@@ -20,7 +20,7 @@ pub mod slice;
 pub mod usage;
 
 #[derive(Debug)]
-pub struct Image<const M: u32 = 1, F: Format = Undefined, U: UsageSet = Unknown> {
+pub struct Image<const M: u32 = 1, F: Format = Undefined, U: ImageUsage = Unknown> {
     pub image: vk::Image,
     pub whole_view: vk::ImageView,
     pub allocation: Allocation,
@@ -30,7 +30,7 @@ pub struct Image<const M: u32 = 1, F: Format = Undefined, U: UsageSet = Unknown>
     _usage: PhantomData<U>,
 }
 
-impl<const M: u32, F: Format, U: UsageSet> Image<M, F, U> {
+impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
     #[validation_trace]
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let extent = vk::Extent3D {
@@ -55,7 +55,7 @@ impl<const M: u32, F: Format, U: UsageSet> Image<M, F, U> {
                 } else {
                     vk::ImageUsageFlags::empty()
                 },
-            initial_layout: vk::ImageLayout::GENERAL,
+            initial_layout: vk::ImageLayout::UNDEFINED,
             ..Default::default()
         };
 
@@ -102,7 +102,7 @@ impl<const M: u32, F: Format, U: UsageSet> Image<M, F, U> {
         Ok(s)
     }
 
-    pub fn cast<NF: Format, NU: UsageSet>(self) -> Image<M, NF, NU> {
+    pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<M, NF, NU> {
         unsafe { std::mem::transmute(self) }
     }
 }

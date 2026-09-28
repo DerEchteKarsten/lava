@@ -13,45 +13,53 @@ use gpu_allocator::{
 };
 use lava_macros::validation_trace;
 
-use crate::{buffer::slice::BufferSlice, state::Ctx};
+use crate::{
+    buffer::{
+        slice::BufferSlice,
+        usage::{BufferUsage, Storage},
+    },
+    state::Ctx,
+};
 
 pub mod slice;
+pub mod usage;
 
 #[derive(Debug)]
-pub struct Buffer<T: Copy + Pod> {
+pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
     pub handle: vk::Buffer,
     pub address: u64,
     pub allocation: Allocation,
     _type_marker: PhantomData<T>,
+    _usage_marker: PhantomData<U>,
 }
 
-impl<T: Copy + Pod> Index<usize> for Buffer<T> {
+impl<T: Copy + Pod, U: BufferUsage> Index<usize> for Buffer<T, U> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
         unsafe { self.range(..).ptr().add(index).as_ref() }.unwrap()
     }
 }
 
-impl<T: Copy + Pod> IndexMut<usize> for Buffer<T> {
+impl<T: Copy + Pod, U: BufferUsage> IndexMut<usize> for Buffer<T, U> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         unsafe { self.range(..).ptr().add(index).as_mut() }.unwrap()
     }
 }
 
-impl<'a, T: Copy + Pod> Index<usize> for BufferSlice<'a, T> {
+impl<'a, T: Copy + Pod, U: BufferUsage> Index<usize> for BufferSlice<'a, T, U> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
         unsafe { self.ptr().add(index).as_ref() }.unwrap()
     }
 }
 
-impl<'a, T: Copy + Pod> IndexMut<usize> for BufferSlice<'a, T> {
+impl<'a, T: Copy + Pod, U: BufferUsage> IndexMut<usize> for BufferSlice<'a, T, U> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         unsafe { self.ptr().add(index).as_mut() }.unwrap()
     }
 }
 
-impl<T: Copy + Pod> Drop for Buffer<T> {
+impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     fn drop(&mut self) {
         unsafe { Ctx::device().destroy_buffer(self.handle, None) };
         let alloc = std::mem::take(&mut self.allocation);
@@ -59,13 +67,13 @@ impl<T: Copy + Pod> Drop for Buffer<T> {
     }
 }
 
-impl<'a, T: Copy + Pod> Into<BufferSlice<'a, T>> for &'a Buffer<T> {
-    fn into(self) -> BufferSlice<'a, T> {
+impl<'a, T: Copy + Pod, U: BufferUsage> Into<BufferSlice<'a, T, U>> for &'a Buffer<T, U> {
+    fn into(self) -> BufferSlice<'a, T, U> {
         self.range(..)
     }
 }
 
-impl<T: Copy + Pod> Buffer<T> {
+impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
     #[validation_trace]
     pub fn raw(
         usage: vk::BufferUsageFlags,
@@ -102,6 +110,7 @@ impl<T: Copy + Pod> Buffer<T> {
         let address = unsafe { Ctx::device().get_buffer_device_address(&addr_info) };
         Ok(Self {
             _type_marker: PhantomData,
+            _usage_marker: PhantomData,
             address,
             allocation: allocation,
             handle: buffer,
@@ -115,10 +124,9 @@ impl<T: Copy + Pod> Buffer<T> {
     #[validation_trace]
     pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
         Self::raw(
-            vk::BufferUsageFlags::STORAGE_BUFFER
+            U::VK
                 | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             cpu_writable,
             (size * size_of::<T>()) as u64,
@@ -130,7 +138,7 @@ impl<T: Copy + Pod> Buffer<T> {
         (self.size() / size_of::<T>() as u64) as usize
     }
 
-    pub fn cast<B: Copy + Pod>(self) -> Buffer<B> {
+    pub fn cast<B: Copy + Pod>(self) -> Buffer<B, U> {
         unsafe { std::mem::transmute(self) }
     }
 }

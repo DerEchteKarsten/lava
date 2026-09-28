@@ -390,6 +390,7 @@ impl Features {
         mesh: &'a mut vk::PhysicalDeviceMeshShaderFeaturesEXT,
         ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+        host_image_copy: &'a mut vk::PhysicalDeviceHostImageCopyFeaturesEXT,
     ) -> vk::PhysicalDeviceFeatures2<'a> {
         *vk11 = vk11.shader_draw_parameters(true);
         *vk12 = vk12
@@ -431,12 +432,15 @@ impl Features {
             .extended_dynamic_state3_color_blend_enable(true);
         *dy2 = dy2.extended_dynamic_state2_logic_op(true);
 
+        *host_image_copy =
+            vk::PhysicalDeviceHostImageCopyFeaturesEXT::default().host_image_copy(true);
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(phfeatures)
             .push_next(vk11)
             .push_next(vk12)
             .push_next(vk13)
             .push_next(dy2)
+            .push_next(host_image_copy)
             .push_next(dn3);
         if self.mesh {
             *mesh = mesh.task_shader(true).mesh_shader(true);
@@ -571,10 +575,27 @@ pub(super) fn create_device(
         .map(|e| e.as_ptr() as *const i8)
         .collect::<Vec<_>>();
 
-    let (mut vk11, mut vk12, mut vk13, mut dy2, mut dn3, mut mesh, mut ray, mut acc) =
-        Default::default();
+    let (
+        mut vk11,
+        mut vk12,
+        mut vk13,
+        mut dy2,
+        mut dn3,
+        mut mesh,
+        mut ray,
+        mut acc,
+        mut host_image_copy,
+    ) = Default::default();
     let mut features = features.features(
-        &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
+        &mut vk11,
+        &mut vk12,
+        &mut vk13,
+        &mut dn3,
+        &mut dy2,
+        &mut mesh,
+        &mut ray,
+        &mut acc,
+        &mut host_image_copy,
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)

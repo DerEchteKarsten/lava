@@ -293,12 +293,13 @@ impl Drop for CommandBufferMemory {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PendingAccesses {
     pub(crate) buffer_reads: SmallVec<[BufferAccess; 8]>,
     pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
     pub(crate) buffer_writes: SmallVec<[BufferAccess; 8]>,
     pub(crate) image_writes: SmallVec<[ImageAccess; 8]>,
+    pub(crate) image_layouts: SmallVec<[(vk::Image, vk::ImageLayout); 4]>,
 }
 
 impl<Q: QueueFamilie> Queue<Q> {
