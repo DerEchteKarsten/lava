@@ -1,5 +1,5 @@
 #pragma once
-#define NUM_SAMPLERS 2
+#define NUM_SAMPLERS 3
 [vk::binding(0, 0)] SamplerState SamplerHeap[];
 [vk::binding(NUM_SAMPLERS, 0)] __DynamicResource TextureHeap[];
 [vk::binding(0, 1)] __DynamicResource RWTextureHeap[];
@@ -18,7 +18,7 @@ public extension Img<E, Shape, 0> {
         return TextureHeap[SampledIndex].asOpaqueDescriptor<T>()[p];
     }
     [ForceInline] public E Sample(vector<float, Shape.dimensions> uv, uint sampler = 0) {
-        return TextureHeap[SampledIndex].asOpaqueDescriptor<T>().Sample(SamplerHeap[sampler], uv);
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().Sample(SamplerHeap[sampler], uv);
     }
 }
 
