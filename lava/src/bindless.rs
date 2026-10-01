@@ -17,6 +17,7 @@ use crate::{
 pub struct Bindless {
     num_images: AtomicU32,
     num_textures: AtomicU32,
+    num_samplers: u32,
     layout: vk::PipelineLayout,
     layouts: [vk::DescriptorSetLayout; 2],
     sets: [vk::DescriptorSet; 2],
@@ -64,9 +65,20 @@ impl Bindless {
             .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
             .mipmap_mode(SamplerMipmapMode::NEAREST);
 
+        // Sampler 2: trilinear + repeat, what mipmapped material textures use.
+        let sci3 = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(SamplerMipmapMode::LINEAR)
+            .address_mode_u(SamplerAddressMode::REPEAT)
+            .address_mode_v(SamplerAddressMode::REPEAT)
+            .address_mode_w(SamplerAddressMode::REPEAT)
+            .max_lod(vk::LOD_CLAMP_NONE);
+
         let samplers = [
             unsafe { Ctx::device().create_sampler(&sci2, None) }?,
             unsafe { Ctx::device().create_sampler(&sci, None) }?,
+            unsafe { Ctx::device().create_sampler(&sci3, None) }?,
         ];
         let descriptor_binding_flags = [
             vk::DescriptorBindingFlags::empty(),
@@ -183,6 +195,7 @@ impl Bindless {
             .set(Self {
                 num_images: AtomicU32::new(0),
                 num_textures: AtomicU32::new(0),
+                num_samplers: samplers.len() as u32,
                 layout,
                 layouts,
                 sets,
@@ -239,7 +252,7 @@ impl Bindless {
                 write
                     .dst_array_element(handle.descriptor_index_set0)
                     .dst_set(Self::get().sets[0])
-                    .dst_binding(2)
+                    .dst_binding(Self::get().num_samplers)
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE),
             );
         }

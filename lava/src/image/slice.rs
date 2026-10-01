@@ -107,7 +107,7 @@ impl<const M: u32, F: Format, U: ImageUsage> AsImage<M> for Image<M, F, U> {
     type Usage = U;
 
     fn mip_range(&self) -> Range<u32> {
-        (0..M).into()
+        (0..self.mip_levels).into()
     }
     fn get_ref(&self) -> &Image<M, Self::Format, Self::Usage> {
         self
@@ -175,6 +175,10 @@ pub trait AsImage<const M: u32> {
             extend: image.extent,
             offset: Offset3D::default(),
         }
+    }
+    /// Slice covering the full extent of one mip level. Pass the same `level` to `copy_from`.
+    fn mip<'a>(&'a self, level: u32) -> ImageSlice<'a, Self::Format, Self::Usage> {
+        self.whole_view().region(self.get_ref().mip_extent(level))
     }
     fn offset<'a>(&'a self, offset: UVec2) -> ImageSlice<'a, Self::Format, Self::Usage> {
         self.whole().offset(offset)

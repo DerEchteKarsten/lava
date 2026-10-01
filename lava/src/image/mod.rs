@@ -13,9 +13,10 @@ use crate::{
         slice::AsImage,
         usage::{ImageUsage, Unknown},
     },
-    state::Ctx,
+    state::{Ctx, Functions},
     vkobjects::queue::{CommandBufferMemory, Fence, Gfx, Queue, SemaphoreInfo},
 };
+use glam::UVec2;
 
 pub mod format;
 pub mod slice;
@@ -30,6 +31,7 @@ pub struct Image<const M: u32 = 1, F: Format = Undefined, U: ImageUsage = Unknow
     pub whole_view: vk::ImageView,
     pub allocation: Allocation,
     pub extent: vk::Extent3D,
+    pub mip_levels: u32,
     pub handle: Option<BindlessHandle>,
     _format: PhantomData<F>,
     _usage: PhantomData<U>,
@@ -38,6 +40,13 @@ pub struct Image<const M: u32 = 1, F: Format = Undefined, U: ImageUsage = Unknow
 impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
     #[validation_trace]
     pub fn new(width: u32, height: u32) -> Result<Self> {
+        Self::with_mip_levels(width, height, M)
+    }
+
+    /// Like `new`, but with a mip level count chosen at runtime. The whole view and the bindless
+    /// descriptor cover all `mip_levels` levels, the const generic `M` is only a default.
+    #[validation_trace]
+    pub fn with_mip_levels(width: u32, height: u32, mip_levels: u32) -> Result<Self> {
         let extent = vk::Extent3D {
             width,
             height,
@@ -48,7 +57,7 @@ impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
             extent,
             format: F::format(),
             image_type: vk::ImageType::TYPE_2D,
-            mip_levels: M,
+            mip_levels,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
@@ -86,12 +95,13 @@ impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
             handle: None,
             allocation,
             extent,
+            mip_levels,
             image,
             whole_view: vk::ImageView::null(),
         };
         let (handle, view) = {
             let view = s.create_new_view(
-                (0..M).into(),
+                (0..mip_levels).into(),
                 vk::ComponentMapping {
                     r: ComponentSwizzle::R,
                     g: ComponentSwizzle::G,
@@ -146,6 +156,27 @@ impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
             )?
         };
         Ok(())
+    }
+
+    /// Transitions every mip level from UNDEFINED to GENERAL on the host (host image copy), so no
+    /// queue or command buffer is needed. Use this for images that are filled with `copy_from`.
+    #[validation_trace]
+    pub fn set_layout_host(&self) -> Result<()> {
+        let transition = vk::HostImageLayoutTransitionInfoEXT::default()
+            .image(self.image)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .subresource_range(self.whole_view().subresource_range());
+        unsafe { Functions::host_image_copy().transition_image_layout(&[transition])? };
+        Ok(())
+    }
+
+    /// Extent of the given mip level.
+    pub fn mip_extent(&self, level: u32) -> UVec2 {
+        UVec2::new(
+            (self.extent.width >> level).max(1),
+            (self.extent.height >> level).max(1),
+        )
     }
 
     pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<M, NF, NU> {
