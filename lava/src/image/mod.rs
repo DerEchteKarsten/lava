@@ -1,9 +1,10 @@
 use std::marker::PhantomData;
 
-use anyhow::Result;
+use crate::error::Result;
 use ash::vk::{self, ComponentSwizzle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use lava_macros::validation_trace;
+use smallvec::SmallVec;
 
 use crate::{
     bindless::{Bindless, BindlessHandle},
@@ -13,11 +14,15 @@ use crate::{
         usage::{ImageUsage, Unknown},
     },
     state::Ctx,
+    vkobjects::queue::{CommandBufferMemory, Fence, Gfx, Queue, SemaphoreInfo},
 };
 
 pub mod format;
 pub mod slice;
 pub mod usage;
+
+const LAYOUT_UNDEFINED: u8 = 0;
+const LAYOUT_GENERAL: u8 = 1;
 
 #[derive(Debug)]
 pub struct Image<const M: u32 = 1, F: Format = Undefined, U: ImageUsage = Unknown> {
@@ -93,13 +98,54 @@ impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
                     b: ComponentSwizzle::B,
                     a: ComponentSwizzle::A,
                 },
-            );
+            )?;
             let handle = Bindless::push(view);
             (handle, view.view)
         };
         s.handle = handle;
         s.whole_view = view;
         Ok(s)
+    }
+
+    pub fn set_layout(
+        &self,
+        fence: &Fence,
+        queue: &Queue<Gfx>,
+        buffer: &CommandBufferMemory,
+    ) -> Result<()> {
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            Ctx::device().begin_command_buffer(buffer.handle, &begin_info)?;
+            Ctx::device().cmd_pipeline_barrier(
+                buffer.handle,
+                vk::PipelineStageFlags::empty(),
+                vk::PipelineStageFlags::empty(),
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(self.image)
+                    .subresource_range(self.whole_view().subresource_range())],
+            );
+            Ctx::device().end_command_buffer(buffer.handle)?;
+        };
+        let cmd_buffer_submit_info =
+            vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info))
+            .wait_semaphore_infos(&[])
+            .signal_semaphore_infos(&[]);
+
+        unsafe {
+            Ctx::device().queue_submit2(
+                queue.handle,
+                std::slice::from_ref(&submit_info),
+                fence.handle,
+            )?
+        };
+        Ok(())
     }
 
     pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<M, NF, NU> {

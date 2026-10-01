@@ -16,6 +16,7 @@ use crate::{
         slice::BufferSlice,
         usage::{IsIndex, IsIndirect},
     },
+    error::Result,
     image::{
         format::{ColorAspect, DepthAspect, Format},
         slice::{ImageSlice, ImageView},
@@ -1583,14 +1584,16 @@ impl CommandBuffer {
         }
     }
 
-    pub(crate) fn begin(&mut self) {
+    pub(crate) fn begin(&mut self) -> Result<()> {
         let begin_info = vk::CommandBufferBeginInfo::default();
-        unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info) }.unwrap();
+        unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info)? };
         Bindless::bind(&self.handle);
+        Ok(())
     }
 
-    pub(crate) fn end(&mut self) {
-        unsafe { Ctx::device().end_command_buffer(self.handle) }.unwrap();
+    pub(crate) fn end(&mut self) -> Result<()> {
+        unsafe { Ctx::device().end_command_buffer(self.handle)? };
+        Ok(())
     }
 }
 

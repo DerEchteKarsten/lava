@@ -6,7 +6,6 @@ build = "build.rs"
 
 [dependencies]
 glam = {workspace = true}
-anyhow = {workspace = true}
 bytemuck = {workspace = true}
 tracing = {workspace = true}
 ash = {workspace = true}

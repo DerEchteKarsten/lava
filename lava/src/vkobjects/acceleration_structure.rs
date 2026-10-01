@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{Error, Result};
 use ash::vk;
 
 use crate::{buffer::Buffer, state::Functions};
@@ -23,7 +23,7 @@ impl AccelerationStructure {
         unsafe {
             let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
             Functions::acceleration_structure()
-                .unwrap()
+                .expect("acceleration structure functions are unavailable")
                 .get_acceleration_structure_build_sizes(
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
                     &build_geo_info,
@@ -50,7 +50,7 @@ impl AccelerationStructure {
             .ty(level);
         let handle = unsafe {
             Functions::acceleration_structure()
-                .unwrap()
+                .ok_or_else(|| Error::message("acceleration structure functions are unavailable"))?
                 .create_acceleration_structure(&create_info, None)?
         };
         let build_geo_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
@@ -65,7 +65,7 @@ impl AccelerationStructure {
 
         unsafe {
             Functions::acceleration_structure()
-                .unwrap()
+                .ok_or_else(|| Error::message("acceleration structure functions are unavailable"))?
                 .cmd_build_acceleration_structures(*cmd, &[build_geo_info], &[as_ranges])
         };
 

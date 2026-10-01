@@ -1,6 +1,6 @@
 use std::sync::{OnceLock, atomic::AtomicU32};
 
-use anyhow::Result;
+use crate::error::{Error, Result};
 use ash::vk::{self, BorderColor, SamplerAddressMode, SamplerMipmapMode};
 use bytemuck::{Pod, Zeroable};
 
@@ -35,7 +35,9 @@ pub struct BindlessHandle {
 
 impl Bindless {
     fn get() -> &'static Self {
-        BINDLESS.get().unwrap()
+        BINDLESS
+            .get()
+            .expect("bindless resources have not been initialized")
     }
     pub(crate) fn layout() -> vk::PipelineLayout {
         Self::get().layout
@@ -63,8 +65,8 @@ impl Bindless {
             .mipmap_mode(SamplerMipmapMode::NEAREST);
 
         let samplers = [
-            unsafe { Ctx::device().create_sampler(&sci2, None) }.unwrap(),
-            unsafe { Ctx::device().create_sampler(&sci, None) }.unwrap(),
+            unsafe { Ctx::device().create_sampler(&sci2, None) }?,
+            unsafe { Ctx::device().create_sampler(&sci, None) }?,
         ];
         let descriptor_binding_flags = [
             vk::DescriptorBindingFlags::empty(),
@@ -155,7 +157,7 @@ impl Bindless {
             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND_EXT)
             .max_sets(2)
             .pool_sizes(&pool_sizes);
-        let pool = unsafe { Ctx::device().create_descriptor_pool(&pool_info, None) }.unwrap();
+        let pool = unsafe { Ctx::device().create_descriptor_pool(&pool_info, None) }?;
 
         let desc_counts = [
             Ctx::physical_device()
@@ -175,7 +177,7 @@ impl Bindless {
             .push_next(&mut alloc_info);
         let sets = unsafe { Ctx::device().allocate_descriptor_sets(&allocate_info) }?
             .try_into()
-            .unwrap();
+            .expect("allocated descriptor set count matches the two layouts");
 
         BINDLESS
             .set(Self {
@@ -186,7 +188,7 @@ impl Bindless {
                 sets,
                 pool,
             })
-            .unwrap();
+            .map_err(|_| Error::message("bindless resources were already initialized"))?;
         Ok(())
     }
 
@@ -295,7 +297,9 @@ impl Bindless {
             for i in s.layouts {
                 Ctx::device().destroy_descriptor_set_layout(i, None);
             }
-            Ctx::device().free_descriptor_sets(s.pool, &s.sets).unwrap();
+            if let Err(err) = Ctx::device().free_descriptor_sets(s.pool, &s.sets) {
+                tracing::error!(%err, "failed to free bindless descriptor sets");
+            }
             Ctx::device().destroy_descriptor_pool(s.pool, None);
         }
     }

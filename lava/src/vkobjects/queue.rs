@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{Result, anyhow};
+use crate::error::{Error, Result};
 use ash::vk;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
@@ -25,7 +25,7 @@ pub struct Semaphore<T: SemaphoreType + ?Sized> {
 
 impl<T: SemaphoreType> Default for Semaphore<T> {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("failed to create default semaphore")
     }
 }
 
@@ -41,25 +41,27 @@ pub struct Event {
 
 impl Event {
     #[validation_trace]
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let create_info = vk::EventCreateInfo::default();
-        Self {
-            handle: unsafe { Ctx::device().create_event(&create_info, None).unwrap() },
-        }
+        Ok(Self {
+            handle: unsafe { Ctx::device().create_event(&create_info, None)? },
+        })
     }
     #[validation_trace]
-    pub fn wait(&self) {
+    pub fn wait(&self) -> Result<()> {
         loop {
-            if unsafe { Ctx::device().get_event_status(self.handle).unwrap() } {
-                unsafe { Ctx::device().set_event(self.handle).unwrap() };
+            if unsafe { Ctx::device().get_event_status(self.handle)? } {
+                unsafe { Ctx::device().set_event(self.handle)? };
                 break;
             }
             std::thread::yield_now();
         }
+        Ok(())
     }
     #[validation_trace]
-    pub fn set(&self) {
-        unsafe { Ctx::device().set_event(self.handle).unwrap() }
+    pub fn set(&self) -> Result<()> {
+        unsafe { Ctx::device().set_event(self.handle)? };
+        Ok(())
     }
 }
 
@@ -75,7 +77,10 @@ pub enum SemaphoreInfo {
     Binary(vk::Semaphore),
 }
 impl SemaphoreInfo {
-    fn to_vk<'a>(&'a self, stage: vk::PipelineStageFlags2) -> vk::SemaphoreSubmitInfo<'a> {
+    pub(crate) fn to_vk<'a>(
+        &'a self,
+        stage: vk::PipelineStageFlags2,
+    ) -> vk::SemaphoreSubmitInfo<'a> {
         let sub = vk::SemaphoreSubmitInfo::default().stage_mask(stage);
         match self {
             SemaphoreInfo::Binary(handle) => sub.semaphore(*handle),
@@ -85,56 +90,57 @@ impl SemaphoreInfo {
 }
 
 pub trait SemaphoreType {
-    fn create() -> Semaphore<Self>;
+    fn create() -> Result<Semaphore<Self>>;
 }
 
 #[derive(Debug)]
 pub struct Timeline;
 impl SemaphoreType for Timeline {
-    fn create() -> Semaphore<Self> {
+    fn create() -> Result<Semaphore<Self>> {
         let mut timeline = vk::SemaphoreTypeCreateInfo {
             initial_value: 0,
             semaphore_type: vk::SemaphoreType::TIMELINE,
             ..Default::default()
         };
         let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
-        let handle = unsafe { Ctx::device().create_semaphore(&create_info, None) }.unwrap();
-        Semaphore {
+        let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
+        Ok(Semaphore {
             handle,
             marker: PhantomData,
-        }
+        })
     }
 }
 
 #[derive(Debug)]
 pub struct Binary;
 impl SemaphoreType for Binary {
-    fn create() -> Semaphore<Self> {
+    fn create() -> Result<Semaphore<Self>> {
         let create_info = vk::SemaphoreCreateInfo::default();
-        let handle = unsafe { Ctx::device().create_semaphore(&create_info, None) }.unwrap();
-        Semaphore {
+        let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
+        Ok(Semaphore {
             handle,
             marker: PhantomData,
-        }
+        })
     }
 }
 
 impl<T: SemaphoreType> Semaphore<T> {
     #[validation_trace]
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         T::create()
     }
 }
 
 impl Semaphore<Timeline> {
     #[validation_trace]
-    pub fn block_until_value(&self, value: u64) {
+    pub fn block_until_value(&self, value: u64) -> Result<()> {
         let binding = [self.handle];
         let values = [value];
         let wait_info = vk::SemaphoreWaitInfo::default()
             .semaphores(&binding)
             .values(&values);
-        unsafe { Ctx::device().wait_semaphores(&wait_info, u64::MAX).unwrap() }
+        unsafe { Ctx::device().wait_semaphores(&wait_info, u64::MAX)? };
+        Ok(())
     }
     #[validation_trace]
     pub fn info(&self, value: u64) -> SemaphoreInfo {
@@ -160,33 +166,32 @@ impl Drop for Fence {
 
 impl Default for Fence {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("failed to create default fence")
     }
 }
 
 impl Fence {
     #[validation_trace]
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let create_info = vk::FenceCreateInfo::default();
-        let handle = unsafe { Ctx::device().create_fence(&create_info, None) }.unwrap();
-        Self { handle }
+        let handle = unsafe { Ctx::device().create_fence(&create_info, None)? };
+        Ok(Self { handle })
     }
     #[validation_trace]
-    pub fn reset(&self) {
-        unsafe { Ctx::device().reset_fences(&[self.handle]) }.unwrap();
+    pub fn reset(&self) -> Result<()> {
+        unsafe { Ctx::device().reset_fences(&[self.handle])? };
+        Ok(())
     }
     #[validation_trace]
-    pub fn wait(&self) {
-        unsafe { Ctx::device().wait_for_fences(&[self.handle], true, u64::MAX) }.unwrap();
-    }
-    pub fn wait_async(&self) -> FenceFuture {
-        FenceFuture { fence: self.handle }
+    pub fn wait(&self) -> Result<()> {
+        unsafe { Ctx::device().wait_for_fences(&[self.handle], true, u64::MAX)? };
+        Ok(())
     }
 }
 
 pub trait QueueFamilie: Debug {
     fn index() -> u32;
-    fn is_free() -> &'static Vec<AtomicBool>;
+    fn is_free() -> &'static [AtomicBool];
 }
 
 #[derive(Debug)]
@@ -200,7 +205,7 @@ impl QueueFamilie for Transfer {
     fn index() -> u32 {
         Ctx::transfer_queue_index()
     }
-    fn is_free() -> &'static Vec<AtomicBool> {
+    fn is_free() -> &'static [AtomicBool] {
         Ctx::get()
             .transfer_queues_in_use
             .as_ref()
@@ -211,7 +216,7 @@ impl QueueFamilie for Present {
     fn index() -> u32 {
         Ctx::present_queue_index()
     }
-    fn is_free() -> &'static Vec<AtomicBool> {
+    fn is_free() -> &'static [AtomicBool] {
         Ctx::get()
             .present_queues_in_use
             .as_ref()
@@ -222,14 +227,14 @@ impl QueueFamilie for Gfx {
     fn index() -> u32 {
         Ctx::gfx_queue_index()
     }
-    fn is_free() -> &'static Vec<AtomicBool> {
+    fn is_free() -> &'static [AtomicBool] {
         &Ctx::get().gfx_queues_in_use
     }
 }
 
 #[derive(Debug)]
 pub struct Queue<Q: QueueFamilie> {
-    handle: vk::Queue,
+    pub(crate) handle: vk::Queue,
     familie: u32,
     idx: u32,
     _marker: PhantomData<Q>,
@@ -247,29 +252,25 @@ pub struct CommandPool {
 }
 impl CommandPool {
     #[validation_trace]
-    pub fn reset(&self) {
+    pub fn reset(&self) -> Result<()> {
         unsafe {
-            Ctx::device().reset_command_pool(self.handle, vk::CommandPoolResetFlags::empty())
-        }
-        .unwrap();
+            Ctx::device().reset_command_pool(self.handle, vk::CommandPoolResetFlags::empty())?
+        };
+        Ok(())
     }
     #[validation_trace]
-    pub fn create_command_buffer(&self) -> CommandBufferMemory {
+    pub fn create_command_buffer(&self) -> Result<CommandBufferMemory> {
         let allocate_info = vk::CommandBufferAllocateInfo {
             level: vk::CommandBufferLevel::PRIMARY,
             command_buffer_count: 1,
             command_pool: self.handle,
             ..Default::default()
         };
-        let handle = unsafe {
-            Ctx::device()
-                .allocate_command_buffers(&allocate_info)
-                .unwrap()
-        }[0];
-        CommandBufferMemory {
+        let handle = unsafe { Ctx::device().allocate_command_buffers(&allocate_info)? }[0];
+        Ok(CommandBufferMemory {
             pool: self.handle,
             handle,
-        }
+        })
     }
 }
 
@@ -281,8 +282,8 @@ impl Drop for CommandPool {
 
 #[derive(Debug)]
 pub struct CommandBufferMemory {
-    pool: vk::CommandPool,
-    handle: vk::CommandBuffer,
+    pub(crate) pool: vk::CommandPool,
+    pub(crate) handle: vk::CommandBuffer,
 }
 
 impl Drop for CommandBufferMemory {
@@ -317,7 +318,7 @@ impl<Q: QueueFamilie> Queue<Q> {
                 break;
             }
         }
-        let (idx, handle) = handle.ok_or(anyhow!("All queues used up"))?;
+        let (idx, handle) = handle.ok_or(Error::message("All queues used up"))?;
         Ok(Self {
             handle,
             idx,
@@ -326,8 +327,8 @@ impl<Q: QueueFamilie> Queue<Q> {
         })
     }
     #[validation_trace]
-    pub fn create_pool(&self) -> CommandPool {
-        CommandPool {
+    pub fn create_pool(&self) -> Result<CommandPool> {
+        Ok(CommandPool {
             handle: unsafe {
                 Ctx::device().create_command_pool(
                     &vk::CommandPoolCreateInfo {
@@ -335,10 +336,9 @@ impl<Q: QueueFamilie> Queue<Q> {
                         ..Default::default()
                     },
                     None,
-                )
-            }
-            .unwrap(),
-        }
+                )?
+            },
+        })
     }
 
     #[validation_trace]
@@ -357,11 +357,11 @@ impl<Q: QueueFamilie> Queue<Q> {
                 pending_accesses: pending,
             };
 
-            cmd_buffer.begin();
+            cmd_buffer.begin()?;
             let prev = CALLSITE.replace(None);
             executor(&mut cmd_buffer);
             CALLSITE.set(prev);
-            cmd_buffer.end();
+            cmd_buffer.end()?;
 
             let cmd_buffer_submit_info =
                 vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
@@ -417,25 +417,7 @@ impl<Q: QueueFamilie> Queue<Q> {
         match unsafe { Functions::swapchain().queue_present(self.handle, &present_info) } {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
             Ok(false) => Ok(false),
-            Err(e) => Err(anyhow!("present failed: {e:?}")),
-        }
-    }
-}
-
-pub struct FenceFuture {
-    fence: vk::Fence,
-}
-
-impl Future for FenceFuture {
-    type Output = ();
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        if unsafe { Ctx::device().get_fence_status(self.fence).unwrap() } {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
+            Err(e) => Err(Error::Vulkan(e)),
         }
     }
 }

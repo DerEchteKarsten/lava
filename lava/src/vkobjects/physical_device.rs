@@ -1,6 +1,6 @@
 use std::ffi::CStr;
 
-use anyhow::Result;
+use crate::error::{Error, Result};
 use ash::vk;
 use lava_macros::validation_trace;
 
@@ -91,19 +91,22 @@ impl PhysicalDevice {
             .map(|(index, p)| {
                 let present_support = unsafe {
                     surface_fn
-                        .unwrap()
-                        .get_physical_device_surface_support(physical_device, index as _, *surface)
-                        .unwrap()
+                        .ok_or_else(|| Error::message("surface function table is unavailable"))?
+                        .get_physical_device_surface_support(
+                            physical_device,
+                            index as _,
+                            *surface,
+                        )?
                 };
 
-                QueueFamily {
+                Ok(QueueFamily {
                     num_queues: p.queue_count,
                     index: index as _,
                     handel: p,
                     supports_present: present_support,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         let extension_properties =
             unsafe { instance.enumerate_device_extension_properties(physical_device)? };
@@ -111,19 +114,19 @@ impl PhysicalDevice {
             .into_iter()
             .map(|p| {
                 let name = unsafe { CStr::from_ptr(p.extension_name.as_ptr()) };
-                name.to_str().unwrap().to_owned()
+                Ok(name.to_str()?.to_owned())
             })
-            .collect::<Vec<String>>();
+            .collect::<Result<Vec<String>>>()?;
 
         let supported_surface_formats = unsafe {
             surface_fn
-                .unwrap()
+                .ok_or_else(|| Error::message("surface function table is unavailable"))?
                 .get_physical_device_surface_formats(physical_device, *surface)?
         };
 
         let supported_present_modes = unsafe {
             surface_fn
-                .unwrap()
+                .ok_or_else(|| Error::message("surface function table is unavailable"))?
                 .get_physical_device_surface_present_modes(physical_device, *surface)?
         };
 
@@ -165,8 +168,12 @@ impl PhysicalDevice {
             rebar,
             present: true,
             debug_utils: true,
-            device_debug_utils: supported_extensions
-                .contains(&ash::ext::debug_utils::NAME.to_str().unwrap().to_owned()),
+            device_debug_utils: supported_extensions.contains(
+                &ash::ext::debug_utils::NAME
+                    .to_str()
+                    .expect("extension names are valid UTF-8")
+                    .to_owned(),
+            ),
             mesh: mesh_shading.mesh_shader == vk::TRUE,
             raytracing: ray_tracing_feature.ray_tracing_pipeline == vk::TRUE
                 && acceleration_struct_feature.acceleration_structure == vk::TRUE,
@@ -204,7 +211,11 @@ impl PhysicalDevice {
     pub(crate) fn unsupports_extensions(&self, extensions: &[&CStr]) -> Vec<String> {
         extensions
             .iter()
-            .map(|e| e.to_str().unwrap().to_owned())
+            .map(|e| {
+                e.to_str()
+                    .expect("Vulkan extension names are valid UTF-8")
+                    .to_owned()
+            })
             .filter(|e| self.supported_extensions.iter().find(|i| *i == e).is_none())
             .collect::<Vec<String>>()
     }
@@ -271,7 +282,7 @@ impl PhysicalDevice {
                     && (device.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
                         || device.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU)
             })
-            .ok_or_else(|| anyhow::anyhow!("Could not find a suitable device"))?;
+            .ok_or_else(|| Error::message("Could not find a suitable device"))?;
         let unsuported_ext = device.unsupports_extensions(&device.supported_features.extensions());
         if !unsuported_ext.is_empty() {
             tracing::error!("Unsuported Extensions: {:#?}", unsuported_ext);
@@ -281,6 +292,11 @@ impl PhysicalDevice {
         features.mesh = device.supported_features.mesh;
         features.raytracing = device.supported_features.raytracing;
         features.rebar = device.supported_features.rebar;
-        Ok((device.clone(), graphics.unwrap(), present, transfer_queue))
+        Ok((
+            device.clone(),
+            graphics.expect("suitable device has a graphics queue family"),
+            present,
+            transfer_queue,
+        ))
     }
 }

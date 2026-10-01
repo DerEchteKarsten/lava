@@ -11,7 +11,9 @@ pub trait Format: 'static + Copy + Clone {
 
     fn format() -> vk::Format {
         if Self::FORMAT == vk::Format::UNDEFINED {
-            *FORMAT.get().unwrap()
+            *FORMAT
+                .get()
+                .expect("swapchain format has not been initialized")
         } else {
             Self::FORMAT
         }

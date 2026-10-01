@@ -4,7 +4,7 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use anyhow::Result;
+use crate::error::Result;
 use ash::vk::{self};
 use bytemuck::Pod;
 use gpu_allocator::{
@@ -63,7 +63,9 @@ impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     fn drop(&mut self) {
         unsafe { Ctx::device().destroy_buffer(self.handle, None) };
         let alloc = std::mem::take(&mut self.allocation);
-        Ctx::allocator().free(alloc).unwrap();
+        if let Err(err) = Ctx::allocator().free(alloc) {
+            tracing::error!(%err, "failed to free buffer allocation");
+        }
     }
 }
 

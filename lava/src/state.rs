@@ -6,7 +6,7 @@ use std::{
     sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicBool},
 };
 
-use anyhow::Result;
+use crate::error::{Error, Result};
 use ash::{
     Device, Entry,
     ext::debug_utils,
@@ -40,16 +40,13 @@ pub struct Ctx {
     allocator: Mutex<Allocator>,
 
     pub(crate) gfx_queue_familie: QueueFamily,
-    pub(crate) gfx_queues_in_use: Vec<AtomicBool>,
+    pub(crate) gfx_queues_in_use: Box<[AtomicBool]>,
 
     pub(crate) transfer_queue_familie: Option<QueueFamily>,
-    pub(crate) transfer_queues_in_use: Option<Vec<AtomicBool>>,
+    pub(crate) transfer_queues_in_use: Option<Box<[AtomicBool]>>,
 
     pub(crate) present_queue_familie: Option<QueueFamily>,
-    pub(crate) present_queues_in_use: Option<Vec<AtomicBool>>,
-
-    #[cfg(debug_assertions)]
-    messages: Mutex<Vec<String>>,
+    pub(crate) present_queues_in_use: Option<Box<[AtomicBool]>>,
 }
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -86,7 +83,10 @@ impl Ctx {
             .unwrap_or(Ctx::get().gfx_queue_familie.index)
     }
     pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        Ctx::get().allocator.lock().unwrap()
+        Ctx::get()
+            .allocator
+            .lock()
+            .expect("allocator mutex was poisoned")
     }
 
     pub(crate) fn surface() -> &'static Surface {
@@ -95,11 +95,6 @@ impl Ctx {
 
     pub(crate) fn features() -> Features {
         Ctx::get().features.clone()
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn log_debug_printf_output() -> Vec<String> {
-        Ctx::get().messages.lock().unwrap().drain(..).collect()
     }
 
     pub(super) fn init(
@@ -122,9 +117,7 @@ impl Ctx {
             .map(|raw_name| raw_name.as_ptr())
             .collect();
 
-        let mut instance_extensions = ash_window::enumerate_required_extensions(*display)
-            .unwrap()
-            .to_vec();
+        let mut instance_extensions = ash_window::enumerate_required_extensions(*display)?.to_vec();
 
         let mut features = Features::default();
         features.present = true;
@@ -177,15 +170,13 @@ impl Ctx {
             unsafe {
                 instance_debug_utils
                     .as_ref()
-                    .unwrap()
-                    .create_debug_utils_messenger(&debug_info, None)
-                    .unwrap()
+                    .expect("debug utils instance was just created")
+                    .create_debug_utils_messenger(&debug_info, None)?
             };
         }
 
         let surface =
-            unsafe { ash_window::create_surface(&entry, &instance, *display, *window, None) }
-                .unwrap();
+            unsafe { ash_window::create_surface(&entry, &instance, *display, *window, None) }?;
 
         let surface_fn = Some(ash::khr::surface::Instance::new(&entry, &instance));
 
@@ -228,8 +219,10 @@ impl Ctx {
         let surface = Some(Surface::new(
             surface,
             &physical_device,
-            &surface_fn.as_ref().unwrap(),
-        ));
+            surface_fn
+                .as_ref()
+                .expect("surface function table was created above"),
+        )?);
 
         FUNCTIONS
             .set(Functions {
@@ -260,7 +253,7 @@ impl Ctx {
                 debug_utils: instance_debug_utils,
                 device_debug_utils: debug_utils,
             })
-            .unwrap();
+            .map_err(|_| Error::message("Vulkan functions were already initialized"))?;
 
         STATE
             .set(Ctx {
@@ -294,11 +287,9 @@ impl Ctx {
 
                 features: features,
                 physical_device: physical_device,
-                #[cfg(debug_assertions)]
-                messages: Mutex::new(Vec::new()),
-                surface: surface.unwrap(),
+                surface: surface.expect("surface was just created"),
             })
-            .expect("Faild to initilize Vulkan Context");
+            .map_err(|_| Error::message("Vulkan context was already initialized"))?;
 
         Ok(())
     }
@@ -517,18 +508,20 @@ impl Functions {
     {
         if let Some(debug_utils) = Self::debug_utils() {
             let name = format!("{}\0", name);
-            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+            let name = CStr::from_bytes_with_nul(name.as_bytes()).expect("name is nul terminated");
             let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
                 .object_handle(object)
                 .object_name(name);
-            unsafe { debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
+            if let Err(err) = unsafe { debug_utils.set_debug_utils_object_name(&name_info) } {
+                tracing::error!(%err, "failed to set Vulkan debug name");
+            }
         }
     }
 
     pub(crate) fn cmd_start_label(cmd: &vk::CommandBuffer, name: &str) {
         if let Some(debug_utils) = Self::debug_utils() {
             let name = format!("{}\0", name);
-            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+            let name = CStr::from_bytes_with_nul(name.as_bytes()).expect("name is nul terminated");
             let name_info = vk::DebugUtilsLabelEXT::default().label_name(name);
             unsafe { debug_utils.cmd_begin_debug_utils_label(*cmd, &name_info) };
         }
@@ -536,7 +529,7 @@ impl Functions {
     pub(crate) fn cmd_insert_label(cmd: &vk::CommandBuffer, name: &str) {
         if let Some(debug_utils) = Self::debug_utils() {
             let name = format!("{}\0", name);
-            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+            let name = CStr::from_bytes_with_nul(name.as_bytes()).expect("name is nul terminated");
             let name_info = vk::DebugUtilsLabelEXT::default().label_name(name);
             unsafe { debug_utils.cmd_insert_debug_utils_label(*cmd, &name_info) };
         }
@@ -548,7 +541,9 @@ impl Functions {
     }
 }
 fn get() -> &'static Functions {
-    FUNCTIONS.get().unwrap()
+    FUNCTIONS
+        .get()
+        .expect("Vulkan functions have not been initialized")
 }
 
 #[validation_trace]
@@ -602,11 +597,8 @@ pub(super) fn create_device(
         .enabled_extension_names(device_extensions_as_ptr.as_slice())
         .push_next(&mut features);
 
-    let device = unsafe {
-        instance
-            .create_device(physical_device.handel, &device_create_info, None)
-            .unwrap()
-    };
+    let device =
+        unsafe { instance.create_device(physical_device.handel, &device_create_info, None)? };
 
     Ok(device)
 }

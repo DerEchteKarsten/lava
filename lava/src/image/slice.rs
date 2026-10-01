@@ -6,6 +6,7 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindless::BindlessHandle,
+    error::Result,
     image::{
         Image,
         format::{Format, Undefined},
@@ -84,7 +85,7 @@ impl<'a, F: Format, U: ImageUsage> ImageSlice<'a, F, U> {
     }
 
     #[validation_trace]
-    pub fn copy_from(&self, data: &[u8], mip_level: u32) {
+    pub fn copy_from(&self, data: &[u8], mip_level: u32) -> Result<()> {
         let regions = [vk::MemoryToImageCopyEXT::default()
             .host_pointer(data.as_ptr().cast())
             .image_extent(self.extend)
@@ -94,13 +95,10 @@ impl<'a, F: Format, U: ImageUsage> ImageSlice<'a, F, U> {
             .memory_row_length(self.extend.width)];
         let copy_memory_to_image_info = vk::CopyMemoryToImageInfoEXT::default()
             .dst_image(self.view.image)
-            .dst_image_layout(vk::ImageLayout::UNDEFINED)
+            .dst_image_layout(vk::ImageLayout::GENERAL)
             .regions(&regions);
-        unsafe {
-            Functions::host_image_copy()
-                .copy_memory_to_image(&copy_memory_to_image_info)
-                .unwrap()
-        };
+        unsafe { Functions::host_image_copy().copy_memory_to_image(&copy_memory_to_image_info)? };
+        Ok(())
     }
 }
 
@@ -144,7 +142,7 @@ pub trait AsImage<const M: u32> {
         &'a self,
         mip_range: Range<u32>,
         swizzel: vk::ComponentMapping,
-    ) -> ImageView<'a, Self::Format, Self::Usage> {
+    ) -> Result<ImageView<'a, Self::Format, Self::Usage>> {
         let image = self.get_ref();
         let create_info = vk::ImageViewCreateInfo::default()
             .components(swizzel)
@@ -158,8 +156,8 @@ pub trait AsImage<const M: u32> {
                 base_mip_level: mip_range.start,
                 level_count: mip_range.end - mip_range.start,
             });
-        let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
-        ImageView {
+        let view = unsafe { Ctx::device().create_image_view(&create_info, None)? };
+        Ok(ImageView {
             image: image.image,
             view,
             mip_range: mip_range,
@@ -167,7 +165,7 @@ pub trait AsImage<const M: u32> {
             _marker: PhantomData,
             _marker2: PhantomData,
             _marker3: PhantomData,
-        }
+        })
     }
 
     fn whole<'a>(&'a self) -> ImageSlice<'a, Self::Format, Self::Usage> {

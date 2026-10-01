@@ -5,8 +5,8 @@ use std::panic::Location;
 
 use crate::state::CALLSITE;
 use crate::{bindless::Bindless, state::Ctx};
-use anyhow::{Ok, Result};
 
+pub use crate::error::{Error, Result};
 pub use ash::vk::Pipeline as VkPipeline;
 pub use ash::vk::ShaderModule as VkShaderModule;
 pub use ash::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
@@ -15,6 +15,7 @@ pub mod bindings;
 pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;
+pub mod error;
 pub mod image;
 pub mod state;
 pub mod vkobjects;

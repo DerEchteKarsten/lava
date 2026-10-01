@@ -1,8 +1,7 @@
 use std::{ffi::CStr, marker::PhantomData, sync::OnceLock};
 
-use anyhow::Result;
+use crate::error::Result;
 use ash::vk::{self};
-use glam::UVec2;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -17,14 +16,14 @@ pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct Swapchain<'a> {
-    pub size: UVec2,
+    pub size: [u32; 2],
     pub(crate) handle: vk::SwapchainKHR,
     pub images: SmallVec<[ImageView<'a, format::Swapchain, ColorAttachmentStorage>; 5]>,
 }
 
 impl<'a> Swapchain<'a> {
     #[validation_trace]
-    pub fn new(old: Option<&Swapchain>, size: Option<UVec2>) -> Result<Self> {
+    pub fn new(old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = {
             let formats = &Ctx::surface().formats;
             if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
@@ -106,24 +105,21 @@ impl<'a> Swapchain<'a> {
                 .clipped(true)
         };
 
-        let handle = unsafe {
-            Functions::swapchain()
-                .create_swapchain(&create_info, None)
-                .unwrap()
-        };
-        let images = unsafe { Functions::swapchain().get_swapchain_images(handle).unwrap() };
+        let handle = unsafe { Functions::swapchain().create_swapchain(&create_info, None)? };
+        let images = unsafe { Functions::swapchain().get_swapchain_images(handle)? };
 
         let images = images
             .into_iter()
             .enumerate()
-            .map(|(i, image)| {
+            .map(|(i, image)| -> Result<ImageView<'_, format::Swapchain, ColorAttachmentStorage>> {
                 if let Some(debug_utils) = Functions::debug_utils() {
                     let name = format!("Swapchain Image {}\0", i);
-                    let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+                    let name = CStr::from_bytes_with_nul(name.as_bytes())
+                        .expect("name is nul terminated");
                     let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
                         .object_handle(image)
                         .object_name(name);
-                    unsafe { debug_utils.set_debug_utils_object_name(&name_info) }.unwrap();
+                    unsafe { debug_utils.set_debug_utils_object_name(&name_info) }?;
                 }
                 let create_info = vk::ImageViewCreateInfo::default()
                     .components(vk::ComponentMapping {
@@ -142,7 +138,7 @@ impl<'a> Swapchain<'a> {
                         base_mip_level: 0,
                         level_count: 1,
                     });
-                let view = unsafe { Ctx::device().create_image_view(&create_info, None).unwrap() };
+                let view = unsafe { Ctx::device().create_image_view(&create_info, None)? };
 
                 let mut image = ImageView {
                     handle: None,
@@ -155,26 +151,30 @@ impl<'a> Swapchain<'a> {
                 };
 
                 if let Some(old) = old {
-                    let handle = old.images[i].handle.unwrap();
+                    let handle = old.images[i]
+                        .handle
+                        .expect("reused swapchain image has a bindless handle");
                     Bindless::write_image(image, handle);
                     image.handle = Some(handle);
                 } else {
                     let handle = Bindless::push(image);
                     image.handle = handle;
                 }
-                image
+                Ok(image)
             })
-            .collect::<SmallVec<[ImageView<'_, format::Swapchain, ColorAttachmentStorage>; 5]>>();
+            .collect::<Result<
+                SmallVec<[ImageView<'_, format::Swapchain, ColorAttachmentStorage>; 5]>,
+            >>()?;
 
         Ok(Self {
             handle,
             images,
-            size: UVec2::from_array([extent.width, extent.height]),
+            size: [extent.width, extent.height],
         })
     }
 
     #[validation_trace]
-    pub fn aquire_image(&self, wait_on: &Semaphore<Binary>, fence: Option<&Fence>) -> u32 {
+    pub fn aquire_image(&self, wait_on: &Semaphore<Binary>, fence: Option<&Fence>) -> Result<u32> {
         let (image_index, _suboptimal) = unsafe {
             Functions::swapchain().acquire_next_image(
                 self.handle,
@@ -182,20 +182,20 @@ impl<'a> Swapchain<'a> {
                 wait_on.handle,
                 fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
             )
-        }
-        .unwrap();
-        image_index
+        }?;
+        Ok(image_index)
     }
 
     #[validation_trace]
-    pub fn recreate(&mut self, size: UVec2) {
+    pub fn recreate(&mut self, size: [u32; 2]) -> Result<()> {
         let _span = tracing::info_span!("Swapchain Recreation");
-        let swapchain = Swapchain::new(Some(self), Some(size)).unwrap();
+        let swapchain = Swapchain::new(Some(self), Some(size))?;
 
         unsafe {
-            Ctx::device().device_wait_idle().unwrap();
+            Ctx::device().device_wait_idle()?;
             Functions::swapchain().destroy_swapchain(self.handle, None);
         };
         *self = swapchain;
+        Ok(())
     }
 }

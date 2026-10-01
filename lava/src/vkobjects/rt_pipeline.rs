@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{Error, Result};
 use ash::vk;
 
 use crate::{
@@ -100,15 +100,22 @@ impl RaytracingPipeline {
 
         let pipeline = unsafe {
             Functions::raytracing_pipeline()
-                .unwrap()
+                .ok_or_else(|| Error::message("ray tracing pipeline functions are unavailable"))?
                 .create_ray_tracing_pipelines(
                     vk::DeferredOperationKHR::null(),
                     vk::PipelineCache::null(),
                     std::slice::from_ref(&pipe_info),
                     None,
                 )
-        }
-        .unwrap();
+                .map_err(|(partial, result)| {
+                    // Vulkan may hand back partially created pipelines together
+                    // with the error; destroy them so they do not leak.
+                    for pipeline in partial {
+                        Ctx::device().destroy_pipeline(pipeline, None);
+                    }
+                    Error::Vulkan(result)
+                })?
+        };
         let sbt = ShaderBindingTable::new(&pipeline[0], &shader_group_info)?;
         Ok(RaytracingPipeline {
             pipeline: pipeline[0],
@@ -131,26 +138,21 @@ impl ShaderBindingTable {
     ) -> Result<Self> {
         let desc = shaders;
 
-        let handle_size = Ctx::physical_device()
+        let rt_properties = Ctx::physical_device()
             .ray_tracing_pipeline_properties
-            .unwrap()
-            .shader_group_handle_size;
-        let handle_alignment = Ctx::physical_device()
-            .ray_tracing_pipeline_properties
-            .unwrap()
-            .shader_group_handle_alignment;
+            .ok_or_else(|| Error::message("ray tracing pipeline properties are unavailable"))?;
+
+        let handle_size = rt_properties.shader_group_handle_size;
+        let handle_alignment = rt_properties.shader_group_handle_alignment;
         let aligned_handle_size = alinged_size(handle_size, handle_alignment);
         let handle_pad = aligned_handle_size - handle_size;
 
-        let group_alignment = Ctx::physical_device()
-            .ray_tracing_pipeline_properties
-            .unwrap()
-            .shader_group_base_alignment;
+        let group_alignment = rt_properties.shader_group_base_alignment;
 
         let data_size = desc.group_count * handle_size;
         let handles = unsafe {
             Functions::raytracing_pipeline()
-                .unwrap()
+                .ok_or_else(|| Error::message("ray tracing pipeline functions are unavailable"))?
                 .get_ray_tracing_shader_group_handles(
                     *pipeline,
                     0,
@@ -185,12 +187,7 @@ impl ShaderBindingTable {
             buffer_usage,
             true,
             buffer_size as _,
-            Some(
-                Ctx::physical_device()
-                    .ray_tracing_pipeline_properties
-                    .unwrap()
-                    .shader_group_base_alignment,
-            ),
+            Some(rt_properties.shader_group_base_alignment),
         )?;
 
         let mut offset = 0;

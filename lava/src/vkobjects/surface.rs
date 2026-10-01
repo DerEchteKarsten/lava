@@ -1,6 +1,6 @@
 use ash::vk;
 
-use crate::vkobjects::physical_device::PhysicalDevice;
+use crate::{error::Result, vkobjects::physical_device::PhysicalDevice};
 
 #[derive(Debug)]
 pub struct Surface {
@@ -15,20 +15,17 @@ impl Surface {
         surface: vk::SurfaceKHR,
         physical_device: &PhysicalDevice,
         surface_fn: &ash::khr::surface::Instance,
-    ) -> Self {
+    ) -> Result<Self> {
         unsafe {
-            Self {
+            Ok(Self {
                 handle: surface,
                 formats: surface_fn
-                    .get_physical_device_surface_formats(physical_device.handel, surface)
-                    .unwrap(),
+                    .get_physical_device_surface_formats(physical_device.handel, surface)?,
                 present_modes: surface_fn
-                    .get_physical_device_surface_present_modes(physical_device.handel, surface)
-                    .unwrap(),
+                    .get_physical_device_surface_present_modes(physical_device.handel, surface)?,
                 capabilities: surface_fn
-                    .get_physical_device_surface_capabilities(physical_device.handel, surface)
-                    .unwrap(),
-            }
+                    .get_physical_device_surface_capabilities(physical_device.handel, surface)?,
+            })
         }
     }
 }
