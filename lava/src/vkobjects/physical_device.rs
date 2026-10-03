@@ -1,3 +1,4 @@
+//! Physical device selection and queue family capability discovery
 use std::ffi::CStr;
 
 use crate::error::{Error, Result};

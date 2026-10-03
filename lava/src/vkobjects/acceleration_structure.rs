@@ -1,3 +1,4 @@
+//! Ray tracing acceleration structures: build-size queries and construction
 use crate::error::{Error, Result};
 use ash::vk;
 

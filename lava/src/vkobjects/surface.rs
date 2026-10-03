@@ -1,3 +1,4 @@
+//! Window surface handle with its supported formats, present modes, and capabilities
 use ash::vk;
 
 use crate::{error::Result, vkobjects::physical_device::PhysicalDevice};

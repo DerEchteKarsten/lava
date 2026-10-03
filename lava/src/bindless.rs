@@ -1,3 +1,4 @@
+//! Global bindless descriptor sets: immutable samplers, image registration, handles
 use std::sync::{OnceLock, atomic::AtomicU32};
 
 use crate::error::{Error, Result};
@@ -32,6 +33,14 @@ pub const NULL_HANDLE: u32 = !0;
 pub struct BindlessHandle {
     pub descriptor_index_set0: u32,
     pub descriptor_index_set1: u32,
+}
+impl BindlessHandle {
+    pub fn none() -> Self {
+        Self {
+            descriptor_index_set0: NULL_HANDLE,
+            descriptor_index_set1: NULL_HANDLE,
+        }
+    }
 }
 
 impl Bindless {
@@ -205,9 +214,12 @@ impl Bindless {
         Ok(())
     }
 
-    pub(crate) fn push<F: Format, U: ImageUsage>(image: ImageView<F, U>) -> Option<BindlessHandle> {
+    pub(crate) fn push<F: Format, U: ImageUsage>(image: ImageView<F, U>) -> BindlessHandle {
         let handle = match U::SET {
-            BindlessImageUsageSet::None => return None,
+            BindlessImageUsageSet::None => BindlessHandle {
+                descriptor_index_set1: NULL_HANDLE,
+                descriptor_index_set0: NULL_HANDLE,
+            },
             BindlessImageUsageSet::Both => BindlessHandle {
                 descriptor_index_set1: Self::get()
                     .num_images
@@ -230,7 +242,7 @@ impl Bindless {
             },
         };
         Self::write_image(image, handle);
-        Some(handle)
+        handle
     }
 
     pub(crate) fn write_image<F: Format, U: ImageUsage>(

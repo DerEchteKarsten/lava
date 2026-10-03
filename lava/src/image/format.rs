@@ -1,3 +1,4 @@
+//! Type-level image formats with their Vulkan format, aspects, and clear-value texels
 use ash::vk;
 
 use crate::vkobjects::swapchain::FORMAT;

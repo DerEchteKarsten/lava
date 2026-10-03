@@ -1,3 +1,4 @@
+//! Typed, usage-tagged GPU buffers backed by host-mapped gpu-allocator memory
 use std::{
     fmt::Debug,
     marker::PhantomData,

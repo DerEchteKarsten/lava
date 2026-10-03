@@ -1,12 +1,16 @@
+//! Typed buffer slices: sub-ranges, byte views, casts, and host copies
 use ash::vk;
 use bytemuck::Pod;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::range::Range;
 
-use crate::buffer::{
-    Buffer,
-    usage::{BufferUsage, Storage},
+use crate::{
+    buffer::{
+        Buffer,
+        usage::{BufferUsage, Storage},
+    },
+    command_buffer::BufferAccess,
 };
 
 impl<'a, T: Pod + Copy, U: BufferUsage> IntoIterator for BufferSlice<'a, T, U> {
@@ -94,6 +98,17 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
 }
 
 impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
+    pub(crate) fn access(
+        &self,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> BufferAccess {
+        BufferAccess {
+            stage,
+            access,
+            range: self.get_range(),
+        }
+    }
     pub fn get_range(&self) -> Range<u64> {
         (self.gpu_ptr..(self.gpu_ptr + self.size)).into()
     }
@@ -134,12 +149,7 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     pub fn offset(&self) -> u64 {
         self.gpu_ptr - self.base_address
     }
-    pub fn cast<B: Copy + Pod, U2: BufferUsage>(self) -> BufferSlice<'a, B, U2> {
-        unsafe { std::mem::transmute(self) }
-    }
-    /// Reinterprets this slice as a different buffer usage without changing the
-    /// underlying element type. Useful when a buffer is used in multiple roles.
-    pub fn cast_usage<U2: BufferUsage>(self) -> BufferSlice<'a, T, U2> {
+    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B, U> {
         unsafe { std::mem::transmute(self) }
     }
     pub fn copy_from(self, slice: &[T]) {

@@ -15,6 +15,7 @@ raw-window-handle = {workspace = true}
 lava-macros = { version = "0.1.0", path = "../lava-macros" }
 smallvec.workspace = true
 notify = "8.2.0"
+shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
 
 [build-dependencies]
 shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }

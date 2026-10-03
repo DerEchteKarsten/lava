@@ -1,3 +1,4 @@
+//! Lava: typed, bindless Vulkan abstraction over ash with shader-generated passes
 #![feature(const_trait_impl)]
 #![feature(range_into_bounds)]
 #![feature(range_bounds_is_empty)]

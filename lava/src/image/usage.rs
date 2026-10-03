@@ -1,12 +1,10 @@
+//! Type-level image usage markers mapping to Vulkan flags and bindless descriptor sets
 use ash::vk;
 
 pub trait ImageUsage: 'static + Copy + Clone {
     const VK: vk::ImageUsageFlags;
     const SET: BindlessImageUsageSet;
 }
-
-#[derive(Clone, Copy, Debug)]
-pub struct Unknown;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sampled;
@@ -24,11 +22,6 @@ pub struct ColorAttachmentSampled;
 pub struct DepthAttachmentSampled;
 #[derive(Clone, Copy, Debug)]
 pub struct SampledStorage;
-
-impl ImageUsage for Unknown {
-    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::empty();
-    const SET: BindlessImageUsageSet = BindlessImageUsageSet::None;
-}
 
 impl ImageUsage for Sampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;

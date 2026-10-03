@@ -1,3 +1,4 @@
+//! Proc macros for lava: records caller locations for Vulkan validation messages
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Item, Stmt, parse_macro_input};

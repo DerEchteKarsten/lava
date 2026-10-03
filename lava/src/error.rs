@@ -1,3 +1,4 @@
+//! Crate-wide error type and Result alias wrapping Vulkan, allocator, and IO failures
 use std::fmt;
 
 use ash::vk;
@@ -11,6 +12,7 @@ pub enum Error {
     Utf8(std::str::Utf8Error),
     Io(std::io::Error),
     Message(String),
+    Lock,
 }
 
 impl Error {
@@ -28,6 +30,7 @@ impl fmt::Display for Error {
             Error::Utf8(err) => write!(f, "invalid UTF-8: {err}"),
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::Message(msg) => f.write_str(msg),
+            Error::Lock => write!(f, "lock error"),
         }
     }
 }
@@ -41,6 +44,7 @@ impl std::error::Error for Error {
             Error::Utf8(err) => Some(err),
             Error::Io(err) => Some(err),
             Error::Message(_) => None,
+            Error::Lock => None,
         }
     }
 }
@@ -84,6 +88,12 @@ impl From<String> for Error {
 impl From<&str> for Error {
     fn from(err: &str) -> Self {
         Error::Message(err.to_owned())
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(_err: std::sync::PoisonError<T>) -> Self {
+        Error::Lock
     }
 }
 

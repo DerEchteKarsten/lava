@@ -1,3 +1,4 @@
+//! Compiles Slang passes to SPIR-V and generates typed pass bindings from reflection
 use std::{
     collections::{BTreeMap, HashMap},
     env,
@@ -197,13 +198,6 @@ fn image_access(usage: u64) -> &'static str {
     }
 }
 
-fn usage_bound(usage: u64) -> &'static str {
-    match usage {
-        0 => "IsSampled",
-        _ => "IsStorage",
-    }
-}
-
 fn image_texel(t: &TypeLayout) -> Option<(&'static str, usize)> {
     let generics = t.ty().unwrap().generic_container().unwrap();
     let element = generics
@@ -217,7 +211,6 @@ fn image_texel(t: &TypeLayout) -> Option<(&'static str, usize)> {
         ScalarType::Uint8 => "u8",
         _ => return None,
     };
-    // A scalar element has 1 component, a vector as many as its element count.
     let components = match element.kind() {
         TypeKind::Vector => element.element_count(),
         _ => 1,
@@ -234,18 +227,6 @@ fn field_kind(t: &TypeLayout) -> FieldKind {
         FieldKind::Buffer
     } else {
         FieldKind::Plain
-    }
-}
-
-fn cpu_type(t: &TypeLayout, structs: &mut Structs) -> (String, bool) {
-    match field_kind(t) {
-        FieldKind::Image { .. } => ("ImageView<'a>".into(), true),
-        FieldKind::Buffer => {
-            let ptr = t.field_by_index(0).unwrap().type_layout().unwrap();
-            let inner = cpu_type(ptr.element_type_layout().unwrap(), structs).0;
-            (format!("BufferSlice<'a, {inner}>"), true)
-        }
-        FieldKind::Plain => (rust_type(t, structs), false),
     }
 }
 
@@ -299,10 +280,10 @@ fn build_new_fn(pc: &TypeLayout, structs: &mut Structs, stage: &str) -> NewFn {
     for f in pc.fields() {
         let name = field_name(f);
         let t = f.type_layout().unwrap();
+        let suffix = camel_case(name);
         match field_kind(t) {
             FieldKind::Image { usage } => {
                 out.lifetime = true;
-                let suffix = camel_case(name);
                 let format_bound = match image_texel(t) {
                     Some((texel, components)) => {
                         format!("F{suffix}: Format<Texels = [{texel}; {components}]>")
@@ -310,20 +291,28 @@ fn build_new_fn(pc: &TypeLayout, structs: &mut Structs, stage: &str) -> NewFn {
                     None => format!("F{suffix}: Format"),
                 };
                 out.generics.push(format_bound);
-                out.generics
-                    .push(format!("U{suffix}: {}", usage_bound(usage)));
+                out.generics.push(format!(
+                    "U{suffix}: {}",
+                    match usage {
+                        0 => "image::usage::IsSampled",
+                        _ => "image::usage::IsStorage",
+                    }
+                ));
                 out.params
                     .push(format!("{name}: ImageView<'a, F{suffix}, U{suffix}>"));
-                out.gpu_inits
-                    .push(format!("{name}: {name}.handle.unwrap()"));
+                out.gpu_inits.push(format!("{name}: {name}.handle"));
                 out.image_accesses.push(format!(
-                    "ImageAccess {{\n                    stage: {stage},\n                    access: {access},\n                    image: {name}.image,\n                layout: vk::ImageLayout::GENERAL\n}}",
+                    "{name}.access({stage}, {access}, vk::ImageLayout::GENERAL)",
                     access = image_access(usage)
                 ));
             }
             FieldKind::Buffer => {
                 out.lifetime = true;
-                let (ty, _) = cpu_type(t, structs);
+                let ptr = t.field_by_index(0).unwrap().type_layout().unwrap();
+                let inner = rust_type(ptr.element_type_layout().unwrap(), structs);
+                let ty = format!("BufferSlice<'a, {inner}, U{suffix}>");
+                out.generics
+                    .push(format!("U{suffix}: buffer::usage::IsStorage"));
                 out.params.push(format!("{name}: {ty}"));
                 out.gpu_inits.push(format!("{name}: {name}.gpu_ptr"));
                 let access = if type_name(t) == "MutBuf" {
@@ -331,12 +320,11 @@ fn build_new_fn(pc: &TypeLayout, structs: &mut Structs, stage: &str) -> NewFn {
                 } else {
                     "vk::AccessFlags2::SHADER_STORAGE_READ"
                 };
-                out.buffer_accesses.push(format!(
-                    "BufferAccess {{\n                    stage: {stage},\n                    access: {access},\n                    range: {name}.get_range(),\n                }}"
-                ));
+                out.buffer_accesses
+                    .push(format!("{name}.access({stage}, {access})"));
             }
             FieldKind::Plain => {
-                let (ty, _) = cpu_type(t, structs);
+                let ty = rust_type(t, structs);
                 out.params.push(format!("{name}: {ty}"));
                 out.gpu_inits.push(name.to_string());
             }
@@ -356,8 +344,8 @@ fn generate_pass(
     num_ray_tracing_pipelines: usize,
     num_raster_pipelines: usize,
     path_dir: &PathBuf,
+    source: &str,
 ) -> (String, PassKind) {
-    // Name of the single `#[repr(C)]` push constant struct for this pass.
     let gpu_name = format!("C{pass_name}Bindings");
     let index = pass_map.len();
 
@@ -385,6 +373,7 @@ fn generate_pass(
             format!(
                 r#"    PassEntry {{
                     path: {:?},
+                    source: {source:?},
                     kind: PassKind::RasterVertex {{
                         fragment: "{fragment}\0",
                         vertex: "{vertex}\0",
@@ -403,6 +392,7 @@ fn generate_pass(
             format!(
                 r#"    PassEntry {{
                     path: {:?},
+                    source: {source:?},
                     kind: PassKind::RasterMesh {{
                         fragment: "{fragment}\0",
                         mesh: "{mesh}\0",
@@ -418,6 +408,7 @@ fn generate_pass(
             format!(
                 r#"    PassEntry {{
                     path: {:?},
+                    source: {source:?},
                     kind: PassKind::Compute {{
                         entry: "{compute}\0",
                     }},
@@ -435,6 +426,7 @@ fn generate_pass(
             format!(
                 r#"    PassEntry {{
                     path: {:?},
+                    source: {source:?},
                     kind: PassKind::RayTracing {{
                         ray_gen: "{raygen}\0",
                         ray_hit: "{any}\0",
@@ -479,8 +471,6 @@ fn generate_pass(
     let mut out = String::new();
     out.push_str(&gpu_struct);
 
-    // `RasterVertexPass`/`RasterMeshPass` require `RasterPass`, so emit the base
-    // impl as well when the pass is a raster pass.
     let base_impl = match kind {
         PassKind::RasterVertex | PassKind::RasterMesh => {
             format!("impl RasterPass for {pass_name} {{}}\n")
@@ -529,8 +519,6 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-/// Turn a snake_case field name into an UpperCamelCase suffix for generic
-/// parameter names (`font_atlas` -> `FontAtlas`).
 fn camel_case(s: &str) -> String {
     s.split('_')
         .filter(|part| !part.is_empty())
@@ -542,6 +530,9 @@ fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let shaders = PathBuf::from(manifest_dir).join("../shaders");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // `-lslang` can resolve to the unrelated S-Lang library in /usr/lib, which
+    // comes first in the search path of the final binary.
+    println!("cargo::rustc-link-lib=dylib=slang-compiler");
     println!(
         "cargo::rerun-if-changed={}",
         shaders.join("passes").display()
@@ -592,7 +583,8 @@ use crate::bindless::BindlessHandle;
 use crate::buffer::slice::*;
 use crate::image::format::*;
 use crate::image::slice::*;
-use crate::image::usage::*;
+use crate::buffer;
+use crate::image;
 use crate::command_buffer::*;
 use ash::vk;
 use std::path::PathBuf;
@@ -660,8 +652,9 @@ use std::str::FromStr;
             &mut pass_map,
             num_compute_pipelines,
             num_ray_tracing_pipelines,
-            num_compute_pipelines,
+            num_raster_pipelines,
             &out,
+            &format!("passes/{file}"),
         );
         match kind {
             PassKind::Compute => num_compute_pipelines += 1,

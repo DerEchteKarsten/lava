@@ -1,6 +1,11 @@
-use std::{ffi::CStr, marker::PhantomData, sync::OnceLock};
+//! Swapchain creation, image acquisition, and resize-driven recreation
+use std::{
+    ffi::CStr,
+    marker::PhantomData,
+    sync::{OnceLock, atomic::AtomicU32},
+};
 
-use crate::error::Result;
+use crate::{bindless::BindlessHandle, error::Result};
 use ash::vk::{self};
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
@@ -15,13 +20,38 @@ use crate::{
 pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 
 #[derive(Debug)]
-pub struct Swapchain<'a> {
-    pub size: [u32; 2],
-    pub(crate) handle: vk::SwapchainKHR,
-    pub images: SmallVec<[ImageView<'a, format::Swapchain, ColorAttachmentStorage>; 5]>,
+struct SwapchainImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    handle: BindlessHandle,
+    layout: AtomicU32,
 }
 
-impl<'a> Swapchain<'a> {
+#[derive(Debug)]
+pub struct Swapchain {
+    pub size: [u32; 2],
+    pub(crate) handle: vk::SwapchainKHR,
+    images: SmallVec<[SwapchainImage; 5]>,
+}
+
+impl Swapchain {
+    pub fn image(&self, index: u32) -> ImageView<'_, format::Swapchain, ColorAttachmentStorage> {
+        let image = &self.images[index as usize];
+        ImageView {
+            image: image.image,
+            view: image.view,
+            mip_range: (0..1).into(),
+            handle: image.handle,
+            layout: &image.layout,
+            _marker: PhantomData,
+            _marker2: PhantomData,
+        }
+    }
+
+    pub fn num_images(&self) -> usize {
+        self.images.len()
+    }
+
     #[validation_trace]
     pub fn new(old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = {
@@ -111,7 +141,7 @@ impl<'a> Swapchain<'a> {
         let images = images
             .into_iter()
             .enumerate()
-            .map(|(i, image)| -> Result<ImageView<'_, format::Swapchain, ColorAttachmentStorage>> {
+            .map(|(i, image)| -> Result<SwapchainImage> {
                 if let Some(debug_utils) = Functions::debug_utils() {
                     let name = format!("Swapchain Image {}\0", i);
                     let name = CStr::from_bytes_with_nul(name.as_bytes())
@@ -140,31 +170,32 @@ impl<'a> Swapchain<'a> {
                     });
                 let view = unsafe { Ctx::device().create_image_view(&create_info, None)? };
 
-                let mut image = ImageView {
-                    handle: None,
+                let mut image = SwapchainImage {
+                    handle: BindlessHandle::none(),
                     image,
                     view,
+                    layout: AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32),
+                };
+                let view = ImageView::<format::Swapchain, ColorAttachmentStorage> {
+                    image: image.image,
+                    view: image.view,
                     mip_range: (0..1).into(),
+                    handle: image.handle,
+                    layout: &image.layout,
                     _marker: PhantomData,
                     _marker2: PhantomData,
-                    _marker3: PhantomData,
                 };
 
-                if let Some(old) = old {
-                    let handle = old.images[i]
-                        .handle
-                        .expect("reused swapchain image has a bindless handle");
-                    Bindless::write_image(image, handle);
-                    image.handle = Some(handle);
+                image.handle = if let Some(old) = old {
+                    let handle = old.images[i].handle;
+                    Bindless::write_image(view, handle);
+                    handle
                 } else {
-                    let handle = Bindless::push(image);
-                    image.handle = handle;
-                }
+                    Bindless::push(view)
+                };
                 Ok(image)
             })
-            .collect::<Result<
-                SmallVec<[ImageView<'_, format::Swapchain, ColorAttachmentStorage>; 5]>,
-            >>()?;
+            .collect::<Result<SmallVec<[SwapchainImage; 5]>>>()?;
 
         Ok(Self {
             handle,

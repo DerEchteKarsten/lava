@@ -1,9 +1,6 @@
+//! Type-level buffer usage markers mapping to Vulkan buffer usage flags
 use ash::vk;
 
-/// Describes how a [`Buffer`](super::Buffer) is intended to be used.
-///
-/// Every buffer is created with `SHADER_DEVICE_ADDRESS` unconditionally, so
-/// that flag is deliberately not part of any implementation here.
 pub trait BufferUsage: 'static + Copy + Clone {
     const VK: vk::BufferUsageFlags;
 }

@@ -1,3 +1,4 @@
+//! Ray tracing pipeline creation and shader binding table layout
 use crate::error::{Error, Result};
 use ash::vk;
 

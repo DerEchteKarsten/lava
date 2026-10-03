@@ -1,4 +1,5 @@
-use std::marker::PhantomData;
+//! Format- and usage-typed GPU images with mip levels and host uploads
+use std::{marker::PhantomData, sync::atomic::AtomicU32};
 
 use crate::error::Result;
 use ash::vk::{self, ComponentSwizzle};
@@ -11,7 +12,7 @@ use crate::{
     image::{
         format::{Format, Undefined},
         slice::AsImage,
-        usage::{ImageUsage, Unknown},
+        usage::ImageUsage,
     },
     state::{Ctx, Functions},
     vkobjects::queue::{CommandBufferMemory, Fence, Gfx, Queue, SemaphoreInfo},
@@ -22,29 +23,37 @@ pub mod format;
 pub mod slice;
 pub mod usage;
 
-const LAYOUT_UNDEFINED: u8 = 0;
-const LAYOUT_GENERAL: u8 = 1;
-
 #[derive(Debug)]
-pub struct Image<const M: u32 = 1, F: Format = Undefined, U: ImageUsage = Unknown> {
-    pub image: vk::Image,
-    pub whole_view: vk::ImageView,
-    pub allocation: Allocation,
-    pub extent: vk::Extent3D,
+pub struct Image<F: Format, U: ImageUsage> {
+    pub(crate) image: vk::Image,
+    pub(crate) whole_view: vk::ImageView,
+    pub(crate) allocation: Allocation,
+    pub extent: UVec2,
+    pub handle: BindlessHandle,
     pub mip_levels: u32,
-    pub handle: Option<BindlessHandle>,
+    pub(crate) layout: AtomicU32,
     _format: PhantomData<F>,
     _usage: PhantomData<U>,
 }
 
-impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
+impl<F: Format, U: ImageUsage> Drop for Image<F, U> {
+    fn drop(&mut self) {
+        unsafe {
+            Ctx::device().destroy_image_view(self.whole_view, None);
+            Ctx::device().destroy_image(self.image, None);
+        }
+        let alloc = std::mem::take(&mut self.allocation);
+        if let Err(err) = Ctx::allocator().free(alloc) {
+            tracing::error!(%err, "failed to free image allocation");
+        }
+    }
+}
+
+impl<F: Format, U: ImageUsage> Image<F, U> {
     #[validation_trace]
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        Self::with_mip_levels(width, height, M)
+        Self::with_mip_levels(width, height, 1)
     }
-
-    /// Like `new`, but with a mip level count chosen at runtime. The whole view and the bindless
-    /// descriptor cover all `mip_levels` levels, the const generic `M` is only a default.
     #[validation_trace]
     pub fn with_mip_levels(width: u32, height: u32, mip_levels: u32) -> Result<Self> {
         let extent = vk::Extent3D {
@@ -92,12 +101,13 @@ impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
         let mut s = Self {
             _format: PhantomData,
             _usage: PhantomData,
-            handle: None,
+            handle: BindlessHandle::none(),
             allocation,
-            extent,
+            extent: UVec2::new(width, height),
             mip_levels,
             image,
             whole_view: vk::ImageView::null(),
+            layout: AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32),
         };
         let (handle, view) = {
             let view = s.create_new_view(
@@ -117,69 +127,52 @@ impl<const M: u32, F: Format, U: ImageUsage> Image<M, F, U> {
         Ok(s)
     }
 
-    pub fn set_layout(
-        &self,
-        fence: &Fence,
-        queue: &Queue<Gfx>,
-        buffer: &CommandBufferMemory,
-    ) -> Result<()> {
-        let begin_info = vk::CommandBufferBeginInfo::default();
-        unsafe {
-            Ctx::device().begin_command_buffer(buffer.handle, &begin_info)?;
-            Ctx::device().cmd_pipeline_barrier(
-                buffer.handle,
-                vk::PipelineStageFlags::empty(),
-                vk::PipelineStageFlags::empty(),
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .image(self.image)
-                    .subresource_range(self.whole_view().subresource_range())],
-            );
-            Ctx::device().end_command_buffer(buffer.handle)?;
-        };
-        let cmd_buffer_submit_info =
-            vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
-        let submit_info = vk::SubmitInfo2::default()
-            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info))
-            .wait_semaphore_infos(&[])
-            .signal_semaphore_infos(&[]);
-
-        unsafe {
-            Ctx::device().queue_submit2(
-                queue.handle,
-                std::slice::from_ref(&submit_info),
-                fence.handle,
-            )?
-        };
-        Ok(())
-    }
-
-    /// Transitions every mip level from UNDEFINED to GENERAL on the host (host image copy), so no
-    /// queue or command buffer is needed. Use this for images that are filled with `copy_from`.
     #[validation_trace]
-    pub fn set_layout_host(&self) -> Result<()> {
-        let transition = vk::HostImageLayoutTransitionInfoEXT::default()
-            .image(self.image)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .subresource_range(self.whole_view().subresource_range());
-        unsafe { Functions::host_image_copy().transition_image_layout(&[transition])? };
+    pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
+        let range = self.whole_view().subresource_range();
+        let layout = self.layout.get_mut();
+        let old_layout = vk::ImageLayout::from_raw(*layout as i32);
+        if old_layout != vk::ImageLayout::GENERAL {
+            *layout = vk::ImageLayout::GENERAL.as_raw() as u32;
+            let transition = vk::HostImageLayoutTransitionInfoEXT::default()
+                .image(self.image)
+                .old_layout(old_layout)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .subresource_range(range);
+            unsafe { Functions::host_image_copy().transition_image_layout(&[transition])? };
+        }
+        let extent = self.mip_extent(mip_level);
+        let regions = [vk::MemoryToImageCopyEXT::default()
+            .host_pointer(data.as_ptr().cast())
+            .image_extent(vk::Extent3D {
+                width: extent.x,
+                height: extent.y,
+                depth: 1,
+            })
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: F::ASPECTS,
+                mip_level,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .memory_image_height(extent.y)
+            .memory_row_length(extent.x)];
+        let info = vk::CopyMemoryToImageInfoEXT::default()
+            .dst_image(self.image)
+            .dst_image_layout(vk::ImageLayout::GENERAL)
+            .regions(&regions);
+        unsafe { Functions::host_image_copy().copy_memory_to_image(&info)? };
         Ok(())
     }
 
-    /// Extent of the given mip level.
     pub fn mip_extent(&self, level: u32) -> UVec2 {
         UVec2::new(
-            (self.extent.width >> level).max(1),
-            (self.extent.height >> level).max(1),
+            (self.extent.x >> level).max(1),
+            (self.extent.y >> level).max(1),
         )
     }
 
-    pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<M, NF, NU> {
+    pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<NF, NU> {
         unsafe { std::mem::transmute(self) }
     }
 }

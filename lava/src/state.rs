@@ -1,3 +1,4 @@
+//! Global Vulkan context: instance, device, queues, features, and validation logging
 use std::{
     cell::Cell,
     ffi::{c_char, c_void},
@@ -321,12 +322,22 @@ unsafe extern "system" fn vulkan_debug_callback(
                     return vk::FALSE;
                 }
             }
-            let flags = flag.as_raw() as u64;
-            let typ = typ.as_raw() as u64;
-            if let Some(loc) = CALLSITE.get() {
-                tracing::error!(target: "vulkan-validation", flags = flags, typ = typ, validation_location = format!("{}", loc), "{}", message);
-            } else {
-                tracing::error!(target: "vulkan-validation", flags = flags, typ = typ, "{}", message);
+            let typ = format!("{typ:?}");
+            let location = CALLSITE.get().map(|loc| loc.to_string());
+            let location = location.as_deref();
+            match flag {
+                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
+                    tracing::error!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
+                }
+                vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
+                    tracing::warn!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
+                }
+                vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
+                    tracing::debug!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
+                }
+                _ => {
+                    tracing::trace!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
+                }
             }
         }
     }

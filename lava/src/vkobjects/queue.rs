@@ -1,3 +1,4 @@
+//! Queue submission and sync: typed queues, semaphores, fences, frame slots, presenting
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -12,7 +13,7 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
+    command_buffer::{self, BufferAccess, CommandBuffer, ImageAccess},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -294,13 +295,96 @@ impl Drop for CommandBufferMemory {
     }
 }
 
+pub struct FrameSlot {
+    retired: Vec<Box<dyn Send + Sync>>,
+    buffer: CommandBufferMemory,
+    pool: CommandPool,
+    fence: Fence,
+    submitted: bool,
+}
+
+impl FrameSlot {
+    #[validation_trace]
+    pub fn new<Q: QueueFamilie>(queue: &Queue<Q>) -> Result<Self> {
+        let pool = queue.create_pool()?;
+        let buffer = pool.create_command_buffer()?;
+        Ok(Self {
+            retired: Vec::new(),
+            buffer,
+            pool,
+            fence: Fence::new()?,
+            submitted: false,
+        })
+    }
+
+    #[validation_trace]
+    pub fn begin(&mut self) -> Result<Frame<'_>> {
+        if self.submitted {
+            self.fence.wait()?;
+            self.fence.reset()?;
+            self.pool.reset()?;
+            self.submitted = false;
+            self.retired.clear();
+        }
+        let mut frame = Frame { slot: self };
+        for pipeline in command_buffer::apply_pending_reloads() {
+            frame.retire(pipeline);
+        }
+        Ok(frame)
+    }
+}
+
+pub struct Frame<'a> {
+    slot: &'a mut FrameSlot,
+}
+
+impl Frame<'_> {
+    pub fn retire<T: Send + Sync + 'static>(&mut self, value: T) {
+        self.slot.retired.push(Box::new(value));
+    }
+
+    #[validation_trace]
+    pub fn execute<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
+        self,
+        queue: &Queue<Q>,
+        pending: PendingAccesses,
+        wait_on: &[SemaphoreInfo],
+        signal: &[SemaphoreInfo],
+        executor: F,
+    ) -> Result<PendingAccesses> {
+        let slot = self.slot;
+        let result = queue.execute_command(
+            pending,
+            &slot.buffer,
+            Some(&slot.fence),
+            wait_on,
+            signal,
+            executor,
+        );
+        match result {
+            Ok(_) => slot.submitted = true,
+            Err(_) => slot.pool.reset()?,
+        }
+        result
+    }
+}
+
+impl Drop for FrameSlot {
+    fn drop(&mut self) {
+        if self.submitted
+            && let Err(err) = self.fence.wait()
+        {
+            tracing::error!(%err, "failed to wait for frame slot fence");
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PendingAccesses {
     pub(crate) buffer_reads: SmallVec<[BufferAccess; 8]>,
     pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
     pub(crate) buffer_writes: SmallVec<[BufferAccess; 8]>,
     pub(crate) image_writes: SmallVec<[ImageAccess; 8]>,
-    pub(crate) image_layouts: SmallVec<[(vk::Image, vk::ImageLayout); 4]>,
 }
 
 impl<Q: QueueFamilie> Queue<Q> {
