@@ -1,7 +1,7 @@
 //! Format- and usage-typed GPU images with mip levels and host uploads
 use std::{marker::PhantomData, sync::atomic::AtomicU32};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use ash::vk::{self, ComponentSwizzle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use lava_macros::validation_trace;
@@ -42,6 +42,7 @@ impl<F: Format, U: ImageUsage> Drop for Image<F, U> {
             Ctx::device().destroy_image_view(self.whole_view, None);
             Ctx::device().destroy_image(self.image, None);
         }
+        Bindless::release(self.handle);
         let alloc = std::mem::take(&mut self.allocation);
         if let Err(err) = Ctx::allocator().free(alloc) {
             tracing::error!(%err, "failed to free image allocation");
@@ -119,7 +120,7 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
                     a: ComponentSwizzle::A,
                 },
             )?;
-            let handle = Bindless::push(view);
+            let handle = Bindless::push(view)?;
             (handle, view.view)
         };
         s.handle = handle;
@@ -129,6 +130,28 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
 
     #[validation_trace]
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
+        if !Ctx::features().rebar {
+            return Err(Error::message(
+                "host image copies need host-visible device memory, which this device lacks",
+            ));
+        }
+        if mip_level >= self.mip_levels {
+            return Err(Error::message(format!(
+                "mip level {mip_level} is out of range for an image with {} levels",
+                self.mip_levels
+            )));
+        }
+        if data.is_empty() {
+            return Err(Error::message("no texel data to copy"));
+        }
+        let expected = expected_data_len(mip_extent(self.extent, mip_level), F::TEXEL_SIZE);
+        if expected.is_some_and(|expected| data.len() != expected) {
+            return Err(Error::message(format!(
+                "mip level {mip_level} holds {} bytes but {} were given",
+                expected.unwrap_or_default(),
+                data.len()
+            )));
+        }
         let range = self.whole_view().subresource_range();
         let layout = self.layout.get_mut();
         let old_layout = vk::ImageLayout::from_raw(*layout as i32);
@@ -166,13 +189,56 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
     }
 
     pub fn mip_extent(&self, level: u32) -> UVec2 {
-        UVec2::new(
-            (self.extent.x >> level).max(1),
-            (self.extent.y >> level).max(1),
-        )
+        mip_extent(self.extent, level)
     }
 
     pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<NF, NU> {
         unsafe { std::mem::transmute(self) }
+    }
+}
+
+/// Extent of mip `level` of an image whose level 0 is `extent`: halved per level, at least 1.
+pub fn mip_extent(extent: UVec2, level: u32) -> UVec2 {
+    UVec2::new(
+        extent.x.checked_shr(level).unwrap_or(0).max(1),
+        extent.y.checked_shr(level).unwrap_or(0).max(1),
+    )
+}
+
+/// Bytes of tightly packed texel data for an image of `extent`, or `None` for formats without
+/// a fixed texel size (`texel_size == 0`), where the length can't be checked.
+fn expected_data_len(extent: UVec2, texel_size: usize) -> Option<usize> {
+    (texel_size != 0).then(|| extent.x as usize * extent.y as usize * texel_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_data_len_is_texels_times_texel_size() {
+        assert_eq!(expected_data_len(UVec2::new(8, 4), 4), Some(128));
+        assert_eq!(expected_data_len(UVec2::new(3, 5), 1), Some(15));
+        assert_eq!(expected_data_len(UVec2::new(1, 1), 16), Some(16));
+        // Block-compressed and runtime-defined formats can't be checked.
+        assert_eq!(expected_data_len(UVec2::new(8, 4), 0), None);
+    }
+
+    #[test]
+    fn mip_extent_halves_per_level() {
+        let extent = UVec2::new(256, 64);
+        assert_eq!(mip_extent(extent, 0), UVec2::new(256, 64));
+        assert_eq!(mip_extent(extent, 1), UVec2::new(128, 32));
+        assert_eq!(mip_extent(extent, 6), UVec2::new(4, 1));
+    }
+
+    #[test]
+    fn mip_extent_rounds_down_and_never_reaches_zero() {
+        assert_eq!(mip_extent(UVec2::new(5, 3), 1), UVec2::new(2, 1));
+        assert_eq!(mip_extent(UVec2::new(5, 3), 2), UVec2::new(1, 1));
+        assert_eq!(mip_extent(UVec2::new(5, 3), 31), UVec2::new(1, 1));
+        // Shifting by the full bit width must not overflow.
+        assert_eq!(mip_extent(UVec2::new(5, 3), 32), UVec2::new(1, 1));
+        assert_eq!(mip_extent(UVec2::new(5, 3), 200), UVec2::new(1, 1));
     }
 }

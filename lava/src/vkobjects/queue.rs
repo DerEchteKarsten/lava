@@ -218,10 +218,7 @@ impl QueueFamilie for Present {
         Ctx::present_queue_index()
     }
     fn is_free() -> &'static [AtomicBool] {
-        Ctx::get()
-            .present_queues_in_use
-            .as_ref()
-            .unwrap_or(&Ctx::get().gfx_queues_in_use)
+        &Ctx::get().gfx_queues_in_use
     }
 }
 impl QueueFamilie for Gfx {
@@ -387,6 +384,19 @@ pub struct PendingAccesses {
     pub(crate) image_writes: SmallVec<[ImageAccess; 8]>,
 }
 
+impl PendingAccesses {
+    /// Union of the pipeline stages of every access still pending, i.e. the stages a
+    /// submission has to finish before its signal semaphores may fire.
+    pub(crate) fn last_stage(&self) -> vk::PipelineStageFlags2 {
+        let images = self.image_reads.iter().chain(&self.image_writes);
+        let buffers = self.buffer_reads.iter().chain(&self.buffer_writes);
+        images
+            .map(|i| i.stage)
+            .chain(buffers.map(|b| b.stage))
+            .fold(vk::PipelineStageFlags2::empty(), |acc, stage| acc | stage)
+    }
+}
+
 impl<Q: QueueFamilie> Queue<Q> {
     #[validation_trace]
     pub fn new() -> Result<Self> {
@@ -453,19 +463,7 @@ impl<Q: QueueFamilie> Queue<Q> {
                 .iter()
                 .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
                 .collect();
-            let mut last_stage = vk::PipelineStageFlags2::empty();
-            for i in &cmd_buffer.pending_accesses.image_reads {
-                last_stage |= i.stage;
-            }
-            for i in &cmd_buffer.pending_accesses.image_writes {
-                last_stage |= i.stage;
-            }
-            for i in &cmd_buffer.pending_accesses.buffer_reads {
-                last_stage |= i.stage;
-            }
-            for i in &cmd_buffer.pending_accesses.buffer_writes {
-                last_stage |= i.stage;
-            }
+            let last_stage = cmd_buffer.pending_accesses.last_stage();
             let signal_infos: SmallVec<[_; 1]> =
                 signal.iter().map(|sem| sem.to_vk(last_stage)).collect();
 
@@ -503,5 +501,61 @@ impl<Q: QueueFamilie> Queue<Q> {
             Ok(false) => Ok(false),
             Err(e) => Err(Error::Vulkan(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    #[test]
+    fn binary_semaphore_info_has_no_value() {
+        let info = SemaphoreInfo::Binary(vk::Semaphore::from_raw(7));
+        let submit = info.to_vk(vk::PipelineStageFlags2::COMPUTE_SHADER);
+        assert_eq!(submit.semaphore, vk::Semaphore::from_raw(7));
+        assert_eq!(submit.value, 0);
+        assert_eq!(submit.stage_mask, vk::PipelineStageFlags2::COMPUTE_SHADER);
+    }
+
+    #[test]
+    fn timeline_semaphore_info_carries_its_value() {
+        let info = SemaphoreInfo::Timeline(vk::Semaphore::from_raw(9), 12);
+        let submit = info.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS);
+        assert_eq!(submit.semaphore, vk::Semaphore::from_raw(9));
+        assert_eq!(submit.value, 12);
+        assert_eq!(submit.stage_mask, vk::PipelineStageFlags2::ALL_COMMANDS);
+    }
+
+    #[test]
+    fn last_stage_is_empty_without_pending_accesses() {
+        assert!(PendingAccesses::default().last_stage().is_empty());
+    }
+
+    #[test]
+    fn last_stage_is_the_union_over_all_pending_accesses() {
+        use vk::PipelineStageFlags2 as S;
+        let buffer = |stage| BufferAccess {
+            stage,
+            access: vk::AccessFlags2::empty(),
+            range: (0u64..4).into(),
+        };
+        let image = |stage| ImageAccess {
+            stage,
+            access: vk::AccessFlags2::empty(),
+            image: vk::Image::null(),
+            layout: vk::ImageLayout::GENERAL,
+            aspect: vk::ImageAspectFlags::COLOR,
+            old_layout: vk::ImageLayout::GENERAL,
+        };
+        let mut pending = PendingAccesses::default();
+        pending.buffer_reads.push(buffer(S::VERTEX_SHADER));
+        pending.buffer_writes.push(buffer(S::COMPUTE_SHADER));
+        pending.image_reads.push(image(S::FRAGMENT_SHADER));
+        pending.image_writes.push(image(S::COLOR_ATTACHMENT_OUTPUT));
+        assert_eq!(
+            pending.last_stage(),
+            S::VERTEX_SHADER | S::COMPUTE_SHADER | S::FRAGMENT_SHADER | S::COLOR_ATTACHMENT_OUTPUT
+        );
     }
 }

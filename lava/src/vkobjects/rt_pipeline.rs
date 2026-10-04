@@ -238,3 +238,18 @@ impl ShaderBindingTable {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::alinged_size;
+
+    #[test]
+    fn aligned_size_rounds_up_to_the_next_multiple() {
+        assert_eq!(alinged_size(0, 64), 0);
+        assert_eq!(alinged_size(1, 64), 64);
+        assert_eq!(alinged_size(64, 64), 64);
+        assert_eq!(alinged_size(65, 64), 128);
+        assert_eq!(alinged_size(32, 32), 32);
+        assert_eq!(alinged_size(33, 1), 33);
+    }
+}

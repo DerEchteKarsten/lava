@@ -150,3 +150,101 @@ impl IsIndirect for Indirect {}
 impl IsIndirect for StorageIndirect {}
 impl IsIndirect for UniformIndirect {}
 impl IsIndirect for StorageUniformIndirect {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::BufferUsageFlags as F;
+
+    #[test]
+    fn single_usages_map_to_their_flag() {
+        assert_eq!(Unknown::VK, F::empty());
+        assert_eq!(Storage::VK, F::STORAGE_BUFFER);
+        assert_eq!(Uniform::VK, F::UNIFORM_BUFFER);
+        assert_eq!(Vertex::VK, F::VERTEX_BUFFER);
+        assert_eq!(Index::VK, F::INDEX_BUFFER);
+        assert_eq!(Indirect::VK, F::INDIRECT_BUFFER);
+    }
+
+    #[test]
+    fn combined_usages_are_the_union_of_their_parts() {
+        assert_eq!(StorageUniform::VK, F::STORAGE_BUFFER | F::UNIFORM_BUFFER);
+        assert_eq!(StorageIndirect::VK, F::STORAGE_BUFFER | F::INDIRECT_BUFFER);
+        assert_eq!(UniformIndirect::VK, F::UNIFORM_BUFFER | F::INDIRECT_BUFFER);
+        assert_eq!(
+            StorageUniformIndirect::VK,
+            F::STORAGE_BUFFER | F::UNIFORM_BUFFER | F::INDIRECT_BUFFER
+        );
+        assert_eq!(VertexIndex::VK, F::VERTEX_BUFFER | F::INDEX_BUFFER);
+        assert_eq!(StorageVertex::VK, F::STORAGE_BUFFER | F::VERTEX_BUFFER);
+        assert_eq!(StorageIndex::VK, F::STORAGE_BUFFER | F::INDEX_BUFFER);
+        assert_eq!(UniformVertex::VK, F::UNIFORM_BUFFER | F::VERTEX_BUFFER);
+        assert_eq!(UniformIndex::VK, F::UNIFORM_BUFFER | F::INDEX_BUFFER);
+    }
+
+    /// The `Is*` marker traits must agree with the flags: a type may only claim a capability
+    /// its Vulkan usage actually contains.
+    #[test]
+    fn marker_traits_match_the_flags() {
+        fn storage<U: IsStorage>() -> F {
+            U::VK
+        }
+        fn uniform<U: IsUniform>() -> F {
+            U::VK
+        }
+        fn vertex<U: IsVertex>() -> F {
+            U::VK
+        }
+        fn index<U: IsIndex>() -> F {
+            U::VK
+        }
+        fn indirect<U: IsIndirect>() -> F {
+            U::VK
+        }
+
+        for flags in [
+            storage::<Storage>(),
+            storage::<StorageUniform>(),
+            storage::<StorageIndirect>(),
+            storage::<StorageUniformIndirect>(),
+            storage::<StorageVertex>(),
+            storage::<StorageIndex>(),
+        ] {
+            assert!(flags.contains(F::STORAGE_BUFFER));
+        }
+        for flags in [
+            uniform::<Uniform>(),
+            uniform::<StorageUniform>(),
+            uniform::<UniformIndirect>(),
+            uniform::<StorageUniformIndirect>(),
+            uniform::<UniformVertex>(),
+            uniform::<UniformIndex>(),
+        ] {
+            assert!(flags.contains(F::UNIFORM_BUFFER));
+        }
+        for flags in [
+            vertex::<Vertex>(),
+            vertex::<VertexIndex>(),
+            vertex::<StorageVertex>(),
+            vertex::<UniformVertex>(),
+        ] {
+            assert!(flags.contains(F::VERTEX_BUFFER));
+        }
+        for flags in [
+            index::<Index>(),
+            index::<VertexIndex>(),
+            index::<StorageIndex>(),
+            index::<UniformIndex>(),
+        ] {
+            assert!(flags.contains(F::INDEX_BUFFER));
+        }
+        for flags in [
+            indirect::<Indirect>(),
+            indirect::<StorageIndirect>(),
+            indirect::<UniformIndirect>(),
+            indirect::<StorageUniformIndirect>(),
+        ] {
+            assert!(flags.contains(F::INDIRECT_BUFFER));
+        }
+    }
+}

@@ -30,6 +30,7 @@ pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
     pub handle: vk::Buffer,
     pub address: u64,
     pub allocation: Allocation,
+    num_bytes: u64,
     _type_marker: PhantomData<T>,
     _usage_marker: PhantomData<U>,
 }
@@ -37,26 +38,26 @@ pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
 impl<T: Copy + Pod, U: BufferUsage> Index<usize> for Buffer<T, U> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe { self.range(..).ptr().add(index).as_ref() }.unwrap()
+        unsafe { &*self.range(..).element_ptr(index) }
     }
 }
 
 impl<T: Copy + Pod, U: BufferUsage> IndexMut<usize> for Buffer<T, U> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe { self.range(..).ptr().add(index).as_mut() }.unwrap()
+        unsafe { &mut *self.range(..).element_ptr(index) }
     }
 }
 
 impl<'a, T: Copy + Pod, U: BufferUsage> Index<usize> for BufferSlice<'a, T, U> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe { self.ptr().add(index).as_ref() }.unwrap()
+        unsafe { &*self.element_ptr(index) }
     }
 }
 
 impl<'a, T: Copy + Pod, U: BufferUsage> IndexMut<usize> for BufferSlice<'a, T, U> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe { self.ptr().add(index).as_mut() }.unwrap()
+        unsafe { &mut *self.element_ptr(index) }
     }
 }
 
@@ -115,13 +116,14 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             _type_marker: PhantomData,
             _usage_marker: PhantomData,
             address,
+            num_bytes,
             allocation: allocation,
             handle: buffer,
         })
     }
 
     pub fn size(&self) -> u64 {
-        self.allocation.size()
+        self.num_bytes
     }
 
     #[validation_trace]

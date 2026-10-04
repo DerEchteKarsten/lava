@@ -14,7 +14,10 @@ use crate::{
     bindless::Bindless,
     image::{format, slice::ImageView, usage::ColorAttachmentStorage},
     state::{Ctx, Functions},
-    vkobjects::queue::{Binary, Fence, Semaphore},
+    vkobjects::{
+        queue::{Binary, Fence, Semaphore},
+        surface::Surface,
+    },
 };
 
 pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
@@ -53,58 +56,21 @@ impl Swapchain {
     }
 
     #[validation_trace]
-    pub fn new(old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
-        let format = {
-            let formats = &Ctx::surface().formats;
-            if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
-                vk::SurfaceFormatKHR {
-                    format: vk::Format::B8G8R8A8_UNORM,
-                    color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-                }
-            } else {
-                *formats
-                    .iter()
-                    .find(|format| {
-                        format.format == vk::Format::B8G8R8A8_UNORM
-                            && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-                    })
-                    .unwrap_or(&formats[0])
-            }
-        };
+    pub fn new(surface: &Surface, old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
+        let format = select_surface_format(&surface.formats);
 
         let _ = FORMAT.set(format.format);
 
-        let present_mode = {
-            if Ctx::surface()
-                .present_modes
-                .contains(&vk::PresentModeKHR::IMMEDIATE)
-            {
-                vk::PresentModeKHR::IMMEDIATE
-            } else {
-                vk::PresentModeKHR::MAILBOX
-            }
-        };
+        let present_mode = select_present_mode(&surface.present_modes);
+        let extent = select_extent(size, &surface.capabilities);
 
-        let extent = {
-            if let Some(size) = size {
-                vk::Extent2D {
-                    width: size[0],
-                    height: size[1],
-                }
-            } else if Ctx::surface().capabilities.current_extent.width != u32::MAX {
-                Ctx::surface().capabilities.current_extent
-            } else {
-                Ctx::surface().capabilities.min_image_extent
-            }
-        };
-
-        let image_count = Ctx::surface().capabilities.min_image_count;
+        let image_count = surface.capabilities.min_image_count;
 
         let families_indices = [Ctx::gfx_queue_index(), Ctx::present_queue_index()];
 
         let create_info = {
             let mut builder = vk::SwapchainCreateInfoKHR::default()
-                .surface(Ctx::surface().handle)
+                .surface(surface.handle)
                 .min_image_count(image_count)
                 .image_format(format.format)
                 .image_color_space(format.color_space)
@@ -129,7 +95,7 @@ impl Swapchain {
             }
 
             builder
-                .pre_transform(Ctx::surface().capabilities.current_transform)
+                .pre_transform(surface.capabilities.current_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                 .present_mode(present_mode)
                 .clipped(true)
@@ -144,8 +110,8 @@ impl Swapchain {
             .map(|(i, image)| -> Result<SwapchainImage> {
                 if let Some(debug_utils) = Functions::debug_utils() {
                     let name = format!("Swapchain Image {}\0", i);
-                    let name = CStr::from_bytes_with_nul(name.as_bytes())
-                        .expect("name is nul terminated");
+                    let name =
+                        CStr::from_bytes_with_nul(name.as_bytes()).expect("name is nul terminated");
                     let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
                         .object_handle(image)
                         .object_name(name);
@@ -186,12 +152,12 @@ impl Swapchain {
                     _marker2: PhantomData,
                 };
 
-                image.handle = if let Some(old) = old {
-                    let handle = old.images[i].handle;
-                    Bindless::write_image(view, handle);
-                    handle
+                // Reuse the old swapchain's bindless slots so handles stay stable over a resize.
+                image.handle = if let Some(old) = old.and_then(|old| old.images.get(i)) {
+                    Bindless::write_image(view, old.handle);
+                    old.handle
                 } else {
-                    Bindless::push(view)
+                    Bindless::push(view)?
                 };
                 Ok(image)
             })
@@ -218,15 +184,167 @@ impl Swapchain {
     }
 
     #[validation_trace]
-    pub fn recreate(&mut self, size: [u32; 2]) -> Result<()> {
+    pub fn recreate(&mut self, surface: &Surface, size: [u32; 2]) -> Result<()> {
         let _span = tracing::info_span!("Swapchain Recreation");
-        let swapchain = Swapchain::new(Some(self), Some(size))?;
-
-        unsafe {
-            Ctx::device().device_wait_idle()?;
-            Functions::swapchain().destroy_swapchain(self.handle, None);
-        };
+        let swapchain = Swapchain::new(surface, Some(self), Some(size))?;
+        // Dropping the old swapchain waits for the device and destroys it.
         *self = swapchain;
         Ok(())
+    }
+}
+
+impl Drop for Swapchain {
+    fn drop(&mut self) {
+        unsafe {
+            if let Err(err) = Ctx::device().device_wait_idle() {
+                tracing::error!(%err, "failed to wait for the device before destroying a swapchain");
+            }
+            for image in &self.images {
+                Ctx::device().destroy_image_view(image.view, None);
+            }
+            Functions::swapchain().destroy_swapchain(self.handle, None);
+        }
+    }
+}
+
+/// Prefers BGRA8 unorm with sRGB-nonlinear colour space, otherwise the surface's first format.
+pub(crate) fn select_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+    let preferred = vk::SurfaceFormatKHR {
+        format: vk::Format::B8G8R8A8_UNORM,
+        color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+    };
+    match formats {
+        // No formats or a single UNDEFINED entry: the surface has no preference.
+        [] => preferred,
+        [only] if only.format == vk::Format::UNDEFINED => preferred,
+        _ => *formats
+            .iter()
+            .find(|f| **f == preferred)
+            .unwrap_or(&formats[0]),
+    }
+}
+
+/// Lowest-latency mode available: IMMEDIATE, then MAILBOX, then FIFO (always supported).
+pub(crate) fn select_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX]
+        .into_iter()
+        .find(|mode| modes.contains(mode))
+        .unwrap_or(vk::PresentModeKHR::FIFO)
+}
+
+/// The requested size, else the surface's current extent, else (when the surface leaves the
+/// size to the swapchain, signalled by `u32::MAX`) its minimum extent.
+pub(crate) fn select_extent(
+    size: Option<[u32; 2]>,
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+) -> vk::Extent2D {
+    if let Some([width, height]) = size {
+        vk::Extent2D { width, height }
+    } else if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        capabilities.min_image_extent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn format(format: vk::Format, color_space: vk::ColorSpaceKHR) -> vk::SurfaceFormatKHR {
+        vk::SurfaceFormatKHR {
+            format,
+            color_space,
+        }
+    }
+
+    const BGRA: vk::SurfaceFormatKHR = vk::SurfaceFormatKHR {
+        format: vk::Format::B8G8R8A8_UNORM,
+        color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+    };
+
+    #[test]
+    fn bgra_unorm_srgb_is_preferred_wherever_it_is_listed() {
+        let formats = [
+            format(vk::Format::R8G8B8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR),
+            format(
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+                vk::ColorSpaceKHR::HDR10_ST2084_EXT,
+            ),
+            BGRA,
+        ];
+        assert_eq!(select_surface_format(&formats), BGRA);
+    }
+
+    #[test]
+    fn bgra_with_another_colour_space_does_not_count_as_preferred() {
+        let formats = [
+            format(vk::Format::R8G8B8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR),
+            format(
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ColorSpaceKHR::HDR10_ST2084_EXT,
+            ),
+        ];
+        assert_eq!(select_surface_format(&formats), formats[0]);
+    }
+
+    #[test]
+    fn surfaces_without_a_preference_get_bgra() {
+        assert_eq!(select_surface_format(&[]), BGRA);
+        let undefined = [format(
+            vk::Format::UNDEFINED,
+            vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        )];
+        assert_eq!(select_surface_format(&undefined), BGRA);
+    }
+
+    #[test]
+    fn present_mode_prefers_immediate_then_mailbox_then_fifo() {
+        use vk::PresentModeKHR as P;
+        assert_eq!(
+            select_present_mode(&[P::FIFO, P::MAILBOX, P::IMMEDIATE]),
+            P::IMMEDIATE
+        );
+        assert_eq!(select_present_mode(&[P::FIFO, P::MAILBOX]), P::MAILBOX);
+        // FIFO is the only mode every surface supports, so it is the fallback.
+        assert_eq!(select_present_mode(&[P::FIFO, P::FIFO_RELAXED]), P::FIFO);
+        assert_eq!(select_present_mode(&[]), P::FIFO);
+    }
+
+    #[test]
+    fn extent_prefers_the_requested_size() {
+        let caps = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+            min_image_extent: vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            ..Default::default()
+        };
+        let requested = select_extent(Some([320, 240]), &caps);
+        assert_eq!((requested.width, requested.height), (320, 240));
+
+        let current = select_extent(None, &caps);
+        assert_eq!((current.width, current.height), (800, 600));
+    }
+
+    #[test]
+    fn extent_falls_back_to_the_minimum_when_the_surface_has_no_size() {
+        let caps = vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            min_image_extent: vk::Extent2D {
+                width: 64,
+                height: 48,
+            },
+            ..Default::default()
+        };
+        let extent = select_extent(None, &caps);
+        assert_eq!((extent.width, extent.height), (64, 48));
     }
 }

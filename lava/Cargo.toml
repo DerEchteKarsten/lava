@@ -20,6 +20,19 @@ shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
 [build-dependencies]
 shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
 
+[dev-dependencies]
+# Enables the test passes for lava's own tests only.
+lava = { path = ".", features = ["test-passes"] }
+winit = "0.30"
+tracing-subscriber = { workspace = true }
+png = "0.18"
+
 [features]
 default = []
+# Also compile the passes in `tests/shaders` (bindings then go to OUT_DIR).
+test-passes = []
 # hot-reload = ["notify"]
+
+[[test]]
+name = "gpu_window"
+harness = false

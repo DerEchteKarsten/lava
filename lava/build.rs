@@ -54,6 +54,8 @@ type Structs = BTreeMap<String, StructDef>;
 
 const IMAGE_TYPES: [&str; 1] = ["Img"];
 const BUFFER_TYPES: [&str; 2] = ["Buf", "MutBuf"];
+/// Image types as struct fields: all are a `BindlessHandle` on the Rust side.
+const HANDLE_TYPES: [&str; 2] = ["Img", "DynImg"];
 
 fn field_name(f: &VariableLayout) -> &str {
     f.variable().and_then(|v| v.name()).expect("unnamed field")
@@ -171,7 +173,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
 }
 
 fn gpu_type(t: &TypeLayout, structs: &mut Structs) -> String {
-    if is_struct_named(t, &IMAGE_TYPES) {
+    if is_struct_named(t, &HANDLE_TYPES) {
         "BindlessHandle".into()
     } else if is_struct_named(t, &BUFFER_TYPES) {
         rust_type(t.field_by_index(0).unwrap().type_layout().unwrap(), structs);
@@ -501,6 +503,7 @@ impl {pass_name} {{
             gpu_bindings: {gpu_name} {{
                 {gpu_inits}
             }},
+            stage: {stage},
             _marker: PhantomData,
         }}
     }}
@@ -541,15 +544,33 @@ fn main() {
         "cargo::rerun-if-changed={}",
         shaders.join("include").display()
     );
+    // Lava's own tests render with dedicated passes from `lava/tests/shaders`, so they don't
+    // depend on the engine's shaders. Those passes are only compiled with the `test-passes`
+    // feature, and the bindings then go to OUT_DIR so `src/bindings.rs` keeps describing
+    // exactly the engine passes.
+    let test_passes = env::var_os("CARGO_FEATURE_TEST_PASSES").is_some();
+    let tests = PathBuf::from(manifest_dir).join("tests");
+    if test_passes {
+        println!(
+            "cargo::rerun-if-changed={}",
+            tests.join("shaders").display()
+        );
+    }
 
     let global = slang::GlobalSession::new().unwrap();
     let root = CString::new(shaders.to_str().unwrap()).unwrap();
     let include = CString::new(shaders.join("include").to_str().unwrap()).unwrap();
-    let search_paths = [root.as_ptr(), include.as_ptr()];
+    let tests_path = CString::new(tests.to_str().unwrap()).unwrap();
+    let mut search_paths = vec![root.as_ptr(), include.as_ptr()];
+    if test_passes {
+        search_paths.push(tests_path.as_ptr());
+    }
     let targets = [slang::TargetDesc::default()
         .format(slang::CompileTarget::Spirv)
         .profile(global.find_profile("spirv_1_6"))];
-    let options = CompilerOptions::default().vulkan_use_entry_point_name(true);
+    let options = CompilerOptions::default()
+        .vulkan_use_entry_point_name(true)
+        .matrix_layout_column(true);
     let session = global
         .create_session(
             &SessionDesc::default()
@@ -559,13 +580,22 @@ fn main() {
         )
         .unwrap();
 
-    let mut pass_files: Vec<String> = fs::read_dir(shaders.join("passes"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|f| f.ends_with(".slang"))
-        .collect();
-    pass_files.sort();
+    // (directory relative to a search path, file name) of every pass, engine passes first.
+    let list_passes = |parent: &PathBuf, dir: &'static str| {
+        let mut files: Vec<(&'static str, String)> = fs::read_dir(parent.join(dir))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|f| f.ends_with(".slang"))
+            .map(|f| (dir, f))
+            .collect();
+        files.sort();
+        files
+    };
+    let mut pass_files = list_passes(&shaders, "passes");
+    if test_passes {
+        pass_files.extend(list_passes(&tests, "shaders"));
+    }
 
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -603,9 +633,10 @@ use std::str::FromStr;
     let passes_dir = out_dir.join("passes");
     fs::create_dir_all(&passes_dir).unwrap();
 
-    for file in pass_files.iter() {
+    for (dir, file) in pass_files.iter() {
+        let source = format!("{dir}/{file}");
         let module = session
-            .load_module(&format!("passes/{file}"))
+            .load_module(&source)
             .unwrap_or_else(|e| panic!("{file}:\n{e}"));
 
         let mut components: Vec<ComponentType> = vec![module.clone().into()];
@@ -654,7 +685,7 @@ use std::str::FromStr;
             num_ray_tracing_pipelines,
             num_raster_pipelines,
             &out,
-            &format!("passes/{file}"),
+            &source,
         );
         match kind {
             PassKind::Compute => num_compute_pipelines += 1,
@@ -696,11 +727,12 @@ use std::str::FromStr;
         ));
     }
 
-    fs::write(
-        PathBuf::from(manifest_dir).join("src/bindings.rs"),
-        bindings,
-    )
-    .unwrap();
+    let bindings_path = if test_passes {
+        out_dir.join("bindings.rs")
+    } else {
+        PathBuf::from(manifest_dir).join("src/bindings.rs")
+    };
+    fs::write(bindings_path, bindings).unwrap();
 }
 
 fn stage_name(stage: Stage) -> &'static str {

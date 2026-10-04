@@ -98,3 +98,87 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn display_describes_each_variant() {
+        assert_eq!(
+            Error::Vulkan(vk::Result::ERROR_DEVICE_LOST).to_string(),
+            format!("Vulkan error: {}", vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert_eq!(Error::message("boom").to_string(), "boom");
+        assert_eq!(Error::Lock.to_string(), "lock error");
+
+        let io = Error::from(std::io::Error::other("disk on fire"));
+        assert_eq!(io.to_string(), "I/O error: disk on fire");
+
+        let utf8 = Error::from(std::str::from_utf8(&[0xff]).unwrap_err());
+        assert!(utf8.to_string().starts_with("invalid UTF-8: "));
+
+        let alloc = Error::from(gpu_allocator::AllocationError::OutOfMemory);
+        assert!(alloc.to_string().starts_with("GPU allocation error: "));
+    }
+
+    #[test]
+    fn source_is_the_wrapped_error() {
+        assert!(Error::Vulkan(vk::Result::ERROR_UNKNOWN).source().is_none());
+        assert!(Error::message("m").source().is_none());
+        assert!(Error::Lock.source().is_none());
+
+        assert!(Error::from(std::io::Error::other("x")).source().is_some());
+        assert!(
+            Error::from(std::str::from_utf8(&[0xff]).unwrap_err())
+                .source()
+                .is_some()
+        );
+        assert!(
+            Error::from(gpu_allocator::AllocationError::OutOfMemory)
+                .source()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn conversions_pick_the_matching_variant() {
+        assert!(matches!(
+            Error::from(vk::Result::ERROR_OUT_OF_DATE_KHR),
+            Error::Vulkan(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        ));
+        assert!(matches!(Error::from("text"), Error::Message(m) if m == "text"));
+        assert!(matches!(Error::from(String::from("owned")), Error::Message(m) if m == "owned"));
+        assert!(matches!(
+            Error::from(std::sync::PoisonError::new(())),
+            Error::Lock
+        ));
+        assert!(matches!(
+            Error::from(std::io::Error::other("x")),
+            Error::Io(_)
+        ));
+    }
+
+    #[test]
+    fn loading_errors_convert_and_keep_their_source() {
+        let err = unsafe { ash::Entry::load_from("/nonexistent/libvulkan.so") }
+            .err()
+            .expect("loading a missing library fails");
+        let err = Error::from(err);
+        assert!(matches!(err, Error::Loading(_)));
+        assert!(
+            err.to_string()
+                .starts_with("failed to load Vulkan library: ")
+        );
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn question_mark_converts_vulkan_results() {
+        fn fails() -> Result<()> {
+            Err(vk::Result::TIMEOUT)?
+        }
+        assert!(matches!(fails(), Err(Error::Vulkan(vk::Result::TIMEOUT))));
+    }
+}

@@ -1,3 +1,4 @@
+//! Borrowed image views and 2D slices, with per-image layout tracking for barriers
 use std::{
     marker::PhantomData,
     range::Range,
@@ -68,7 +69,7 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
         layout: vk::ImageLayout,
     ) -> ImageAccess {
         let old_layout = vk::ImageLayout::from_raw(
-            self.layout.swap(layout.as_raw() as u32, Ordering::Relaxedaccess) as i32,
+            self.layout.swap(layout.as_raw() as u32, Ordering::Relaxed) as i32,
         );
         ImageAccess {
             stage,
@@ -177,5 +178,138 @@ pub trait AsImage {
             extend: image.extent,
             offset: IVec2::ZERO,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{
+        format::{D32SfloatS8Uint, R8G8B8A8Unorm},
+        usage::{DepthAttachment, Sampled},
+    };
+    use ash::vk::Handle;
+
+    /// A view over a fake image: layout tracking and region math need no device.
+    fn view<F: Format, U: ImageUsage>(
+        layout: &AtomicU32,
+        mips: std::ops::Range<u32>,
+    ) -> ImageView<'_, F, U> {
+        ImageView {
+            image: vk::Image::from_raw(42),
+            view: vk::ImageView::null(),
+            mip_range: mips.into(),
+            handle: BindlessHandle::none(),
+            layout,
+            _marker: PhantomData,
+            _marker2: PhantomData,
+        }
+    }
+
+    fn undefined() -> AtomicU32 {
+        AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32)
+    }
+
+    #[test]
+    fn subresource_range_spans_the_views_mips() {
+        let layout = undefined();
+        let range = view::<R8G8B8A8Unorm, Sampled>(&layout, 2..5).subresource_range();
+        assert_eq!(range.aspect_mask, vk::ImageAspectFlags::COLOR);
+        assert_eq!((range.base_mip_level, range.level_count), (2, 3));
+        assert_eq!((range.base_array_layer, range.layer_count), (0, 1));
+    }
+
+    #[test]
+    fn subresource_layers_use_the_formats_aspects() {
+        let layout = undefined();
+        let layers = view::<D32SfloatS8Uint, DepthAttachment>(&layout, 0..1).subresource_layers(3);
+        assert_eq!(
+            layers.aspect_mask,
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(layers.mip_level, 3);
+        assert_eq!((layers.base_array_layer, layers.layer_count), (0, 1));
+    }
+
+    #[test]
+    fn region_starts_at_the_origin_and_can_be_moved_and_grown() {
+        let layout = undefined();
+        let slice = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1).region(UVec2::new(16, 8));
+        assert_eq!(
+            (slice.offset, slice.extend),
+            (IVec2::ZERO, UVec2::new(16, 8))
+        );
+
+        let moved = slice.offset(IVec2::new(4, 2)).offset(IVec2::new(1, 1));
+        assert_eq!(moved.offset, IVec2::new(5, 3));
+        assert_eq!(moved.extend, UVec2::new(16, 8));
+
+        let grown = moved.grow(UVec2::new(2, 3));
+        assert_eq!(grown.extend, UVec2::new(18, 11));
+        assert_eq!(grown.offset, IVec2::new(5, 3));
+    }
+
+    #[test]
+    fn access_reports_the_previous_layout_and_stores_the_new_one() {
+        let layout = undefined();
+        let view = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
+
+        let first = view.access(
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::ImageLayout::GENERAL,
+        );
+        assert_eq!(first.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(first.layout, vk::ImageLayout::GENERAL);
+        assert_eq!(first.image, vk::Image::from_raw(42));
+        assert_eq!(first.aspect, vk::ImageAspectFlags::COLOR);
+        assert_eq!(first.stage, vk::PipelineStageFlags2::TRANSFER);
+        assert_eq!(first.access, vk::AccessFlags2::TRANSFER_WRITE);
+
+        // Same layout again: no transition pending.
+        let second = view.access(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_STORAGE_READ,
+            vk::ImageLayout::GENERAL,
+        );
+        assert_eq!(second.old_layout, vk::ImageLayout::GENERAL);
+
+        let present = view.access(
+            vk::PipelineStageFlags2::empty(),
+            vk::AccessFlags2::empty(),
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        );
+        assert_eq!(present.old_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(
+            layout.load(Ordering::Relaxed),
+            vk::ImageLayout::PRESENT_SRC_KHR.as_raw() as u32
+        );
+    }
+
+    /// Views are `Copy`; all copies (and casts) of a view must track one layout per image.
+    #[test]
+    fn copies_and_casts_share_the_layout_state() {
+        let layout = undefined();
+        let a = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
+        let b = a;
+        let c = a.cast::<R8G8B8A8Unorm, crate::image::usage::Storage>();
+
+        a.access(
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::ImageLayout::GENERAL,
+        );
+        let from_copy = b.access(
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        assert_eq!(from_copy.old_layout, vk::ImageLayout::GENERAL);
+        let from_cast = c.access(
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+            vk::ImageLayout::GENERAL,
+        );
+        assert_eq!(from_cast.old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
     }
 }
