@@ -25,7 +25,7 @@ shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
 lava = { path = ".", features = ["test-passes"] }
 winit = "0.30"
 tracing-subscriber = { workspace = true }
-png = "0.18"
+png = {workspace = true}
 
 [features]
 default = []

@@ -596,6 +596,48 @@ fn host_copy_uploads_a_mip_level() {
     assert_eq!(readback.range(..).as_slice(), data);
 }
 
+#[test]
+fn host_copy_writes_only_the_region() {
+    let gpu = gpu();
+    let mut image = Image::<R8G8B8A8Unorm, Sampled>::new(8, 8).unwrap();
+    let (offset, extent) = (UVec2::new(4, 5), UVec2::new(3, 2));
+    let patch = vec![200u8; 3 * 2 * 4];
+
+    if !Ctx::features().rebar {
+        assert!(image.copy_region_from(&patch, 0, offset, extent).is_err());
+        return;
+    }
+
+    let data = pattern(8, 8);
+    image.copy_from(&data, 0).unwrap();
+    image.copy_region_from(&patch, 0, offset, extent).unwrap();
+
+    // Regions have to lie inside the mip and match the data length.
+    assert!(
+        image
+            .copy_region_from(&patch, 0, UVec2::new(6, 5), extent)
+            .is_err()
+    );
+    assert!(
+        image
+            .copy_region_from(&patch[4..], 0, offset, extent)
+            .is_err()
+    );
+
+    let readback = zeroed_buffer::<u8, Storage>(data.len());
+    gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
+    let readback = readback.range(..).as_slice();
+    for (y, x) in (0..8).flat_map(|y| (0..8).map(move |x| (y, x))) {
+        let inside = (4..7).contains(&x) && (5..7).contains(&y);
+        let expected = if inside {
+            &[200u8; 4][..]
+        } else {
+            texel(&data, 8, x, y)
+        };
+        assert_eq!(texel(readback, 8, x, y), expected, "({x}, {y})");
+    }
+}
+
 // ---- compute passes --------------------------------------------------------------------------
 
 fn compute_image_bindings<'a>(

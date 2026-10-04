@@ -130,6 +130,48 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
 
     #[validation_trace]
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
+        self.check_host_copy(data, mip_level)?;
+        let extent = self.mip_extent(mip_level);
+        let expected = expected_data_len(extent, F::TEXEL_SIZE);
+        if expected.is_some_and(|expected| data.len() != expected) {
+            return Err(Error::message(format!(
+                "mip level {mip_level} holds {} bytes but {} were given",
+                expected.unwrap_or_default(),
+                data.len()
+            )));
+        }
+        self.host_copy(data, mip_level, UVec2::ZERO, extent)
+    }
+
+    /// Like `copy_from`, but only writes the `extent` texels at `offset` of the mip level.
+    /// `data` holds that rectangle, tightly packed.
+    #[validation_trace]
+    pub fn copy_region_from(
+        &mut self,
+        data: &[u8],
+        mip_level: u32,
+        offset: UVec2,
+        extent: UVec2,
+    ) -> Result<()> {
+        self.check_host_copy(data, mip_level)?;
+        let mip_extent = self.mip_extent(mip_level);
+        if !region_fits(mip_extent, offset, extent) {
+            return Err(Error::message(format!(
+                "region {extent} at {offset} does not fit mip level {mip_level} of size {mip_extent}"
+            )));
+        }
+        let expected = expected_data_len(extent, F::TEXEL_SIZE);
+        if expected.is_some_and(|expected| data.len() != expected) {
+            return Err(Error::message(format!(
+                "the region holds {} bytes but {} were given",
+                expected.unwrap_or_default(),
+                data.len()
+            )));
+        }
+        self.host_copy(data, mip_level, offset, extent)
+    }
+
+    fn check_host_copy(&self, data: &[u8], mip_level: u32) -> Result<()> {
         if !Ctx::features().rebar {
             return Err(Error::message(
                 "host image copies need host-visible device memory, which this device lacks",
@@ -144,14 +186,16 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
         if data.is_empty() {
             return Err(Error::message("no texel data to copy"));
         }
-        let expected = expected_data_len(mip_extent(self.extent, mip_level), F::TEXEL_SIZE);
-        if expected.is_some_and(|expected| data.len() != expected) {
-            return Err(Error::message(format!(
-                "mip level {mip_level} holds {} bytes but {} were given",
-                expected.unwrap_or_default(),
-                data.len()
-            )));
-        }
+        Ok(())
+    }
+
+    fn host_copy(
+        &mut self,
+        data: &[u8],
+        mip_level: u32,
+        offset: UVec2,
+        extent: UVec2,
+    ) -> Result<()> {
         let range = self.whole_view().subresource_range();
         let layout = self.layout.get_mut();
         let old_layout = vk::ImageLayout::from_raw(*layout as i32);
@@ -164,9 +208,13 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
                 .subresource_range(range);
             unsafe { Functions::host_image_copy().transition_image_layout(&[transition])? };
         }
-        let extent = self.mip_extent(mip_level);
         let regions = [vk::MemoryToImageCopyEXT::default()
             .host_pointer(data.as_ptr().cast())
+            .image_offset(vk::Offset3D {
+                x: offset.x as i32,
+                y: offset.y as i32,
+                z: 0,
+            })
             .image_extent(vk::Extent3D {
                 width: extent.x,
                 height: extent.y,
@@ -211,9 +259,32 @@ fn expected_data_len(extent: UVec2, texel_size: usize) -> Option<usize> {
     (texel_size != 0).then(|| extent.x as usize * extent.y as usize * texel_size)
 }
 
+/// Whether the `extent` rectangle at `offset` is non-empty and lies inside `mip_extent`.
+fn region_fits(mip_extent: UVec2, offset: UVec2, extent: UVec2) -> bool {
+    extent.cmpgt(UVec2::ZERO).all()
+        && offset.cmple(mip_extent).all()
+        && extent.cmple(mip_extent - offset.min(mip_extent)).all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regions_must_lie_inside_the_mip() {
+        let mip = UVec2::new(8, 4);
+        assert!(region_fits(mip, UVec2::ZERO, mip));
+        assert!(region_fits(mip, UVec2::new(6, 3), UVec2::new(2, 1)));
+        assert!(!region_fits(mip, UVec2::new(6, 3), UVec2::new(3, 1)));
+        assert!(!region_fits(mip, UVec2::new(9, 0), UVec2::ONE));
+        assert!(!region_fits(mip, UVec2::ZERO, UVec2::new(0, 4)));
+        // Offsets near `u32::MAX` must not overflow.
+        assert!(!region_fits(
+            mip,
+            UVec2::splat(u32::MAX),
+            UVec2::splat(u32::MAX)
+        ));
+    }
 
     #[test]
     fn expected_data_len_is_texels_times_texel_size() {

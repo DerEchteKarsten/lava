@@ -412,6 +412,8 @@ impl Features {
         *vk13 = vk13
             .dynamic_rendering(true)
             .maintenance4(true)
+            // What `discard` compiles to.
+            .shader_demote_to_helper_invocation(true)
             .synchronization2(true);
         let phfeatures = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
@@ -732,6 +734,7 @@ mod tests {
         assert_eq!(vk12.scalar_block_layout, vk::TRUE);
         assert_eq!(vk13.synchronization2, vk::TRUE);
         assert_eq!(vk13.dynamic_rendering, vk::TRUE);
+        assert_eq!(vk13.shader_demote_to_helper_invocation, vk::TRUE);
 
         assert_eq!(mesh.mesh_shader, vk::FALSE);
         assert_eq!(ray.ray_tracing_pipeline, vk::FALSE);
