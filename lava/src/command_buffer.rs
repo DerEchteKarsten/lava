@@ -791,7 +791,7 @@ impl<'a> RasterBuilder<'a> {
             .iter()
             .map(|e| {
                 let ret = vk::RenderingAttachmentInfo::default()
-                    .image_layout(vk::ImageLayout::GENERAL)
+                    .image_layout(ATTACHMENT_LAYOUT)
                     .image_view(e.0)
                     .store_op(vk::AttachmentStoreOp::STORE);
                 if let Some(clear_value) = e.1 {
@@ -818,7 +818,7 @@ impl<'a> RasterBuilder<'a> {
 
         if self.depth_attachment != vk::ImageView::null() {
             render_info1 = vk::RenderingAttachmentInfo::default()
-                .image_layout(vk::ImageLayout::GENERAL)
+                .image_layout(ATTACHMENT_LAYOUT)
                 .image_view(self.depth_attachment)
                 .store_op(vk::AttachmentStoreOp::NONE)
                 .load_op(vk::AttachmentLoadOp::LOAD);
@@ -1196,7 +1196,7 @@ impl<'a> RasterBuilder<'a> {
                 } else {
                     vk::AccessFlags2::empty()
                 },
-            vk::ImageLayout::GENERAL,
+            ATTACHMENT_LAYOUT,
         ));
         self
     }
@@ -1231,7 +1231,7 @@ impl<'a> RasterBuilder<'a> {
                 } else {
                     vk::AccessFlags2::empty()
                 },
-            vk::ImageLayout::GENERAL,
+            ATTACHMENT_LAYOUT,
         ));
         self
     }
@@ -1677,6 +1677,11 @@ impl CommandBuffer {
         Ok(())
     }
 }
+
+/// The layout of colour and depth attachments while they are drawn to. Every other access
+/// asks for `GENERAL`, which costs nothing when sampling but can keep a driver from
+/// compressing a framebuffer.
+pub(crate) const ATTACHMENT_LAYOUT: vk::ImageLayout = vk::ImageLayout::ATTACHMENT_OPTIMAL;
 
 /// Barriers one command needs before it may run, given what is still pending.
 pub(crate) struct Barriers {
@@ -2420,8 +2425,41 @@ mod tests {
         assert_eq!(access.access, A::COLOR_ATTACHMENT_WRITE);
         assert_eq!(
             (access.old_layout, access.layout),
-            (L::UNDEFINED, L::GENERAL)
+            (L::UNDEFINED, ATTACHMENT_LAYOUT)
         );
+    }
+
+    /// An image is only in the attachment layout while it is drawn to: sampling it in
+    /// between is an access in `GENERAL`, so the next draw transitions it back.
+    #[test]
+    fn attachments_are_transitioned_into_the_attachment_layout() {
+        let color = layout(L::GENERAL);
+        let depth = layout(L::GENERAL);
+        let draw = |cmd: &mut CommandBuffer| {
+            let builder = cmd
+                .raster()
+                .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&color), None)
+                .depth_attachment(view::<D32Sfloat, DepthAttachment>(&depth), None, true);
+            (
+                builder.color_accesses[0].old_layout,
+                builder.depth_access.as_ref().unwrap().old_layout,
+                builder.depth_access.as_ref().unwrap().layout,
+            )
+        };
+        let mut cmd = offline_cmd();
+        assert_eq!(draw(&mut cmd), (L::GENERAL, L::GENERAL, ATTACHMENT_LAYOUT));
+        // A second draw finds them there.
+        assert_eq!(
+            draw(&mut cmd),
+            (ATTACHMENT_LAYOUT, ATTACHMENT_LAYOUT, ATTACHMENT_LAYOUT)
+        );
+        let sampled = view::<R8G8B8A8Unorm, ColorAttachment>(&color).access(
+            S::FRAGMENT_SHADER,
+            A::SHADER_SAMPLED_READ,
+            L::GENERAL,
+        );
+        assert_eq!(sampled.old_layout, ATTACHMENT_LAYOUT);
+        assert_eq!(draw(&mut cmd).0, L::GENERAL);
     }
 
     #[test]

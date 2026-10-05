@@ -24,6 +24,31 @@ pub trait Format: 'static + Copy + Clone {
     }
 }
 
+/// Side length in texels and size in bytes of the blocks of a BC format, `None` for every
+/// other format.
+pub fn bc_block(format: vk::Format) -> Option<(u32, usize)> {
+    use vk::Format as F;
+    match format {
+        F::BC1_RGB_UNORM_BLOCK
+        | F::BC1_RGB_SRGB_BLOCK
+        | F::BC1_RGBA_UNORM_BLOCK
+        | F::BC1_RGBA_SRGB_BLOCK
+        | F::BC4_UNORM_BLOCK
+        | F::BC4_SNORM_BLOCK => Some((4, 8)),
+        F::BC2_UNORM_BLOCK
+        | F::BC2_SRGB_BLOCK
+        | F::BC3_UNORM_BLOCK
+        | F::BC3_SRGB_BLOCK
+        | F::BC5_UNORM_BLOCK
+        | F::BC5_SNORM_BLOCK
+        | F::BC6H_UFLOAT_BLOCK
+        | F::BC6H_SFLOAT_BLOCK
+        | F::BC7_UNORM_BLOCK
+        | F::BC7_SRGB_BLOCK => Some((4, 16)),
+        _ => None,
+    }
+}
+
 pub trait ColorAspect {}
 pub trait DepthAspect {}
 pub trait StencilAspect {}

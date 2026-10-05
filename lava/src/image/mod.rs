@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 use crate::{
     bindless::{Bindless, BindlessHandle},
     image::{
-        format::{Format, Undefined},
+        format::{Format, Undefined, bc_block},
         slice::AsImage,
         usage::ImageUsage,
     },
@@ -132,7 +132,7 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
         self.check_host_copy(data, mip_level)?;
         let extent = self.mip_extent(mip_level);
-        let expected = expected_data_len(extent, F::TEXEL_SIZE);
+        let expected = expected_data_len(extent, F::TEXEL_SIZE, bc_block(F::FORMAT));
         if expected.is_some_and(|expected| data.len() != expected) {
             return Err(Error::message(format!(
                 "mip level {mip_level} holds {} bytes but {} were given",
@@ -160,7 +160,7 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
                 "region {extent} at {offset} does not fit mip level {mip_level} of size {mip_extent}"
             )));
         }
-        let expected = expected_data_len(extent, F::TEXEL_SIZE);
+        let expected = expected_data_len(extent, F::TEXEL_SIZE, bc_block(F::FORMAT));
         if expected.is_some_and(|expected| data.len() != expected) {
             return Err(Error::message(format!(
                 "the region holds {} bytes but {} were given",
@@ -226,8 +226,10 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
                 base_array_layer: 0,
                 layer_count: 1,
             })
-            .memory_image_height(extent.y)
-            .memory_row_length(extent.x)];
+            // 0: the rows of `data` are as long as the region is wide, which is also right
+            // for block-compressed formats, where a small mip is narrower than its one block.
+            .memory_image_height(0)
+            .memory_row_length(0)];
         let info = vk::CopyMemoryToImageInfoEXT::default()
             .dst_image(self.image)
             .dst_image_layout(vk::ImageLayout::GENERAL)
@@ -253,10 +255,19 @@ pub fn mip_extent(extent: UVec2, level: u32) -> UVec2 {
     )
 }
 
-/// Bytes of tightly packed texel data for an image of `extent`, or `None` for formats without
-/// a fixed texel size (`texel_size == 0`), where the length can't be checked.
-fn expected_data_len(extent: UVec2, texel_size: usize) -> Option<usize> {
-    (texel_size != 0).then(|| extent.x as usize * extent.y as usize * texel_size)
+/// Bytes of tightly packed texel data for an image of `extent`: texels of `texel_size` bytes,
+/// or whole blocks of `(side length, bytes)` when there is no fixed texel size
+/// (`texel_size == 0`). `None` when the format has neither, so the length can't be checked.
+fn expected_data_len(
+    extent: UVec2,
+    texel_size: usize,
+    block: Option<(u32, usize)>,
+) -> Option<usize> {
+    if texel_size != 0 {
+        return Some(extent.x as usize * extent.y as usize * texel_size);
+    }
+    let (side, bytes) = block?;
+    Some(extent.x.div_ceil(side) as usize * extent.y.div_ceil(side) as usize * bytes)
 }
 
 /// Whether the `extent` rectangle at `offset` is non-empty and lies inside `mip_extent`.
@@ -288,11 +299,23 @@ mod tests {
 
     #[test]
     fn expected_data_len_is_texels_times_texel_size() {
-        assert_eq!(expected_data_len(UVec2::new(8, 4), 4), Some(128));
-        assert_eq!(expected_data_len(UVec2::new(3, 5), 1), Some(15));
-        assert_eq!(expected_data_len(UVec2::new(1, 1), 16), Some(16));
+        assert_eq!(expected_data_len(UVec2::new(8, 4), 4, None), Some(128));
+        assert_eq!(expected_data_len(UVec2::new(3, 5), 1, None), Some(15));
+        assert_eq!(expected_data_len(UVec2::new(1, 1), 16, None), Some(16));
         // Block-compressed and runtime-defined formats can't be checked.
-        assert_eq!(expected_data_len(UVec2::new(8, 4), 0), None);
+        assert_eq!(expected_data_len(UVec2::new(8, 4), 0, None), None);
+    }
+
+    #[test]
+    fn block_formats_hold_whole_blocks() {
+        let bc7 = bc_block(vk::Format::BC7_SRGB_BLOCK);
+        assert_eq!(bc7, Some((4, 16)));
+        assert_eq!(bc_block(vk::Format::BC4_UNORM_BLOCK), Some((4, 8)));
+        assert_eq!(bc_block(vk::Format::R8G8B8A8_UNORM), None);
+        assert_eq!(expected_data_len(UVec2::new(8, 4), 0, bc7), Some(32));
+        // Mips smaller than a block, or not a multiple of it, still take whole blocks.
+        assert_eq!(expected_data_len(UVec2::new(1, 1), 0, bc7), Some(16));
+        assert_eq!(expected_data_len(UVec2::new(6, 2), 0, bc7), Some(32));
     }
 
     #[test]

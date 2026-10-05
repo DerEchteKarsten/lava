@@ -14,7 +14,7 @@ gpu-allocator = {workspace = true}
 raw-window-handle = {workspace = true}
 lava-macros = { version = "0.1.0", path = "../lava-macros" }
 smallvec.workspace = true
-notify = "8.2.0"
+notify = {workspace = true}
 shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
 
 [build-dependencies]

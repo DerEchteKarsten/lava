@@ -417,6 +417,7 @@ impl Features {
             .synchronization2(true);
         let phfeatures = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
+            .texture_compression_bc(true)
             .fill_mode_non_solid(true)
             .fragment_stores_and_atomics(true)
             .shader_int16(true)

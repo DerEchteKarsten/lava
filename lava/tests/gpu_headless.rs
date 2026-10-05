@@ -21,7 +21,7 @@ use lava::{
     },
     image::{
         Image,
-        format::{D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
+        format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
         slice::AsImage,
         usage::{
             ColorAttachment, ColorAttachmentStorage, DepthAttachment, Sampled, SampledStorage,
@@ -1219,6 +1219,74 @@ fn indexed_draw_samples_a_bindless_texture() {
     });
     assert_pixel(&half, 40, 24, [0, 255, 0, 255]);
     assert_pixel(&half, 24, 40, BLACK);
+}
+
+/// A BC7 block (mode 6) of one colour: each channel is `(channel << 1) | low_bit`.
+fn bc7_block(channels: [u8; 4], low_bit: u8) -> [u8; 16] {
+    let mut bits = 1u128 << 6;
+    for (index, channel) in channels.into_iter().enumerate() {
+        assert!(channel < 128);
+        // Both endpoints of the channel.
+        bits |= (channel as u128) << (7 + index * 14);
+        bits |= (channel as u128) << (14 + index * 14);
+    }
+    bits |= (low_bit as u128) << 63 | (low_bit as u128) << 64;
+    bits.to_le_bytes()
+}
+
+#[test]
+fn host_copy_uploads_block_compressed_mips() {
+    let gpu = gpu();
+    if !Ctx::features().rebar {
+        return;
+    }
+    // 8x8 texels are 2x2 blocks: red, green / blue, yellow.
+    let blocks: Vec<u8> = [
+        bc7_block([127, 0, 0, 127], 1),
+        bc7_block([0, 127, 0, 127], 1),
+        bc7_block([0, 0, 127, 127], 1),
+        bc7_block([127, 127, 0, 127], 1),
+    ]
+    .concat();
+    let mut texture = Image::<BC7UnormBlock, Sampled>::with_mip_levels(8, 8, 4).unwrap();
+    texture.copy_from(&blocks, 0).unwrap();
+    // The smaller levels are one block each, even the ones smaller than a block.
+    for level in 1..4 {
+        texture.copy_from(&blocks[..16], level).unwrap();
+        assert!(texture.copy_from(&blocks[..8], level).is_err());
+        assert!(texture.copy_from(&blocks[..32], level).is_err());
+    }
+    assert!(texture.copy_from(&blocks[..48], 0).is_err());
+    // A region of one block: the yellow block becomes red.
+    texture
+        .copy_region_from(&blocks[..16], 0, UVec2::splat(4), UVec2::splat(4))
+        .unwrap();
+
+    let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
+        position: Vec2::new(x, y),
+        uv: Vec2::new(u, v),
+    };
+    let vertices = buffer_with::<TestTexturedVertex, Storage>(&[
+        corner(-0.5, -0.5, 0.0, 0.0),
+        corner(0.5, -0.5, 1.0, 0.0),
+        corner(0.5, 0.5, 1.0, 1.0),
+        corner(-0.5, 0.5, 0.0, 1.0),
+    ]);
+    let indices = buffer_with::<u32, Index>(&[0, 1, 2, 0, 2, 3]);
+    let pixels = render(&gpu, |cmd, target| {
+        cmd.raster()
+            .color_attachment(target.whole_view(), None)
+            .draw_indexed(
+                TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
+                EXTENT,
+                indices.range(..),
+                1,
+            )
+    });
+    assert_pixel(&pixels, 24, 24, [255, 1, 1, 255]);
+    assert_pixel(&pixels, 40, 24, [1, 255, 1, 255]);
+    assert_pixel(&pixels, 24, 40, [1, 1, 255, 255]);
+    assert_pixel(&pixels, 40, 40, [255, 1, 1, 255]);
 }
 
 #[test]
