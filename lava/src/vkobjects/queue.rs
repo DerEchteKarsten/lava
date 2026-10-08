@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use crate::{
     command_buffer::{self, BufferAccess, CommandBuffer, ImageAccess},
-    profiling::{FrameQueries, GpuScope},
+    profiling::{FrameQueries, FrameTimings},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -329,7 +329,8 @@ impl FrameSlot {
     #[validation_trace]
     pub fn begin(&mut self) -> Result<Frame<'_>> {
         if self.submitted {
-            tracing::info_span!("wait for frame slot").in_scope(|| self.fence.wait())?;
+            // `wait`: the profiler doesn't count it as CPU work.
+            tracing::info_span!("wait for frame slot", wait = true).in_scope(|| self.fence.wait())?;
             if let Some(queries) = &mut self.queries {
                 queries.read()?;
             }
@@ -361,9 +362,9 @@ impl Frame<'_> {
         self.slot.retired.push(Box::new(value));
     }
 
-    /// The GPU scopes of the frame this slot submitted before, if it was profiled: the root
-    /// scope "frame" first, then the passes and `begin_scope` groups in recording order.
-    pub fn last_timings(&self) -> Option<&[GpuScope]> {
+    /// The GPU scopes and shader clock times of the frame this slot submitted before, if it
+    /// was profiled.
+    pub fn last_timings(&self) -> Option<&FrameTimings> {
         self.slot.queries.as_ref()?.results()
     }
 
@@ -408,16 +409,49 @@ impl Drop for FrameSlot {
 pub struct PendingAccesses {
     pub(crate) buffer_reads: SmallVec<[BufferAccess; 8]>,
     pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
-    pub(crate) buffer_writes: SmallVec<[BufferAccess; 8]>,
-    pub(crate) image_writes: SmallVec<[ImageAccess; 8]>,
+    pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
+    pub(crate) image_writes: SmallVec<[PendingWrite<ImageAccess>; 8]>,
+}
+
+/// A write later commands may have to wait for, and the stages and accesses a barrier recorded
+/// since already made it visible to: those need no barrier for it anymore.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingWrite<A> {
+    pub(crate) write: A,
+    pub(crate) visible_stages: vk::PipelineStageFlags2,
+    pub(crate) visible_access: vk::AccessFlags2,
+}
+
+impl<A> PendingWrite<A> {
+    pub(crate) fn new(write: A) -> Self {
+        Self {
+            write,
+            visible_stages: vk::PipelineStageFlags2::NONE,
+            visible_access: vk::AccessFlags2::NONE,
+        }
+    }
+
+    pub(crate) fn visible_to(
+        &self,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> bool {
+        self.visible_stages.contains(stage) && self.visible_access.contains(access)
+    }
 }
 
 impl PendingAccesses {
     /// Union of the pipeline stages of every access still pending, i.e. the stages a
     /// submission has to finish before its signal semaphores may fire.
     pub(crate) fn last_stage(&self) -> vk::PipelineStageFlags2 {
-        let images = self.image_reads.iter().chain(&self.image_writes);
-        let buffers = self.buffer_reads.iter().chain(&self.buffer_writes);
+        let images = self
+            .image_reads
+            .iter()
+            .chain(self.image_writes.iter().map(|w| &w.write));
+        let buffers = self
+            .buffer_reads
+            .iter()
+            .chain(self.buffer_writes.iter().map(|w| &w.write));
         images
             .map(|i| i.stage)
             .chain(buffers.map(|b| b.stage))
@@ -492,6 +526,9 @@ impl<Q: QueueFamilie> Queue<Q> {
             executor(&mut cmd_buffer);
             CALLSITE.set(prev);
             cmd_buffer.end_scope();
+            if let Some(queries) = &cmd_buffer.queries {
+                queries.finish(buffer.handle);
+            }
             *queries = cmd_buffer.queries.take();
             cmd_buffer.end()?;
 
@@ -530,6 +567,7 @@ impl<Q: QueueFamilie> Queue<Q> {
         let sc = [swapchain.handle];
         let ii = [image_index];
         let waits: Vec<_> = wait_on.iter().map(|sem| sem.handle).collect();
+        let _span = tracing::info_span!("present", wait = true).entered();
         let present_info = vk::PresentInfoKHR::default()
             .swapchains(&sc)
             .image_indices(&ii)
@@ -588,9 +626,13 @@ mod tests {
         };
         let mut pending = PendingAccesses::default();
         pending.buffer_reads.push(buffer(S::VERTEX_SHADER));
-        pending.buffer_writes.push(buffer(S::COMPUTE_SHADER));
+        pending
+            .buffer_writes
+            .push(PendingWrite::new(buffer(S::COMPUTE_SHADER)));
         pending.image_reads.push(image(S::FRAGMENT_SHADER));
-        pending.image_writes.push(image(S::COLOR_ATTACHMENT_OUTPUT));
+        pending
+            .image_writes
+            .push(PendingWrite::new(image(S::COLOR_ATTACHMENT_OUTPUT)));
         assert_eq!(
             pending.last_stage(),
             S::VERTEX_SHADER | S::COMPUTE_SHADER | S::FRAGMENT_SHADER | S::COLOR_ATTACHMENT_OUTPUT

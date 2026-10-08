@@ -176,6 +176,7 @@ impl Swapchain {
 
     #[validation_trace]
     pub fn aquire_image(&self, wait_on: &Semaphore<Binary>, fence: Option<&Fence>) -> Result<u32> {
+        let _span = tracing::info_span!("wait for swapchain image", wait = true).entered();
         let (image_index, _suboptimal) = unsafe {
             Functions::swapchain().acquire_next_image(
                 self.handle,
@@ -189,7 +190,7 @@ impl Swapchain {
 
     #[validation_trace]
     pub fn recreate(&mut self, surface: &Surface, size: [u32; 2]) -> Result<()> {
-        let _span = tracing::info_span!("Swapchain Recreation");
+        let _span = tracing::info_span!("Swapchain Recreation").entered();
         let swapchain = Swapchain::new(surface, Some(self), Some(size))?;
         // Dropping the old swapchain waits for the device and destroys it.
         *self = swapchain;

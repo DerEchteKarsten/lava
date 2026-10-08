@@ -102,6 +102,7 @@ impl PhysicalDevice {
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
         let mut rt_pipeline_properties =
             vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -110,7 +111,8 @@ impl PhysicalDevice {
             .push_next(&mut features12)
             .push_next(&mut ray_tracing_feature)
             .push_next(&mut acceleration_struct_feature)
-            .push_next(&mut mesh_shading);
+            .push_next(&mut mesh_shading)
+            .push_next(&mut clock);
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
         let pipeline_statistics = features2.features.pipeline_statistics_query == vk::TRUE;
 
@@ -143,6 +145,7 @@ impl PhysicalDevice {
             pipeline_statistics,
             mesh_queries: mesh_shading.mesh_shader_queries == vk::TRUE,
             memory_budget: has_extension(ash::ext::memory_budget::NAME),
+            shader_clock: clock.shader_subgroup_clock == vk::TRUE,
         };
 
         Ok(Self {
@@ -251,6 +254,7 @@ impl PhysicalDevice {
         features.pipeline_statistics = device.supported_features.pipeline_statistics;
         features.mesh_queries = device.supported_features.mesh_queries;
         features.memory_budget = device.supported_features.memory_budget;
+        features.shader_clock = device.supported_features.shader_clock;
         Ok((device.clone(), graphics, transfer_queue))
     }
 }
@@ -468,6 +472,7 @@ mod tests {
             pipeline_statistics: true,
             mesh_queries: false,
             memory_budget: true,
+            shader_clock: true,
         };
 
         // Without validation the device debug utils stay off, and `present` is the caller's.

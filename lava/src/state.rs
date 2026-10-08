@@ -351,6 +351,9 @@ pub struct Features {
     pub mesh_queries: bool,
     /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
     pub memory_budget: bool,
+    /// `VK_KHR_shader_clock` with subgroup clocks, which `profile.slang` reads. Shaders that
+    /// use `PROFILE` need it.
+    pub shader_clock: bool,
 }
 impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
@@ -376,6 +379,9 @@ impl Features {
         if self.memory_budget {
             extensions.push(ash::ext::memory_budget::NAME);
         }
+        if self.shader_clock {
+            extensions.push(ash::khr::shader_clock::NAME);
+        }
         if self.raytracing {
             extensions.push(ash::khr::ray_tracing_pipeline::NAME);
             extensions.push(ash::khr::deferred_host_operations::NAME);
@@ -395,6 +401,7 @@ impl Features {
         ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
         host_image_copy: &'a mut vk::PhysicalDeviceHostImageCopyFeaturesEXT,
+        clock: &'a mut vk::PhysicalDeviceShaderClockFeaturesKHR,
     ) -> vk::PhysicalDeviceFeatures2<'a> {
         *vk11 = vk11.shader_draw_parameters(true);
         *vk12 = vk12
@@ -461,6 +468,10 @@ impl Features {
                 .mesh_shader(true)
                 .mesh_shader_queries(self.mesh_queries);
             features = features.push_next(mesh);
+        }
+        if self.shader_clock {
+            *clock = clock.shader_subgroup_clock(true);
+            features = features.push_next(clock);
         }
         if self.raytracing {
             *ray = ray.ray_tracing_pipeline(true);
@@ -616,6 +627,7 @@ pub(super) fn create_device(
         mut ray,
         mut acc,
         mut host_image_copy,
+        mut clock,
     ) = Default::default();
     let mut features = features.features(
         &mut vk11,
@@ -627,6 +639,7 @@ pub(super) fn create_device(
         &mut ray,
         &mut acc,
         &mut host_image_copy,
+        &mut clock,
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
@@ -695,6 +708,13 @@ mod tests {
         );
         assert_eq!(
             only(Features {
+                shader_clock: true,
+                ..Default::default()
+            }),
+            ["VK_KHR_shader_clock"]
+        );
+        assert_eq!(
+            only(Features {
                 device_debug_utils: true,
                 ..Default::default()
             }),
@@ -733,9 +753,10 @@ mod tests {
     ) {
         let (mut vk11, mut vk12, mut vk13, mut dn3, mut dy2, mut mesh, mut ray, mut acc, mut hic) =
             Default::default();
+        let mut clock = Default::default();
         features.features(
             &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
-            &mut hic,
+            &mut hic, &mut clock,
         );
         // Detach the copies from the pNext chain that borrowed them.
         vk12.p_next = std::ptr::null_mut();

@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use lava_macros::validation_trace;
 
 use crate::{
+    bindings::MAX_PUSH_CONSTANTS_SIZE,
     image::{
         format::Format,
         slice::ImageView,
@@ -21,8 +22,9 @@ pub struct Bindless {
     counts: [u32; 2],
     num_samplers: u32,
     layout: vk::PipelineLayout,
-    layouts: [vk::DescriptorSetLayout; 2],
-    sets: [vk::DescriptorSet; 2],
+    layouts: [vk::DescriptorSetLayout; 3],
+    /// Sampled images, storage images, and the profiler's shader clock counters.
+    sets: [vk::DescriptorSet; 3],
     pool: vk::DescriptorPool,
 }
 
@@ -125,8 +127,11 @@ impl Bindless {
     pub(crate) fn layout() -> vk::PipelineLayout {
         Self::get().layout
     }
+    pub(crate) fn profile_set() -> vk::DescriptorSet {
+        Self::get().sets[2]
+    }
     pub(crate) fn init() -> Result<()> {
-        let mut layouts = [vk::DescriptorSetLayout::default(); 2];
+        let mut layouts = [vk::DescriptorSetLayout::default(); 3];
         let sci2 = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST)
@@ -218,9 +223,22 @@ impl Bindless {
             .push_next(&mut ext_flags);
         layouts[1] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
+        let bindings = [vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            ..Default::default()
+        }];
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        layouts[2] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
+
+        // Every pass pushes this many bytes.
+        let size = MAX_PUSH_CONSTANTS_SIZE as u32;
+        assert!(Ctx::physical_device().limits.max_push_constants_size >= size);
         let ranges = [vk::PushConstantRange {
             offset: 0,
-            size: Ctx::physical_device().limits.max_push_constants_size,
+            size,
             stage_flags: vk::ShaderStageFlags::ALL,
         }];
         let pipline_layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -247,11 +265,15 @@ impl Bindless {
                     .min(10000),
                 ty: vk::DescriptorType::STORAGE_IMAGE,
             },
+            vk::DescriptorPoolSize {
+                descriptor_count: 1,
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+            },
         ];
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND_EXT)
-            .max_sets(2)
+            .max_sets(3)
             .pool_sizes(&pool_sizes);
         let pool = unsafe { Ctx::device().create_descriptor_pool(&pool_info, None) }?;
 
@@ -265,15 +287,17 @@ impl Bindless {
                 .max_descriptor_set_storage_images
                 .min(10000),
         ];
+        // The counter set has no variable-sized binding, so its count is ignored.
+        let variable_counts = [desc_counts[0], desc_counts[1], 0];
         let mut alloc_info = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
-            .descriptor_counts(&desc_counts);
+            .descriptor_counts(&variable_counts);
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts)
             .push_next(&mut alloc_info);
         let sets = unsafe { Ctx::device().allocate_descriptor_sets(&allocate_info) }?
             .try_into()
-            .expect("allocated descriptor set count matches the two layouts");
+            .expect("allocated descriptor set count matches the three layouts");
 
         BINDLESS
             .set(Self {

@@ -1,6 +1,6 @@
 //! Compiles Slang passes to SPIR-V and generates typed pass bindings from reflection
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     env,
     ffi::CString,
     fs,
@@ -51,6 +51,9 @@ enum FieldKind {
 }
 
 type Structs = BTreeMap<String, StructDef>;
+
+/// The push constants every pass gets, pushed whole; Vulkan 1.4 guarantees 256 bytes.
+const MAX_PUSH_CONSTANTS_SIZE: usize = 256;
 
 const IMAGE_TYPES: [&str; 1] = ["Img"];
 const BUFFER_TYPES: [&str; 2] = ["Buf", "MutBuf"];
@@ -350,7 +353,7 @@ fn generate_pass(
     num_raster_pipelines: usize,
     path_dir: &PathBuf,
     source: &str,
-) -> (String, PassKind) {
+) -> (String, PassKind, usize, usize) {
     let gpu_name = format!("C{pass_name}Bindings");
     let index = pass_map.len();
 
@@ -377,6 +380,7 @@ fn generate_pass(
             let (vertex, fragment) = (entry("vertex").unwrap(), entry("fragment").unwrap());
             format!(
                 r#"    PassEntry {{
+                    name: "{pass_name}",
                     path: {:?},
                     source: {source:?},
                     kind: PassKind::RasterVertex {{
@@ -396,6 +400,7 @@ fn generate_pass(
             };
             format!(
                 r#"    PassEntry {{
+                    name: "{pass_name}",
                     path: {:?},
                     source: {source:?},
                     kind: PassKind::RasterMesh {{
@@ -412,6 +417,7 @@ fn generate_pass(
             let compute = entry("compute").unwrap();
             format!(
                 r#"    PassEntry {{
+                    name: "{pass_name}",
                     path: {:?},
                     source: {source:?},
                     kind: PassKind::Compute {{
@@ -424,17 +430,15 @@ fn generate_pass(
         }
         PassKind::RayTracing => {
             let (raygen, closest) = (entry("raygen").unwrap(), entry("closest_hit").unwrap());
-            let any = match entry("any_hit") {
-                Some(any) => format!("\"{any}\""),
-                None => format!("\"{closest}\""),
-            };
+            let any = entry("any_hit").unwrap_or(closest);
             format!(
                 r#"    PassEntry {{
+                    name: "{pass_name}",
                     path: {:?},
                     source: {source:?},
                     kind: PassKind::RayTracing {{
                         ray_gen: "{raygen}\0",
-                        ray_hit: "{any}\0",
+                        ray_any: "{any}\0",
                         ray_closest: "{closest}\0",
                     }},
                     index: {num_ray_tracing_pipelines}
@@ -445,12 +449,17 @@ fn generate_pass(
     };
     pass_map.push(pass_entry);
 
-    let trait_impl = match kind {
-        PassKind::RasterVertex => "RasterVertexPass",
-        PassKind::RasterMesh => "RasterMeshPass",
-        PassKind::Compute => "ComputePass",
-        PassKind::RayTracing => "RaytracingPass",
+    let kind_marker = match kind {
+        PassKind::RasterVertex => "RasterVertex",
+        PassKind::RasterMesh => "RasterMesh",
+        PassKind::Compute => "Compute",
+        PassKind::RayTracing => "RayTracing",
     };
+    let size = pc.size(Cat::Uniform);
+    assert!(
+        size <= MAX_PUSH_CONSTANTS_SIZE,
+        "the push constants of {source} take {size} bytes, more than the {MAX_PUSH_CONSTANTS_SIZE} every pass gets"
+    );
 
     let gpu_struct = generate_gpu_struct(&gpu_name, pc, structs);
     let new = build_new_fn(pc, structs, stage);
@@ -470,52 +479,39 @@ fn generate_pass(
     let image_accesses = new.image_accesses.join(",\n");
     let buffer_accesses = new.buffer_accesses.join(",\n");
     let gpu_inits = new.gpu_inits.join(", ");
-    let num_images = new.image_accesses.len();
-    let num_buffers = new.buffer_accesses.len();
 
     let mut out = String::new();
     out.push_str(&gpu_struct);
-
-    let base_impl = match kind {
-        PassKind::RasterVertex | PassKind::RasterMesh => {
-            format!("impl RasterPass for {pass_name} {{}}\n")
-        }
-        _ => String::new(),
-    };
-
     out.push_str(&format!(
         r#"
 pub struct {pass_name};
 
-impl PassType for {pass_name} {{
-    const PASS_INDEX: usize = {index};
-    const NAME: &'static str = "{pass_name}";
-}}
-
-{base_impl}
-impl {trait_impl} for {pass_name} {{}}
-
 impl {pass_name} {{
-    pub fn new{generics}({params}) -> BindingOutput<{gpu_name}, Self, {num_images}, {num_buffers}> {{
-        BindingOutput {{
-            images: [
-                {image_accesses}
-            ],
-            buffers: [
-                {buffer_accesses}
-            ],
-            gpu_bindings: {gpu_name} {{
+    pub fn new{generics}({params}) -> BindingOutput<kind::{kind_marker}> {{
+        BindingOutput::new(
+            {index},
+            &{gpu_name} {{
                 {gpu_inits}
             }},
-            stage: {stage},
-            _marker: PhantomData,
-        }}
+            {stage},
+            [
+                {image_accesses}
+            ],
+            [
+                {buffer_accesses}
+            ],
+        )
     }}
 }}
 "#
     ));
 
-    (out, kind)
+    (
+        out,
+        kind,
+        new.image_accesses.len(),
+        new.buffer_accesses.len(),
+    )
 }
 
 fn capitalize_first(s: &str) -> String {
@@ -610,7 +606,6 @@ fn main() {
     let mut bindings = format!(
         r#"
 //{h}:{m}:{s}
-use std::marker::PhantomData;
 use std::sync::OnceLock;
 use glam::*;
 use bytemuck::{{Pod, Zeroable}};
@@ -629,11 +624,11 @@ use std::str::FromStr;
     );
 
     let mut structs = Structs::new();
-    let mut entry_owner: HashMap<(&'static str, String), String> = HashMap::new();
     let mut pass_map: Vec<String> = Vec::new();
     let mut num_compute_pipelines: usize = 0;
     let mut num_ray_tracing_pipelines: usize = 0;
     let mut num_raster_pipelines: usize = 0;
+    let (mut max_images, mut max_buffers) = (0, 0);
 
     let passes_dir = out_dir.join("passes");
     fs::create_dir_all(&passes_dir).unwrap();
@@ -663,14 +658,6 @@ use std::str::FromStr;
             .entry_points()
             .map(|ep| (stage_name(ep.stage()), ep.name().unwrap().to_string()))
             .collect();
-        for (stage, name) in &entries {
-            if let Some(other) = entry_owner.insert((*stage, name.clone()), file.clone()) {
-                panic!(
-                    "{stage} entry point `{name}` exists in both {other} and {file}; \
-                     names must be unique per stage inside one SPIR-V module"
-                );
-            }
-        }
 
         let pc = layout
             .parameters()
@@ -680,7 +667,7 @@ use std::str::FromStr;
             .unwrap_or_else(|| panic!("no push constant buffer found in {file}"));
 
         let out = passes_dir.join(format!("{pass_name}.spv"));
-        let (pass_code, kind) = generate_pass(
+        let (pass_code, kind, images, buffers) = generate_pass(
             &pass_name,
             pc,
             &entries,
@@ -697,6 +684,8 @@ use std::str::FromStr;
             PassKind::RayTracing => num_ray_tracing_pipelines += 1,
             PassKind::RasterVertex | PassKind::RasterMesh => num_raster_pipelines += 1,
         }
+        max_images = max_images.max(images);
+        max_buffers = max_buffers.max(buffers);
         bindings.push_str(&pass_code);
 
         let pass_spirv = program
@@ -716,6 +705,15 @@ use std::str::FromStr;
     bindings.push_str(&format!(
         "pub const NUM_RASTER_PIPELINES: usize = {};\n",
         num_raster_pipelines
+    ));
+    // The inline capacity of a pass's accesses; the margin covers the buffers of a draw and
+    // registered accesses, and more only spill to the heap.
+    bindings.push_str(&format!(
+        "pub const MAX_PUSH_CONSTANTS_SIZE: usize = {MAX_PUSH_CONSTANTS_SIZE};\n\
+         pub const MAX_PASS_IMAGES: usize = {};\n\
+         pub const MAX_PASS_BUFFERS: usize = {};\n",
+        max_images + 2,
+        max_buffers + 2
     ));
 
     bindings.push_str(&format!(

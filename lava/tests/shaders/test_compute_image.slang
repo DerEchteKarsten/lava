@@ -1,5 +1,6 @@
 // Test pass (compute, storage image): writes a UV gradient with a checkerboard in blue.
 #include "bindless.slang"
+#include "profile.slang"
 
 struct TestComputeImageBindings {
     MutImage2D<float4> target;
@@ -14,6 +15,7 @@ struct TestComputeImageBindings {
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void test_compute_image(uint2 dtid: SV_DispatchThreadID) {
+    PROFILE(PROFILE_COMPUTE);
     if (any(dtid >= b.size)) {
         return;
     }

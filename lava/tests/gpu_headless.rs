@@ -2,6 +2,9 @@
 //!
 //! These run on the real GPU with the validation layer on; every test fails if the layer
 //! reports an error. The passes come from `lava/tests/shaders`, not from the engine.
+// Needed to call `RasterBuilder`'s draw methods, whose return type is `{ N + 1 }`.
+#![allow(incomplete_features)]
+#![feature(generic_const_exprs)]
 mod common;
 
 use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
@@ -19,8 +22,8 @@ use lava::{
         usage::{Index, Indirect, Storage},
     },
     command_buffer::{
-        Blend, CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand, Filter, Scissor,
-        Viewport,
+        BindingOutput, Blend, CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand, Filter,
+        RasterState, Scissor, Viewport, kind,
     },
     image::{
         Image,
@@ -339,25 +342,24 @@ fn profiled_frame_slot_times_scopes_and_passes() {
             }
             cmd.end_scope();
             if mesh {
-                cmd.raster()
-                    .color_attachment(target.whole_view(), None, None)
-                    .backface_culling(false)
+                cmd.raster(EXTENT)
+                    .color_attachment(target.whole_view(), None)
                     .launch(
                         TestMesh::new(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
-                        2,
-                        1,
-                        1,
-                        EXTENT,
-                    );
+                        [2, 1, 1],
+                        RasterState::default().backface_culling(false),
+                    )
+                    .record("TestMesh");
             }
         })
         .unwrap();
 
     let frame = slot.begin().unwrap();
-    let scopes = frame
+    let timings = frame
         .last_timings()
         .expect("the frame was profiled")
-        .to_vec();
+        .clone();
+    let scopes = timings.scopes;
     let names: Vec<_> = scopes.iter().map(|s| (s.name, s.depth)).collect();
     let mut expected = vec![
         ("frame", 0),
@@ -399,6 +401,16 @@ fn profiled_frame_slot_times_scopes_and_passes() {
                 assert!(stats.mesh > 0);
             }
         }
+    }
+
+    // `test_compute_image.slang` is instrumented with `PROFILE`; the other passes aren't.
+    if Ctx::features().shader_clock {
+        let shaders: Vec<_> = timings.shaders.iter().map(|s| (s.pass, s.stage)).collect();
+        assert_eq!(shaders, [("TestComputeImage", "compute")]);
+        let time = &timings.shaders[0];
+        // Both dispatches, at most one subgroup per invocation.
+        assert!(time.subgroups >= 2 && time.subgroups <= 2 * (SIZE * SIZE) as u64);
+        assert!(time.ticks > 0);
     }
     drop(frame);
 
@@ -887,20 +899,27 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
 
 // ---- raster passes ---------------------------------------------------------------------------
 
-fn bindings(
-    vertices: &Buffer<TestVertex>,
-) -> lava::command_buffer::BindingOutput<lava::bindings::CTestRasterBindings, TestRaster, 0, 1> {
+fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<kind::RasterVertex> {
     TestRaster::new(vertices.range(..), Vec2::ZERO)
+}
+
+fn unculled() -> RasterState {
+    RasterState::default().backface_culling(false)
 }
 
 /// Draws the first `vertex_count` vertices of [`two_triangles`] with backface culling on/off.
 fn draw_triangles(gpu: &common::Gpu, vertex_count: u32, culling: bool) -> Vec<u8> {
     let vertices = two_triangles();
     render(gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .backface_culling(culling)
-            .draw(bindings(&vertices), EXTENT, vertex_count, 1)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .draw(
+                bindings(&vertices),
+                vertex_count,
+                1,
+                RasterState::default().backface_culling(culling),
+            )
+            .record("triangles")
     })
 }
 
@@ -933,11 +952,10 @@ fn wireframe_draws_only_the_edges() {
     let gpu = gpu();
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .backface_culling(false)
-            .wire_frame(true)
-            .draw(bindings(&vertices), EXTENT, 6, 1)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .draw(bindings(&vertices), 6, 1, unculled().wire_frame(true))
+            .record("wireframe")
     });
     // The interior stays empty, the bottom edge (y = 0.8 -> row 57) is drawn.
     assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, BLACK);
@@ -950,9 +968,10 @@ fn color_attachment_clear_replaces_the_previous_content() {
     let gpu = gpu();
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), Some([0.0, 0.0, 1.0, 1.0]), None)
-            .draw(bindings(&vertices), EXTENT, 3, 1)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), Some([0.0, 0.0, 1.0, 1.0]))
+            .draw(bindings(&vertices), 3, 1, RasterState::default())
+            .record("cleared")
     });
     assert_pixel(&pixels, 32, 32, [0, 0, 255, 255]);
     assert_ne!(pixel(&pixels, IN_LEFT.0, IN_LEFT.1), [0, 0, 255, 255]);
@@ -963,15 +982,16 @@ fn instances_are_drawn_with_their_instance_index() {
     let gpu = gpu();
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
             // The second instance of the left triangle lands where the right one would be.
             .draw(
                 TestRaster::new(vertices.range(..), Vec2::new(1.0, 0.0)),
-                EXTENT,
                 3,
                 2,
+                RasterState::default(),
             )
+            .record("instanced")
     });
     assert_ne!(pixel(&pixels, IN_LEFT.0, IN_LEFT.1), BLACK);
     assert_eq!(
@@ -994,9 +1014,14 @@ fn indirect_draw_matches_the_direct_one() {
         first_instance: 0,
     }]);
     let indirect = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .draw_indirect(bindings(&vertices), EXTENT, commands.range(..))
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .draw_indirect(
+                bindings(&vertices),
+                commands.range(..),
+                RasterState::default(),
+            )
+            .record("indirect")
     });
     assert_eq!(indirect, direct);
 }
@@ -1018,15 +1043,15 @@ fn indirect_count_draws_only_the_counted_commands() {
     let draw_counted = |count: u32| {
         let count = buffer_with::<u32, Indirect>(&[count]);
         render(&gpu, |cmd, target| {
-            cmd.raster()
-                .color_attachment(target.whole_view(), None, None)
-                .backface_culling(false)
+            cmd.raster(EXTENT)
+                .color_attachment(target.whole_view(), None)
                 .draw_indirect_count(
                     bindings(&vertices),
-                    EXTENT,
                     commands.range(..),
                     count.range(..),
+                    unculled(),
                 )
+                .record("indirect count")
         })
     };
     assert_eq!(draw_counted(2), draw_triangles(&gpu, 6, false));
@@ -1042,23 +1067,14 @@ fn scissor_clips_and_viewport_scales_the_draw() {
 
     // Scissor: the full-size picture, cut to the left half.
     let scissored = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .backface_culling(false)
-            .draw_with_dynstates(
-                bindings(&vertices),
-                EXTENT,
-                6,
-                1,
-                &[Scissor {
-                    offset: IVec2::ZERO,
-                    extent: UVec2::new(SIZE / 2, SIZE),
-                }],
-                Viewport {
-                    offset: IVec2::ZERO,
-                    extent: EXTENT,
-                },
-            )
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .scissors(&[Scissor {
+                offset: IVec2::ZERO,
+                extent: UVec2::new(SIZE / 2, SIZE),
+            }])
+            .draw(bindings(&vertices), 6, 1, unculled())
+            .record("scissored")
     });
     for (y, x) in (0..SIZE).flat_map(|y| (0..SIZE).map(move |x| (y, x))) {
         let expected = if x < SIZE / 2 {
@@ -1071,23 +1087,14 @@ fn scissor_clips_and_viewport_scales_the_draw() {
 
     // Viewport: the whole picture squeezed into the bottom-right quarter.
     let quarter = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .backface_culling(false)
-            .draw_with_dynstates(
-                bindings(&vertices),
-                EXTENT,
-                6,
-                1,
-                &[Scissor {
-                    offset: IVec2::ZERO,
-                    extent: EXTENT,
-                }],
-                Viewport {
-                    offset: IVec2::splat(SIZE as i32 / 2),
-                    extent: EXTENT / 2,
-                },
-            )
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .viewport(Viewport {
+                offset: IVec2::splat(SIZE as i32 / 2),
+                extent: EXTENT / 2,
+            })
+            .draw(bindings(&vertices), 6, 1, unculled())
+            .record("viewport")
     });
     assert_pixel(&quarter, IN_RIGHT.0, IN_RIGHT.1, BLACK);
     assert_pixel(
@@ -1122,19 +1129,21 @@ fn depth_attachment_keeps_the_nearer_fragment() {
     let vertices = overlapping_triangles();
 
     let without_depth = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .draw(bindings(&vertices), EXTENT, 6, 1)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .draw(bindings(&vertices), 6, 1, RasterState::default())
+            .record("without depth")
     });
     // Without a depth test the later (far, red) triangle wins.
     assert_pixel(&without_depth, 32, 40, [255, 0, 0, 255]);
 
     let depth = Image::<D32Sfloat, DepthAttachment>::new(SIZE, SIZE).unwrap();
     let with_depth = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .depth_attachment(depth.whole_view(), Some([0.0]), true)
-            .draw(bindings(&vertices), EXTENT, 6, 1)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), Some([0.0]))
+            .draw(bindings(&vertices), 6, 1, RasterState::default())
+            .record("with depth")
     });
     assert_pixel(&with_depth, 32, 40, [0, 255, 0, 255]);
     assert_golden("raster_depth", &with_depth, [SIZE, SIZE]);
@@ -1146,33 +1155,48 @@ fn blend_modes_combine_overlapping_fragments() {
     let vertices = overlapping_triangles();
     let draw = |clear: [f32; 4], blend| {
         render(&gpu, |cmd, target| {
-            cmd.raster()
-                .color_attachment(target.whole_view(), Some(clear), blend)
-                .draw(bindings(&vertices), EXTENT, 6, 1)
+            cmd.raster(EXTENT)
+                .color_attachment(target.whole_view(), Some(clear))
+                .draw(
+                    bindings(&vertices),
+                    6,
+                    1,
+                    RasterState::default().blends([blend]),
+                )
+                .record("blended")
         })
     };
     // Green, then red on top of it, both opaque.
-    assert_pixel(
-        &draw([0.0; 4], Some(Blend::Alpha)),
-        32,
-        40,
-        [255, 0, 0, 255],
-    );
-    assert_pixel(
-        &draw([0.0; 4], Some(Blend::Add)),
-        32,
-        40,
-        [255, 255, 0, 255],
-    );
+    assert_pixel(&draw([0.0; 4], Blend::Alpha), 32, 40, [255, 0, 0, 255]);
+    assert_pixel(&draw([0.0; 4], Blend::Add), 32, 40, [255, 255, 0, 255]);
     // White loses green, then red; alpha goes with the first draw.
-    assert_pixel(
-        &draw([1.0; 4], Some(Blend::Attenuate)),
-        32,
-        40,
-        [0, 0, 255, 0],
-    );
+    assert_pixel(&draw([1.0; 4], Blend::Attenuate), 32, 40, [0, 0, 255, 0]);
     // Outside the triangles the clear stays.
-    assert_pixel(&draw([1.0; 4], Some(Blend::Attenuate)), 2, 2, [255; 4]);
+    assert_pixel(&draw([1.0; 4], Blend::Attenuate), 2, 2, [255; 4]);
+}
+
+#[test]
+fn skipped_attachment_keeps_its_content() {
+    let gpu = gpu();
+    let vertices = overlapping_triangles();
+    let second = Target::new_storage(SIZE, SIZE, 1, 1).unwrap();
+    let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);
+    let pixels = render(&gpu, |cmd, target| {
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .color_attachment(second.whole_view(), Some([0.0, 0.0, 1.0, 1.0]))
+            .draw(
+                bindings(&vertices),
+                6,
+                1,
+                RasterState::default().blends([Blend::Replace, Blend::Skip]),
+            )
+            .record("skip");
+        cmd.copy_image_to_buffer(second.whole(), readback.range(..));
+    });
+    assert_pixel(&pixels, 32, 40, [255, 0, 0, 255]);
+    let second = readback.range(..).as_slice();
+    assert!(second.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
 }
 
 #[test]
@@ -1183,24 +1207,26 @@ fn depth_persists_between_draws_unless_cleared() {
 
     let draw_far_after_near = |clear_between: Option<[f32; 1]>| {
         render(&gpu, |cmd, target| {
-            cmd.raster()
-                .color_attachment(target.whole_view(), None, None)
-                .depth_attachment(depth.whole_view(), Some([0.0]), true)
+            cmd.raster(EXTENT)
+                .color_attachment(target.whole_view(), None)
+                .depth_attachment(depth.whole_view(), Some([0.0]))
                 .draw(
                     TestRaster::new(vertices.range(0..3), Vec2::ZERO),
-                    EXTENT,
                     3,
                     1,
-                );
-            cmd.raster()
-                .color_attachment(target.whole_view(), None, None)
-                .depth_attachment(depth.whole_view(), clear_between, true)
+                    RasterState::default(),
+                )
+                .record("near");
+            cmd.raster(EXTENT)
+                .color_attachment(target.whole_view(), None)
+                .depth_attachment(depth.whole_view(), clear_between)
                 .draw(
                     TestRaster::new(vertices.range(3..), Vec2::ZERO),
-                    EXTENT,
                     3,
                     1,
-                );
+                    RasterState::default(),
+                )
+                .record("far");
         })
     };
 
@@ -1208,6 +1234,37 @@ fn depth_persists_between_draws_unless_cleared() {
     assert_pixel(&draw_far_after_near(None), 32, 40, [0, 255, 0, 255]);
     // Clearing depth in between lets the far triangle through.
     assert_pixel(&draw_far_after_near(Some([0.0])), 32, 40, [255, 0, 0, 255]);
+}
+
+/// A draw is depth-tested against the depth an earlier draw of the same rendering wrote, with
+/// no barrier in between.
+#[test]
+fn draws_of_one_rendering_see_the_earlier_depth() {
+    let gpu = gpu();
+    let near = overlapping_triangles();
+    // Larger than the near triangle, so its rim stays visible.
+    let far = buffer_with::<TestVertex, Storage>(&[
+        vertex(0.0, -0.95, 0.2, RED),
+        vertex(0.95, 0.95, 0.2, RED),
+        vertex(-0.95, 0.95, 0.2, RED),
+    ]);
+    let depth = Image::<D32Sfloat, DepthAttachment>::new(SIZE, SIZE).unwrap();
+    let pixels = render(&gpu, |cmd, target| {
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), Some([0.0]))
+            .draw(
+                TestRaster::new(near.range(0..3), Vec2::ZERO),
+                3,
+                1,
+                RasterState::default(),
+            )
+            .draw(bindings(&far), 3, 1, RasterState::default())
+            .record("near then far")
+    });
+    assert_pixel(&pixels, 32, 40, [0, 255, 0, 255]);
+    // Below the near triangle's base.
+    assert_pixel(&pixels, 32, 61, [255, 0, 0, 255]);
 }
 
 /// Regression: `write: false` only skipped storing the attachment while the pipeline kept
@@ -1234,10 +1291,16 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
                 (&near, None, write_near),
                 (&middle, None, true),
             ] {
-                cmd.raster()
-                    .color_attachment(target.whole_view(), None, None)
-                    .depth_attachment(depth.whole_view(), clear, write)
-                    .draw(bindings(vertices), EXTENT, 3, 1);
+                cmd.raster(EXTENT)
+                    .color_attachment(target.whole_view(), None)
+                    .depth_attachment(depth.whole_view(), clear)
+                    .draw(
+                        bindings(vertices),
+                        3,
+                        1,
+                        RasterState::default().depth_write(write),
+                    )
+                    .record("triangle");
             }
         })
     };
@@ -1250,14 +1313,21 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
 
     // A read-only draw is still occluded by what is already in the depth buffer.
     let occluded = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .depth_attachment(depth.whole_view(), Some([0.0]), true)
-            .draw(bindings(&near), EXTENT, 3, 1);
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .depth_attachment(depth.whole_view(), None, false)
-            .draw(bindings(&far), EXTENT, 3, 1);
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), Some([0.0]))
+            .draw(bindings(&near), 3, 1, RasterState::default())
+            .record("near");
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), None)
+            .draw(
+                bindings(&far),
+                3,
+                1,
+                RasterState::default().depth_write(false),
+            )
+            .record("far");
     });
     assert_pixel(&occluded, 32, 40, [0, 255, 0, 255]);
 }
@@ -1269,33 +1339,36 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
     let depth = Image::<D32Sfloat, DepthAttachment>::new(SIZE, SIZE).unwrap();
     let pixels = render(&gpu, |cmd, target| {
         // Near triangle written, then depth cleared by a read-only pass, then the far one.
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .depth_attachment(depth.whole_view(), Some([0.0]), true)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(
                 TestRaster::new(vertices.range(0..3), Vec2::ZERO),
-                EXTENT,
                 3,
                 1,
-            );
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .depth_attachment(depth.whole_view(), Some([0.0]), false)
+                RasterState::default(),
+            )
+            .record("near");
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(
                 TestRaster::new(vertices.range(0..3), Vec2::ZERO),
-                EXTENT,
                 3,
                 1,
-            );
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .depth_attachment(depth.whole_view(), None, true)
+                RasterState::default().depth_write(false),
+            )
+            .record("read-only");
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), None)
             .draw(
                 TestRaster::new(vertices.range(3..), Vec2::ZERO),
-                EXTENT,
                 3,
                 1,
-            );
+                RasterState::default(),
+            )
+            .record("far");
     });
     assert_pixel(&pixels, 32, 40, [255, 0, 0, 255]);
 }
@@ -1307,10 +1380,11 @@ fn depth_stencil_formats_work_as_depth_attachment() {
     let vertices = overlapping_triangles();
     let depth = Image::<D32SfloatS8Uint, DepthAttachment>::new(SIZE, SIZE).unwrap();
     let pixels = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .depth_attachment(depth.whole_view(), Some((0.0, 0)), true)
-            .draw(bindings(&vertices), EXTENT, 6, 1)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), Some((0.0, 0)))
+            .draw(bindings(&vertices), 6, 1, RasterState::default())
+            .record("depth stencil")
     });
     assert_pixel(&pixels, 32, 40, [0, 255, 0, 255]);
 }
@@ -1344,15 +1418,16 @@ fn indexed_draw_samples_a_bindless_texture() {
 
     let pixels = render(&gpu, |cmd, target| {
         cmd.copy_buffer_to_image(upload.range(..), texture.whole());
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
             .draw_indexed(
                 // Sampler 0 is nearest-neighbour.
                 TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
-                EXTENT,
                 indices.range(..),
                 1,
+                RasterState::default(),
             )
+            .record("textured")
     });
 
     assert_pixel(&pixels, 24, 24, [255, 0, 0, 255]);
@@ -1364,14 +1439,15 @@ fn indexed_draw_samples_a_bindless_texture() {
 
     // Only the first three indices: one triangle, the lower-left half stays empty.
     let half = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
             .draw_indexed(
                 TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
-                EXTENT,
                 indices.range(..3),
                 1,
+                RasterState::default(),
             )
+            .record("half")
     });
     assert_pixel(&half, 40, 24, [0, 255, 0, 255]);
     assert_pixel(&half, 24, 40, BLACK);
@@ -1424,14 +1500,15 @@ fn batched_bindings_are_sampled_from_their_slots() {
             cmd.copy_buffer_to_image(upload.range(..), texture.whole());
         }
         for (quad, texture) in quads.iter().zip(&textures) {
-            cmd.raster()
-                .color_attachment(target.whole_view(), None, None)
+            cmd.raster(EXTENT)
+                .color_attachment(target.whole_view(), None)
                 .draw_indexed(
                     TestRasterTextured::new(quad.range(..), texture.whole_view(), 0),
-                    EXTENT,
                     indices.range(..),
                     1,
+                    RasterState::default(),
                 )
+                .record("quad")
         }
     });
 
@@ -1495,14 +1572,15 @@ fn host_copy_uploads_block_compressed_mips() {
     ]);
     let indices = buffer_with::<u32, Index>(&[0, 1, 2, 0, 2, 3]);
     let pixels = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
             .draw_indexed(
                 TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
-                EXTENT,
                 indices.range(..),
                 1,
+                RasterState::default(),
             )
+            .record("compressed")
     });
     assert_pixel(&pixels, 24, 24, [255, 1, 1, 255]);
     assert_pixel(&pixels, 40, 24, [1, 255, 1, 255]);
@@ -1518,16 +1596,14 @@ fn mesh_pass_emits_triangles_per_workgroup() {
         return;
     }
     let pixels = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .backface_culling(false)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
             .launch(
                 TestMesh::new(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4),
-                2,
-                1,
-                1,
-                EXTENT,
+                [2, 1, 1],
+                unculled(),
             )
+            .record("mesh")
     });
     // Workgroup 0 draws around the centre, workgroup 1 shifted to the right edge.
     assert_ne!(pixel(&pixels, 32, 36), BLACK);
@@ -1545,10 +1621,10 @@ fn indirect_mesh_launch_matches_the_direct_one() {
     }
     let bindings = || TestMesh::new(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4);
     let direct = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .backface_culling(false)
-            .launch(bindings(), 2, 1, 1, EXTENT)
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .launch(bindings(), [2, 1, 1], unculled())
+            .record("direct")
     });
     let launch = buffer_with::<DispatchIndirectCommand, Indirect>(&[DispatchIndirectCommand {
         x: 2,
@@ -1556,22 +1632,10 @@ fn indirect_mesh_launch_matches_the_direct_one() {
         z: 1,
     }]);
     let indirect = render(&gpu, |cmd, target| {
-        cmd.raster()
-            .color_attachment(target.whole_view(), None, None)
-            .backface_culling(false)
-            .launch_indirect_with_dynstates(
-                bindings(),
-                EXTENT,
-                launch.range(..),
-                &[Scissor {
-                    offset: IVec2::ZERO,
-                    extent: EXTENT,
-                }],
-                Viewport {
-                    offset: IVec2::ZERO,
-                    extent: EXTENT,
-                },
-            )
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .launch_indirect(bindings(), launch.range(..), unculled())
+            .record("indirect")
     });
     assert_eq!(indirect, direct);
 }

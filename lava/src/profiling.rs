@@ -1,9 +1,15 @@
-//! GPU timestamp and pipeline-statistics queries per frame slot
-use std::sync::atomic::{AtomicBool, Ordering};
+//! GPU timestamp and pipeline-statistics queries per frame slot, and the shader clock counters that `profile.slang` fills
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use ash::vk;
 
 use crate::{
+    bindings::PASS_MAP,
+    bindless::Bindless,
+    buffer::Buffer,
     error::Result,
     state::{Ctx, Functions},
 };
@@ -31,6 +37,106 @@ pub struct GpuScope {
     pub stats: Option<PipelineStats>,
 }
 
+/// Subgroup clock ticks the shaders of one pass and stage spent since the frame before, as
+/// counted by `PROFILE` in the shader. Ticks are the device's own unit; only ratios between
+/// passes and stages are meaningful.
+#[derive(Clone, Debug)]
+pub struct ShaderTime {
+    pub pass: &'static str,
+    pub stage: &'static str,
+    /// Summed over all subgroups, which run in parallel, so it can exceed the frame.
+    pub ticks: u64,
+    pub subgroups: u64,
+}
+
+/// What a profiled frame slot read back about the frame it submitted before.
+#[derive(Clone, Debug, Default)]
+pub struct FrameTimings {
+    /// The root scope "frame" first, then passes and `begin_scope` groups in recording order.
+    pub scopes: Vec<GpuScope>,
+    pub shaders: Vec<ShaderTime>,
+}
+
+/// Mirrors `profile.slang`.
+const FLAG_WORDS: usize = 8;
+const STAGES: [&str; 4] = ["compute", "task", "mesh", "vertex"];
+const STRIPES: usize = 64;
+const STRIPE_WORDS: usize = 8;
+
+/// The buffer `profile.slang` adds to, in descriptor set 2. Word 0 counts the profiling
+/// `FrameQueries`; the shaders skip their atomics while it is 0.
+static COUNTERS: OnceLock<Buffer<u64>> = OnceLock::new();
+/// Per pass and stage, the ticks and subgroups at the last read. Shared by all frame slots,
+/// since the counters only grow.
+static LAST_READ: Mutex<Vec<[u64; 2]>> = Mutex::new(Vec::new());
+
+fn counter(index: usize) -> &'static AtomicU64 {
+    let counters = COUNTERS.get().expect("shader clocks are initialised");
+    unsafe { &*(counters.range(..).element_ptr(index) as *const AtomicU64) }
+}
+
+/// Creates the shader clock counters and binds them, if the device has subgroup clocks.
+pub(crate) fn init() -> Result<()> {
+    if !Ctx::features().shader_clock {
+        return Ok(());
+    }
+    let len = FLAG_WORDS + PASS_MAP.len() * STAGES.len() * STRIPES * STRIPE_WORDS;
+    let counters = Buffer::<u64>::new(len, true)?;
+    counters.range(..).copy_from(&vec![0; counters.len()]);
+    let info = [vk::DescriptorBufferInfo::default()
+        .buffer(counters.handle)
+        .range(vk::WHOLE_SIZE)];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(Bindless::profile_set())
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&info);
+    unsafe { Ctx::device().update_descriptor_sets(&[write], &[]) };
+    let _ = COUNTERS.set(counters);
+    Ok(())
+}
+
+/// The ticks every pass and stage spent since the last call, from any frame slot.
+fn read_shader_clocks() -> Vec<ShaderTime> {
+    if COUNTERS.get().is_none() {
+        return Vec::new();
+    }
+    let mut last = LAST_READ.lock().unwrap();
+    last.resize(PASS_MAP.len() * STAGES.len(), [0; 2]);
+    let mut times = Vec::new();
+    for (slot, last) in last.iter_mut().enumerate() {
+        let mut now = [0; 2];
+        for stripe in 0..STRIPES {
+            let base = FLAG_WORDS + (slot * STRIPES + stripe) * STRIPE_WORDS;
+            now[0] += counter(base).load(Ordering::Relaxed);
+            now[1] += counter(base + 1).load(Ordering::Relaxed);
+        }
+        let (ticks, subgroups) = (now[0] - last[0], now[1] - last[1]);
+        *last = now;
+        if subgroups > 0 {
+            times.push(ShaderTime {
+                pass: PASS_MAP[slot / STAGES.len()].name,
+                stage: STAGES[slot % STAGES.len()],
+                ticks,
+                subgroups,
+            });
+        }
+    }
+    times
+}
+
+/// Specialization info telling `profile.slang` which pass a pipeline belongs to.
+pub(crate) fn pass_constant(pass_index: &u32) -> vk::SpecializationInfo<'_> {
+    const ENTRIES: [vk::SpecializationMapEntry; 1] = [vk::SpecializationMapEntry {
+        constant_id: 900,
+        offset: 0,
+        size: 4,
+    }];
+    vk::SpecializationInfo::default()
+        .map_entries(&ENTRIES)
+        .data(bytemuck::bytes_of(pass_index))
+}
+
 struct Scope {
     name: &'static str,
     depth: u16,
@@ -50,7 +156,7 @@ pub struct FrameQueries {
     open: Vec<Option<usize>>,
     next_timestamp: u32,
     next_statistic: u32,
-    results: Vec<GpuScope>,
+    results: FrameTimings,
 }
 
 static OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
@@ -90,6 +196,9 @@ impl FrameQueries {
         let bits = Ctx::physical_device().queue_families[queue_family as usize]
             .handel
             .timestamp_valid_bits;
+        if COUNTERS.get().is_some() {
+            counter(0).fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Self {
             timestamps,
             statistics,
@@ -98,7 +207,7 @@ impl FrameQueries {
             open: Vec::new(),
             next_timestamp: 0,
             next_statistic: 0,
-            results: Vec::new(),
+            results: FrameTimings::default(),
         })
     }
 
@@ -177,8 +286,20 @@ impl FrameQueries {
     }
 
     /// Reads the results of the last submission, which must have finished.
+    /// Makes the shader clock counters readable by the host once the submission finished.
+    pub(crate) fn finish(&self, cmd: vk::CommandBuffer) {
+        let barrier = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+        let info = vk::DependencyInfo::default().memory_barriers(&barrier);
+        unsafe { Ctx::device().cmd_pipeline_barrier2(cmd, &info) };
+    }
+
     pub(crate) fn read(&mut self) -> Result<()> {
-        self.results.clear();
+        self.results.scopes.clear();
+        self.results.shaders = read_shader_clocks();
         if self.scopes.is_empty() {
             return Ok(());
         }
@@ -210,6 +331,7 @@ impl FrameQueries {
         let base = ticks[self.scopes[0].timestamp as usize] & self.valid_bits;
         let ns = |tick: u64| ((tick & self.valid_bits).saturating_sub(base) as f64 * period) as u64;
         self.results
+            .scopes
             .extend(self.scopes.iter().map(|scope| GpuScope {
                 name: scope.name,
                 depth: scope.depth,
@@ -229,13 +351,16 @@ impl FrameQueries {
         Ok(())
     }
 
-    pub(crate) fn results(&self) -> Option<&[GpuScope]> {
-        (!self.results.is_empty()).then_some(&self.results)
+    pub(crate) fn results(&self) -> Option<&FrameTimings> {
+        (!self.results.scopes.is_empty()).then_some(&self.results)
     }
 }
 
 impl Drop for FrameQueries {
     fn drop(&mut self) {
+        if COUNTERS.get().is_some() {
+            counter(0).fetch_sub(1, Ordering::Relaxed);
+        }
         let device = Ctx::device();
         unsafe {
             device.destroy_query_pool(self.timestamps, None);

@@ -1,5 +1,5 @@
 //! Lava: typed, bindless Vulkan abstraction over ash with shader-generated passes
-// `BindingOutput` grows its access arrays by one per registered resource.
+// `RasterBuilder` grows its array of draws by one per draw.
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 #![feature(const_trait_impl)]
@@ -42,6 +42,7 @@ pub fn init(
 ) -> Result<()> {
     Ctx::init(display, enable_validation, enable_gpu_assited_validation)?;
     Bindless::init()?;
+    profiling::init()?;
     command_buffer::init();
     Ok(())
 }
