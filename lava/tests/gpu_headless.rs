@@ -19,7 +19,8 @@ use lava::{
         usage::{Index, Indirect, Storage},
     },
     command_buffer::{
-        CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand, Filter, Scissor, Viewport,
+        Blend, CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand, Filter, Scissor,
+        Viewport,
     },
     image::{
         Image,
@@ -190,6 +191,7 @@ fn fence_signals_when_the_submission_finished() {
             PendingAccesses::default(),
             &memory,
             Some(&fence),
+            &mut None,
             &[],
             &[],
             |cmd| {
@@ -208,6 +210,7 @@ fn fence_signals_when_the_submission_finished() {
             PendingAccesses::default(),
             &memory,
             Some(&fence),
+            &mut None,
             &[],
             &[],
             |cmd| {
@@ -314,6 +317,101 @@ fn frame_slot_can_be_reused_and_keeps_retired_values_until_the_frame_is_done() {
     }
     drop(slot);
     assert_eq!(buffer.range(..).as_slice(), [3; 4]);
+}
+
+#[test]
+fn profiled_frame_slot_times_scopes_and_passes() {
+    let gpu = gpu();
+    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let mesh = Ctx::features().mesh;
+    let mut slot = FrameSlot::new(&gpu.queue).unwrap();
+    slot.set_profiling(true);
+    let frame = slot.begin().unwrap();
+    assert!(frame.last_timings().is_none(), "nothing was submitted yet");
+    frame
+        .execute(&gpu.queue, PendingAccesses::default(), &[], &[], |cmd| {
+            cmd.begin_scope("group");
+            for color in [Vec4::ONE, Vec4::ZERO] {
+                cmd.compute(
+                    TestComputeImage::new(target.whole_view(), color, UVec2::ZERO, EXTENT),
+                    [SIZE / 8, SIZE / 8, 1],
+                );
+            }
+            cmd.end_scope();
+            if mesh {
+                cmd.raster()
+                    .color_attachment(target.whole_view(), None, None)
+                    .backface_culling(false)
+                    .launch(
+                        TestMesh::new(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
+                        2,
+                        1,
+                        1,
+                        EXTENT,
+                    );
+            }
+        })
+        .unwrap();
+
+    let frame = slot.begin().unwrap();
+    let scopes = frame
+        .last_timings()
+        .expect("the frame was profiled")
+        .to_vec();
+    let names: Vec<_> = scopes.iter().map(|s| (s.name, s.depth)).collect();
+    let mut expected = vec![
+        ("frame", 0),
+        ("group", 1),
+        ("TestComputeImage", 2),
+        ("TestComputeImage", 2),
+    ];
+    if mesh {
+        expected.push(("TestMesh", 1));
+    }
+    assert_eq!(names, expected);
+    for scope in &scopes {
+        assert!(scope.start_ns <= scope.end_ns, "{scope:?}");
+    }
+    assert_eq!(scopes[0].start_ns, 0);
+    assert!(scopes[0].end_ns > 0);
+    let inside = |child: usize, parent: usize| {
+        scopes[parent].start_ns <= scopes[child].start_ns
+            && scopes[child].end_ns <= scopes[parent].end_ns
+    };
+    assert!(inside(1, 0) && inside(2, 1) && inside(3, 1));
+    assert!(
+        scopes[3].start_ns >= scopes[2].end_ns,
+        "passes run in order"
+    );
+
+    // Statistics are counted for passes only.
+    assert!(scopes[..2].iter().all(|s| s.stats.is_none()));
+    if Ctx::features().pipeline_statistics {
+        for pass in &scopes[2..4] {
+            let stats = pass.stats.unwrap();
+            assert_eq!(stats.compute, (SIZE * SIZE) as u64);
+            assert_eq!(stats.fragment, 0);
+        }
+        if mesh {
+            let stats = scopes[4].stats.unwrap();
+            assert!(stats.fragment > 0 && stats.compute == 0);
+            if Ctx::features().mesh_queries {
+                assert!(stats.mesh > 0);
+            }
+        }
+    }
+    drop(frame);
+
+    // Without profiling the slot reports nothing.
+    slot.set_profiling(false);
+    let frame = slot.begin().unwrap();
+    frame
+        .execute(&gpu.queue, PendingAccesses::default(), &[], &[], |cmd| {
+            cmd.begin_scope("group");
+            cmd.end_scope();
+        })
+        .unwrap();
+    assert!(slot.begin().unwrap().last_timings().is_none());
 }
 
 // ---- buffer commands -------------------------------------------------------------------------
@@ -800,7 +898,7 @@ fn draw_triangles(gpu: &common::Gpu, vertex_count: u32, culling: bool) -> Vec<u8
     let vertices = two_triangles();
     render(gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .backface_culling(culling)
             .draw(bindings(&vertices), EXTENT, vertex_count, 1)
     })
@@ -836,7 +934,7 @@ fn wireframe_draws_only_the_edges() {
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .backface_culling(false)
             .wire_frame(true)
             .draw(bindings(&vertices), EXTENT, 6, 1)
@@ -853,7 +951,7 @@ fn color_attachment_clear_replaces_the_previous_content() {
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), Some([0.0, 0.0, 1.0, 1.0]))
+            .color_attachment(target.whole_view(), Some([0.0, 0.0, 1.0, 1.0]), None)
             .draw(bindings(&vertices), EXTENT, 3, 1)
     });
     assert_pixel(&pixels, 32, 32, [0, 0, 255, 255]);
@@ -866,7 +964,7 @@ fn instances_are_drawn_with_their_instance_index() {
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             // The second instance of the left triangle lands where the right one would be.
             .draw(
                 TestRaster::new(vertices.range(..), Vec2::new(1.0, 0.0)),
@@ -897,7 +995,7 @@ fn indirect_draw_matches_the_direct_one() {
     }]);
     let indirect = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .draw_indirect(bindings(&vertices), EXTENT, commands.range(..))
     });
     assert_eq!(indirect, direct);
@@ -921,7 +1019,7 @@ fn indirect_count_draws_only_the_counted_commands() {
         let count = buffer_with::<u32, Indirect>(&[count]);
         render(&gpu, |cmd, target| {
             cmd.raster()
-                .color_attachment(target.whole_view(), None)
+                .color_attachment(target.whole_view(), None, None)
                 .backface_culling(false)
                 .draw_indirect_count(
                     bindings(&vertices),
@@ -945,7 +1043,7 @@ fn scissor_clips_and_viewport_scales_the_draw() {
     // Scissor: the full-size picture, cut to the left half.
     let scissored = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .backface_culling(false)
             .draw_with_dynstates(
                 bindings(&vertices),
@@ -974,7 +1072,7 @@ fn scissor_clips_and_viewport_scales_the_draw() {
     // Viewport: the whole picture squeezed into the bottom-right quarter.
     let quarter = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .backface_culling(false)
             .draw_with_dynstates(
                 bindings(&vertices),
@@ -1025,7 +1123,7 @@ fn depth_attachment_keeps_the_nearer_fragment() {
 
     let without_depth = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .draw(bindings(&vertices), EXTENT, 6, 1)
     });
     // Without a depth test the later (far, red) triangle wins.
@@ -1034,12 +1132,47 @@ fn depth_attachment_keeps_the_nearer_fragment() {
     let depth = Image::<D32Sfloat, DepthAttachment>::new(SIZE, SIZE).unwrap();
     let with_depth = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .depth_attachment(depth.whole_view(), Some([0.0]), true)
             .draw(bindings(&vertices), EXTENT, 6, 1)
     });
     assert_pixel(&with_depth, 32, 40, [0, 255, 0, 255]);
     assert_golden("raster_depth", &with_depth, [SIZE, SIZE]);
+}
+
+#[test]
+fn blend_modes_combine_overlapping_fragments() {
+    let gpu = gpu();
+    let vertices = overlapping_triangles();
+    let draw = |clear: [f32; 4], blend| {
+        render(&gpu, |cmd, target| {
+            cmd.raster()
+                .color_attachment(target.whole_view(), Some(clear), blend)
+                .draw(bindings(&vertices), EXTENT, 6, 1)
+        })
+    };
+    // Green, then red on top of it, both opaque.
+    assert_pixel(
+        &draw([0.0; 4], Some(Blend::Alpha)),
+        32,
+        40,
+        [255, 0, 0, 255],
+    );
+    assert_pixel(
+        &draw([0.0; 4], Some(Blend::Add)),
+        32,
+        40,
+        [255, 255, 0, 255],
+    );
+    // White loses green, then red; alpha goes with the first draw.
+    assert_pixel(
+        &draw([1.0; 4], Some(Blend::Attenuate)),
+        32,
+        40,
+        [0, 0, 255, 0],
+    );
+    // Outside the triangles the clear stays.
+    assert_pixel(&draw([1.0; 4], Some(Blend::Attenuate)), 2, 2, [255; 4]);
 }
 
 #[test]
@@ -1051,7 +1184,7 @@ fn depth_persists_between_draws_unless_cleared() {
     let draw_far_after_near = |clear_between: Option<[f32; 1]>| {
         render(&gpu, |cmd, target| {
             cmd.raster()
-                .color_attachment(target.whole_view(), None)
+                .color_attachment(target.whole_view(), None, None)
                 .depth_attachment(depth.whole_view(), Some([0.0]), true)
                 .draw(
                     TestRaster::new(vertices.range(0..3), Vec2::ZERO),
@@ -1060,7 +1193,7 @@ fn depth_persists_between_draws_unless_cleared() {
                     1,
                 );
             cmd.raster()
-                .color_attachment(target.whole_view(), None)
+                .color_attachment(target.whole_view(), None, None)
                 .depth_attachment(depth.whole_view(), clear_between, true)
                 .draw(
                     TestRaster::new(vertices.range(3..), Vec2::ZERO),
@@ -1102,7 +1235,7 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
                 (&middle, None, true),
             ] {
                 cmd.raster()
-                    .color_attachment(target.whole_view(), None)
+                    .color_attachment(target.whole_view(), None, None)
                     .depth_attachment(depth.whole_view(), clear, write)
                     .draw(bindings(vertices), EXTENT, 3, 1);
             }
@@ -1118,11 +1251,11 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
     // A read-only draw is still occluded by what is already in the depth buffer.
     let occluded = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .depth_attachment(depth.whole_view(), Some([0.0]), true)
             .draw(bindings(&near), EXTENT, 3, 1);
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .depth_attachment(depth.whole_view(), None, false)
             .draw(bindings(&far), EXTENT, 3, 1);
     });
@@ -1137,7 +1270,7 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
     let pixels = render(&gpu, |cmd, target| {
         // Near triangle written, then depth cleared by a read-only pass, then the far one.
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .depth_attachment(depth.whole_view(), Some([0.0]), true)
             .draw(
                 TestRaster::new(vertices.range(0..3), Vec2::ZERO),
@@ -1146,7 +1279,7 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
                 1,
             );
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .depth_attachment(depth.whole_view(), Some([0.0]), false)
             .draw(
                 TestRaster::new(vertices.range(0..3), Vec2::ZERO),
@@ -1155,7 +1288,7 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
                 1,
             );
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .depth_attachment(depth.whole_view(), None, true)
             .draw(
                 TestRaster::new(vertices.range(3..), Vec2::ZERO),
@@ -1175,7 +1308,7 @@ fn depth_stencil_formats_work_as_depth_attachment() {
     let depth = Image::<D32SfloatS8Uint, DepthAttachment>::new(SIZE, SIZE).unwrap();
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .depth_attachment(depth.whole_view(), Some((0.0, 0)), true)
             .draw(bindings(&vertices), EXTENT, 6, 1)
     });
@@ -1212,7 +1345,7 @@ fn indexed_draw_samples_a_bindless_texture() {
     let pixels = render(&gpu, |cmd, target| {
         cmd.copy_buffer_to_image(upload.range(..), texture.whole());
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .draw_indexed(
                 // Sampler 0 is nearest-neighbour.
                 TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
@@ -1232,7 +1365,7 @@ fn indexed_draw_samples_a_bindless_texture() {
     // Only the first three indices: one triangle, the lower-left half stays empty.
     let half = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .draw_indexed(
                 TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
                 EXTENT,
@@ -1292,7 +1425,7 @@ fn batched_bindings_are_sampled_from_their_slots() {
         }
         for (quad, texture) in quads.iter().zip(&textures) {
             cmd.raster()
-                .color_attachment(target.whole_view(), None)
+                .color_attachment(target.whole_view(), None, None)
                 .draw_indexed(
                     TestRasterTextured::new(quad.range(..), texture.whole_view(), 0),
                     EXTENT,
@@ -1363,7 +1496,7 @@ fn host_copy_uploads_block_compressed_mips() {
     let indices = buffer_with::<u32, Index>(&[0, 1, 2, 0, 2, 3]);
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .draw_indexed(
                 TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
                 EXTENT,
@@ -1386,7 +1519,7 @@ fn mesh_pass_emits_triangles_per_workgroup() {
     }
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster()
-            .color_attachment(target.whole_view(), None)
+            .color_attachment(target.whole_view(), None, None)
             .backface_culling(false)
             .launch(
                 TestMesh::new(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4),
@@ -1401,4 +1534,44 @@ fn mesh_pass_emits_triangles_per_workgroup() {
     assert_ne!(pixel(&pixels, 60, 36), BLACK);
     assert_pixel(&pixels, 4, 4, BLACK);
     assert_golden("mesh", &pixels, [SIZE, SIZE]);
+}
+
+#[test]
+fn indirect_mesh_launch_matches_the_direct_one() {
+    let gpu = gpu();
+    if !Ctx::features().mesh {
+        eprintln!("SKIPPED indirect_mesh_launch_matches_the_direct_one: no mesh shader support");
+        return;
+    }
+    let bindings = || TestMesh::new(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4);
+    let direct = render(&gpu, |cmd, target| {
+        cmd.raster()
+            .color_attachment(target.whole_view(), None, None)
+            .backface_culling(false)
+            .launch(bindings(), 2, 1, 1, EXTENT)
+    });
+    let launch = buffer_with::<DispatchIndirectCommand, Indirect>(&[DispatchIndirectCommand {
+        x: 2,
+        y: 1,
+        z: 1,
+    }]);
+    let indirect = render(&gpu, |cmd, target| {
+        cmd.raster()
+            .color_attachment(target.whole_view(), None, None)
+            .backface_culling(false)
+            .launch_indirect_with_dynstates(
+                bindings(),
+                EXTENT,
+                launch.range(..),
+                &[Scissor {
+                    offset: IVec2::ZERO,
+                    extent: EXTENT,
+                }],
+                Viewport {
+                    offset: IVec2::ZERO,
+                    extent: EXTENT,
+                },
+            )
+    });
+    assert_eq!(indirect, direct);
 }

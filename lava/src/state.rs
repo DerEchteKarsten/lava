@@ -345,6 +345,12 @@ pub struct Features {
     pub debug_utils: bool,
     pub mesh: bool,
     pub raytracing: bool,
+    /// Pipeline statistics queries (invocation counts per pass).
+    pub pipeline_statistics: bool,
+    /// Task and mesh shader invocations in pipeline statistics.
+    pub mesh_queries: bool,
+    /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
+    pub memory_budget: bool,
 }
 impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
@@ -366,6 +372,9 @@ impl Features {
         }
         if self.mesh {
             extensions.push(ash::ext::mesh_shader::NAME);
+        }
+        if self.memory_budget {
+            extensions.push(ash::ext::memory_budget::NAME);
         }
         if self.raytracing {
             extensions.push(ash::khr::ray_tracing_pipeline::NAME);
@@ -420,8 +429,11 @@ impl Features {
             .shader_int64(true)
             .texture_compression_bc(true)
             .fill_mode_non_solid(true)
+            // Per-attachment `Blend` modes.
+            .independent_blend(true)
             .fragment_stores_and_atomics(true)
             .shader_int16(true)
+            .pipeline_statistics_query(self.pipeline_statistics)
             .vertex_pipeline_stores_and_atomics(true);
 
         *dn3 = dn3
@@ -444,7 +456,10 @@ impl Features {
             .push_next(host_image_copy)
             .push_next(dn3);
         if self.mesh {
-            *mesh = mesh.task_shader(true).mesh_shader(true);
+            *mesh = mesh
+                .task_shader(true)
+                .mesh_shader(true)
+                .mesh_shader_queries(self.mesh_queries);
             features = features.push_next(mesh);
         }
         if self.raytracing {
@@ -670,6 +685,13 @@ mod tests {
                 ..Default::default()
             }),
             ["VK_EXT_mesh_shader"]
+        );
+        assert_eq!(
+            only(Features {
+                memory_budget: true,
+                ..Default::default()
+            }),
+            ["VK_EXT_memory_budget"]
         );
         assert_eq!(
             only(Features {

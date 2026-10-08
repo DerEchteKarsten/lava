@@ -38,7 +38,7 @@ impl PassKind {
                 "vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER"
             }
             PassKind::RasterMesh => {
-                "vk::PipelineStageFlags2::MESH_SHADER_EXT | vk::PipelineStageFlags2::FRAGMENT_SHADER"
+                "vk::PipelineStageFlags2::TASK_SHADER_EXT | vk::PipelineStageFlags2::MESH_SHADER_EXT | vk::PipelineStageFlags2::FRAGMENT_SHADER"
             }
         }
     }
@@ -489,6 +489,7 @@ pub struct {pass_name};
 
 impl PassType for {pass_name} {{
     const PASS_INDEX: usize = {index};
+    const NAME: &'static str = "{pass_name}";
 }}
 
 {base_impl}
@@ -572,6 +573,7 @@ fn main() {
         .format(slang::CompileTarget::Spirv)
         .profile(global.find_profile("spirv_1_6"))];
     let options = CompilerOptions::default()
+        .optimization(shader_slang::OptimizationLevel::Maximal)
         .vulkan_use_entry_point_name(true)
         .matrix_layout_column(true);
     let session = global

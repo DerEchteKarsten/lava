@@ -14,6 +14,7 @@ use smallvec::SmallVec;
 
 use crate::{
     command_buffer::{self, BufferAccess, CommandBuffer, ImageAccess},
+    profiling::{FrameQueries, GpuScope},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -298,6 +299,9 @@ pub struct FrameSlot {
     pool: CommandPool,
     fence: Fence,
     submitted: bool,
+    family: u32,
+    profiling: bool,
+    queries: Option<FrameQueries>,
 }
 
 impl FrameSlot {
@@ -311,17 +315,34 @@ impl FrameSlot {
             pool,
             fence: Fence::new()?,
             submitted: false,
+            family: queue.familie,
+            profiling: false,
+            queries: None,
         })
+    }
+
+    /// Times the scopes of the frames begun from now on; see [`Frame::last_timings`].
+    pub fn set_profiling(&mut self, profiling: bool) {
+        self.profiling = profiling;
     }
 
     #[validation_trace]
     pub fn begin(&mut self) -> Result<Frame<'_>> {
         if self.submitted {
-            self.fence.wait()?;
+            tracing::info_span!("wait for frame slot").in_scope(|| self.fence.wait())?;
+            if let Some(queries) = &mut self.queries {
+                queries.read()?;
+            }
             self.fence.reset()?;
             self.pool.reset()?;
             self.submitted = false;
             self.retired.clear();
+        }
+        // The pools are idle now.
+        if !self.profiling {
+            self.queries = None;
+        } else if self.queries.is_none() {
+            self.queries = Some(FrameQueries::new(self.family)?);
         }
         let mut frame = Frame { slot: self };
         for pipeline in command_buffer::apply_pending_reloads() {
@@ -340,6 +361,12 @@ impl Frame<'_> {
         self.slot.retired.push(Box::new(value));
     }
 
+    /// The GPU scopes of the frame this slot submitted before, if it was profiled: the root
+    /// scope "frame" first, then the passes and `begin_scope` groups in recording order.
+    pub fn last_timings(&self) -> Option<&[GpuScope]> {
+        self.slot.queries.as_ref()?.results()
+    }
+
     #[validation_trace]
     pub fn execute<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         self,
@@ -354,6 +381,7 @@ impl Frame<'_> {
             pending,
             &slot.buffer,
             Some(&slot.fence),
+            &mut slot.queries,
             wait_on,
             signal,
             executor,
@@ -435,12 +463,15 @@ impl<Q: QueueFamilie> Queue<Q> {
         })
     }
 
+    /// Records `executor` into `buffer` and submits it. With `queries`, the recording is
+    /// timed: the root scope "frame" around it, plus every pass and `begin_scope`.
     #[validation_trace]
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
         pending: PendingAccesses,
         buffer: &CommandBufferMemory,
         fence: Option<&Fence>,
+        queries: &mut Option<FrameQueries>,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
         executor: F,
@@ -449,12 +480,19 @@ impl<Q: QueueFamilie> Queue<Q> {
             let mut cmd_buffer = CommandBuffer {
                 handle: buffer.handle,
                 pending_accesses: pending,
+                queries: queries.take(),
             };
 
             cmd_buffer.begin()?;
+            if let Some(queries) = &mut cmd_buffer.queries {
+                queries.reset(buffer.handle);
+            }
+            cmd_buffer.begin_scope("frame");
             let prev = CALLSITE.replace(None);
             executor(&mut cmd_buffer);
             CALLSITE.set(prev);
+            cmd_buffer.end_scope();
+            *queries = cmd_buffer.queries.take();
             cmd_buffer.end()?;
 
             let cmd_buffer_submit_info =

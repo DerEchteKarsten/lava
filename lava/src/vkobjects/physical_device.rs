@@ -112,6 +112,7 @@ impl PhysicalDevice {
             .push_next(&mut acceleration_struct_feature)
             .push_next(&mut mesh_shading);
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+        let pipeline_statistics = features2.features.pipeline_statistics_query == vk::TRUE;
 
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut rt_pipeline_properties)
@@ -121,6 +122,11 @@ impl PhysicalDevice {
         let mem_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let rebar = has_rebar(&mem_properties);
+        let has_extension = |name: &CStr| {
+            supported_extensions
+                .iter()
+                .any(|e| e.as_bytes() == name.to_bytes())
+        };
         let features = Features {
             rebar,
             present: true,
@@ -134,6 +140,9 @@ impl PhysicalDevice {
             mesh: mesh_shading.mesh_shader == vk::TRUE,
             raytracing: ray_tracing_feature.ray_tracing_pipeline == vk::TRUE
                 && acceleration_struct_feature.acceleration_structure == vk::TRUE,
+            pipeline_statistics,
+            mesh_queries: mesh_shading.mesh_shader_queries == vk::TRUE,
+            memory_budget: has_extension(ash::ext::memory_budget::NAME),
         };
 
         Ok(Self {
@@ -239,6 +248,9 @@ impl PhysicalDevice {
         features.mesh = device.supported_features.mesh;
         features.raytracing = device.supported_features.raytracing;
         features.rebar = device.supported_features.rebar;
+        features.pipeline_statistics = device.supported_features.pipeline_statistics;
+        features.mesh_queries = device.supported_features.mesh_queries;
+        features.memory_budget = device.supported_features.memory_budget;
         Ok((device.clone(), graphics, transfer_queue))
     }
 }
@@ -453,13 +465,17 @@ mod tests {
             debug_utils: true,
             mesh: true,
             raytracing: false,
+            pipeline_statistics: true,
+            mesh_queries: false,
+            memory_budget: true,
         };
 
         // Without validation the device debug utils stay off, and `present` is the caller's.
         let mut features = Features::default();
         PhysicalDevice::select_suitable_physical_device(&[dev.clone()], &mut features).unwrap();
         assert!(features.mesh && features.rebar);
-        assert!(!features.raytracing);
+        assert!(features.pipeline_statistics && features.memory_budget);
+        assert!(!features.raytracing && !features.mesh_queries);
         assert!(!features.device_debug_utils);
         assert!(!features.present);
 
