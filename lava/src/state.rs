@@ -400,6 +400,7 @@ impl Features {
             .descriptor_binding_variable_descriptor_count(true)
             .descriptor_binding_storage_image_update_after_bind(true)
             .descriptor_binding_sampled_image_update_after_bind(true)
+            .descriptor_binding_update_unused_while_pending(true)
             .timeline_semaphore(true)
             .draw_indirect_count(true)
             .scalar_block_layout(true)
@@ -731,6 +732,7 @@ mod tests {
         assert_eq!(vk12.runtime_descriptor_array, vk::TRUE);
         assert_eq!(vk12.descriptor_binding_partially_bound, vk::TRUE);
         assert_eq!(vk12.descriptor_binding_variable_descriptor_count, vk::TRUE);
+        assert_eq!(vk12.descriptor_binding_update_unused_while_pending, vk::TRUE);
         assert_eq!(vk12.timeline_semaphore, vk::TRUE);
         assert_eq!(vk12.scalar_block_layout, vk::TRUE);
         assert_eq!(vk13.synchronization2, vk::TRUE);

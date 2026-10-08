@@ -23,6 +23,10 @@ public extension Img<E, Shape, 0> {
     [ForceInline] public E Sample(vector<float, Shape.dimensions> uv, uint sampler = 0) {
         return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().Sample(SamplerHeap[sampler], uv);
     }
+    /// Sample at an explicit mip level, which compute shaders need.
+    [ForceInline] public E SampleLevel(vector<float, Shape.dimensions> uv, float level, uint sampler = 0) {
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().SampleLevel(SamplerHeap[sampler], uv, level);
+    }
 }
 
 /// Size in texels of mip 0, for every kind of `Img`: read through the index its usage has.

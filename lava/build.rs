@@ -245,11 +245,14 @@ fn generate_gpu_struct(name: &str, pc: &TypeLayout, structs: &mut Structs) -> St
         .collect::<Vec<_>>()
         .join("\n");
     let checks = layout_checks(name, pc);
+    // Slang rounds the size up to its alignment (8 for a trailing `uint2` and `float`), which
+    // can be more than the Rust fields need.
+    let align = pc.alignment(Cat::Uniform).max(1);
 
     format!(
         r#"
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, align({align}))]
 pub struct {name} {{
 {fields}
 }}

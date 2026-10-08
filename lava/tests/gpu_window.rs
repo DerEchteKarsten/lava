@@ -8,6 +8,7 @@ mod common;
 use std::process::ExitCode;
 
 use lava::{
+    bindless::{BindlessHandle, BindlessWrites},
     image::format::{self, Format},
     state::Ctx,
     vkobjects::{
@@ -104,6 +105,10 @@ fn run(event_loop: &ActiveEventLoop) {
     step("surface_reports_formats_modes_and_capabilities");
 
     let mut swapchain = Swapchain::new(&surface, None, Some(SIZE)).unwrap();
+    assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
+    let mut writes = BindlessWrites::default();
+    swapchain.bind_storage(0, &mut writes);
+    writes.submit();
     assert_eq!(swapchain.size, SIZE);
     assert!(swapchain.num_images() >= surface.capabilities.min_image_count as usize);
     // Creating a swapchain fixes the format behind `format::Swapchain`.
@@ -117,11 +122,8 @@ fn run(event_loop: &ActiveEventLoop) {
         .map(|i| swapchain.image(i).handle)
         .collect();
     for (i, handle) in handles.iter().enumerate() {
-        assert_ne!(handle.descriptor_index_set1, lava::bindless::NULL_HANDLE);
-        assert!(
-            !handles[..i].contains(handle),
-            "swapchain images share a bindless slot"
-        );
+        assert_eq!(handle.descriptor_index_set1, i as u32);
+        assert_eq!(handle.descriptor_index_set0, lava::bindless::NULL_HANDLE);
     }
     step("swapchain_creation");
 
@@ -144,7 +146,11 @@ fn run(event_loop: &ActiveEventLoop) {
 
     let second_window = create_window(event_loop, "lava test 2");
     let second_surface = surface_for(&second_window).unwrap();
-    let second_swapchain = Swapchain::new(&second_surface, None, Some(SIZE)).unwrap();
+    let mut second_swapchain = Swapchain::new(&second_surface, None, Some(SIZE)).unwrap();
+    let mut writes = BindlessWrites::default();
+    second_swapchain.bind_storage(8, &mut writes);
+    writes.submit();
+    assert_eq!(second_swapchain.image(0).handle.descriptor_index_set1, 8);
     assert_ne!(second_surface.handle, surface.handle);
     present_frame(
         &queue,

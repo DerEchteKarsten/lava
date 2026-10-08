@@ -11,7 +11,7 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    bindless::Bindless,
+    bindless::BindlessWrites,
     image::{format, slice::ImageView, usage::ColorAttachmentStorage},
     state::{Ctx, Functions},
     vkobjects::{
@@ -34,6 +34,8 @@ struct SwapchainImage {
 pub struct Swapchain {
     pub size: [u32; 2],
     pub(crate) handle: vk::SwapchainKHR,
+    /// Set once the images are bound; a recreated swapchain keeps it.
+    first_storage_index: Option<u32>,
     images: SmallVec<[SwapchainImage; 5]>,
 }
 
@@ -55,6 +57,7 @@ impl Swapchain {
         self.images.len()
     }
 
+    /// The images are unbound, unless `old` was bound: then they take its slots.
     #[validation_trace]
     pub fn new(surface: &Surface, old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = select_surface_format(&surface.formats);
@@ -136,38 +139,39 @@ impl Swapchain {
                     });
                 let view = unsafe { Ctx::device().create_image_view(&create_info, None)? };
 
-                let mut image = SwapchainImage {
+                Ok(SwapchainImage {
                     handle: BindlessHandle::none(),
                     image,
                     view,
                     layout: AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32),
-                };
-                let view = ImageView::<format::Swapchain, ColorAttachmentStorage> {
-                    image: image.image,
-                    view: image.view,
-                    mip_range: (0..1).into(),
-                    handle: image.handle,
-                    layout: &image.layout,
-                    _marker: PhantomData,
-                    _marker2: PhantomData,
-                };
-
-                // Reuse the old swapchain's bindless slots so handles stay stable over a resize.
-                image.handle = if let Some(old) = old.and_then(|old| old.images.get(i)) {
-                    Bindless::write_image(view, old.handle);
-                    old.handle
-                } else {
-                    Bindless::push(view)?
-                };
-                Ok(image)
+                })
             })
             .collect::<Result<SmallVec<[SwapchainImage; 5]>>>()?;
 
-        Ok(Self {
+        let mut swapchain = Self {
             handle,
             images,
+            first_storage_index: None,
             size: [extent.width, extent.height],
-        })
+        };
+        if let Some(first) = old.and_then(|old| old.first_storage_index) {
+            let mut writes = BindlessWrites::default();
+            swapchain.bind_storage(first, &mut writes);
+            writes.submit();
+        }
+        Ok(swapchain)
+    }
+
+    /// Binds image `i` at `first_storage_index + i` of the storage set.
+    pub fn bind_storage(&mut self, first_storage_index: u32, writes: &mut BindlessWrites) {
+        self.first_storage_index = Some(first_storage_index);
+        for (i, image) in self.images.iter_mut().enumerate() {
+            image.handle.descriptor_index_set1 = first_storage_index + i as u32;
+        }
+        for i in 0..self.images.len() as u32 {
+            let view = self.image(i);
+            writes.storage(view, view.handle.descriptor_index_set1);
+        }
     }
 
     #[validation_trace]

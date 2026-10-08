@@ -1,99 +1,24 @@
-//! Global bindless descriptor sets: immutable samplers, image registration, handles
-use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicU32, Ordering},
-};
+//! Global bindless descriptor sets: immutable samplers, caller-indexed image descriptors, handles
+use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
 use ash::vk::{self, BorderColor, SamplerAddressMode, SamplerMipmapMode};
 use bytemuck::{Pod, Zeroable};
+use lava_macros::validation_trace;
 
 use crate::{
     image::{
         format::Format,
         slice::ImageView,
-        usage::{BindlessImageUsageSet, ImageUsage},
+        usage::{IsSampled, IsStorage},
     },
     state::Ctx,
 };
 
-/// Hands out descriptor indices for the two bindless image arrays. Released indices are
-/// handed out again before new ones.
-#[derive(Debug)]
-pub(crate) struct BindlessCounters {
-    /// Next never-used index in set 0 (sampled images).
-    num_textures: AtomicU32,
-    /// Next never-used index in set 1 (storage images).
-    num_images: AtomicU32,
-    /// Number of descriptors allocated for each of the two sets.
-    capacity: [u32; 2],
-    /// Released indices of each set.
-    free: [Mutex<Vec<u32>>; 2],
-}
-
-impl BindlessCounters {
-    pub(crate) fn new(capacity: [u32; 2]) -> Self {
-        Self {
-            num_textures: AtomicU32::new(0),
-            num_images: AtomicU32::new(0),
-            capacity,
-            free: Default::default(),
-        }
-    }
-
-    fn next(&self, set: usize, kind: &str) -> Result<u32> {
-        if let Some(index) = self.free[set].lock().ok().and_then(|mut free| free.pop()) {
-            return Ok(index);
-        }
-        let counter = [&self.num_textures, &self.num_images][set];
-        let capacity = self.capacity[set];
-        counter
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-                (next < capacity).then_some(next + 1)
-            })
-            .map_err(|_| Error::message(format!("all {capacity} bindless {kind} slots are in use")))
-    }
-
-    /// Reserves the indices an image with the given usage needs; unused sets get `NULL_HANDLE`.
-    pub(crate) fn alloc(&self, set: BindlessImageUsageSet) -> Result<BindlessHandle> {
-        let (sampled, storage) = match set {
-            BindlessImageUsageSet::None => (false, false),
-            BindlessImageUsageSet::SampledImage => (true, false),
-            BindlessImageUsageSet::StorageImage => (false, true),
-            BindlessImageUsageSet::Both => (true, true),
-        };
-        let mut handle = BindlessHandle::none();
-        if storage {
-            handle.descriptor_index_set1 = self.next(1, "storage image")?;
-        }
-        if sampled {
-            handle.descriptor_index_set0 = match self.next(0, "sampled image") {
-                Ok(index) => index,
-                Err(err) => {
-                    self.release(handle);
-                    return Err(err);
-                }
-            };
-        }
-        Ok(handle)
-    }
-
-    /// Makes the indices of `handle` available again. The caller must be done using them.
-    pub(crate) fn release(&self, handle: BindlessHandle) {
-        let indices = [handle.descriptor_index_set0, handle.descriptor_index_set1];
-        for (free, index) in self.free.iter().zip(indices) {
-            if index != NULL_HANDLE
-                && let Ok(mut free) = free.lock()
-            {
-                free.push(index);
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct Bindless {
-    counters: BindlessCounters,
+    /// Descriptors allocated in the sampled (set 0) and storage (set 1) image arrays.
+    counts: [u32; 2],
     num_samplers: u32,
     layout: vk::PipelineLayout,
     layouts: [vk::DescriptorSetLayout; 2],
@@ -122,6 +47,72 @@ impl BindlessHandle {
 impl Default for BindlessHandle {
     fn default() -> Self {
         Self::none()
+    }
+}
+
+/// Size of the sampled image array: valid sampled indices are `0..max_sampled_images()`.
+pub fn max_sampled_images() -> u32 {
+    Bindless::get().counts[0]
+}
+
+/// Size of the storage image array: valid storage indices are `0..max_storage_images()`.
+pub fn max_storage_images() -> u32 {
+    Bindless::get().counts[1]
+}
+
+/// Descriptor writes collected for one `vkUpdateDescriptorSets`. The caller picks every index;
+/// a slot may only be rewritten while no pending command buffer uses it.
+#[derive(Default)]
+pub struct BindlessWrites {
+    writes: Vec<(usize, u32, vk::DescriptorImageInfo)>,
+}
+
+impl BindlessWrites {
+    pub fn sampled<F: Format, U: IsSampled>(&mut self, view: ImageView<F, U>, index: u32) {
+        self.push(0, index, view.view);
+    }
+
+    pub fn storage<F: Format, U: IsStorage>(&mut self, view: ImageView<F, U>, index: u32) {
+        self.push(1, index, view.view);
+    }
+
+    fn push(&mut self, set: usize, index: u32, view: vk::ImageView) {
+        let info = vk::DescriptorImageInfo {
+            image_layout: vk::ImageLayout::GENERAL,
+            image_view: view,
+            ..Default::default()
+        };
+        self.writes.push((set, index, info));
+    }
+
+    #[validation_trace]
+    pub fn submit(self) {
+        if self.writes.is_empty() {
+            return;
+        }
+        let bindless = Bindless::get();
+        let writes: Vec<_> = self
+            .writes
+            .iter()
+            .map(|(set, index, info)| {
+                assert!(
+                    *index < bindless.counts[*set],
+                    "bindless index {index} is outside set {set} of {} descriptors",
+                    bindless.counts[*set]
+                );
+                let (binding, ty) = match set {
+                    0 => (bindless.num_samplers, vk::DescriptorType::SAMPLED_IMAGE),
+                    _ => (0, vk::DescriptorType::STORAGE_IMAGE),
+                };
+                vk::WriteDescriptorSet::default()
+                    .dst_set(bindless.sets[*set])
+                    .dst_binding(binding)
+                    .dst_array_element(*index)
+                    .descriptor_type(ty)
+                    .image_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe { Ctx::device().update_descriptor_sets(&writes, &[]) };
     }
 }
 
@@ -175,7 +166,8 @@ impl Bindless {
             vk::DescriptorBindingFlags::empty(),
             vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
                 | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT_EXT
-                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT,
+                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT
+                | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING,
         ];
         let bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -206,7 +198,8 @@ impl Bindless {
 
         let descriptor_binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
             | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT_EXT
-            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT];
+            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT
+            | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING];
 
         let bindings = [vk::DescriptorSetLayoutBinding {
             binding: 0,
@@ -284,7 +277,7 @@ impl Bindless {
 
         BINDLESS
             .set(Self {
-                counters: BindlessCounters::new(desc_counts),
+                counts: desc_counts,
                 num_samplers: samplers.len() as u32,
                 layout,
                 layouts,
@@ -293,54 +286,6 @@ impl Bindless {
             })
             .map_err(|_| Error::message("bindless resources were already initialized"))?;
         Ok(())
-    }
-
-    pub(crate) fn push<F: Format, U: ImageUsage>(image: ImageView<F, U>) -> Result<BindlessHandle> {
-        let handle = Self::get().counters.alloc(U::SET)?;
-        Self::write_image(image, handle);
-        Ok(handle)
-    }
-
-    /// Returns the slots of a destroyed image. Its descriptors stay stale until the slots
-    /// are handed out again, which is fine as long as no shader indexes them.
-    pub(crate) fn release(handle: BindlessHandle) {
-        if let Some(bindless) = BINDLESS.get() {
-            bindless.counters.release(handle);
-        }
-    }
-
-    pub(crate) fn write_image<F: Format, U: ImageUsage>(
-        image: ImageView<F, U>,
-        handle: BindlessHandle,
-    ) {
-        let image_info = [vk::DescriptorImageInfo {
-            image_layout: vk::ImageLayout::GENERAL,
-            image_view: image.view,
-            ..Default::default()
-        }];
-        let write = vk::WriteDescriptorSet::default()
-            .descriptor_count(1)
-            .dst_binding(0)
-            .image_info(&image_info);
-        let mut writes = Vec::new();
-        if handle.descriptor_index_set0 != NULL_HANDLE {
-            writes.push(
-                write
-                    .dst_array_element(handle.descriptor_index_set0)
-                    .dst_set(Self::get().sets[0])
-                    .dst_binding(Self::get().num_samplers)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE),
-            );
-        }
-        if handle.descriptor_index_set1 != NULL_HANDLE {
-            writes.push(
-                write
-                    .dst_array_element(handle.descriptor_index_set1)
-                    .dst_set(Self::get().sets[1])
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE),
-            );
-        }
-        unsafe { Ctx::device().update_descriptor_sets(&writes, &[]) };
     }
 
     pub(crate) fn bind(cmd: &vk::CommandBuffer) {
@@ -397,7 +342,6 @@ impl Bindless {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use BindlessImageUsageSet as Set;
 
     #[test]
     fn none_handle_is_null_in_both_sets() {
@@ -416,119 +360,5 @@ mod tests {
             descriptor_index_set1: 2,
         };
         assert_eq!(bytemuck::bytes_of(&handle), &[1, 0, 0, 0, 2, 0, 0, 0]);
-    }
-
-    #[test]
-    fn each_set_counts_independently() {
-        let counters = BindlessCounters::new([8, 8]);
-        let sampled = counters.alloc(Set::SampledImage).unwrap();
-        assert_eq!(
-            (sampled.descriptor_index_set0, sampled.descriptor_index_set1),
-            (0, NULL_HANDLE)
-        );
-
-        let storage = counters.alloc(Set::StorageImage).unwrap();
-        assert_eq!(
-            (storage.descriptor_index_set0, storage.descriptor_index_set1),
-            (NULL_HANDLE, 0)
-        );
-
-        let sampled = counters.alloc(Set::SampledImage).unwrap();
-        assert_eq!(sampled.descriptor_index_set0, 1);
-
-        // `Both` takes the next slot of each set; the two indices need not be equal.
-        let both = counters.alloc(Set::Both).unwrap();
-        assert_eq!(
-            (both.descriptor_index_set0, both.descriptor_index_set1),
-            (2, 1)
-        );
-    }
-
-    #[test]
-    fn unregistered_images_get_the_null_handle_and_use_no_slot() {
-        let counters = BindlessCounters::new([1, 1]);
-        for _ in 0..10 {
-            assert_eq!(counters.alloc(Set::None).unwrap(), BindlessHandle::none());
-        }
-        assert!(counters.alloc(Set::Both).is_ok());
-    }
-
-    #[test]
-    fn allocation_fails_once_a_set_is_full() {
-        let counters = BindlessCounters::new([2, 1]);
-        assert!(counters.alloc(Set::StorageImage).is_ok());
-        assert!(counters.alloc(Set::StorageImage).is_err());
-        // The sampled set still has room, and stays usable after the failure.
-        assert_eq!(
-            counters
-                .alloc(Set::SampledImage)
-                .unwrap()
-                .descriptor_index_set0,
-            0
-        );
-        assert_eq!(
-            counters
-                .alloc(Set::SampledImage)
-                .unwrap()
-                .descriptor_index_set0,
-            1
-        );
-        assert!(counters.alloc(Set::SampledImage).is_err());
-        assert!(counters.alloc(Set::Both).is_err());
-    }
-
-    #[test]
-    fn released_indices_are_reused_before_new_ones() {
-        let counters = BindlessCounters::new([2, 2]);
-        let first = counters.alloc(Set::Both).unwrap();
-        let second = counters.alloc(Set::Both).unwrap();
-        assert!(counters.alloc(Set::SampledImage).is_err());
-
-        counters.release(first);
-        // A null handle releases nothing.
-        counters.release(BindlessHandle::none());
-        assert_eq!(counters.alloc(Set::Both).unwrap(), first);
-        assert!(counters.alloc(Set::StorageImage).is_err());
-
-        counters.release(second);
-        assert_eq!(
-            counters.alloc(Set::StorageImage).unwrap().descriptor_index_set1,
-            second.descriptor_index_set1
-        );
-    }
-
-    /// A failed `Both` allocation must not leak the storage index it already took.
-    #[test]
-    fn failed_allocation_returns_its_partial_indices() {
-        let counters = BindlessCounters::new([0, 1]);
-        assert!(counters.alloc(Set::Both).is_err());
-        assert!(counters.alloc(Set::StorageImage).is_ok());
-    }
-
-    #[test]
-    fn concurrent_allocations_hand_out_unique_indices() {
-        let counters = BindlessCounters::new([400, 400]);
-        let mut indices: Vec<u32> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..4)
-                .map(|_| {
-                    scope.spawn(|| {
-                        (0..100)
-                            .map(|_| {
-                                counters
-                                    .alloc(Set::SampledImage)
-                                    .unwrap()
-                                    .descriptor_index_set0
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .flat_map(|w| w.join().unwrap())
-                .collect()
-        });
-        indices.sort_unstable();
-        assert_eq!(indices, (0..400).collect::<Vec<_>>());
     }
 }
