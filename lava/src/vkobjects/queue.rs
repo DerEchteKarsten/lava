@@ -321,16 +321,18 @@ impl FrameSlot {
         })
     }
 
-    /// Times the scopes of the frames begun from now on; see [`Frame::last_timings`].
+    /// Times the scopes of the frames begun from now on; see [`Frame::last_timings`]. Does
+    /// nothing without the `profiling` feature.
     pub fn set_profiling(&mut self, profiling: bool) {
-        self.profiling = profiling;
+        self.profiling = profiling && cfg!(feature = "profiling");
     }
 
     #[validation_trace]
     pub fn begin(&mut self) -> Result<Frame<'_>> {
         if self.submitted {
             // `wait`: the profiler doesn't count it as CPU work.
-            tracing::info_span!("wait for frame slot", wait = true).in_scope(|| self.fence.wait())?;
+            tracing::info_span!("wait for frame slot", wait = true)
+                .in_scope(|| self.fence.wait())?;
             if let Some(queries) = &mut self.queries {
                 queries.read()?;
             }

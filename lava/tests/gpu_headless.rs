@@ -323,6 +323,7 @@ fn frame_slot_can_be_reused_and_keeps_retired_values_until_the_frame_is_done() {
 }
 
 #[test]
+#[cfg(feature = "profiling")]
 fn profiled_frame_slot_times_scopes_and_passes() {
     let gpu = gpu();
     let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();

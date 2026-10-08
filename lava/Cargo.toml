@@ -22,13 +22,15 @@ shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
 
 [dev-dependencies]
 # Enables the test passes for lava's own tests only.
-lava = { path = ".", features = ["test-passes"] }
+lava = { path = ".", default-features = false, features = ["test-passes"] }
 winit = "0.30"
 tracing-subscriber = { workspace = true }
 png = {workspace = true}
 
 [features]
-default = []
+default = ["profiling"]
+# GPU timestamps, pipeline statistics and shader clocks (`PROFILING` in `profile.slang`).
+profiling = []
 # Also compile the passes in `tests/shaders` (bindings then go to OUT_DIR).
 test-passes = []
 # hot-reload = ["notify"]

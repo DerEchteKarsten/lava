@@ -46,4 +46,9 @@ void profile_end(uint stage, uint64_t start)
     InterlockedAdd(ProfileCounters[slot + 1], 1);
 }
 
+// lava defines `PROFILING` with its `profiling` feature; without it the clocks aren't compiled.
+#ifdef PROFILING
 #define PROFILE(stage) let profile_start = subgroup_clock(); defer profile_end(stage, profile_start);
+#else
+#define PROFILE(stage)
+#endif

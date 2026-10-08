@@ -568,10 +568,13 @@ fn main() {
     let targets = [slang::TargetDesc::default()
         .format(slang::CompileTarget::Spirv)
         .profile(global.find_profile("spirv_1_6"))];
-    let options = CompilerOptions::default()
+    let mut options = CompilerOptions::default()
         .optimization(shader_slang::OptimizationLevel::Maximal)
         .vulkan_use_entry_point_name(true)
         .matrix_layout_column(true);
+    if env::var_os("CARGO_FEATURE_PROFILING").is_some() {
+        options = options.macro_define("PROFILING", "1");
+    }
     let session = global
         .create_session(
             &SessionDesc::default()

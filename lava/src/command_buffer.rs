@@ -407,10 +407,13 @@ fn compile_pass(global: &slang::GlobalSession, source: &str) -> slang::Result<sl
     let targets = [slang::TargetDesc::default()
         .format(slang::CompileTarget::Spirv)
         .profile(global.find_profile("spirv_1_6"))];
-    let options = slang::CompilerOptions::default()
+    let mut options = slang::CompilerOptions::default()
         .optimization(shader_slang::OptimizationLevel::Maximal)
         .vulkan_use_entry_point_name(true)
         .matrix_layout_column(true);
+    if cfg!(feature = "profiling") {
+        options = options.macro_define("PROFILING", "1");
+    }
 
     let session = global
         .create_session(

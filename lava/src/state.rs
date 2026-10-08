@@ -352,7 +352,7 @@ pub struct Features {
     /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
     pub memory_budget: bool,
     /// `VK_KHR_shader_clock` with subgroup clocks, which `profile.slang` reads. Shaders that
-    /// use `PROFILE` need it.
+    /// use `PROFILE` need it; only enabled with the `profiling` feature.
     pub shader_clock: bool,
 }
 impl Features {
