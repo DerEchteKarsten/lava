@@ -150,3 +150,13 @@ public typealias MutTex2D<E : ITexelElement = float4>   = Img<E, __Shape2D, 3>;
 
 public struct Buf<T>    { public T *val; }
 public struct MutBuf<T> { public T *val; }
+
+/// Marks the `uint64_t` behind an `SCONST`; lava's `build.rs` reads the type from it.
+[__AttributeUsage(_AttributeTargets.Var)]
+public struct SConstAttribute { string type; };
+
+/// A specialization constant of an 8-byte handle type (`Buf<T>`, `MutBuf<T>`, any `Img`,
+/// `DynImg`): lava bakes it into the pipeline, which the generated `constant_bindings` sets.
+/// Scalars need no macro: `[SpecializationConstant] const uint name = 0;`. Every distinct value
+/// builds its own pipeline, so only use them for values that never change.
+#define SCONST(T, name) [SpecializationConstant][SConst(#T)] const uint64_t name##_sconst = 0; static T name = bit_cast<T>(name##_sconst);

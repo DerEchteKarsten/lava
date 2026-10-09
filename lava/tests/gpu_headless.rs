@@ -11,7 +11,7 @@ use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{IVec2, UVec2, Vec2, Vec4};
 use lava::{
     bindings::{
-        TestComputeBuffer, TestComputeImage, TestMesh, TestRaster, TestRasterTextured,
+        TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster, TestRasterTextured,
         TestTexturedVertex, TestVertex,
     },
     bindless::{
@@ -337,7 +337,7 @@ fn profiled_frame_slot_times_scopes_and_passes() {
             cmd.begin_scope("group");
             for color in [Vec4::ONE, Vec4::ZERO] {
                 cmd.compute(
-                    TestComputeImage::new(target.whole_view(), color, UVec2::ZERO, EXTENT),
+                    TestComputeImage::push_bindings(target.whole_view(), color, UVec2::ZERO, EXTENT),
                     [SIZE / 8, SIZE / 8, 1],
                 );
             }
@@ -346,7 +346,7 @@ fn profiled_frame_slot_times_scopes_and_passes() {
                 cmd.raster(EXTENT)
                     .color_attachment(target.whole_view(), None)
                     .launch(
-                        TestMesh::new(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
+                        TestMesh::push_bindings(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
                         [2, 1, 1],
                         RasterState::default().backface_culling(false),
                     )
@@ -781,7 +781,7 @@ fn compute_image_bindings<'a>(
 ) -> impl FnOnce(&mut CommandBuffer) + 'a {
     move |cmd| {
         cmd.compute(
-            TestComputeImage::new(
+            TestComputeImage::push_bindings(
                 target.whole_view(),
                 Vec4::new(1.0, 1.0, 1.0, 1.0),
                 offset,
@@ -812,7 +812,7 @@ fn compute_pass_push_constants_reach_the_shader() {
     let gpu = gpu();
     let pixels = render(&gpu, |cmd, target| {
         cmd.compute(
-            TestComputeImage::new(
+            TestComputeImage::push_bindings(
                 target.whole_view(),
                 Vec4::new(0.0, 1.0, 0.0, 1.0),
                 UVec2::new(16, 24),
@@ -847,7 +847,7 @@ fn indirect_compute_dispatch_matches_the_direct_one() {
     }]);
     let indirect = render(&gpu, |cmd, target| {
         cmd.compute_indirect(
-            TestComputeImage::new(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT),
+            TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT),
             dispatch.range(..),
         )
     });
@@ -862,7 +862,7 @@ fn compute_pass_reads_and_writes_buffers() {
     let dst = buffer_with::<u32, Storage>(&[u32::MAX; 100]);
     gpu.submit(|cmd| {
         cmd.compute(
-            TestComputeBuffer::new(src.range(..), dst.range(..), 90, 3),
+            TestComputeBuffer::push_bindings(src.range(..), dst.range(..), 90, 3),
             [2, 1, 1],
         )
     });
@@ -889,7 +889,7 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
     gpu.submit(|cmd| {
         cmd.fill_buffer(src.range(..), 5);
         cmd.compute(
-            TestComputeBuffer::new(src.range(..), dst.range(..), 64, 2),
+            TestComputeBuffer::push_bindings(src.range(..), dst.range(..), 64, 2),
             [1, 1, 1],
         );
         cmd.copy_buffer(dst.range(..), copy.range(..));
@@ -898,10 +898,50 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
     assert_eq!(copy.range(..).as_slice(), expected);
 }
 
+/// Two sets of specialization constants make two pipelines; each dispatch writes through the
+/// buffer and image handles of its own set, with its own scalars.
+#[test]
+fn specialization_constants_pick_the_pipeline() {
+    let gpu = gpu();
+    let (a, b) = (
+        zeroed_buffer::<u32, Storage>(8),
+        zeroed_buffer::<u32, Storage>(8),
+    );
+    let (image_a, image_b) = (
+        Target::new_storage(SIZE, SIZE, 1, 0).unwrap(),
+        Target::new_storage(SIZE, SIZE, 1, 1).unwrap(),
+    );
+    let pixels = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4 * 2) as usize);
+    let half = (SIZE * SIZE * 4) as usize;
+    gpu.submit(|cmd| {
+        let groups = [SIZE / 8, SIZE / 8, 1];
+        let first = |offset| {
+            TestConstants::push_bindings(offset, 8)
+                .constant_bindings(a.range(..), image_a.whole_view(), 3, 1.0)
+        };
+        cmd.compute(first(100), groups);
+        cmd.compute(
+            TestConstants::push_bindings(0, 4)
+                .constant_bindings(b.range(..), image_b.whole_view(), 5, 0.5),
+            groups,
+        );
+        // The first set again, now cached, with other push constants.
+        cmd.compute(first(200), groups);
+        cmd.copy_image_to_buffer(image_a.whole(), pixels.range(..half));
+        cmd.copy_image_to_buffer(image_b.whole(), pixels.range(half..));
+    });
+    let expected_a: Vec<u32> = (0..8).map(|i| 200 + i * 3).collect();
+    assert_eq!(a.range(..).as_slice(), expected_a);
+    assert_eq!(b.range(..).as_slice(), [0, 5, 10, 15, 0, 0, 0, 0]);
+    let pixels = pixels.range(..).as_slice();
+    assert_pixel(&pixels[..half], 7, 9, [255, 0, 0, 255]);
+    assert_pixel(&pixels[half..], 7, 9, [128, 0, 0, 255]);
+}
+
 // ---- raster passes ---------------------------------------------------------------------------
 
 fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<kind::RasterVertex> {
-    TestRaster::new(vertices.range(..), Vec2::ZERO)
+    TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
 }
 
 fn unculled() -> RasterState {
@@ -987,7 +1027,7 @@ fn instances_are_drawn_with_their_instance_index() {
             .color_attachment(target.whole_view(), None)
             // The second instance of the left triangle lands where the right one would be.
             .draw(
-                TestRaster::new(vertices.range(..), Vec2::new(1.0, 0.0)),
+                TestRaster::push_bindings(vertices.range(..), Vec2::new(1.0, 0.0)),
                 3,
                 2,
                 RasterState::default(),
@@ -1212,7 +1252,7 @@ fn depth_persists_between_draws_unless_cleared() {
                 .color_attachment(target.whole_view(), None)
                 .depth_attachment(depth.whole_view(), Some([0.0]))
                 .draw(
-                    TestRaster::new(vertices.range(0..3), Vec2::ZERO),
+                    TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO),
                     3,
                     1,
                     RasterState::default(),
@@ -1222,7 +1262,7 @@ fn depth_persists_between_draws_unless_cleared() {
                 .color_attachment(target.whole_view(), None)
                 .depth_attachment(depth.whole_view(), clear_between)
                 .draw(
-                    TestRaster::new(vertices.range(3..), Vec2::ZERO),
+                    TestRaster::push_bindings(vertices.range(3..), Vec2::ZERO),
                     3,
                     1,
                     RasterState::default(),
@@ -1255,7 +1295,7 @@ fn draws_of_one_rendering_see_the_earlier_depth() {
             .color_attachment(target.whole_view(), None)
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(
-                TestRaster::new(near.range(0..3), Vec2::ZERO),
+                TestRaster::push_bindings(near.range(0..3), Vec2::ZERO),
                 3,
                 1,
                 RasterState::default(),
@@ -1344,7 +1384,7 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
             .color_attachment(target.whole_view(), None)
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(
-                TestRaster::new(vertices.range(0..3), Vec2::ZERO),
+                TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO),
                 3,
                 1,
                 RasterState::default(),
@@ -1354,7 +1394,7 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
             .color_attachment(target.whole_view(), None)
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(
-                TestRaster::new(vertices.range(0..3), Vec2::ZERO),
+                TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO),
                 3,
                 1,
                 RasterState::default().depth_write(false),
@@ -1364,7 +1404,7 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
             .color_attachment(target.whole_view(), None)
             .depth_attachment(depth.whole_view(), None)
             .draw(
-                TestRaster::new(vertices.range(3..), Vec2::ZERO),
+                TestRaster::push_bindings(vertices.range(3..), Vec2::ZERO),
                 3,
                 1,
                 RasterState::default(),
@@ -1423,7 +1463,7 @@ fn indexed_draw_samples_a_bindless_texture() {
             .color_attachment(target.whole_view(), None)
             .draw_indexed(
                 // Sampler 0 is nearest-neighbour.
-                TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
+                TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), 0),
                 indices.range(..),
                 1,
                 RasterState::default(),
@@ -1443,7 +1483,7 @@ fn indexed_draw_samples_a_bindless_texture() {
         cmd.raster(EXTENT)
             .color_attachment(target.whole_view(), None)
             .draw_indexed(
-                TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
+                TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), 0),
                 indices.range(..3),
                 1,
                 RasterState::default(),
@@ -1504,7 +1544,7 @@ fn batched_bindings_are_sampled_from_their_slots() {
             cmd.raster(EXTENT)
                 .color_attachment(target.whole_view(), None)
                 .draw_indexed(
-                    TestRasterTextured::new(quad.range(..), texture.whole_view(), 0),
+                    TestRasterTextured::push_bindings(quad.range(..), texture.whole_view(), 0),
                     indices.range(..),
                     1,
                     RasterState::default(),
@@ -1576,7 +1616,7 @@ fn host_copy_uploads_block_compressed_mips() {
         cmd.raster(EXTENT)
             .color_attachment(target.whole_view(), None)
             .draw_indexed(
-                TestRasterTextured::new(vertices.range(..), texture.whole_view(), 0),
+                TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), 0),
                 indices.range(..),
                 1,
                 RasterState::default(),
@@ -1600,7 +1640,7 @@ fn mesh_pass_emits_triangles_per_workgroup() {
         cmd.raster(EXTENT)
             .color_attachment(target.whole_view(), None)
             .launch(
-                TestMesh::new(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4),
+                TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4),
                 [2, 1, 1],
                 unculled(),
             )
@@ -1620,7 +1660,7 @@ fn indirect_mesh_launch_matches_the_direct_one() {
         eprintln!("SKIPPED indirect_mesh_launch_matches_the_direct_one: no mesh shader support");
         return;
     }
-    let bindings = || TestMesh::new(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4);
+    let bindings = || TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4);
     let direct = render(&gpu, |cmd, target| {
         cmd.raster(EXTENT)
             .color_attachment(target.whole_view(), None)

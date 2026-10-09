@@ -129,18 +129,6 @@ fn read_shader_clocks() -> Vec<ShaderTime> {
     times
 }
 
-/// Specialization info telling `profile.slang` which pass a pipeline belongs to.
-pub(crate) fn pass_constant(pass_index: &u32) -> vk::SpecializationInfo<'_> {
-    const ENTRIES: [vk::SpecializationMapEntry; 1] = [vk::SpecializationMapEntry {
-        constant_id: 900,
-        offset: 0,
-        size: 4,
-    }];
-    vk::SpecializationInfo::default()
-        .map_entries(&ENTRIES)
-        .data(bytemuck::bytes_of(pass_index))
-}
-
 struct Scope {
     name: &'static str,
     depth: u16,

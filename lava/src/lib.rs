@@ -29,6 +29,8 @@ pub mod command_buffer;
 pub mod error;
 pub mod image;
 pub mod profiling;
+mod slang_compile;
+// pub mod scratchpad;
 pub mod state;
 pub mod vkobjects;
 use raw_window_handle::RawDisplayHandle;

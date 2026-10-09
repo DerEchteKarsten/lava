@@ -1,7 +1,7 @@
 //! Command recording for generated passes, with pipeline caching and shader hot-reload
 use std::{
     collections::HashMap,
-    ffi::{CStr, CString},
+    ffi::CStr,
     fmt::Debug,
     iter,
     marker::PhantomData,
@@ -14,8 +14,10 @@ use std::{
 
 use crate::{
     bindings::{
-        MAX_PASS_BUFFERS, MAX_PASS_IMAGES, MAX_PUSH_CONSTANTS_SIZE, NUM_COMPUTE_PIPELINES,
-        NUM_RASTER_PIPELINES, NUM_RAY_TRACING_PIPELINES, PASS_MAP,
+        MAX_PASS_BUFFERS, MAX_PASS_IMAGES, MAX_PUSH_CONSTANTS_SIZE,
+        MAX_SPECIALIZATION_CONSTANTS_SIZE, NUM_COMPUTE_PIPELINES, NUM_RASTER_PIPELINES,
+        NUM_RAY_TRACING_PIPELINES, NUM_SPECIALIZED_COMPUTE_PIPELINES,
+        NUM_SPECIALIZED_RAY_TRACING_PIPELINES, PASS_MAP,
     },
     bindless::Bindless,
     buffer::{
@@ -29,7 +31,8 @@ use crate::{
         slice::{ImageSlice, ImageView},
         usage::{ImageUsage, IsColorAttachment, IsDepthAttachment},
     },
-    profiling::{FrameQueries, pass_constant},
+    profiling::FrameQueries,
+    slang_compile,
     state::{Ctx, Functions},
     vkobjects::{
         queue::{PendingAccesses, PendingWrite},
@@ -77,7 +80,7 @@ pub struct ShaderHash {
 }
 
 pub const PASS_DIR: &str = concat!(env!("OUT_DIR"), "/passes");
-pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../shaders");
+pub use crate::slang_compile::SHADER_DIR;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassKind {
@@ -107,7 +110,11 @@ pub struct PassEntry {
     pub path: &'static str,
     pub source: &'static str,
     pub kind: PassKind,
+    /// Index into the pipelines of its kind: the specialized ones if it has `constants`.
     pub index: usize,
+    /// Where each specialization constant sits in `BindingOutput::constants`.
+    pub constants: &'static [vk::SpecializationMapEntry],
+    pub constants_size: usize,
 }
 
 static PIPELINES: OnceLock<PipelineManager> = OnceLock::new();
@@ -118,10 +125,18 @@ pub(crate) fn pipelines() -> &'static PipelineManager {
     )
 }
 
+/// The specialization constants of a pipeline, as `BindingOutput::constants` holds them.
+pub(crate) type Constants = [u8; MAX_SPECIALIZATION_CONSTANTS_SIZE];
+
 pub struct PipelineManager {
     pass_modules: RwLock<Vec<vk::ShaderModule>>,
     pub compute_pipelines: RwLock<[vk::Pipeline; NUM_COMPUTE_PIPELINES]>,
+    /// One map per compute pass with specialization constants, created on first use.
+    specialized_compute_pipelines:
+        RwLock<[HashMap<Constants, vk::Pipeline>; NUM_SPECIALIZED_COMPUTE_PIPELINES]>,
     pub raytracing_pipelines: RwLock<[Option<RaytracingPipeline>; NUM_RAY_TRACING_PIPELINES]>,
+    specialized_raytracing_pipelines:
+        RwLock<[HashMap<Constants, RaytracingPipeline>; NUM_SPECIALIZED_RAY_TRACING_PIPELINES]>,
     pub raster_pipelines: RwLock<[HashMap<RasterHash, vk::Pipeline>; NUM_RASTER_PIPELINES]>,
     pending_reloads: Mutex<Vec<(usize, Vec<u8>)>>,
 }
@@ -129,6 +144,15 @@ pub struct PipelineManager {
 pub(crate) struct RetiredPipeline {
     pipeline: vk::Pipeline,
     _sbt: Option<ShaderBindingTable>,
+}
+
+impl RetiredPipeline {
+    fn ray_tracing(pipeline: RaytracingPipeline) -> Self {
+        Self {
+            pipeline: pipeline.pipeline,
+            _sbt: Some(pipeline.sbt),
+        }
+    }
 }
 
 impl Drop for RetiredPipeline {
@@ -154,15 +178,29 @@ pub(crate) fn apply_pending_reloads() -> Vec<RetiredPipeline> {
         .collect()
 }
 
+/// A pass whose pipeline cache grows this large gets one warning: its specialization constants
+/// (or raster states) change too often, so they should be push constants.
+const MANY_PIPELINES: usize = 16;
+
+fn note_new_pipeline(pass: &PassEntry, cached: usize) {
+    if cached + 1 == MANY_PIPELINES {
+        tracing::warn!(
+            "pass `{}` now has {MANY_PIPELINES} pipelines: its specialization constants change \
+             too often, pass those values as push constants",
+            pass.name
+        );
+    }
+}
+
 impl PipelineManager {
     fn new() -> Self {
         let manager = Self {
             pass_modules: RwLock::new(vec![vk::ShaderModule::null(); PASS_MAP.len()]),
             compute_pipelines: RwLock::new([vk::Pipeline::null(); NUM_COMPUTE_PIPELINES]),
+            specialized_compute_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raytracing_pipelines: RwLock::new([None; NUM_RAY_TRACING_PIPELINES]),
-            raster_pipelines: RwLock::new(std::array::from_fn::<_, NUM_RASTER_PIPELINES, _>(
-                |_| HashMap::new(),
-            )),
+            specialized_raytracing_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
+            raster_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             pending_reloads: Mutex::new(Vec::new()),
         };
 
@@ -171,6 +209,81 @@ impl PipelineManager {
         }
 
         manager
+    }
+
+    /// The compute pipeline of `pass_index` with `constants`, created on first use.
+    fn compute(&self, pass_index: usize, constants: &Constants) -> vk::Pipeline {
+        let pass = &PASS_MAP[pass_index];
+        if pass.constants.is_empty() {
+            return self.compute_pipelines.read().unwrap()[pass.index];
+        }
+        if let Some(pipeline) =
+            self.specialized_compute_pipelines.read().unwrap()[pass.index].get(constants)
+        {
+            return *pipeline;
+        }
+        let PassKind::Compute { entry } = pass.kind else {
+            unreachable!("{} is a compute pass", pass.name)
+        };
+        let module = self.pass_modules.read().unwrap()[pass_index];
+        let mut maps = self.specialized_compute_pipelines.write().unwrap();
+        let map = &mut maps[pass.index];
+        let cached = map.len();
+        *map.entry(*constants).or_insert_with(|| {
+            note_new_pipeline(pass, cached);
+            create_compute_pipeline(
+                module,
+                entry,
+                pass.constants,
+                &constants[..pass.constants_size],
+            )
+        })
+    }
+
+    /// Calls `record` with the ray tracing pipeline of `pass_index` with `constants`, created
+    /// on first use, while the cache stays locked.
+    fn ray_tracing<R>(
+        &self,
+        pass_index: usize,
+        constants: &Constants,
+        record: impl FnOnce(&RaytracingPipeline) -> R,
+    ) -> R {
+        let pass = &PASS_MAP[pass_index];
+        if pass.constants.is_empty() {
+            return record(
+                self.raytracing_pipelines.read().unwrap()[pass.index]
+                    .as_ref()
+                    .unwrap(),
+            );
+        }
+        if !self.specialized_raytracing_pipelines.read().unwrap()[pass.index]
+            .contains_key(constants)
+        {
+            let PassKind::RayTracing {
+                ray_gen,
+                ray_any,
+                ray_closest,
+            } = pass.kind
+            else {
+                unreachable!("{} is a ray tracing pass", pass.name)
+            };
+            let module = self.pass_modules.read().unwrap()[pass_index];
+            let mut maps = self.specialized_raytracing_pipelines.write().unwrap();
+            let map = &mut maps[pass.index];
+            let cached = map.len();
+            map.entry(*constants).or_insert_with(|| {
+                note_new_pipeline(pass, cached);
+                create_raytracing_pipeline(
+                    module,
+                    ray_any,
+                    ray_closest,
+                    ray_gen,
+                    pass.constants,
+                    &constants[..pass.constants_size],
+                )
+            });
+        }
+        record(&self.specialized_raytracing_pipelines.read().unwrap()[pass.index][constants])
     }
 
     fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Vec<RetiredPipeline> {
@@ -185,13 +298,26 @@ impl PipelineManager {
         let old = std::mem::replace(&mut modules[pass_index], module);
         unsafe { Ctx::device().destroy_shader_module(old, None) };
 
+        let specialized = !pass.constants.is_empty();
         match pass.kind {
+            PassKind::Compute { entry } if specialized => {
+                let mut pipelines = self.specialized_compute_pipelines.write().unwrap();
+                for (constants, pipeline) in pipelines[pass.index].iter_mut() {
+                    let new = create_compute_pipeline(
+                        module,
+                        entry,
+                        pass.constants,
+                        &constants[..pass.constants_size],
+                    );
+                    retired.push(RetiredPipeline {
+                        pipeline: std::mem::replace(pipeline, new),
+                        _sbt: None,
+                    });
+                }
+            }
             PassKind::Compute { entry } => {
-                let pipeline = create_compute_pipeline(module, entry, pass_index);
-                let Ok(mut pipelines) = self.compute_pipelines.write() else {
-                    tracing::error!("failed to acquire lock on compute pipelines");
-                    return retired;
-                };
+                let pipeline = create_compute_pipeline(module, entry, &[], &[]);
+                let mut pipelines = self.compute_pipelines.write().unwrap();
                 retired.push(RetiredPipeline {
                     pipeline: std::mem::replace(&mut pipelines[pass.index], pipeline),
                     _sbt: None,
@@ -201,25 +327,36 @@ impl PipelineManager {
                 ray_any,
                 ray_closest,
                 ray_gen,
+            } if specialized => {
+                let mut pipelines = self.specialized_raytracing_pipelines.write().unwrap();
+                for (constants, pipeline) in pipelines[pass.index].iter_mut() {
+                    let new = create_raytracing_pipeline(
+                        module,
+                        ray_any,
+                        ray_closest,
+                        ray_gen,
+                        pass.constants,
+                        &constants[..pass.constants_size],
+                    );
+                    retired.push(RetiredPipeline::ray_tracing(std::mem::replace(
+                        pipeline, new,
+                    )));
+                }
+            }
+            PassKind::RayTracing {
+                ray_any,
+                ray_closest,
+                ray_gen,
             } => {
                 let pipeline =
-                    create_raytracing_pipeline(module, ray_any, ray_closest, ray_gen, pass_index);
-                let Ok(mut pipelines) = self.raytracing_pipelines.write() else {
-                    tracing::error!("failed to acquire lock on ray tracing pipelines");
-                    return retired;
-                };
+                    create_raytracing_pipeline(module, ray_any, ray_closest, ray_gen, &[], &[]);
+                let mut pipelines = self.raytracing_pipelines.write().unwrap();
                 if let Some(old) = pipelines[pass.index].replace(pipeline) {
-                    retired.push(RetiredPipeline {
-                        pipeline: old.pipeline,
-                        _sbt: Some(old.sbt),
-                    });
+                    retired.push(RetiredPipeline::ray_tracing(old));
                 }
             }
             PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. } => {
-                let Ok(mut pipelines) = self.raster_pipelines.write() else {
-                    tracing::error!("failed to acquire lock on raster pipelines");
-                    return retired;
-                };
+                let mut pipelines = self.raster_pipelines.write().unwrap();
                 for (k, v) in pipelines[pass.index].iter_mut() {
                     let new = create_raster_pipeline(module, k, pass_index);
                     retired.push(RetiredPipeline {
@@ -238,14 +375,18 @@ fn read_pass_spirv(file: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// `layout` places the pass's specialization constants in `constants`; both are empty for a
+/// pass without them.
 fn create_compute_pipeline(
     module: vk::ShaderModule,
     entry: &str,
-    pass_index: usize,
+    layout: &[vk::SpecializationMapEntry],
+    constants: &[u8],
 ) -> vk::Pipeline {
-    let pass_index = pass_index as u32;
-    let constants = pass_constant(&pass_index);
-    let stage = make_shader_stage(entry, vk::ShaderStageFlags::COMPUTE, module, &constants);
+    let info = vk::SpecializationInfo::default()
+        .map_entries(layout)
+        .data(constants);
+    let stage = make_shader_stage(entry, vk::ShaderStageFlags::COMPUTE, module, &info);
     let create_info = vk::ComputePipelineCreateInfo::default()
         .layout(Bindless::layout())
         .stage(stage);
@@ -263,10 +404,12 @@ fn create_raytracing_pipeline(
     raygen_entry: &str,
     hit_entry: &str,
     miss_entry: &str,
-    pass_index: usize,
+    layout: &[vk::SpecializationMapEntry],
+    constants: &[u8],
 ) -> RaytracingPipeline {
-    let pass_index = pass_index as u32;
-    let c = pass_constant(&pass_index);
+    let c = vk::SpecializationInfo::default()
+        .map_entries(layout)
+        .data(constants);
     let raygen = make_shader_stage(raygen_entry, vk::ShaderStageFlags::RAYGEN_KHR, module, &c);
     let hit = make_shader_stage(hit_entry, vk::ShaderStageFlags::CLOSEST_HIT_KHR, module, &c);
     let miss = make_shader_stage(miss_entry, vk::ShaderStageFlags::MISS_KHR, module, &c);
@@ -358,7 +501,7 @@ fn hot_reload(manager: &'static PipelineManager, changed: mpsc::Receiver<PathBuf
         for pass_index in passes_to_reload(&paths, &PASS_MAP) {
             let pass = &PASS_MAP[pass_index];
 
-            match compile_pass(&global, pass.source) {
+            match compile_pass(&global, pass_index) {
                 Ok(spirv) => {
                     tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
                     match manager.pending_reloads.lock() {
@@ -392,46 +535,14 @@ fn passes_to_reload(changed: &[PathBuf], passes: &[PassEntry]) -> Vec<usize> {
         .collect()
 }
 
-fn compile_pass(global: &slang::GlobalSession, source: &str) -> slang::Result<slang::Blob> {
-    let root = CString::new(SHADER_DIR).unwrap();
-    let include = CString::new(format!("{SHADER_DIR}/include")).unwrap();
-    // Lava's own test passes live outside `shaders/`; see `build.rs`.
-    #[cfg(feature = "test-passes")]
-    let tests = CString::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests")).unwrap();
-    let search_paths = [
-        root.as_ptr(),
-        include.as_ptr(),
-        #[cfg(feature = "test-passes")]
-        tests.as_ptr(),
-    ];
-    let targets = [slang::TargetDesc::default()
-        .format(slang::CompileTarget::Spirv)
-        .profile(global.find_profile("spirv_1_6"))];
-    let mut options = slang::CompilerOptions::default()
-        .optimization(shader_slang::OptimizationLevel::Maximal)
-        .vulkan_use_entry_point_name(true)
-        .matrix_layout_column(true);
-    if cfg!(feature = "profiling") {
-        options = options.macro_define("PROFILING", "1");
-    }
-
-    let session = global
-        .create_session(
-            &slang::SessionDesc::default()
-                .targets(&targets)
-                .search_paths(&search_paths)
-                .options(&options),
-        )
-        .expect("failed to create slang session");
-
-    let module = session.load_module(source)?;
-    let mut components: Vec<slang::ComponentType> = vec![module.clone().into()];
-    components.extend(module.entry_points().map(Into::into));
-
-    session
-        .create_composite_component_type(&components)?
-        .link()?
-        .target_code(0)
+fn compile_pass(global: &slang::GlobalSession, pass_index: usize) -> slang::Result<slang::Blob> {
+    let options = slang_compile::Options {
+        test_passes: cfg!(feature = "test-passes"),
+        profiling: cfg!(feature = "profiling"),
+        pass_index,
+    };
+    let session = slang_compile::session(global, &options);
+    slang_compile::link(&session, PASS_MAP[pass_index].source)?.target_code(0)
 }
 
 fn create_module(bytes: &[u8]) -> vk::ShaderModule {
@@ -465,18 +576,23 @@ pub struct RasterHash {
     stencil_format: vk::Format,
     /// With one blend per color attachment.
     state: RasterState,
+    /// Zeros for a pass without specialization constants.
+    constants: Constants,
 }
 
 fn get_raster_pipeline(hash: &RasterHash, pass_index: usize) -> vk::Pipeline {
     let manager = pipelines();
-    let map = &mut manager.raster_pipelines.write().unwrap()[PASS_MAP[pass_index].index];
-    if let Some(pipeline) = map.get(hash) {
+    let pass = &PASS_MAP[pass_index];
+    if let Some(pipeline) = manager.raster_pipelines.read().unwrap()[pass.index].get(hash) {
         return *pipeline;
     }
     let module = manager.pass_modules.read().unwrap()[pass_index];
-    let pipeline = create_raster_pipeline(module, hash, pass_index);
-    map.insert(hash.clone(), pipeline);
-    pipeline
+    let map = &mut manager.raster_pipelines.write().unwrap()[pass.index];
+    let cached = map.len();
+    *map.entry(hash.clone()).or_insert_with(|| {
+        note_new_pipeline(pass, cached);
+        create_raster_pipeline(module, hash, pass_index)
+    })
 }
 
 fn create_raster_pipeline(
@@ -487,8 +603,9 @@ fn create_raster_pipeline(
     let _span = tracing::info_span!("create raster pipeline").entered();
 
     let pass = &PASS_MAP[pass_index];
-    let index = pass_index as u32;
-    let c = pass_constant(&index);
+    let c = vk::SpecializationInfo::default()
+        .map_entries(pass.constants)
+        .data(&hash.constants[..pass.constants_size]);
     let stages = match pass.kind {
         PassKind::RasterVertex { vertex, fragment } => {
             smallvec![
@@ -653,12 +770,17 @@ pub mod kind {
     pub struct RasterMesh;
 }
 
-/// A pass's push constants and the resources it accesses, made by the generated `Pass::new`.
+/// A pass's push constants, specialization constants and the resources it accesses, made by
+/// the generated `Pass::push_bindings` (and `constant_bindings` for a pass with
+/// specialization constants).
 pub struct BindingOutput<K> {
     /// Index into `PASS_MAP`.
     pub(crate) pass: usize,
     /// The pass's push-constant struct, zero-padded; always pushed whole.
     pub(crate) push_constants: [u8; MAX_PUSH_CONSTANTS_SIZE],
+    /// The pass's specialization constants (laid out by `PassEntry.constants`), zero-padded;
+    /// part of the key of its pipeline.
+    pub(crate) constants: [u8; MAX_SPECIALIZATION_CONSTANTS_SIZE],
     pub(crate) images: SmallVec<[ImageAccess; MAX_PASS_IMAGES]>,
     pub(crate) buffers: SmallVec<[BufferAccess; MAX_PASS_BUFFERS]>,
     /// Shader stages of the pass; accesses registered later use the same stages.
@@ -680,6 +802,7 @@ impl<K> BindingOutput<K> {
         Self {
             pass,
             push_constants,
+            constants: [0; MAX_SPECIALIZATION_CONSTANTS_SIZE],
             images: images.into_iter().collect(),
             buffers: buffers.into_iter().collect(),
             stage,
@@ -687,10 +810,24 @@ impl<K> BindingOutput<K> {
         }
     }
 
+    /// Sets the specialization constants and adds the accesses of the resources they name.
+    pub(crate) fn with_constants<G: Pod, const I: usize, const B: usize>(
+        mut self,
+        constants: &G,
+        images: [ImageAccess; I],
+        buffers: [BufferAccess; B],
+    ) -> Self {
+        self.constants[..size_of::<G>()].copy_from_slice(bytes_of(constants));
+        self.images.extend(images);
+        self.buffers.extend(buffers);
+        self
+    }
+
     fn erase(self) -> BindingOutput<()> {
         BindingOutput {
             pass: self.pass,
             push_constants: self.push_constants,
+            constants: self.constants,
             images: self.images,
             buffers: self.buffers,
             stage: self.stage,
@@ -1136,7 +1273,7 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
     }
 
     /// The pipeline key of a draw with `state` in this rendering.
-    fn pipeline_key(&self, state: &RasterState) -> RasterHash {
+    fn pipeline_key(&self, state: &RasterState, constants: &Constants) -> RasterHash {
         let mut state = state.clone();
         if state.blends.is_empty() {
             state.blends = smallvec![Blend::Replace; self.color_formats.len()];
@@ -1151,6 +1288,7 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
             state,
+            constants: *constants,
         }
     }
 
@@ -1246,7 +1384,10 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
             {
                 continue;
             }
-            let pipeline = get_raster_pipeline(&self.pipeline_key(&draw.state), draw.bindings.pass);
+            let pipeline = get_raster_pipeline(
+                &self.pipeline_key(&draw.state, &draw.bindings.constants),
+                draw.bindings.pass,
+            );
             self.cmd_buf.push_constants(&draw.bindings.push_constants);
             unsafe {
                 device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -1597,7 +1738,7 @@ impl CommandBuffer {
         self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
         self.push_constants(&bindings.push_constants);
 
-        let pipeline = pipelines().compute_pipelines.read().unwrap()[pass.index];
+        let pipeline = pipelines().compute(bindings.pass, &bindings.constants);
 
         self.open_scope(pass.name, true);
         unsafe {
@@ -1630,10 +1771,8 @@ impl CommandBuffer {
         self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
         self.push_constants(&bindings.push_constants);
 
-        let lock = pipelines().raytracing_pipelines.read().unwrap();
-        let pipeline = lock[pass.index].as_ref().unwrap();
         self.open_scope(pass.name, true);
-        unsafe {
+        pipelines().ray_tracing(bindings.pass, &bindings.constants, |pipeline| unsafe {
             Ctx::device().cmd_bind_pipeline(
                 self.handle,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1650,7 +1789,7 @@ impl CommandBuffer {
                 y,
                 1,
             );
-        };
+        });
         self.end_scope();
     }
 
@@ -2645,6 +2784,8 @@ mod tests {
         assert!(state.blends.is_empty());
     }
 
+    const NO_CONSTANTS: Constants = [0; MAX_SPECIALIZATION_CONSTANTS_SIZE];
+
     #[test]
     fn raster_state_setters_end_up_in_the_pipeline_key() {
         let mut cmd = offline_cmd();
@@ -2653,13 +2794,13 @@ mod tests {
             .backface_culling(false)
             .wire_frame(true)
             .depth_write(false);
-        let key = builder.pipeline_key(&state);
+        let key = builder.pipeline_key(&state, &NO_CONSTANTS);
         assert!(!key.state.backface_culling);
         assert!(key.state.wire_frame);
         assert!(!key.state.depth_write);
         assert_ne!(
             key,
-            builder.pipeline_key(&RasterState::default()),
+            builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS),
             "different state must not share a pipeline"
         );
     }
@@ -2678,7 +2819,7 @@ mod tests {
             Blend::Attenuate,
             Blend::Skip,
         ]
-        .map(|blend| builder.pipeline_key(&RasterState::default().blends([blend])));
+        .map(|blend| builder.pipeline_key(&RasterState::default().blends([blend]), &NO_CONSTANTS));
         for (i, key) in keys.iter().enumerate() {
             assert!(!keys[i + 1..].contains(key), "{key:?}");
         }
@@ -2692,10 +2833,10 @@ mod tests {
             .raster(EXTENT)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&a), None)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&b), None);
-        let key = builder.pipeline_key(&RasterState::default());
+        let key = builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS);
         assert_eq!(key.state.blends.as_slice(), [Blend::Replace; 2]);
         let explicit = RasterState::default().blends([Blend::Replace; 2]);
-        assert_eq!(key, builder.pipeline_key(&explicit));
+        assert_eq!(key, builder.pipeline_key(&explicit, &NO_CONSTANTS));
     }
 
     #[test]
@@ -2707,7 +2848,10 @@ mod tests {
             .raster(EXTENT)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&a), None)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&b), None);
-        builder.pipeline_key(&RasterState::default().blends([Blend::Alpha]));
+        builder.pipeline_key(
+            &RasterState::default().blends([Blend::Alpha]),
+            &NO_CONSTANTS,
+        );
     }
 
     #[test]
@@ -2809,8 +2953,8 @@ mod tests {
         );
         // Depth writes are pipeline state, so read-only draws get their own pipeline.
         assert_ne!(
-            builder.pipeline_key(&read_only),
-            builder.pipeline_key(&RasterState::default())
+            builder.pipeline_key(&read_only, &NO_CONSTANTS),
+            builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS)
         );
     }
 
@@ -2981,6 +3125,8 @@ mod tests {
             source,
             kind: PassKind::Compute { entry: "main\0" },
             index: 0,
+            constants: &[],
+            constants_size: 0,
         }
     }
 
@@ -3084,10 +3230,21 @@ mod tests {
     #[test]
     fn pass_map_entries_are_consistent() {
         let (mut compute, mut raster, mut raytracing) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut specialized_compute, mut specialized_raytracing) = (Vec::new(), Vec::new());
         for pass in PASS_MAP.iter() {
+            let specialized = !pass.constants.is_empty();
+            // The constants fill their struct exactly, and fit every pipeline key.
+            let end = pass.constants.iter().map(|c| c.offset as usize + c.size);
+            assert_eq!(end.max().unwrap_or(0), pass.constants_size, "{}", pass.name);
+            assert!(pass.constants_size <= MAX_SPECIALIZATION_CONSTANTS_SIZE);
             let names: Vec<&str> = match pass.kind {
                 PassKind::Compute { entry } => {
-                    compute.push(pass.index);
+                    if specialized {
+                        &mut specialized_compute
+                    } else {
+                        &mut compute
+                    }
+                    .push(pass.index);
                     vec![entry]
                 }
                 PassKind::RasterVertex { vertex, fragment } => {
@@ -3107,7 +3264,12 @@ mod tests {
                     ray_any,
                     ray_closest,
                 } => {
-                    raytracing.push(pass.index);
+                    if specialized {
+                        &mut specialized_raytracing
+                    } else {
+                        &mut raytracing
+                    }
+                    .push(pass.index);
                     vec![ray_gen, ray_any, ray_closest]
                 }
             };
@@ -3126,6 +3288,14 @@ mod tests {
         assert_eq!(
             raytracing,
             (0..NUM_RAY_TRACING_PIPELINES).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            specialized_compute,
+            (0..NUM_SPECIALIZED_COMPUTE_PIPELINES).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            specialized_raytracing,
+            (0..NUM_SPECIALIZED_RAY_TRACING_PIPELINES).collect::<Vec<_>>()
         );
     }
 
@@ -3164,14 +3334,16 @@ mod tests {
         #[test]
         fn test_passes_are_registered_with_their_kind() {
             let compute =
-                TestComputeBuffer::new(storage::<u32>(0, 1), storage::<u32>(0, 1), 1, 1).pass;
+                TestComputeBuffer::push_bindings(storage::<u32>(0, 1), storage::<u32>(0, 1), 1, 1)
+                    .pass;
             assert!(matches!(
                 PASS_MAP[compute].kind,
                 PassKind::Compute {
                     entry: "test_compute_buffer\0"
                 }
             ));
-            let raster = TestRaster::new(storage::<TestVertex>(0, 1), glam::Vec2::ZERO).pass;
+            let raster =
+                TestRaster::push_bindings(storage::<TestVertex>(0, 1), glam::Vec2::ZERO).pass;
             assert!(matches!(
                 PASS_MAP[raster].kind,
                 PassKind::RasterVertex {
@@ -3184,7 +3356,7 @@ mod tests {
 
         #[test]
         fn push_constants_are_the_struct_zero_padded() {
-            let bindings = TestComputeBuffer::new(
+            let bindings = TestComputeBuffer::push_bindings(
                 storage::<u32>(0x1000, 16),
                 storage::<u32>(0x2000, 16),
                 16,
@@ -3196,7 +3368,7 @@ mod tests {
 
         #[test]
         fn buffer_fields_become_device_addresses_and_accesses() {
-            let bindings = TestComputeBuffer::new(
+            let bindings = TestComputeBuffer::push_bindings(
                 storage::<u32>(0x1000, 16),
                 storage::<u32>(0x2000, 16),
                 16,
@@ -3220,8 +3392,10 @@ mod tests {
 
         #[test]
         fn raster_passes_access_their_buffers_in_both_shader_stages() {
-            let bindings =
-                TestRaster::new(storage::<TestVertex>(0x4000, 3), glam::Vec2::new(0.5, 0.0));
+            let bindings = TestRaster::push_bindings(
+                storage::<TestVertex>(0x4000, 3),
+                glam::Vec2::new(0.5, 0.0),
+            );
             let constants: CTestRasterBindings = push_constants(&bindings);
             assert_eq!(constants.vertices, 0x4000);
             assert_eq!(
@@ -3235,11 +3409,13 @@ mod tests {
         fn registered_accesses_are_appended_with_the_pass_stages() {
             let state = layout(L::UNDEFINED);
             let extra = view::<R8G8B8A8Unorm, StorageImage>(&state);
-            let bindings =
-                TestRaster::new(storage::<TestVertex>(0x4000, 3), glam::Vec2::new(0.5, 0.0))
-                    .storage_read(extra)
-                    .buffer_read(storage::<u32>(0x5000, 4))
-                    .buffer_write(storage::<u32>(0x6000, 4));
+            let bindings = TestRaster::push_bindings(
+                storage::<TestVertex>(0x4000, 3),
+                glam::Vec2::new(0.5, 0.0),
+            )
+            .storage_read(extra)
+            .buffer_read(storage::<u32>(0x5000, 4))
+            .buffer_write(storage::<u32>(0x6000, 4));
 
             let stages = S::VERTEX_SHADER | S::FRAGMENT_SHADER;
             let [image] = bindings.images.as_slice() else {
@@ -3269,8 +3445,12 @@ mod tests {
             let state = layout(L::UNDEFINED);
             let mut target = view::<R8G8B8A8Unorm, StorageImage>(&state);
             target.handle.descriptor_index_set1 = 5;
-            let bindings =
-                TestComputeImage::new(target, glam::Vec4::ONE, UVec2::ZERO, UVec2::new(8, 8));
+            let bindings = TestComputeImage::push_bindings(
+                target,
+                glam::Vec4::ONE,
+                UVec2::ZERO,
+                UVec2::new(8, 8),
+            );
             let constants: CTestComputeImageBindings = push_constants(&bindings);
             assert_eq!(constants.target.descriptor_index_set1, 5);
             let [access] = bindings.images.as_slice() else {

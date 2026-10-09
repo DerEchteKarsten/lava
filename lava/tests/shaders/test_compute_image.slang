@@ -1,3 +1,4 @@
+#define USE_CLOCKS
 // Test pass (compute, storage image): writes a UV gradient with a checkerboard in blue.
 #include "bindless.slang"
 #include "profile.slang"

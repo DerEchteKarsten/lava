@@ -4,9 +4,12 @@
 // point returns to its pass's counters, while a profiled frame slot exists. Not in fragment
 // shaders: a fragment shader that writes a buffer loses early depth testing, even while the
 // profiler is off.
-
-// Set by lava for every pipeline: the pass's index in `PASS_MAP`.
-[vk::constant_id(900)] const uint PROFILE_PASS = 0;
+//
+// Only a pass that `#define USE_CLOCKS` before its first include of this file gets the clocks
+// (and their counter binding); in every other pass `PROFILE` is empty, so shared code can call
+// it. lava's Slang session defines `PROFILING` with its `profiling` feature, and `PROFILE_PASS`,
+// the pass's index in `PASS_MAP`, for every pass.
+#if defined(PROFILING) && defined(USE_CLOCKS)
 
 // `PROFILE_FLAG_WORDS` words of flags (word 0: profiled frame slots alive), then per pass, stage
 // and stripe one counter: the summed ticks in its low `PROFILE_TICK_BITS` bits and the number
@@ -48,8 +51,6 @@ void profile_end(uint stage, uint64_t start)
     InterlockedAdd(ProfileCounters[slot], ticks + (1ull << PROFILE_TICK_BITS));
 }
 
-// lava defines `PROFILING` with its `profiling` feature; without it the clocks aren't compiled.
-#ifdef PROFILING
 #define PROFILE(stage) let profile_start = subgroup_clock(); defer profile_end(stage, profile_start);
 #else
 #define PROFILE(stage)

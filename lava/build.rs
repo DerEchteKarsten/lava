@@ -1,18 +1,18 @@
 //! Compiles Slang passes to SPIR-V and generates typed pass bindings from reflection
 use std::{
     collections::BTreeMap,
-    env,
-    ffi::CString,
-    fs,
+    env, fs,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use shader_slang::{
-    self as slang, CompilerOptions, ComponentType, ParameterCategory as Cat, ScalarType,
-    SessionDesc, Stage, TypeKind,
+    self as slang, ParameterCategory as Cat, ScalarType, Stage, TypeKind,
     reflection::{TypeLayout, VariableLayout},
 };
+
+#[path = "src/slang_compile.rs"]
+mod slang_compile;
 
 struct StructDef {
     body: String,
@@ -276,7 +276,11 @@ struct NewFn {
     image_accesses: Vec<String>,
 }
 
-fn build_new_fn(pc: &TypeLayout, structs: &mut Structs, stage: &str) -> NewFn {
+fn build_new_fn<'a>(
+    fields: impl Iterator<Item = (&'a str, &'a TypeLayout)>,
+    structs: &mut Structs,
+    stage: &str,
+) -> NewFn {
     let mut out = NewFn {
         lifetime: false,
         generics: Vec::new(),
@@ -286,9 +290,7 @@ fn build_new_fn(pc: &TypeLayout, structs: &mut Structs, stage: &str) -> NewFn {
         image_accesses: Vec::new(),
     };
 
-    for f in pc.fields() {
-        let name = field_name(f);
-        let t = f.type_layout().unwrap();
+    for (name, t) in fields {
         let suffix = camel_case(name);
         match field_kind(t) {
             FieldKind::Image { usage } => {
@@ -344,19 +346,103 @@ fn build_new_fn(pc: &TypeLayout, structs: &mut Structs, stage: &str) -> NewFn {
     out
 }
 
+/// A specialization constant of a pass, which lava bakes into its pipelines.
+struct SConst<'a> {
+    name: String,
+    id: u32,
+    layout: &'a TypeLayout,
+}
+
+/// The pass's specialization constants by id. `SCONST(T, name)` (`bindless.slang`) declares a
+/// `uint64_t name_sconst` whose `SConst` attribute names `T`, a buffer or image handle; any
+/// other one is a plain scalar.
+fn sconsts<'a>(layout: &'a slang::reflection::Shader, file: &str) -> Vec<SConst<'a>> {
+    let mut consts: Vec<SConst> = layout
+        .parameters()
+        .filter(|p| p.category() == Some(Cat::SpecializationConstant))
+        .map(|p| (p, p.offset(Cat::SpecializationConstant) as u32))
+        .map(|(p, id)| {
+            let name = field_name(p);
+            let attribute = p
+                .variable()
+                .and_then(|v| v.user_attributes().find(|a| a.name() == Some("SConst")));
+            let Some(attribute) = attribute else {
+                return SConst {
+                    name: name.to_string(),
+                    id,
+                    layout: p.type_layout().unwrap(),
+                };
+            };
+            let ty = attribute.argument_value_string(0).unwrap();
+            let layout = layout
+                .find_type_by_name(ty)
+                .and_then(|t| layout.type_layout(t, slang::LayoutRules::Default))
+                .unwrap_or_else(|| panic!("{file}: unknown type `{ty}` of SCONST `{name}`"));
+            assert!(
+                matches!(
+                    field_kind(layout),
+                    FieldKind::Buffer | FieldKind::Image { .. }
+                ),
+                "{file}: SCONST `{name}` has type `{ty}`, which isn't a buffer or image"
+            );
+            SConst {
+                name: name.trim_end_matches("_sconst").to_string(),
+                id,
+                layout,
+            }
+        })
+        .collect();
+    consts.sort_by_key(|c| c.id);
+    consts
+}
+
+/// Pipeline counts per kind; a pass's pipelines go to the specialized maps if it has
+/// specialization constants.
+#[derive(Default)]
+struct Pipelines {
+    compute: usize,
+    specialized_compute: usize,
+    ray_tracing: usize,
+    specialized_ray_tracing: usize,
+    raster: usize,
+}
+
+impl Pipelines {
+    /// The pass's index into the pipeline array of its kind, counting it.
+    fn index(&mut self, kind: PassKind, specialized: bool) -> usize {
+        let count = match (kind, specialized) {
+            (PassKind::Compute, false) => &mut self.compute,
+            (PassKind::Compute, true) => &mut self.specialized_compute,
+            (PassKind::RayTracing, false) => &mut self.ray_tracing,
+            (PassKind::RayTracing, true) => &mut self.specialized_ray_tracing,
+            (PassKind::RasterVertex | PassKind::RasterMesh, _) => &mut self.raster,
+        };
+        *count += 1;
+        *count - 1
+    }
+}
+
+/// What a pass adds to the generated bindings.
+struct GeneratedPass {
+    code: String,
+    images: usize,
+    buffers: usize,
+    constants_size: String,
+}
+
 fn generate_pass(
     pass_name: &str,
     pc: &TypeLayout,
+    consts: &[SConst],
     entries: &[(&'static str, String)],
     structs: &mut Structs,
     pass_map: &mut Vec<String>,
-    num_compute_pipelines: usize,
-    num_ray_tracing_pipelines: usize,
-    num_raster_pipelines: usize,
+    pipelines: &mut Pipelines,
     path_dir: &PathBuf,
     source: &str,
-) -> (String, PassKind, usize, usize) {
+) -> GeneratedPass {
     let gpu_name = format!("C{pass_name}Bindings");
+    let consts_name = format!("C{pass_name}Constants");
     let index = pass_map.len();
 
     let entry = |stage: &str| {
@@ -376,80 +462,65 @@ fn generate_pass(
         other => panic!("entry points {other:?} in pass {pass_name} don't match any pass pattern"),
     };
     let stage = kind.stage();
+    let pipeline_index = pipelines.index(kind, !consts.is_empty());
 
-    let pass_entry = match kind {
+    let kind_fields = match kind {
         PassKind::RasterVertex => {
             let (vertex, fragment) = (entry("vertex").unwrap(), entry("fragment").unwrap());
-            format!(
-                r#"    PassEntry {{
-                    name: "{pass_name}",
-                    path: {:?},
-                    source: {source:?},
-                    kind: PassKind::RasterVertex {{
-                        fragment: "{fragment}\0",
-                        vertex: "{vertex}\0",
-                    }},
-                    index: {num_raster_pipelines}
-                }},"#,
-                path_dir
-            )
+            format!("RasterVertex {{ fragment: \"{fragment}\\0\", vertex: \"{vertex}\\0\" }}")
         }
         PassKind::RasterMesh => {
             let (mesh, fragment) = (entry("mesh").unwrap(), entry("fragment").unwrap());
             let task = match entry("amplification") {
-                Some(task) => format!("Some(\"{task}\0\")"),
+                Some(task) => format!("Some(\"{task}\\0\")"),
                 None => "None".to_string(),
             };
             format!(
-                r#"    PassEntry {{
-                    name: "{pass_name}",
-                    path: {:?},
-                    source: {source:?},
-                    kind: PassKind::RasterMesh {{
-                        fragment: "{fragment}\0",
-                        mesh: "{mesh}\0",
-                        amp: {task},
-                    }},
-                    index: {num_raster_pipelines}
-                }},"#,
-                path_dir
+                "RasterMesh {{ fragment: \"{fragment}\\0\", mesh: \"{mesh}\\0\", amp: {task} }}"
             )
         }
         PassKind::Compute => {
             let compute = entry("compute").unwrap();
-            format!(
-                r#"    PassEntry {{
-                    name: "{pass_name}",
-                    path: {:?},
-                    source: {source:?},
-                    kind: PassKind::Compute {{
-                        entry: "{compute}\0",
-                    }},
-                    index: {num_compute_pipelines}
-                }},"#,
-                path_dir
-            )
+            format!("Compute {{ entry: \"{compute}\\0\" }}")
         }
         PassKind::RayTracing => {
             let (raygen, closest) = (entry("raygen").unwrap(), entry("closest_hit").unwrap());
             let any = entry("any_hit").unwrap_or(closest);
             format!(
-                r#"    PassEntry {{
-                    name: "{pass_name}",
-                    path: {:?},
-                    source: {source:?},
-                    kind: PassKind::RayTracing {{
-                        ray_gen: "{raygen}\0",
-                        ray_any: "{any}\0",
-                        ray_closest: "{closest}\0",
-                    }},
-                    index: {num_ray_tracing_pipelines}
-                }},"#,
-                path_dir
+                "RayTracing {{ ray_gen: \"{raygen}\\0\", ray_any: \"{any}\\0\", ray_closest: \"{closest}\\0\" }}"
             )
         }
     };
-    pass_map.push(pass_entry);
+    let (constants, constants_size) = if consts.is_empty() {
+        ("&[]".to_string(), "0".to_string())
+    } else {
+        let entries: Vec<String> = consts
+            .iter()
+            .map(|c| {
+                format!(
+                    "vk::SpecializationMapEntry {{ constant_id: {id}, offset: core::mem::offset_of!({consts_name}, {name}) as u32, size: size_of::<{ty}>() }}",
+                    id = c.id,
+                    name = c.name,
+                    ty = gpu_type(c.layout, structs),
+                )
+            })
+            .collect();
+        (
+            format!("&[{}]", entries.join(", ")),
+            format!("size_of::<{consts_name}>()"),
+        )
+    };
+    pass_map.push(format!(
+        r#"    PassEntry {{
+        name: "{pass_name}",
+        path: {path_dir:?},
+        source: {source:?},
+        kind: PassKind::{kind_fields},
+        index: {pipeline_index},
+        constants: {constants},
+        constants_size: {constants_size},
+    }},"#
+    ));
 
     let kind_marker = match kind {
         PassKind::RasterVertex => "RasterVertex",
@@ -464,33 +535,17 @@ fn generate_pass(
     );
 
     let gpu_struct = generate_gpu_struct(&gpu_name, pc, structs);
-    let new = build_new_fn(pc, structs, stage);
+    let push = build_new_fn(
+        pc.fields()
+            .map(|f| (field_name(f), f.type_layout().unwrap())),
+        structs,
+        stage,
+    );
+    let output = format!("BindingOutput<kind::{kind_marker}>");
+    let incomplete = format!("Incomplete{pass_name}");
 
-    let mut generics: Vec<String> = Vec::new();
-    if new.lifetime {
-        generics.push("'a".to_string());
-    }
-    generics.extend(new.generics.iter().cloned());
-    let generics = if generics.is_empty() {
-        String::new()
-    } else {
-        format!("<{}>", generics.join(", "))
-    };
-
-    let params = new.params.join(", ");
-    let image_accesses = new.image_accesses.join(",\n");
-    let buffer_accesses = new.buffer_accesses.join(",\n");
-    let gpu_inits = new.gpu_inits.join(", ");
-
-    let mut out = String::new();
-    out.push_str(&gpu_struct);
-    out.push_str(&format!(
-        r#"
-pub struct {pass_name};
-
-impl {pass_name} {{
-    pub fn new{generics}({params}) -> BindingOutput<kind::{kind_marker}> {{
-        BindingOutput::new(
+    let binding_output = format!(
+        r#"BindingOutput::new(
             {index},
             &{gpu_name} {{
                 {gpu_inits}
@@ -502,18 +557,107 @@ impl {pass_name} {{
             [
                 {buffer_accesses}
             ],
+        )"#,
+        gpu_inits = push.gpu_inits.join(", "),
+        image_accesses = push.image_accesses.join(",\n"),
+        buffer_accesses = push.buffer_accesses.join(",\n"),
+    );
+    let (returns, body) = if consts.is_empty() {
+        (output.clone(), binding_output)
+    } else {
+        (
+            incomplete.clone(),
+            format!("{incomplete}({binding_output})"),
+        )
+    };
+
+    let mut out = gpu_struct;
+    out.push_str(&format!(
+        r#"
+pub struct {pass_name};
+
+impl {pass_name} {{
+    pub fn push_bindings{generics}({params}) -> {returns} {{
+        {body}
+    }}
+}}
+"#,
+        generics = fn_generics(&push),
+        params = push.params.join(", "),
+    ));
+    let (mut images, mut buffers) = (push.image_accesses.len(), push.buffer_accesses.len());
+
+    if !consts.is_empty() {
+        let new = build_new_fn(
+            consts.iter().map(|c| (c.name.as_str(), c.layout)),
+            structs,
+            stage,
+        );
+        let fields: Vec<String> = consts
+            .iter()
+            .map(|c| format!("    pub {}: {},", c.name, gpu_type(c.layout, structs)))
+            .collect();
+        out.push_str(&format!(
+            r#"
+/// Packed: the specialization constant data is read at each entry's offset.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct {consts_name} {{
+{fields}
+}}
+unsafe impl bytemuck::Pod for {consts_name} {{}}
+unsafe impl bytemuck::Zeroable for {consts_name} {{}}
+
+#[must_use = "`{pass_name}` has specialization constants: call `.constant_bindings(..)`"]
+pub struct {incomplete}({output});
+
+impl {incomplete} {{
+    pub fn constant_bindings{generics}(self, {params}) -> {output} {{
+        self.0.with_constants(
+            &{consts_name} {{
+                {gpu_inits}
+            }},
+            [
+                {image_accesses}
+            ],
+            [
+                {buffer_accesses}
+            ],
         )
     }}
 }}
-"#
-    ));
+"#,
+            fields = fields.join("\n"),
+            generics = fn_generics(&new),
+            params = new.params.join(", "),
+            gpu_inits = new.gpu_inits.join(", "),
+            image_accesses = new.image_accesses.join(",\n"),
+            buffer_accesses = new.buffer_accesses.join(",\n"),
+        ));
+        images += new.image_accesses.len();
+        buffers += new.buffer_accesses.len();
+    }
 
-    (
-        out,
-        kind,
-        new.image_accesses.len(),
-        new.buffer_accesses.len(),
-    )
+    GeneratedPass {
+        code: out,
+        images,
+        buffers,
+        constants_size,
+    }
+}
+
+/// `<'a, F…, U…>` of a generated function, empty without parameters that borrow.
+fn fn_generics(new: &NewFn) -> String {
+    let mut generics: Vec<String> = Vec::new();
+    if new.lifetime {
+        generics.push("'a".to_string());
+    }
+    generics.extend(new.generics.iter().cloned());
+    if generics.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", generics.join(", "))
+    }
 }
 
 fn capitalize_first(s: &str) -> String {
@@ -533,7 +677,7 @@ fn camel_case(s: &str) -> String {
 
 fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let shaders = PathBuf::from(manifest_dir).join("../shaders");
+    let shaders = PathBuf::from(slang_compile::SHADER_DIR);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     // `-lslang` can resolve to the unrelated S-Lang library in /usr/lib, which
     // comes first in the search path of the final binary.
@@ -551,7 +695,7 @@ fn main() {
     // feature, and the bindings then go to OUT_DIR so `src/bindings.rs` keeps describing
     // exactly the engine passes.
     let test_passes = env::var_os("CARGO_FEATURE_TEST_PASSES").is_some();
-    let tests = PathBuf::from(manifest_dir).join("tests");
+    let tests = PathBuf::from(slang_compile::TEST_DIR);
     if test_passes {
         println!(
             "cargo::rerun-if-changed={}",
@@ -560,31 +704,7 @@ fn main() {
     }
 
     let global = slang::GlobalSession::new().unwrap();
-    let root = CString::new(shaders.to_str().unwrap()).unwrap();
-    let include = CString::new(shaders.join("include").to_str().unwrap()).unwrap();
-    let tests_path = CString::new(tests.to_str().unwrap()).unwrap();
-    let mut search_paths = vec![root.as_ptr(), include.as_ptr()];
-    if test_passes {
-        search_paths.push(tests_path.as_ptr());
-    }
-    let targets = [slang::TargetDesc::default()
-        .format(slang::CompileTarget::Spirv)
-        .profile(global.find_profile("spirv_1_6"))];
-    let mut options = CompilerOptions::default()
-        .optimization(shader_slang::OptimizationLevel::Maximal)
-        .vulkan_use_entry_point_name(true)
-        .matrix_layout_column(true);
-    if env::var_os("CARGO_FEATURE_PROFILING").is_some() {
-        options = options.macro_define("PROFILING", "1");
-    }
-    let session = global
-        .create_session(
-            &SessionDesc::default()
-                .targets(&targets)
-                .search_paths(&search_paths)
-                .options(&options),
-        )
-        .unwrap();
+    let profiling = env::var_os("CARGO_FEATURE_PROFILING").is_some();
 
     // (directory relative to a search path, file name) of every pass, engine passes first.
     let list_passes = |parent: &PathBuf, dir: &'static str| {
@@ -630,27 +750,23 @@ use std::str::FromStr;
 
     let mut structs = Structs::new();
     let mut pass_map: Vec<String> = Vec::new();
-    let mut num_compute_pipelines: usize = 0;
-    let mut num_ray_tracing_pipelines: usize = 0;
-    let mut num_raster_pipelines: usize = 0;
+    let mut pipelines = Pipelines::default();
     let (mut max_images, mut max_buffers) = (0, 0);
+    let mut constants_sizes = vec!["0".to_string()];
 
     let passes_dir = out_dir.join("passes");
     fs::create_dir_all(&passes_dir).unwrap();
 
     for (dir, file) in pass_files.iter() {
         let source = format!("{dir}/{file}");
-        let module = session
-            .load_module(&source)
-            .unwrap_or_else(|e| panic!("{file}:\n{e}"));
-
-        let mut components: Vec<ComponentType> = vec![module.clone().into()];
-        components.extend(module.entry_points().map(Into::into));
-
-        let program = session
-            .create_composite_component_type(&components)
-            .and_then(|c| c.link())
-            .unwrap_or_else(|e| panic!("{file}:\n{e}"));
+        let options = slang_compile::Options {
+            test_passes,
+            profiling,
+            pass_index: pass_map.len(),
+        };
+        let session = slang_compile::session(&global, &options);
+        let program =
+            slang_compile::link(&session, &source).unwrap_or_else(|e| panic!("{file}:\n{e}"));
         let layout = program.layout(0).unwrap();
 
         let pass_name: String = file
@@ -671,27 +787,24 @@ use std::str::FromStr;
             .and_then(|t| t.element_type_layout())
             .unwrap_or_else(|| panic!("no push constant buffer found in {file}"));
 
+        let consts = sconsts(layout, file);
+
         let out = passes_dir.join(format!("{pass_name}.spv"));
-        let (pass_code, kind, images, buffers) = generate_pass(
+        let pass = generate_pass(
             &pass_name,
             pc,
+            &consts,
             &entries,
             &mut structs,
             &mut pass_map,
-            num_compute_pipelines,
-            num_ray_tracing_pipelines,
-            num_raster_pipelines,
+            &mut pipelines,
             &out,
             &source,
         );
-        match kind {
-            PassKind::Compute => num_compute_pipelines += 1,
-            PassKind::RayTracing => num_ray_tracing_pipelines += 1,
-            PassKind::RasterVertex | PassKind::RasterMesh => num_raster_pipelines += 1,
-        }
-        max_images = max_images.max(images);
-        max_buffers = max_buffers.max(buffers);
-        bindings.push_str(&pass_code);
+        max_images = max_images.max(pass.images);
+        max_buffers = max_buffers.max(pass.buffers);
+        constants_sizes.push(pass.constants_size);
+        bindings.push_str(&pass.code);
 
         let pass_spirv = program
             .target_code(0)
@@ -699,17 +812,36 @@ use std::str::FromStr;
         fs::write(out, pass_spirv.as_slice()).unwrap();
     }
 
+    let Pipelines {
+        compute,
+        specialized_compute,
+        ray_tracing,
+        specialized_ray_tracing,
+        raster,
+    } = pipelines;
     bindings.push_str(&format!(
-        "pub const NUM_COMPUTE_PIPELINES: usize = {};\n",
-        num_compute_pipelines
+        "pub const NUM_COMPUTE_PIPELINES: usize = {compute};\n\
+         pub const NUM_SPECIALIZED_COMPUTE_PIPELINES: usize = {specialized_compute};\n\
+         pub const NUM_RAY_TRACING_PIPELINES: usize = {ray_tracing};\n\
+         pub const NUM_SPECIALIZED_RAY_TRACING_PIPELINES: usize = {specialized_ray_tracing};\n\
+         pub const NUM_RASTER_PIPELINES: usize = {raster};\n"
     ));
+    // Every pipeline cache is keyed by this many bytes of specialization constants.
     bindings.push_str(&format!(
-        "pub const NUM_RAY_TRACING_PIPELINES: usize = {};\n",
-        num_ray_tracing_pipelines
-    ));
-    bindings.push_str(&format!(
-        "pub const NUM_RASTER_PIPELINES: usize = {};\n",
-        num_raster_pipelines
+        r#"pub const MAX_SPECIALIZATION_CONSTANTS_SIZE: usize = {{
+    let sizes = [{}];
+    let (mut max, mut i) = (0, 0);
+    while i < sizes.len() {{
+        if sizes[i] > max {{
+            max = sizes[i];
+        }}
+        i += 1;
+    }}
+    max
+}};
+const _: () = assert!(MAX_SPECIALIZATION_CONSTANTS_SIZE < 128, "Keep SConstants small!!");
+"#,
+        constants_sizes.join(", ")
     ));
     // The inline capacity of a pass's accesses; the margin covers the buffers of a draw and
     // registered accesses, and more only spill to the heap.
