@@ -1706,6 +1706,21 @@ impl CommandBuffer {
         self.pending_accesses.record(image_acceses, buffer_acceses);
     }
 
+    /// Debugging aid: a full barrier that makes every command recorded before it finish, and
+    /// its writes visible to every later command, before anything after it starts. Leaves the
+    /// tracked accesses alone, so the automatic barriers stay what they would be without it:
+    /// if a glitch goes away with this call, an automatic barrier before it is missing.
+    pub fn flush_all(&mut self) {
+        let all = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
+        let memory = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(all)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(all)];
+        let info = vk::DependencyInfo::default().memory_barriers(&memory);
+        unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
+    }
+
     /// Opens a named group of the commands recorded until [`Self::end_scope`]. Profiled
     /// frames time it (see `FrameSlot::set_profiling`), and debug builds label it for
     /// RenderDoc/Nsight. Every pass is such a scope on its own.

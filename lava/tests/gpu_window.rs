@@ -137,12 +137,16 @@ fn run(event_loop: &ActiveEventLoop) {
     surface.refresh_capabilities().unwrap();
     swapchain.recreate(&surface, new_size).unwrap();
     assert_eq!(swapchain.size, new_size);
-    // Shaders keep addressing the swapchain images through the same bindless slots.
+    // Binding is left to the application, which may have to reserve slots for more images.
+    assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
+    let mut writes = BindlessWrites::default();
+    swapchain.bind_storage(0, &mut writes);
+    writes.submit();
     for (i, handle) in handles.iter().enumerate().take(swapchain.num_images()) {
         assert_eq!(swapchain.image(i as u32).handle, *handle);
     }
     present_frame(&queue, &swapchain, [0.0, 0.0, 1.0, 1.0], &mut semaphores);
-    step("swapchain_recreate_keeps_bindless_handles");
+    step("swapchain_recreate_is_unbound");
 
     let second_window = create_window(event_loop, "lava test 2");
     let second_surface = surface_for(&second_window).unwrap();

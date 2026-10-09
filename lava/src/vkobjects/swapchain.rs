@@ -33,9 +33,11 @@ struct SwapchainImage {
 #[derive(Debug)]
 pub struct Swapchain {
     pub size: [u32; 2],
+    /// The surface's supported modes of `PRESENT_MODES`, lowest latency first, with their names.
+    pub present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,
+    /// Index into `present_modes`; set it and `recreate` to switch. A recreated swapchain keeps it.
+    pub present_mode: usize,
     pub(crate) handle: vk::SwapchainKHR,
-    /// Set once the images are bound; a recreated swapchain keeps it.
-    first_storage_index: Option<u32>,
     images: SmallVec<[SwapchainImage; 5]>,
 }
 
@@ -57,14 +59,17 @@ impl Swapchain {
         self.images.len()
     }
 
-    /// The images are unbound, unless `old` was bound: then they take its slots.
+    /// The images are unbound; the caller binds them. The image count can change between
+    /// swapchains of one surface, e.g. with the present mode (Mailbox often needs one more).
     #[validation_trace]
     pub fn new(surface: &Surface, old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = select_surface_format(&surface.formats);
 
         let _ = FORMAT.set(format.format);
 
-        let present_mode = select_present_mode(&surface.present_modes);
+        let present_modes = supported_present_modes(&surface.present_modes);
+        let present_mode_index = old.map_or(0, |old| old.present_mode.min(present_modes.len() - 1));
+        let present_mode = present_modes[present_mode_index].0;
         let extent = select_extent(size, &surface.capabilities);
 
         let image_count = surface.capabilities.min_image_count;
@@ -148,23 +153,17 @@ impl Swapchain {
             })
             .collect::<Result<SmallVec<[SwapchainImage; 5]>>>()?;
 
-        let mut swapchain = Self {
+        Ok(Self {
             handle,
             images,
-            first_storage_index: None,
             size: [extent.width, extent.height],
-        };
-        if let Some(first) = old.and_then(|old| old.first_storage_index) {
-            let mut writes = BindlessWrites::default();
-            swapchain.bind_storage(first, &mut writes);
-            writes.submit();
-        }
-        Ok(swapchain)
+            present_modes,
+            present_mode: present_mode_index,
+        })
     }
 
     /// Binds image `i` at `first_storage_index + i` of the storage set.
     pub fn bind_storage(&mut self, first_storage_index: u32, writes: &mut BindlessWrites) {
-        self.first_storage_index = Some(first_storage_index);
         for (i, image) in self.images.iter_mut().enumerate() {
             image.handle.descriptor_index_set1 = first_storage_index + i as u32;
         }
@@ -188,6 +187,7 @@ impl Swapchain {
         Ok(image_index)
     }
 
+    /// The new images are unbound (see `new`); bind them again.
     #[validation_trace]
     pub fn recreate(&mut self, surface: &Surface, size: [u32; 2]) -> Result<()> {
         let _span = tracing::info_span!("Swapchain Recreation").entered();
@@ -229,12 +229,22 @@ pub(crate) fn select_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::Sur
     }
 }
 
-/// Lowest-latency mode available: IMMEDIATE, then MAILBOX, then FIFO (always supported).
-pub(crate) fn select_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX]
+/// The swapchain's present modes, lowest latency first.
+const PRESENT_MODES: [(vk::PresentModeKHR, &str); 4] = [
+    (vk::PresentModeKHR::IMMEDIATE, "Immediate"),
+    (vk::PresentModeKHR::MAILBOX, "Mailbox"),
+    (vk::PresentModeKHR::FIFO_RELAXED, "FIFO relaxed"),
+    (vk::PresentModeKHR::FIFO, "FIFO (vsync)"),
+];
+
+/// The supported entries of `PRESENT_MODES`; FIFO is always supported, even if not reported.
+pub(crate) fn supported_present_modes(
+    modes: &[vk::PresentModeKHR],
+) -> SmallVec<[(vk::PresentModeKHR, &'static str); 4]> {
+    PRESENT_MODES
         .into_iter()
-        .find(|mode| modes.contains(mode))
-        .unwrap_or(vk::PresentModeKHR::FIFO)
+        .filter(|(mode, _)| *mode == vk::PresentModeKHR::FIFO || modes.contains(mode))
+        .collect()
 }
 
 /// The requested size, else the surface's current extent, else (when the surface leaves the
@@ -304,16 +314,23 @@ mod tests {
     }
 
     #[test]
-    fn present_mode_prefers_immediate_then_mailbox_then_fifo() {
+    fn present_modes_are_sorted_by_latency_and_always_have_fifo() {
         use vk::PresentModeKHR as P;
+        let modes = |supported: &[P]| -> Vec<P> {
+            supported_present_modes(supported)
+                .iter()
+                .map(|m| m.0)
+                .collect()
+        };
         assert_eq!(
-            select_present_mode(&[P::FIFO, P::MAILBOX, P::IMMEDIATE]),
-            P::IMMEDIATE
+            modes(&[P::FIFO, P::MAILBOX, P::IMMEDIATE]),
+            [P::IMMEDIATE, P::MAILBOX, P::FIFO]
         );
-        assert_eq!(select_present_mode(&[P::FIFO, P::MAILBOX]), P::MAILBOX);
-        // FIFO is the only mode every surface supports, so it is the fallback.
-        assert_eq!(select_present_mode(&[P::FIFO, P::FIFO_RELAXED]), P::FIFO);
-        assert_eq!(select_present_mode(&[]), P::FIFO);
+        assert_eq!(
+            modes(&[P::FIFO_RELAXED, P::FIFO]),
+            [P::FIFO_RELAXED, P::FIFO]
+        );
+        assert_eq!(modes(&[]), [P::FIFO]);
     }
 
     #[test]

@@ -199,6 +199,7 @@ fn image_access(usage: u64) -> &'static str {
     match usage {
         0 => "vk::AccessFlags2::SHADER_SAMPLED_READ",
         1 => "vk::AccessFlags2::SHADER_STORAGE_READ",
+        3 => "vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE",
         _ => "vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE",
     }
 }
@@ -303,6 +304,7 @@ fn build_new_fn(pc: &TypeLayout, structs: &mut Structs, stage: &str) -> NewFn {
                     "U{suffix}: {}",
                     match usage {
                         0 => "image::usage::IsSampled",
+                        3 => "image::usage::UnifiedBinding",
                         _ => "image::usage::IsStorage",
                     }
                 ));

@@ -81,6 +81,21 @@ public extension Img<E, Shape, 2> {
 
 }
 
+/// Bound in both sets: reads go through the sampler, which fetches far faster than a typed
+/// load of a storage image does on Intel, and writes through the storage descriptor.
+__generic<E : ITexelElement, Shape : __ITextureShape>
+public extension Img<E, Shape, 3> {
+    typealias Sampled = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, 0>;
+    typealias Storage = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, 0>;
+
+    [ForceInline] public E Load(vector<uint, Shape.dimensions> p) {
+        return TextureHeap[SampledIndex].asOpaqueDescriptor<Sampled>()[p];
+    }
+    [ForceInline] public void Store(vector<uint, Shape.dimensions> p, E v) {
+        RWTextureHeap[StorageIndex].asOpaqueDescriptor<Storage>().Store(p, v);
+    }
+}
+
 /// A 2D image whose kind is only known at runtime, e.g. a handle stored in vertex data.
 /// Reads the sampled image if the handle has one, the storage image otherwise.
 public struct DynImg<E : ITexelElement = float4> {
@@ -131,6 +146,7 @@ public typealias Image2D<E : ITexelElement = float4>    = Img<E, __Shape2D, 1>;
 public typealias Image3D<E : ITexelElement = float4>    = Img<E, __Shape3D, 1>;
 public typealias MutImage2D<E : ITexelElement = float4> = Img<E, __Shape2D, 2>;
 public typealias MutImage3D<E : ITexelElement = float4> = Img<E, __Shape3D, 2>;
+public typealias MutTex2D<E : ITexelElement = float4>   = Img<E, __Shape2D, 3>;
 
 public struct Buf<T>    { public T *val; }
 public struct MutBuf<T> { public T *val; }

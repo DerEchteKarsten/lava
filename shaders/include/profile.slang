@@ -9,15 +9,18 @@
 [vk::constant_id(900)] const uint PROFILE_PASS = 0;
 
 // `PROFILE_FLAG_WORDS` words of flags (word 0: profiled frame slots alive), then per pass, stage
-// and stripe the summed ticks and the number of subgroups. Mirrored by `profiling.rs`.
+// and stripe one counter: the summed ticks in its low `PROFILE_TICK_BITS` bits and the number
+// of subgroups above them, so a subgroup adds both with one atomic. Mirrored by `profiling.rs`.
 [vk::binding(0, 2)] RWStructuredBuffer<uint64_t> ProfileCounters;
 
 static const uint PROFILE_FLAG_WORDS = 8;
 static const uint PROFILE_STAGES = 4;
 // Subgroups spread their atomics over this many copies of a counter, each in its own cache
-// line (`PROFILE_STRIPE_WORDS`), or contention makes them cost more than the shader.
+// line (`PROFILE_STRIPE_WORDS`): the L2 serialises the atomics to a line, about 200 cycles
+// each, so with 64 stripes a pass of 30k subgroups pays 0.1 ms per atomic per subgroup.
 static const uint PROFILE_STRIPES = 64;
 static const uint PROFILE_STRIPE_WORDS = 8;
+static const uint PROFILE_TICK_BITS = 40;
 
 static const uint PROFILE_COMPUTE = 0;
 static const uint PROFILE_TASK = 1;
@@ -42,8 +45,7 @@ void profile_end(uint stage, uint64_t start)
     let ticks = subgroup_clock() - start;
     let stripe = uint(start) % PROFILE_STRIPES;
     let slot = PROFILE_FLAG_WORDS + ((PROFILE_PASS * PROFILE_STAGES + stage) * PROFILE_STRIPES + stripe) * PROFILE_STRIPE_WORDS;
-    InterlockedAdd(ProfileCounters[slot], ticks);
-    InterlockedAdd(ProfileCounters[slot + 1], 1);
+    InterlockedAdd(ProfileCounters[slot], ticks + (1ull << PROFILE_TICK_BITS));
 }
 
 // lava defines `PROFILING` with its `profiling` feature; without it the clocks aren't compiled.

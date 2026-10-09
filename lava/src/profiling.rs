@@ -62,13 +62,15 @@ const FLAG_WORDS: usize = 8;
 const STAGES: [&str; 4] = ["compute", "task", "mesh", "vertex"];
 const STRIPES: usize = 64;
 const STRIPE_WORDS: usize = 8;
+/// A counter holds the ticks in its low bits and the subgroups above them.
+const TICK_BITS: u32 = 40;
 
 /// The buffer `profile.slang` adds to, in descriptor set 2. Word 0 counts the profiling
 /// `FrameQueries`; the shaders skip their atomics while it is 0.
 static COUNTERS: OnceLock<Buffer<u64>> = OnceLock::new();
-/// Per pass and stage, the ticks and subgroups at the last read. Shared by all frame slots,
-/// since the counters only grow.
-static LAST_READ: Mutex<Vec<[u64; 2]>> = Mutex::new(Vec::new());
+/// Per pass and stage, the sum of its stripes' counters at the last read. Shared by all frame
+/// slots, since the counters only grow.
+static LAST_READ: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 fn counter(index: usize) -> &'static AtomicU64 {
     let counters = COUNTERS.get().expect("shader clocks are initialised");
@@ -102,17 +104,19 @@ fn read_shader_clocks() -> Vec<ShaderTime> {
         return Vec::new();
     }
     let mut last = LAST_READ.lock().unwrap();
-    last.resize(PASS_MAP.len() * STAGES.len(), [0; 2]);
+    last.resize(PASS_MAP.len() * STAGES.len(), 0);
     let mut times = Vec::new();
     for (slot, last) in last.iter_mut().enumerate() {
-        let mut now = [0; 2];
+        let mut now = 0u64;
         for stripe in 0..STRIPES {
             let base = FLAG_WORDS + (slot * STRIPES + stripe) * STRIPE_WORDS;
-            now[0] += counter(base).load(Ordering::Relaxed);
-            now[1] += counter(base + 1).load(Ordering::Relaxed);
+            now = now.wrapping_add(counter(base).load(Ordering::Relaxed));
         }
-        let (ticks, subgroups) = (now[0] - last[0], now[1] - last[1]);
+        // The sums wrap, but the difference is exact while the ticks since the last read fit
+        // `TICK_BITS` and the subgroups the bits above.
+        let since = now.wrapping_sub(*last);
         *last = now;
+        let (ticks, subgroups) = (since & ((1 << TICK_BITS) - 1), since >> TICK_BITS);
         if subgroups > 0 {
             times.push(ShaderTime {
                 pass: PASS_MAP[slot / STAGES.len()].name,

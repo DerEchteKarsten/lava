@@ -21,6 +21,8 @@ pub struct ColorAttachmentSampled;
 pub struct DepthAttachmentSampled;
 #[derive(Clone, Copy, Debug)]
 pub struct SampledStorage;
+#[derive(Clone, Copy, Debug)]
+pub struct ColorAttachmentSampledStorage;
 
 impl ImageUsage for Sampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;
@@ -55,6 +57,13 @@ impl ImageUsage for SampledStorage {
         vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::STORAGE.as_raw(),
     );
 }
+impl ImageUsage for ColorAttachmentSampledStorage {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+        vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+            | vk::ImageUsageFlags::SAMPLED.as_raw()
+            | vk::ImageUsageFlags::STORAGE.as_raw(),
+    );
+}
 
 pub trait IsSampled: ImageUsage {}
 pub trait IsStorage: ImageUsage {}
@@ -65,14 +74,17 @@ impl IsSampled for Sampled {}
 impl IsSampled for ColorAttachmentSampled {}
 impl IsSampled for DepthAttachmentSampled {}
 impl IsSampled for SampledStorage {}
+impl IsSampled for ColorAttachmentSampledStorage {}
 
 impl IsStorage for Storage {}
 impl IsStorage for ColorAttachmentStorage {}
 impl IsStorage for SampledStorage {}
+impl IsStorage for ColorAttachmentSampledStorage {}
 
 impl IsColorAttachment for ColorAttachment {}
 impl IsColorAttachment for ColorAttachmentSampled {}
 impl IsColorAttachment for ColorAttachmentStorage {}
+impl IsColorAttachment for ColorAttachmentSampledStorage {}
 
 impl IsDepthAttachment for DepthAttachment {}
 impl IsDepthAttachment for DepthAttachmentSampled {}
@@ -92,6 +104,7 @@ impl StorageBinding for Storage {}
 impl StorageBinding for ColorAttachmentStorage {}
 
 impl UnifiedBinding for SampledStorage {}
+impl UnifiedBinding for ColorAttachmentSampledStorage {}
 
 #[cfg(test)]
 mod tests {
@@ -111,6 +124,10 @@ mod tests {
             F::DEPTH_STENCIL_ATTACHMENT | F::SAMPLED
         );
         assert_eq!(SampledStorage::VK, F::SAMPLED | F::STORAGE);
+        assert_eq!(
+            ColorAttachmentSampledStorage::VK,
+            F::COLOR_ATTACHMENT | F::SAMPLED | F::STORAGE
+        );
     }
 
     #[test]
@@ -132,6 +149,7 @@ mod tests {
             sampled::<ColorAttachmentSampled>(),
             sampled::<DepthAttachmentSampled>(),
             sampled::<SampledStorage>(),
+            sampled::<ColorAttachmentSampledStorage>(),
         ] {
             assert!(flags.contains(F::SAMPLED));
         }
@@ -139,6 +157,7 @@ mod tests {
             storage::<Storage>(),
             storage::<ColorAttachmentStorage>(),
             storage::<SampledStorage>(),
+            storage::<ColorAttachmentSampledStorage>(),
         ] {
             assert!(flags.contains(F::STORAGE));
         }
@@ -146,6 +165,7 @@ mod tests {
             color::<ColorAttachment>(),
             color::<ColorAttachmentSampled>(),
             color::<ColorAttachmentStorage>(),
+            color::<ColorAttachmentSampledStorage>(),
         ] {
             assert!(flags.contains(F::COLOR_ATTACHMENT));
         }
