@@ -2,7 +2,7 @@
 //!
 //! These run on the real GPU with the validation layer on; every test fails if the layer
 //! reports an error. The passes come from `lava/tests/shaders`, not from the engine.
-// Needed to call `RasterBuilder`'s draw methods, whose return type is `{ N + 1 }`.
+// Needed to call `RasterBuilder`'s attachment and draw methods, which return it one larger.
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 mod common;
@@ -944,7 +944,7 @@ fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<kind::RasterVertex> 
     TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
 }
 
-fn unculled() -> RasterState {
+fn unculled() -> RasterState<1> {
     RasterState::default().backface_culling(false)
 }
 

@@ -1,5 +1,5 @@
 //! Lava: typed, bindless Vulkan abstraction over ash with shader-generated passes
-// `RasterBuilder` grows its array of draws by one per draw.
+// `RasterBuilder` grows its arrays of draws and color attachments by one per call.
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 #![feature(const_trait_impl)]

@@ -574,8 +574,10 @@ pub struct RasterHash {
     color_formats: SmallVec<[vk::Format; 4]>,
     depth_format: vk::Format,
     stencil_format: vk::Format,
-    /// With one blend per color attachment.
-    state: RasterState,
+    blends: SmallVec<[Blend; 4]>,
+    depth_write: bool,
+    backface_culling: bool,
+    wire_frame: bool,
     /// Zeros for a pass without specialization constants.
     constants: Constants,
 }
@@ -672,7 +674,6 @@ fn create_raster_pipeline(
         .sample_mask(&[]);
 
     let color_blend_attachments = hash
-        .state
         .blends
         .iter()
         .map(|blend| {
@@ -714,12 +715,12 @@ fn create_raster_pipeline(
         .depth_clamp_enable(false)
         .rasterizer_discard_enable(false)
         .line_width(1.0)
-        .polygon_mode(if hash.state.wire_frame {
+        .polygon_mode(if hash.wire_frame {
             vk::PolygonMode::LINE
         } else {
             vk::PolygonMode::FILL
         })
-        .cull_mode(if hash.state.backface_culling {
+        .cull_mode(if hash.backface_culling {
             vk::CullModeFlags::BACK
         } else {
             vk::CullModeFlags::NONE
@@ -731,7 +732,7 @@ fn create_raster_pipeline(
             .depth_bounds_test_enable(false)
             .depth_compare_op(vk::CompareOp::GREATER)
             .depth_test_enable(true)
-            .depth_write_enable(hash.state.depth_write)
+            .depth_write_enable(hash.depth_write)
             .min_depth_bounds(1.0)
             .max_depth_bounds(0.0)
             .stencil_test_enable(false)
@@ -913,23 +914,23 @@ pub enum Filter {
     Liniear = 1,
 }
 
-/// One rendering being built: its attachments and its `N` draws so far, which [`Self::record`]
-/// records.
-pub struct RasterBuilder<'a, const N: usize> {
+/// One rendering being built: its `COLOR_ATTACHMENTS` and its `DRAWS` so far, which
+/// [`Self::record`] records.
+pub struct RasterBuilder<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize> {
     cmd_buf: &'a mut CommandBuffer,
     extent: UVec2,
     viewport: Viewport,
     scissors: SmallVec<[vk::Rect2D; 1]>,
-    color_formats: SmallVec<[vk::Format; 4]>,
-    color_attachments: SmallVec<[(vk::ImageView, Option<vk::ClearValue>); 4]>,
-    color_accesses: SmallVec<[ImageAccess; 4]>,
+    color_formats: [vk::Format; COLOR_ATTACHMENTS],
+    color_attachments: [(vk::ImageView, Option<vk::ClearValue>); COLOR_ATTACHMENTS],
+    color_accesses: [ImageAccess; COLOR_ATTACHMENTS],
     depth_format: vk::Format,
     stencil_format: vk::Format,
     depth_attachment: vk::ImageView,
     /// Only a read; [`Self::depth_access`] adds the write.
     depth_access: Option<ImageAccess>,
     clear_depth: Option<vk::ClearValue>,
-    draws: [Draw; N],
+    draws: [Draw<COLOR_ATTACHMENTS>; DRAWS],
 }
 
 /// How a color attachment combines a fragment's output `src` with the stored value `dst`.
@@ -947,20 +948,19 @@ pub enum Blend {
     Skip,
 }
 
-/// The pipeline state of one draw.
+/// The pipeline state of one draw into `COLOR_ATTACHMENTS` color attachments.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RasterState {
-    /// Empty means [`Blend::Replace`] on every attachment.
-    blends: SmallVec<[Blend; 4]>,
+pub struct RasterState<const COLOR_ATTACHMENTS: usize> {
+    blends: [Blend; COLOR_ATTACHMENTS],
     depth_write: bool,
     backface_culling: bool,
     wire_frame: bool,
 }
 
-impl Default for RasterState {
+impl<const COLOR_ATTACHMENTS: usize> Default for RasterState<COLOR_ATTACHMENTS> {
     fn default() -> Self {
         Self {
-            blends: SmallVec::new(),
+            blends: [Blend::Replace; COLOR_ATTACHMENTS],
             depth_write: true,
             backface_culling: true,
             wire_frame: false,
@@ -968,10 +968,10 @@ impl Default for RasterState {
     }
 }
 
-impl RasterState {
+impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
     /// One blend per color attachment, in attachment order.
-    pub fn blends(mut self, blends: impl IntoIterator<Item = Blend>) -> Self {
-        self.blends = blends.into_iter().collect();
+    pub fn blends(mut self, blends: [Blend; COLOR_ATTACHMENTS]) -> Self {
+        self.blends = blends;
         self
     }
 
@@ -992,13 +992,13 @@ impl RasterState {
     }
 }
 
-struct Draw {
+struct Draw<const COLOR_ATTACHMENTS: usize> {
     bindings: BindingOutput<()>,
     command: DrawCommand,
-    state: RasterState,
+    state: RasterState<COLOR_ATTACHMENTS>,
 }
 
-enum DrawCommand {
+pub(crate) enum DrawCommand {
     Draw {
         vertices: u32,
         instances: u32,
@@ -1071,34 +1071,58 @@ fn rect(offset: IVec2, extent: UVec2) -> vk::Rect2D {
     }
 }
 
-impl<'a, const N: usize> RasterBuilder<'a, N> {
+/// `array` with `item` added at the end.
+fn append<T, const N: usize>(array: [T; N], item: T) -> [T; N + 1] {
+    let mut items = array.into_iter().chain(iter::once(item));
+    std::array::from_fn(|_| items.next().unwrap())
+}
+
+impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS> {
+    /// Color attachments come before the draws, since every draw has a blend for each.
     pub fn color_attachment<F: Format, U>(
-        mut self,
+        self,
         image: ImageView<'a, F, U>,
         clear: Option<F::Texels>,
-    ) -> Self
+    ) -> RasterBuilder<'a, 0, { COLOR_ATTACHMENTS + 1 }>
     where
         U: IsColorAttachment,
         F: ColorAspect,
     {
         assert!(F::ASPECTS.contains(vk::ImageAspectFlags::COLOR));
-        self.color_formats.push(F::format());
-        let no_clear = clear.is_none();
-        self.color_attachments
-            .push((image.view, clear.map(|e| F::clear_value(e))));
-        self.color_accesses.push(image.access(
+        let access = image.access(
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                | if no_clear {
+                | if clear.is_none() {
                     vk::AccessFlags2::COLOR_ATTACHMENT_READ
                 } else {
                     vk::AccessFlags2::empty()
                 },
             ATTACHMENT_LAYOUT,
-        ));
-        self
+        );
+        RasterBuilder {
+            cmd_buf: self.cmd_buf,
+            extent: self.extent,
+            viewport: self.viewport,
+            scissors: self.scissors,
+            color_formats: append(self.color_formats, F::format()),
+            color_attachments: append(
+                self.color_attachments,
+                (image.view, clear.map(|e| F::clear_value(e))),
+            ),
+            color_accesses: append(self.color_accesses, access),
+            depth_format: self.depth_format,
+            stencil_format: self.stencil_format,
+            depth_attachment: self.depth_attachment,
+            depth_access: self.depth_access,
+            clear_depth: self.clear_depth,
+            draws: [],
+        }
     }
+}
 
+impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
+    RasterBuilder<'a, DRAWS, COLOR_ATTACHMENTS>
+{
     /// Depth-tests the draws against `image` (nearer = greater). `clear` resets the depth first.
     pub fn depth_attachment<'b, F: Format, U>(
         mut self,
@@ -1142,8 +1166,8 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         bindings: BindingOutput<kind::RasterVertex>,
         vertices: u32,
         instances: u32,
-        state: RasterState,
-    ) -> RasterBuilder<'a, { N + 1 }> {
+        state: RasterState<COLOR_ATTACHMENTS>,
+    ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         let command = DrawCommand::Draw {
             vertices,
             instances,
@@ -1156,8 +1180,8 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         bindings: BindingOutput<kind::RasterVertex>,
         index_buffer: BufferSlice<'a, u32, IDX>,
         instances: u32,
-        state: RasterState,
-    ) -> RasterBuilder<'a, { N + 1 }> {
+        state: RasterState<COLOR_ATTACHMENTS>,
+    ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         let mut bindings = bindings.erase();
         bindings.buffers.push(index_buffer.access(
             vk::PipelineStageFlags2::INDEX_INPUT,
@@ -1176,8 +1200,8 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         self,
         bindings: BindingOutput<kind::RasterVertex>,
         buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
-        state: RasterState,
-    ) -> RasterBuilder<'a, { N + 1 }> {
+        state: RasterState<COLOR_ATTACHMENTS>,
+    ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         let mut bindings = bindings.erase();
         bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::Indirect {
@@ -1193,8 +1217,8 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         bindings: BindingOutput<kind::RasterVertex>,
         buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
         count_buffer: BufferSlice<'a, u32, CNT>,
-        state: RasterState,
-    ) -> RasterBuilder<'a, { N + 1 }> {
+        state: RasterState<COLOR_ATTACHMENTS>,
+    ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         let mut bindings = bindings.erase();
         bindings.buffers.push(indirect_access(buffer));
         bindings.buffers.push(indirect_access(count_buffer));
@@ -1212,8 +1236,8 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         self,
         bindings: BindingOutput<kind::RasterMesh>,
         groups: [u32; 3],
-        state: RasterState,
-    ) -> RasterBuilder<'a, { N + 1 }> {
+        state: RasterState<COLOR_ATTACHMENTS>,
+    ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         self.push(bindings.erase(), DrawCommand::Launch(groups), state)
     }
 
@@ -1222,8 +1246,8 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         self,
         bindings: BindingOutput<kind::RasterMesh>,
         buffer: BufferSlice<'a, DispatchIndirectCommand, IND>,
-        state: RasterState,
-    ) -> RasterBuilder<'a, { N + 1 }> {
+        state: RasterState<COLOR_ATTACHMENTS>,
+    ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         let mut bindings = bindings.erase();
         bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::LaunchIndirect {
@@ -1238,16 +1262,15 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         self,
         bindings: BindingOutput<()>,
         command: DrawCommand,
-        state: RasterState,
-    ) -> RasterBuilder<'a, { N + 1 }> {
+        state: RasterState<COLOR_ATTACHMENTS>,
+    ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         let draw = Draw {
             bindings,
             command,
             state,
         };
-        let mut draws = self.draws.into_iter().chain(iter::once(draw));
         RasterBuilder {
-            draws: std::array::from_fn(|_| draws.next().expect("one draw per slot")),
+            draws: append(self.draws, draw),
             cmd_buf: self.cmd_buf,
             extent: self.extent,
             viewport: self.viewport,
@@ -1273,21 +1296,19 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
     }
 
     /// The pipeline key of a draw with `state` in this rendering.
-    fn pipeline_key(&self, state: &RasterState, constants: &Constants) -> RasterHash {
-        let mut state = state.clone();
-        if state.blends.is_empty() {
-            state.blends = smallvec![Blend::Replace; self.color_formats.len()];
-        }
-        assert_eq!(
-            state.blends.len(),
-            self.color_formats.len(),
-            "a draw needs one blend per color attachment"
-        );
+    fn pipeline_key(
+        &self,
+        state: &RasterState<COLOR_ATTACHMENTS>,
+        constants: &Constants,
+    ) -> RasterHash {
         RasterHash {
-            color_formats: self.color_formats.clone(),
+            color_formats: SmallVec::from_slice(&self.color_formats),
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
-            state,
+            blends: SmallVec::from_slice(&state.blends),
+            depth_write: state.depth_write,
+            backface_culling: state.backface_culling,
+            wire_frame: state.wire_frame,
             constants: *constants,
         }
     }
@@ -1311,24 +1332,20 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
                 .flat_map(|draw| draw.bindings.buffers.iter()),
         );
 
-        let color_attachments = self
-            .color_attachments
-            .iter()
-            .map(|e| {
-                let ret = vk::RenderingAttachmentInfo::default()
-                    .image_layout(ATTACHMENT_LAYOUT)
-                    .image_view(e.0)
-                    .store_op(vk::AttachmentStoreOp::STORE);
-                if let Some(clear_value) = e.1 {
-                    ret.clear_value(clear_value)
-                        .load_op(vk::AttachmentLoadOp::CLEAR)
-                } else {
-                    ret.load_op(vk::AttachmentLoadOp::LOAD)
-                }
-            })
-            .collect::<SmallVec<[_; 4]>>();
+        let color_attachments = self.color_attachments.map(|(view, clear)| {
+            let ret = vk::RenderingAttachmentInfo::default()
+                .image_layout(ATTACHMENT_LAYOUT)
+                .image_view(view)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            if let Some(clear_value) = clear {
+                ret.clear_value(clear_value)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+            } else {
+                ret.load_op(vk::AttachmentLoadOp::LOAD)
+            }
+        });
         let mut rendering_info = vk::RenderingInfo::default()
-            .color_attachments(color_attachments.as_slice())
+            .color_attachments(&color_attachments)
             .layer_count(1)
             .render_area(rect(IVec2::ZERO, self.extent))
             .view_mask(0);
@@ -1703,7 +1720,7 @@ impl CommandBuffer {
     }
 
     /// Starts a rendering of the area `extent`, with viewport and scissor covering it.
-    pub fn raster(&mut self, extent: UVec2) -> RasterBuilder<'_, 0> {
+    pub fn raster(&mut self, extent: UVec2) -> RasterBuilder<'_, 0, 0> {
         RasterBuilder {
             cmd_buf: self,
             extent,
@@ -1712,9 +1729,9 @@ impl CommandBuffer {
                 extent,
             },
             scissors: smallvec![rect(IVec2::ZERO, extent)],
-            color_formats: SmallVec::new(),
-            color_attachments: SmallVec::new(),
-            color_accesses: SmallVec::new(),
+            color_formats: [],
+            color_attachments: [],
+            color_accesses: [],
             depth_format: vk::Format::UNDEFINED,
             stencil_format: vk::Format::UNDEFINED,
             depth_attachment: vk::ImageView::null(),
@@ -2777,11 +2794,11 @@ mod tests {
 
     #[test]
     fn raster_state_defaults_to_filled_backface_culled_depth_writing_draws() {
-        let state = RasterState::default();
+        let state = RasterState::<2>::default();
         assert!(state.backface_culling);
         assert!(!state.wire_frame);
         assert!(state.depth_write);
-        assert!(state.blends.is_empty());
+        assert_eq!(state.blends, [Blend::Replace; 2]);
     }
 
     const NO_CONSTANTS: Constants = [0; MAX_SPECIALIZATION_CONSTANTS_SIZE];
@@ -2795,9 +2812,9 @@ mod tests {
             .wire_frame(true)
             .depth_write(false);
         let key = builder.pipeline_key(&state, &NO_CONSTANTS);
-        assert!(!key.state.backface_culling);
-        assert!(key.state.wire_frame);
-        assert!(!key.state.depth_write);
+        assert!(!key.backface_culling);
+        assert!(key.wire_frame);
+        assert!(!key.depth_write);
         assert_ne!(
             key,
             builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS),
@@ -2834,24 +2851,9 @@ mod tests {
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&a), None)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&b), None);
         let key = builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS);
-        assert_eq!(key.state.blends.as_slice(), [Blend::Replace; 2]);
+        assert_eq!(key.blends.as_slice(), [Blend::Replace; 2]);
         let explicit = RasterState::default().blends([Blend::Replace; 2]);
         assert_eq!(key, builder.pipeline_key(&explicit, &NO_CONSTANTS));
-    }
-
-    #[test]
-    #[should_panic(expected = "one blend per color attachment")]
-    fn blends_have_to_name_every_attachment() {
-        let (a, b) = (layout(L::UNDEFINED), layout(L::UNDEFINED));
-        let mut cmd = offline_cmd();
-        let builder = cmd
-            .raster(EXTENT)
-            .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&a), None)
-            .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&b), None);
-        builder.pipeline_key(
-            &RasterState::default().blends([Blend::Alpha]),
-            &NO_CONSTANTS,
-        );
     }
 
     #[test]
