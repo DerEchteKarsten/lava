@@ -8,7 +8,7 @@ use std::{
 
 use shader_slang::{
     self as slang, ParameterCategory as Cat, ScalarType, Stage, TypeKind,
-    reflection::{TypeLayout, VariableLayout},
+    reflection::{TypeLayout, VariableLayout, compute_string_hash},
 };
 
 #[path = "src/slang_compile.rs"]
@@ -351,18 +351,42 @@ struct SConst<'a> {
     name: String,
     id: u32,
     layout: &'a TypeLayout,
+    /// The value of one of lava's own constants, which `constant_bindings` sets without a
+    /// parameter.
+    value: Option<u32>,
 }
 
 /// The pass's specialization constants by id. `SCONST(T, name)` (`bindless.slang`) declares a
 /// `uint64_t name_sconst` whose `SConst` attribute names `T`, a buffer or image handle; any
-/// other one is a plain scalar.
-fn sconsts<'a>(layout: &'a slang::reflection::Shader, file: &str) -> Vec<SConst<'a>> {
+/// other one is a plain scalar. `CLOCK_REGION_IDS` (`profile.slang`) get the hashes of the
+/// pass's clock `regions`.
+fn sconsts<'a>(
+    layout: &'a slang::reflection::Shader,
+    file: &str,
+    regions: &[String],
+) -> Vec<SConst<'a>> {
+    let clock_ids = slang_compile::CLOCK_REGION_IDS;
+    assert!(
+        regions.len() <= clock_ids.len(),
+        "{file} has {} clock regions, at most {} fit",
+        regions.len(),
+        clock_ids.len()
+    );
     let mut consts: Vec<SConst> = layout
         .parameters()
         .filter(|p| p.category() == Some(Cat::SpecializationConstant))
         .map(|p| (p, p.offset(Cat::SpecializationConstant) as u32))
         .map(|(p, id)| {
             let name = field_name(p);
+            if clock_ids.contains(&id) {
+                let region = regions.get((id - clock_ids.start) as usize);
+                return SConst {
+                    name: name.to_lowercase(),
+                    id,
+                    layout: p.type_layout().unwrap(),
+                    value: Some(region.map_or(0, |name| compute_string_hash(name))),
+                };
+            }
             let attribute = p
                 .variable()
                 .and_then(|v| v.user_attributes().find(|a| a.name() == Some("SConst")));
@@ -371,6 +395,7 @@ fn sconsts<'a>(layout: &'a slang::reflection::Shader, file: &str) -> Vec<SConst<
                     name: name.to_string(),
                     id,
                     layout: p.type_layout().unwrap(),
+                    value: None,
                 };
             };
             let ty = attribute.argument_value_string(0).unwrap();
@@ -389,6 +414,7 @@ fn sconsts<'a>(layout: &'a slang::reflection::Shader, file: &str) -> Vec<SConst<
                 name: name.trim_end_matches("_sconst").to_string(),
                 id,
                 layout,
+                value: None,
             }
         })
         .collect();
@@ -434,6 +460,7 @@ fn generate_pass(
     pass_name: &str,
     pc: &TypeLayout,
     consts: &[SConst],
+    regions: &[String],
     entries: &[(&'static str, String)],
     structs: &mut Structs,
     pass_map: &mut Vec<String>,
@@ -519,6 +546,7 @@ fn generate_pass(
         index: {pipeline_index},
         constants: {constants},
         constants_size: {constants_size},
+        regions: &{regions:?},
     }},"#
     ));
 
@@ -588,11 +616,14 @@ impl {pass_name} {{
     let (mut images, mut buffers) = (push.image_accesses.len(), push.buffer_accesses.len());
 
     if !consts.is_empty() {
+        let parameters = consts.iter().filter(|c| c.value.is_none());
         let new = build_new_fn(
-            consts.iter().map(|c| (c.name.as_str(), c.layout)),
+            parameters.map(|c| (c.name.as_str(), c.layout)),
             structs,
             stage,
         );
+        let baked = consts.iter().filter_map(|c| Some(format!("{}: {:#x}", c.name, c.value?)));
+        let gpu_inits: Vec<String> = new.gpu_inits.iter().cloned().chain(baked).collect();
         let fields: Vec<String> = consts
             .iter()
             .map(|c| format!("    pub {}: {},", c.name, gpu_type(c.layout, structs)))
@@ -630,7 +661,7 @@ impl {incomplete} {{
             fields = fields.join("\n"),
             generics = fn_generics(&new),
             params = new.params.join(", "),
-            gpu_inits = new.gpu_inits.join(", "),
+            gpu_inits = gpu_inits.join(", "),
             image_accesses = new.image_accesses.join(",\n"),
             buffer_accesses = new.buffer_accesses.join(",\n"),
         ));
@@ -787,13 +818,15 @@ use std::str::FromStr;
             .and_then(|t| t.element_type_layout())
             .unwrap_or_else(|| panic!("no push constant buffer found in {file}"));
 
-        let consts = sconsts(layout, file);
+        let regions = slang_compile::clock_regions(&program);
+        let consts = sconsts(layout, file, &regions);
 
         let out = passes_dir.join(format!("{pass_name}.spv"));
         let pass = generate_pass(
             &pass_name,
             pc,
             &consts,
+            &regions,
             &entries,
             &mut structs,
             &mut pass_map,

@@ -16,7 +16,7 @@ struct TestComputeImageBindings {
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void test_compute_image(uint2 dtid: SV_DispatchThreadID) {
-    PROFILE(PROFILE_COMPUTE);
+    CLOCK_REGION("fill");
     if (any(dtid >= b.size)) {
         return;
     }

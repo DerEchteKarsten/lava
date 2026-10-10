@@ -115,6 +115,9 @@ pub struct PassEntry {
     /// Where each specialization constant sits in `BindingOutput::constants`.
     pub constants: &'static [vk::SpecializationMapEntry],
     pub constants_size: usize,
+    /// The names of its shader clock regions (`CLOCK_REGION` in `profile.slang`) in slot
+    /// order, whose hashes its `constant_bindings` sets. New names need a `cargo build`.
+    pub regions: &'static [&'static str],
 }
 
 static PIPELINES: OnceLock<PipelineManager> = OnceLock::new();
@@ -304,11 +307,11 @@ impl PipelineManager {
                 let mut pipelines = self.specialized_compute_pipelines.write().unwrap();
                 for (constants, pipeline) in pipelines[pass.index].iter_mut() {
                     let new = create_compute_pipeline(
-                        module,
-                        entry,
-                        pass.constants,
-                        &constants[..pass.constants_size],
-                    );
+                module,
+                entry,
+                pass.constants,
+                &constants[..pass.constants_size],
+            );
                     retired.push(RetiredPipeline {
                         pipeline: std::mem::replace(pipeline, new),
                         _sbt: None,
@@ -348,8 +351,14 @@ impl PipelineManager {
                 ray_closest,
                 ray_gen,
             } => {
-                let pipeline =
-                    create_raytracing_pipeline(module, ray_any, ray_closest, ray_gen, &[], &[]);
+                let pipeline = create_raytracing_pipeline(
+                    module,
+                    ray_any,
+                    ray_closest,
+                    ray_gen,
+                    &[],
+                    &[],
+                );
                 let mut pipelines = self.raytracing_pipelines.write().unwrap();
                 if let Some(old) = pipelines[pass.index].replace(pipeline) {
                     retired.push(RetiredPipeline::ray_tracing(old));
@@ -3129,6 +3138,7 @@ mod tests {
             index: 0,
             constants: &[],
             constants_size: 0,
+            regions: &[],
         }
     }
 
@@ -3452,7 +3462,8 @@ mod tests {
                 glam::Vec4::ONE,
                 UVec2::ZERO,
                 UVec2::new(8, 8),
-            );
+            )
+            .constant_bindings();
             let constants: CTestComputeImageBindings = push_constants(&bindings);
             assert_eq!(constants.target.descriptor_index_set1, 5);
             let [access] = bindings.images.as_slice() else {

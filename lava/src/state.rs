@@ -211,6 +211,12 @@ impl Ctx {
                 } else {
                     None
                 },
+                performance_query: features.performance_query.then(|| {
+                    (
+                        ash::khr::performance_query::Instance::new(&entry, &instance),
+                        ash::khr::performance_query::Device::new(&instance, &device),
+                    )
+                }),
                 raytracing_pipeline: if features.raytracing {
                     Some(ash::khr::ray_tracing_pipeline::Device::new(
                         &instance, &device,
@@ -351,9 +357,13 @@ pub struct Features {
     pub mesh_queries: bool,
     /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
     pub memory_budget: bool,
-    /// `VK_KHR_shader_clock` with subgroup clocks, which `profile.slang` reads. Shaders that
-    /// use `PROFILE` need it; only enabled with the `profiling` feature.
+    /// `VK_KHR_shader_clock` with subgroup clocks, which `profile.slang` reads. Passes with
+    /// `USE_CLOCKS` need it; only enabled with the `profiling` feature.
     pub shader_clock: bool,
+    /// `VK_KHR_performance_query` with query pools, for the hardware counters of
+    /// `profiling::counters`; only enabled with the `profiling` feature. Also enables host query
+    /// reset, since a counter pool may not be reset in a command buffer that uses it.
+    pub performance_query: bool,
 }
 impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
@@ -382,6 +392,9 @@ impl Features {
         if self.shader_clock {
             extensions.push(ash::khr::shader_clock::NAME);
         }
+        if self.performance_query {
+            extensions.push(ash::khr::performance_query::NAME);
+        }
         if self.raytracing {
             extensions.push(ash::khr::ray_tracing_pipeline::NAME);
             extensions.push(ash::khr::deferred_host_operations::NAME);
@@ -402,6 +415,7 @@ impl Features {
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
         host_image_copy: &'a mut vk::PhysicalDeviceHostImageCopyFeaturesEXT,
         clock: &'a mut vk::PhysicalDeviceShaderClockFeaturesKHR,
+        performance: &'a mut vk::PhysicalDevicePerformanceQueryFeaturesKHR,
     ) -> vk::PhysicalDeviceFeatures2<'a> {
         *vk11 = vk11.shader_draw_parameters(true);
         *vk12 = vk12
@@ -425,7 +439,8 @@ impl Features {
             .vulkan_memory_model_device_scope(true)
             .storage_buffer8_bit_access(true)
             .shader_buffer_int64_atomics(true)
-            .shader_int8(true);
+            .shader_int8(true)
+            .host_query_reset(self.performance_query);
         *vk13 = vk13
             .dynamic_rendering(true)
             .maintenance4(true)
@@ -473,6 +488,10 @@ impl Features {
             *clock = clock.shader_subgroup_clock(true);
             features = features.push_next(clock);
         }
+        if self.performance_query {
+            *performance = performance.performance_counter_query_pools(true);
+            features = features.push_next(performance);
+        }
         if self.raytracing {
             *ray = ray.ray_tracing_pipeline(true);
             *acc = acc
@@ -493,6 +512,10 @@ pub struct Functions {
     debug_utils: Option<ash::ext::debug_utils::Instance>,
     device_debug_utils: Option<ash::ext::debug_utils::Device>,
     mesh: Option<ash::ext::mesh_shader::Device>,
+    performance_query: Option<(
+        ash::khr::performance_query::Instance,
+        ash::khr::performance_query::Device,
+    )>,
     raytracing_pipeline: Option<ash::khr::ray_tracing_pipeline::Device>,
     acceleration_structure: Option<ash::khr::acceleration_structure::Device>,
 }
@@ -526,6 +549,12 @@ impl Functions {
     }
     pub(crate) fn instance_debug_utils() -> Option<&'static ash::ext::debug_utils::Instance> {
         get().debug_utils.as_ref()
+    }
+    pub(crate) fn performance_query() -> Option<&'static (
+        ash::khr::performance_query::Instance,
+        ash::khr::performance_query::Device,
+    )> {
+        get().performance_query.as_ref()
     }
     pub(crate) fn mesh() -> Option<&'static ash::ext::mesh_shader::Device> {
         get().mesh.as_ref()
@@ -629,6 +658,7 @@ pub(super) fn create_device(
         mut host_image_copy,
         mut clock,
     ) = Default::default();
+    let mut performance = Default::default();
     let mut features = features.features(
         &mut vk11,
         &mut vk12,
@@ -640,6 +670,7 @@ pub(super) fn create_device(
         &mut acc,
         &mut host_image_copy,
         &mut clock,
+        &mut performance,
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
@@ -715,6 +746,13 @@ mod tests {
         );
         assert_eq!(
             only(Features {
+                performance_query: true,
+                ..Default::default()
+            }),
+            ["VK_KHR_performance_query"]
+        );
+        assert_eq!(
+            only(Features {
                 device_debug_utils: true,
                 ..Default::default()
             }),
@@ -753,10 +791,10 @@ mod tests {
     ) {
         let (mut vk11, mut vk12, mut vk13, mut dn3, mut dy2, mut mesh, mut ray, mut acc, mut hic) =
             Default::default();
-        let mut clock = Default::default();
+        let (mut clock, mut performance) = Default::default();
         features.features(
             &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
-            &mut hic, &mut clock,
+            &mut hic, &mut clock, &mut performance,
         );
         // Detach the copies from the pNext chain that borrowed them.
         vk12.p_next = std::ptr::null_mut();

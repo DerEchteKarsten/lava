@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use crate::{
     command_buffer::{self, BufferAccess, CommandBuffer, ImageAccess},
-    profiling::{FrameQueries, FrameTimings},
+    profiling::{self, FrameQueries, FrameTimings},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -341,10 +341,16 @@ impl FrameSlot {
             self.submitted = false;
             self.retired.clear();
         }
-        // The pools are idle now.
-        if !self.profiling {
+        // The pools are idle now. A new counter selection needs new ones.
+        if !self.profiling
+            || self
+                .queries
+                .as_ref()
+                .is_some_and(|queries| queries.generation != profiling::counters::generation())
+        {
             self.queries = None;
-        } else if self.queries.is_none() {
+        }
+        if self.profiling && self.queries.is_none() {
             self.queries = Some(FrameQueries::new(self.family)?);
         }
         let mut frame = Frame { slot: self };
@@ -364,8 +370,8 @@ impl Frame<'_> {
         self.slot.retired.push(Box::new(value));
     }
 
-    /// The GPU scopes and shader clock times of the frame this slot submitted before, if it
-    /// was profiled.
+    /// The GPU scopes, counters and shader clock regions of the frame this slot submitted
+    /// before, if it was profiled.
     pub fn last_timings(&self) -> Option<&FrameTimings> {
         self.slot.queries.as_ref()?.results()
     }

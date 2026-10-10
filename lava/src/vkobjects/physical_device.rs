@@ -103,6 +103,7 @@ impl PhysicalDevice {
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let mut clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
+        let mut performance = vk::PhysicalDevicePerformanceQueryFeaturesKHR::default();
         let mut rt_pipeline_properties =
             vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -112,7 +113,8 @@ impl PhysicalDevice {
             .push_next(&mut ray_tracing_feature)
             .push_next(&mut acceleration_struct_feature)
             .push_next(&mut mesh_shading)
-            .push_next(&mut clock);
+            .push_next(&mut clock)
+            .push_next(&mut performance);
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
         let pipeline_statistics = features2.features.pipeline_statistics_query == vk::TRUE;
 
@@ -146,6 +148,8 @@ impl PhysicalDevice {
             mesh_queries: mesh_shading.mesh_shader_queries == vk::TRUE,
             memory_budget: has_extension(ash::ext::memory_budget::NAME),
             shader_clock: clock.shader_subgroup_clock == vk::TRUE,
+            performance_query: has_extension(ash::khr::performance_query::NAME)
+                && performance.performance_counter_query_pools == vk::TRUE,
         };
 
         Ok(Self {
@@ -256,6 +260,8 @@ impl PhysicalDevice {
         features.memory_budget = device.supported_features.memory_budget;
         features.shader_clock =
             cfg!(feature = "profiling") && device.supported_features.shader_clock;
+        features.performance_query =
+            cfg!(feature = "profiling") && device.supported_features.performance_query;
         Ok((device.clone(), graphics, transfer_queue))
     }
 }
@@ -474,6 +480,7 @@ mod tests {
             mesh_queries: false,
             memory_budget: true,
             shader_clock: true,
+            performance_query: true,
         };
 
         // Without validation the device debug utils stay off, and `present` is the caller's.

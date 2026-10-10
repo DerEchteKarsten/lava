@@ -6,6 +6,10 @@ use shader_slang as slang;
 pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../shaders");
 /// Lava's own test passes, in `lava/tests/shaders`.
 pub const TEST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+/// The specialization constant ids of a pass's shader clock region hashes (`CLOCK_REGION_0..`
+/// in `profile.slang`). `build.rs` bakes their values into the pass's `constant_bindings`
+/// instead of making them parameters.
+pub const CLOCK_REGION_IDS: std::ops::Range<u32> = 901..909;
 
 /// How a pass compiles: the cargo features that matter, and which pass it is.
 pub struct Options {
@@ -48,6 +52,14 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
                 .options(&compiler),
         )
         .expect("failed to create a slang session")
+}
+
+/// The names of the clock regions in a linked pass: the strings it hashes, which only
+/// `CLOCK_REGION` does.
+#[allow(dead_code)]
+pub fn clock_regions(program: &slang::ComponentType) -> Vec<String> {
+    let layout = program.layout(0).expect("a linked pass has a layout");
+    layout.hashed_strings().map(str::to_string).collect()
 }
 
 /// The pass in `source` with all its entry points, linked.

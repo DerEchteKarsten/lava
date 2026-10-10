@@ -1,18 +1,21 @@
-//! GPU timestamp and pipeline-statistics queries per frame slot, and the shader clock counters that `profile.slang` fills
+//! GPU profiling per frame slot: timestamps, pipeline statistics and hardware counters per pass, shader clock regions, and GPU memory
 use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use ash::vk;
 
 use crate::{
-    bindings::PASS_MAP,
-    bindless::Bindless,
-    buffer::Buffer,
     error::Result,
     state::{Ctx, Functions},
 };
+
+pub mod clock;
+pub mod counters;
+
+pub use clock::RegionTime;
+pub use counters::{Counter, CounterUnit, MAX_COUNTERS};
 
 const TIMESTAMPS: u32 = 256;
 const STATISTICS: u32 = 128;
@@ -35,18 +38,8 @@ pub struct GpuScope {
     pub end_ns: u64,
     /// Only for passes, and only when the device supports pipeline statistics queries.
     pub stats: Option<PipelineStats>,
-}
-
-/// Subgroup clock ticks the shaders of one pass and stage spent since the frame before, as
-/// counted by `PROFILE` in the shader. Ticks are the device's own unit; only ratios between
-/// passes and stages are meaningful.
-#[derive(Clone, Debug)]
-pub struct ShaderTime {
-    pub pass: &'static str,
-    pub stage: &'static str,
-    /// Summed over all subgroups, which run in parallel, so it can exceed the frame.
-    pub ticks: u64,
-    pub subgroups: u64,
+    /// Only for passes and renderings: the values of `FrameTimings::counters`, in order.
+    pub counters: Option<[f64; MAX_COUNTERS]>,
 }
 
 /// What a profiled frame slot read back about the frame it submitted before.
@@ -54,79 +47,15 @@ pub struct ShaderTime {
 pub struct FrameTimings {
     /// The root scope "frame" first, then passes and `begin_scope` groups in recording order.
     pub scopes: Vec<GpuScope>,
-    pub shaders: Vec<ShaderTime>,
+    /// The counters the scopes' values belong to (`counters::selected_counters` when the
+    /// frame slot was created).
+    pub counters: Arc<[&'static Counter]>,
+    pub regions: Vec<RegionTime>,
 }
 
-/// Mirrors `profile.slang`.
-const FLAG_WORDS: usize = 8;
-const STAGES: [&str; 4] = ["compute", "task", "mesh", "vertex"];
-const STRIPES: usize = 64;
-const STRIPE_WORDS: usize = 8;
-/// A counter holds the ticks in its low bits and the subgroups above them.
-const TICK_BITS: u32 = 40;
-
-/// The buffer `profile.slang` adds to, in descriptor set 2. Word 0 counts the profiling
-/// `FrameQueries`; the shaders skip their atomics while it is 0.
-static COUNTERS: OnceLock<Buffer<u64>> = OnceLock::new();
-/// Per pass and stage, the sum of its stripes' counters at the last read. Shared by all frame
-/// slots, since the counters only grow.
-static LAST_READ: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-
-fn counter(index: usize) -> &'static AtomicU64 {
-    let counters = COUNTERS.get().expect("shader clocks are initialised");
-    unsafe { &*(counters.range(..).element_ptr(index) as *const AtomicU64) }
-}
-
-/// Creates the shader clock counters and binds them, if the device has subgroup clocks.
 pub(crate) fn init() -> Result<()> {
-    if !Ctx::features().shader_clock {
-        return Ok(());
-    }
-    let len = FLAG_WORDS + PASS_MAP.len() * STAGES.len() * STRIPES * STRIPE_WORDS;
-    let counters = Buffer::<u64>::new(len, true)?;
-    counters.range(..).copy_from(&vec![0; counters.len()]);
-    let info = [vk::DescriptorBufferInfo::default()
-        .buffer(counters.handle)
-        .range(vk::WHOLE_SIZE)];
-    let write = vk::WriteDescriptorSet::default()
-        .dst_set(Bindless::profile_set())
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&info);
-    unsafe { Ctx::device().update_descriptor_sets(&[write], &[]) };
-    let _ = COUNTERS.set(counters);
-    Ok(())
-}
-
-/// The ticks every pass and stage spent since the last call, from any frame slot.
-fn read_shader_clocks() -> Vec<ShaderTime> {
-    if COUNTERS.get().is_none() {
-        return Vec::new();
-    }
-    let mut last = LAST_READ.lock().unwrap();
-    last.resize(PASS_MAP.len() * STAGES.len(), 0);
-    let mut times = Vec::new();
-    for (slot, last) in last.iter_mut().enumerate() {
-        let mut now = 0u64;
-        for stripe in 0..STRIPES {
-            let base = FLAG_WORDS + (slot * STRIPES + stripe) * STRIPE_WORDS;
-            now = now.wrapping_add(counter(base).load(Ordering::Relaxed));
-        }
-        // The sums wrap, but the difference is exact while the ticks since the last read fit
-        // `TICK_BITS` and the subgroups the bits above.
-        let since = now.wrapping_sub(*last);
-        *last = now;
-        let (ticks, subgroups) = (since & ((1 << TICK_BITS) - 1), since >> TICK_BITS);
-        if subgroups > 0 {
-            times.push(ShaderTime {
-                pass: PASS_MAP[slot / STAGES.len()].name,
-                stage: STAGES[slot % STAGES.len()],
-                ticks,
-                subgroups,
-            });
-        }
-    }
-    times
+    clock::init()?;
+    counters::init()
 }
 
 struct Scope {
@@ -135,6 +64,15 @@ struct Scope {
     /// Its start timestamp; the end is the next one.
     timestamp: u32,
     statistic: Option<u32>,
+    performance: Option<u32>,
+}
+
+/// The counter query pool of a frame slot. It holds the profiling lock while it exists.
+struct Performance {
+    pool: vk::QueryPool,
+    counters: Arc<[&'static Counter]>,
+    /// Scratch for the results, one per counter and query.
+    results: Vec<vk::PerformanceCounterResultKHR>,
 }
 
 /// The query pools of one frame slot and the scopes recorded into them. A scope takes two
@@ -148,6 +86,10 @@ pub struct FrameQueries {
     open: Vec<Option<usize>>,
     next_timestamp: u32,
     next_statistic: u32,
+    performance: Option<Performance>,
+    next_performance: u32,
+    /// `counters::generation()` when this was created; a newer selection needs new pools.
+    pub(crate) generation: u64,
     results: FrameTimings,
 }
 
@@ -188,9 +130,42 @@ impl FrameQueries {
         let bits = Ctx::physical_device().queue_families[queue_family as usize]
             .handel
             .timestamp_valid_bits;
-        if COUNTERS.get().is_some() {
-            counter(0).fetch_add(1, Ordering::Relaxed);
-        }
+        let generation = counters::generation();
+        let selected = counters::selected_counters();
+        // Counters were enumerated for the graphics family; the profiling lock must be held
+        // from before the command buffer is begun until its queries are done.
+        let performance = if !selected.is_empty()
+            && queue_family == Ctx::gfx_queue_index()
+            && counters::acquire_lock()
+        {
+            let indices: Vec<u32> = selected.iter().map(|counter| counter.index).collect();
+            let mut info = vk::QueryPoolPerformanceCreateInfoKHR::default()
+                .queue_family_index(queue_family)
+                .counter_indices(&indices);
+            let pool = unsafe {
+                device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::PERFORMANCE_QUERY_KHR)
+                        .query_count(STATISTICS)
+                        .push_next(&mut info),
+                    None,
+                )
+            };
+            match pool {
+                Ok(pool) => Some(Performance {
+                    pool,
+                    results: Vec::with_capacity(STATISTICS as usize * selected.len()),
+                    counters: selected,
+                }),
+                Err(err) => {
+                    counters::release_lock();
+                    return Err(err.into());
+                }
+            }
+        } else {
+            None
+        };
+        clock::add_profiled_slots(1);
         Ok(Self {
             timestamps,
             statistics,
@@ -199,11 +174,20 @@ impl FrameQueries {
             open: Vec::new(),
             next_timestamp: 0,
             next_statistic: 0,
-            results: FrameTimings::default(),
+            results: FrameTimings {
+                counters: performance
+                    .as_ref()
+                    .map_or_else(|| Arc::new([]) as Arc<[_]>, |p| p.counters.clone()),
+                ..Default::default()
+            },
+            performance,
+            next_performance: 0,
+            generation,
         })
     }
 
-    /// Resets the pools at the start of a command buffer.
+    /// Resets the pools at the start of a command buffer. The counter pool is reset on the
+    /// host: a command buffer that begins its queries may not reset them.
     pub(crate) fn reset(&mut self, cmd: vk::CommandBuffer) {
         let device = Ctx::device();
         unsafe {
@@ -211,15 +195,19 @@ impl FrameQueries {
             if let Some(statistics) = self.statistics {
                 device.cmd_reset_query_pool(cmd, statistics, 0, STATISTICS);
             }
+            if let Some(performance) = &self.performance {
+                device.reset_query_pool(performance.pool, 0, STATISTICS);
+            }
         }
         self.scopes.clear();
         self.open.clear();
         self.next_timestamp = 0;
         self.next_statistic = 0;
+        self.next_performance = 0;
     }
 
-    /// Opens a scope; `statistics` also counts its invocations, so it must not contain
-    /// another scope with statistics.
+    /// Opens a scope; `statistics` also counts its invocations and reads the counters, so it
+    /// must not contain another scope with statistics.
     pub(crate) fn begin(&mut self, cmd: vk::CommandBuffer, name: &'static str, statistics: bool) {
         if self.next_timestamp + 2 > TIMESTAMPS {
             if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
@@ -237,6 +225,14 @@ impl FrameQueries {
                 self.next_statistic += 1;
                 self.next_statistic - 1
             });
+        let performance = self
+            .performance
+            .as_ref()
+            .filter(|_| statistics && self.next_performance < STATISTICS)
+            .map(|_| {
+                self.next_performance += 1;
+                self.next_performance - 1
+            });
         let device = Ctx::device();
         unsafe {
             device.cmd_write_timestamp2(
@@ -248,6 +244,14 @@ impl FrameQueries {
             if let (Some(pool), Some(query)) = (self.statistics, statistic) {
                 device.cmd_begin_query(cmd, pool, query, vk::QueryControlFlags::empty());
             }
+            if let (Some(performance), Some(query)) = (&self.performance, performance) {
+                device.cmd_begin_query(
+                    cmd,
+                    performance.pool,
+                    query,
+                    vk::QueryControlFlags::empty(),
+                );
+            }
         }
         self.open.push(Some(self.scopes.len()));
         self.scopes.push(Scope {
@@ -255,6 +259,7 @@ impl FrameQueries {
             depth: self.open.len() as u16 - 1,
             timestamp,
             statistic,
+            performance,
         });
     }
 
@@ -265,6 +270,9 @@ impl FrameQueries {
         let scope = &self.scopes[index];
         let device = Ctx::device();
         unsafe {
+            if let (Some(performance), Some(query)) = (&self.performance, scope.performance) {
+                device.cmd_end_query(cmd, performance.pool, query);
+            }
             if let (Some(pool), Some(query)) = (self.statistics, scope.statistic) {
                 device.cmd_end_query(cmd, pool, query);
             }
@@ -291,7 +299,7 @@ impl FrameQueries {
 
     pub(crate) fn read(&mut self) -> Result<()> {
         self.results.scopes.clear();
-        self.results.shaders = read_shader_clocks();
+        self.results.regions = clock::read();
         if self.scopes.is_empty() {
             return Ok(());
         }
@@ -319,6 +327,45 @@ impl FrameQueries {
                 )?
             };
         }
+        let count = self.performance.as_ref().map_or(0, |p| p.counters.len());
+        if let Some(performance) = &mut self.performance
+            && self.next_performance > 0
+        {
+            // One result per counter and query; no flags: 64-bit, availability and partial
+            // results are not allowed for counters.
+            let results = &mut performance.results;
+            results.clear();
+            results.resize(
+                self.next_performance as usize * count,
+                vk::PerformanceCounterResultKHR::default(),
+            );
+            let stride = size_of::<vk::PerformanceCounterResultKHR>() * count;
+            unsafe {
+                (device.fp_v1_0().get_query_pool_results)(
+                    device.handle(),
+                    performance.pool,
+                    0,
+                    self.next_performance,
+                    results.len() * size_of::<vk::PerformanceCounterResultKHR>(),
+                    results.as_mut_ptr().cast(),
+                    stride as u64,
+                    vk::QueryResultFlags::empty(),
+                )
+                .result()?
+            };
+        }
+        let performance = &self.performance;
+        let counter_values = |query: u32| {
+            let performance = performance.as_ref()?;
+            let results = &performance.results[query as usize * count..][..count];
+            let mut values = [0.0; MAX_COUNTERS];
+            for (value, (counter, result)) in
+                values.iter_mut().zip(performance.counters.iter().zip(results))
+            {
+                *value = counter.value(result);
+            }
+            Some(values)
+        };
         let period = Ctx::physical_device().limits.timestamp_period as f64;
         let base = ticks[self.scopes[0].timestamp as usize] & self.valid_bits;
         let ns = |tick: u64| ((tick & self.valid_bits).saturating_sub(base) as f64 * period) as u64;
@@ -339,6 +386,7 @@ impl FrameQueries {
                         mesh: v[3],
                     }
                 }),
+                counters: scope.performance.and_then(counter_values),
             }));
         Ok(())
     }
@@ -350,14 +398,16 @@ impl FrameQueries {
 
 impl Drop for FrameQueries {
     fn drop(&mut self) {
-        if COUNTERS.get().is_some() {
-            counter(0).fetch_sub(1, Ordering::Relaxed);
-        }
+        clock::add_profiled_slots(-1);
         let device = Ctx::device();
         unsafe {
             device.destroy_query_pool(self.timestamps, None);
             if let Some(statistics) = self.statistics {
                 device.destroy_query_pool(statistics, None);
+            }
+            if let Some(performance) = &self.performance {
+                device.destroy_query_pool(performance.pool, None);
+                counters::release_lock();
             }
         }
     }

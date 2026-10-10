@@ -11,8 +11,8 @@ use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{IVec2, UVec2, Vec2, Vec4};
 use lava::{
     bindings::{
-        TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster, TestRasterTextured,
-        TestTexturedVertex, TestVertex,
+        TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster,
+        TestRasterTextured, TestTexturedVertex, TestVertex,
     },
     bindless::{
         BindlessHandle, BindlessWrites, NULL_HANDLE, max_sampled_images, max_storage_images,
@@ -34,6 +34,7 @@ use lava::{
             Storage as StorageImage,
         },
     },
+    profiling::counters,
     state::Ctx,
     vkobjects::queue::{
         Binary, Event, Fence, FrameSlot, Gfx, PendingAccesses, Queue, Semaphore, Timeline,
@@ -328,6 +329,14 @@ fn profiled_frame_slot_times_scopes_and_passes() {
     let gpu = gpu();
     let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
     let mesh = Ctx::features().mesh;
+    // One counter, which always fits a single pass; the slot records it per pass. A time
+    // counter, if the device has one, can't be 0 for a pass.
+    let all = counters::counters();
+    let counter = (all
+        .iter()
+        .find(|c| c.unit == counters::CounterUnit::Nanoseconds))
+    .or(all.first());
+    counters::set_counters(counter.as_slice()).unwrap();
     let mut slot = FrameSlot::new(&gpu.queue).unwrap();
     slot.set_profiling(true);
     let frame = slot.begin().unwrap();
@@ -337,7 +346,13 @@ fn profiled_frame_slot_times_scopes_and_passes() {
             cmd.begin_scope("group");
             for color in [Vec4::ONE, Vec4::ZERO] {
                 cmd.compute(
-                    TestComputeImage::push_bindings(target.whole_view(), color, UVec2::ZERO, EXTENT),
+                    TestComputeImage::push_bindings(
+                        target.whole_view(),
+                        color,
+                        UVec2::ZERO,
+                        EXTENT,
+                    )
+                    .constant_bindings(),
                     [SIZE / 8, SIZE / 8, 1],
                 );
             }
@@ -404,16 +419,30 @@ fn profiled_frame_slot_times_scopes_and_passes() {
         }
     }
 
-    // `test_compute_image.slang` is instrumented with `PROFILE`; the other passes aren't.
+    // Counters are read for passes and renderings only.
+    assert_eq!(timings.counters.len(), counter.is_some() as usize);
+    assert!(scopes[..2].iter().all(|s| s.counters.is_none()));
+    if counter.is_some() {
+        for pass in &scopes[2..] {
+            let value = pass.counters.expect("passes read the counters")[0];
+            assert!(value.is_finite() && value >= 0.0, "{value}");
+            if counter.unwrap().unit == counters::CounterUnit::Nanoseconds {
+                assert!(value > 0.0, "{}: {value}", pass.name);
+            }
+        }
+    }
+
+    // `test_compute_image.slang` has the one clock region "fill"; the other passes have none.
     if Ctx::features().shader_clock {
-        let shaders: Vec<_> = timings.shaders.iter().map(|s| (s.pass, s.stage)).collect();
-        assert_eq!(shaders, [("TestComputeImage", "compute")]);
-        let time = &timings.shaders[0];
+        let regions: Vec<_> = timings.regions.iter().map(|r| (r.pass, r.region)).collect();
+        assert_eq!(regions, [("TestComputeImage", "fill")]);
+        let time = &timings.regions[0];
         // Both dispatches, at most one subgroup per invocation.
         assert!(time.subgroups >= 2 && time.subgroups <= 2 * (SIZE * SIZE) as u64);
         assert!(time.ticks > 0);
     }
     drop(frame);
+    counters::set_counters(&[]).unwrap();
 
     // Without profiling the slot reports nothing.
     slot.set_profiling(false);
@@ -786,7 +815,8 @@ fn compute_image_bindings<'a>(
                 Vec4::new(1.0, 1.0, 1.0, 1.0),
                 offset,
                 size,
-            ),
+            )
+            .constant_bindings(),
             [SIZE / 8, SIZE / 8, 1],
         )
     }
@@ -817,7 +847,8 @@ fn compute_pass_push_constants_reach_the_shader() {
                 Vec4::new(0.0, 1.0, 0.0, 1.0),
                 UVec2::new(16, 24),
                 UVec2::new(32, 16),
-            ),
+            )
+            .constant_bindings(),
             [SIZE / 8, SIZE / 8, 1],
         )
     });
@@ -847,7 +878,8 @@ fn indirect_compute_dispatch_matches_the_direct_one() {
     }]);
     let indirect = render(&gpu, |cmd, target| {
         cmd.compute_indirect(
-            TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT),
+            TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT)
+                .constant_bindings(),
             dispatch.range(..),
         )
     });
@@ -916,13 +948,21 @@ fn specialization_constants_pick_the_pipeline() {
     gpu.submit(|cmd| {
         let groups = [SIZE / 8, SIZE / 8, 1];
         let first = |offset| {
-            TestConstants::push_bindings(offset, 8)
-                .constant_bindings(a.range(..), image_a.whole_view(), 3, 1.0)
+            TestConstants::push_bindings(offset, 8).constant_bindings(
+                a.range(..),
+                image_a.whole_view(),
+                3,
+                1.0,
+            )
         };
         cmd.compute(first(100), groups);
         cmd.compute(
-            TestConstants::push_bindings(0, 4)
-                .constant_bindings(b.range(..), image_b.whole_view(), 5, 0.5),
+            TestConstants::push_bindings(0, 4).constant_bindings(
+                b.range(..),
+                image_b.whole_view(),
+                5,
+                0.5,
+            ),
             groups,
         );
         // The first set again, now cached, with other push constants.
@@ -1660,7 +1700,8 @@ fn indirect_mesh_launch_matches_the_direct_one() {
         eprintln!("SKIPPED indirect_mesh_launch_matches_the_direct_one: no mesh shader support");
         return;
     }
-    let bindings = || TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4);
+    let bindings =
+        || TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4);
     let direct = render(&gpu, |cmd, target| {
         cmd.raster(EXTENT)
             .color_attachment(target.whole_view(), None)
