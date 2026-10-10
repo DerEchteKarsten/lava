@@ -33,7 +33,7 @@ struct SwapchainImage {
 #[derive(Debug)]
 pub struct Swapchain {
     pub size: [u32; 2],
-    /// The surface's supported modes of `PRESENT_MODES`, lowest latency first, with their names.
+    /// The surface's supported modes of `PRESENT_MODES`, FIFO first, with their names.
     pub present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,
     /// Index into `present_modes`; set it and `recreate` to switch. A recreated swapchain keeps it.
     pub present_mode: usize,
@@ -229,12 +229,13 @@ pub(crate) fn select_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::Sur
     }
 }
 
-/// The swapchain's present modes, lowest latency first.
+/// The swapchain's present modes, FIFO (the default, always supported and the most frugal)
+/// first, then by falling latency.
 const PRESENT_MODES: [(vk::PresentModeKHR, &str); 4] = [
-    (vk::PresentModeKHR::IMMEDIATE, "Immediate"),
-    (vk::PresentModeKHR::MAILBOX, "Mailbox"),
-    (vk::PresentModeKHR::FIFO_RELAXED, "FIFO relaxed"),
     (vk::PresentModeKHR::FIFO, "FIFO (vsync)"),
+    (vk::PresentModeKHR::FIFO_RELAXED, "FIFO relaxed"),
+    (vk::PresentModeKHR::MAILBOX, "Mailbox"),
+    (vk::PresentModeKHR::IMMEDIATE, "Immediate"),
 ];
 
 /// The supported entries of `PRESENT_MODES`; FIFO is always supported, even if not reported.
@@ -314,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn present_modes_are_sorted_by_latency_and_always_have_fifo() {
+    fn present_modes_start_with_fifo_and_fall_in_latency() {
         use vk::PresentModeKHR as P;
         let modes = |supported: &[P]| -> Vec<P> {
             supported_present_modes(supported)
@@ -324,11 +325,11 @@ mod tests {
         };
         assert_eq!(
             modes(&[P::FIFO, P::MAILBOX, P::IMMEDIATE]),
-            [P::IMMEDIATE, P::MAILBOX, P::FIFO]
+            [P::FIFO, P::MAILBOX, P::IMMEDIATE]
         );
         assert_eq!(
             modes(&[P::FIFO_RELAXED, P::FIFO]),
-            [P::FIFO_RELAXED, P::FIFO]
+            [P::FIFO, P::FIFO_RELAXED]
         );
         assert_eq!(modes(&[]), [P::FIFO]);
     }
