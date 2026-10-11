@@ -1,4 +1,6 @@
-//! Command recording for generated passes, with pipeline caching and shader hot-reload
+//! Command recording for generated passes, with pipeline caching
+#[cfg(feature = "hot-reload")]
+use std::sync::{Mutex, atomic::AtomicU64};
 use std::{
     collections::HashMap,
     ffi::CStr,
@@ -6,10 +8,8 @@ use std::{
     iter,
     marker::PhantomData,
     ops::{IntoBounds, RangeBounds},
-    path::{Path, PathBuf},
     range::Range,
-    sync::{Mutex, OnceLock, RwLock, mpsc},
-    time::Duration,
+    sync::{OnceLock, RwLock},
 };
 
 use crate::{
@@ -32,7 +32,6 @@ use crate::{
         usage::{ImageUsage, IsColorAttachment, IsDepthAttachment, IsTransferDst, IsTransferSrc},
     },
     profiling::{PassQueries, TimestampQueries},
-    slang_compile,
     state::{Ctx, Functions},
     vkobjects::{
         queue::{PendingAccesses, PendingWrite},
@@ -46,8 +45,6 @@ use ash::vk::{self, BufferCopy, IndexType};
 use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
-use notify::EventHandler;
-use shader_slang as slang;
 use smallvec::{SmallVec, smallvec};
 
 #[derive(Debug, Clone)]
@@ -81,7 +78,6 @@ pub struct ShaderHash {
 }
 
 pub const PASS_DIR: &str = concat!(env!("OUT_DIR"), "/passes");
-pub use crate::slang_compile::SHADER_DIR;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassKind {
@@ -121,7 +117,7 @@ pub struct PassEntry {
     pub regions: &'static [&'static str],
 }
 
-static PIPELINES: OnceLock<PipelineManager> = OnceLock::new();
+pub(crate) static PIPELINES: OnceLock<PipelineManager> = OnceLock::new();
 
 pub(crate) fn pipelines() -> &'static PipelineManager {
     PIPELINES.get().expect(
@@ -142,7 +138,16 @@ pub struct PipelineManager {
     specialized_raytracing_pipelines:
         RwLock<[HashMap<Constants, RaytracingPipeline>; NUM_SPECIALIZED_RAY_TRACING_PIPELINES]>,
     pub raster_pipelines: RwLock<[HashMap<RasterHash, vk::Pipeline>; NUM_RASTER_PIPELINES]>,
-    pending_reloads: Mutex<Vec<(usize, Vec<u8>)>>,
+    /// Passes compiled by hot reload, swapped in when the next frame begins.
+    #[cfg(feature = "hot-reload")]
+    pub(crate) pending_reloads: Mutex<Vec<(usize, Vec<u8>)>>,
+    /// Pipelines a reload replaced, with the frame it happened in: frames begun before may
+    /// still use them.
+    #[cfg(feature = "hot-reload")]
+    pub(crate) retired: Mutex<Vec<(u64, RetiredPipeline)>>,
+    /// Frames begun so far, over every `FrameSlot`.
+    #[cfg(feature = "hot-reload")]
+    pub(crate) frame: AtomicU64,
 }
 
 pub(crate) struct RetiredPipeline {
@@ -163,23 +168,6 @@ impl Drop for RetiredPipeline {
     fn drop(&mut self) {
         unsafe { Ctx::device().destroy_pipeline(self.pipeline, None) };
     }
-}
-
-pub(crate) fn apply_pending_reloads() -> Vec<RetiredPipeline> {
-    let Some(manager) = PIPELINES.get() else {
-        return Vec::new();
-    };
-    let pending = match manager.pending_reloads.lock() {
-        Ok(mut pending) => std::mem::take(&mut *pending),
-        Err(_) => {
-            tracing::error!("failed to acquire lock on pending shader reloads");
-            return Vec::new();
-        }
-    };
-    pending
-        .into_iter()
-        .flat_map(|(pass_index, spirv)| manager.reload_pass(pass_index, &spirv))
-        .collect()
 }
 
 /// A pass whose pipeline cache grows this large gets one warning: its specialization constants
@@ -205,7 +193,12 @@ impl PipelineManager {
             raytracing_pipelines: RwLock::new([None; NUM_RAY_TRACING_PIPELINES]),
             specialized_raytracing_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raster_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
+            #[cfg(feature = "hot-reload")]
             pending_reloads: Mutex::new(Vec::new()),
+            #[cfg(feature = "hot-reload")]
+            retired: Mutex::new(Vec::new()),
+            #[cfg(feature = "hot-reload")]
+            frame: AtomicU64::new(0),
         };
 
         for (i, pass) in PASS_MAP.iter().enumerate() {
@@ -229,8 +222,9 @@ impl PipelineManager {
         let PassKind::Compute { entry } = pass.kind else {
             unreachable!("{} is a compute pass", pass.name)
         };
-        let lock = self.pass_modules.read().unwrap();
-        let module = lock[pass_index];
+        // Held until the pipeline exists, so a reload can't destroy the module before.
+        let modules = self.pass_modules.read().unwrap();
+        let module = modules[pass_index];
         let mut maps = self.specialized_compute_pipelines.write().unwrap();
         let map = &mut maps[pass.index];
         let cached = map.len();
@@ -272,7 +266,8 @@ impl PipelineManager {
             else {
                 unreachable!("{} is a ray tracing pass", pass.name)
             };
-            let module = self.pass_modules.read().unwrap()[pass_index];
+            let modules = self.pass_modules.read().unwrap();
+            let module = modules[pass_index];
             let mut maps = self.specialized_raytracing_pipelines.write().unwrap();
             let map = &mut maps[pass.index];
             let cached = map.len();
@@ -291,7 +286,7 @@ impl PipelineManager {
         record(&self.specialized_raytracing_pipelines.read().unwrap()[pass.index][constants])
     }
 
-    fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Vec<RetiredPipeline> {
+    pub(crate) fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Vec<RetiredPipeline> {
         let pass = &PASS_MAP[pass_index];
         let module = create_module(spirv);
         let mut retired = Vec::new();
@@ -440,114 +435,11 @@ fn create_raytracing_pipeline(
 }
 
 pub fn init() {
-    use notify::Watcher;
-
     let manager = PIPELINES.get_or_init(PipelineManager::new);
-
-    let manager: &'static PipelineManager = manager;
-
-    static WATCHER: OnceLock<notify::RecommendedWatcher> = OnceLock::new();
-    let _ = WATCHER.get_or_init(|| {
-        let (changed, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("shader_hot_reload".into())
-            .spawn(move || hot_reload(manager, rx))
-            .unwrap();
-
-        let mut watcher = notify::recommended_watcher(FileWatcher { changed }).unwrap();
-        for dir in ["passes", "include"] {
-            watcher
-                .watch(
-                    &Path::new(SHADER_DIR).join(dir),
-                    notify::RecursiveMode::Recursive,
-                )
-                .unwrap();
-        }
-        watcher
-    });
-}
-
-struct FileWatcher {
-    changed: mpsc::Sender<PathBuf>,
-}
-
-impl EventHandler for FileWatcher {
-    fn handle_event(&mut self, e: notify::Result<notify::Event>) {
-        let event = match e {
-            Ok(event) => event,
-            Err(e) => {
-                tracing::error!(target: "shader_file_watcher", "{e}");
-                return;
-            }
-        };
-
-        if !(event.kind.is_modify() || event.kind.is_create()) {
-            return;
-        }
-
-        for path in event.paths {
-            if path.extension().is_some_and(|ext| ext == "slang") {
-                let _ = self.changed.send(path);
-            }
-        }
-    }
-}
-
-fn hot_reload(manager: &'static PipelineManager, changed: mpsc::Receiver<PathBuf>) {
-    let Some(global) = slang::GlobalSession::new() else {
-        tracing::error!(target: "shader_file_watcher", "failed to create slang session, hot reloading is disabled");
-        return;
-    };
-
-    while let Ok(first) = changed.recv() {
-        std::thread::sleep(Duration::from_millis(50));
-        let paths: Vec<PathBuf> = iter::once(first).chain(changed.try_iter()).collect();
-
-        for pass_index in passes_to_reload(&paths, &PASS_MAP) {
-            let pass = &PASS_MAP[pass_index];
-
-            match compile_pass(&global, pass_index) {
-                Ok(spirv) => {
-                    tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
-                    match manager.pending_reloads.lock() {
-                        Ok(mut pending) => pending.push((pass_index, spirv.as_slice().to_vec())),
-                        Err(_) => {
-                            tracing::error!(target: "shader_file_watcher", "failed to acquire lock on pending shader reloads")
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
-                }
-            }
-        }
-    }
-}
-
-/// Indices of the passes that have to be recompiled after `changed` files were modified:
-/// the passes whose own source changed, or every pass as soon as a non-pass file (an include)
-/// is among them.
-fn passes_to_reload(changed: &[PathBuf], passes: &[PassEntry]) -> Vec<usize> {
-    let is_source_of = |path: &PathBuf, pass: &PassEntry| path.ends_with(pass.source);
-    let all = changed
-        .iter()
-        .any(|path| !passes.iter().any(|pass| is_source_of(path, pass)));
-    passes
-        .iter()
-        .enumerate()
-        .filter(|(_, pass)| all || changed.iter().any(|path| is_source_of(path, pass)))
-        .map(|(index, _)| index)
-        .collect()
-}
-
-fn compile_pass(global: &slang::GlobalSession, pass_index: usize) -> slang::Result<slang::Blob> {
-    let options = slang_compile::Options {
-        test_passes: cfg!(feature = "test-passes"),
-        profiling: cfg!(feature = "profiling"),
-        pass_index,
-    };
-    let session = slang_compile::session(global, &options);
-    slang_compile::link(&session, PASS_MAP[pass_index].source)?.target_code(0)
+    #[cfg(feature = "hot-reload")]
+    crate::hot_reload::watch(manager);
+    #[cfg(not(feature = "hot-reload"))]
+    let _ = manager;
 }
 
 fn create_module(bytes: &[u8]) -> vk::ShaderModule {
@@ -593,7 +485,8 @@ fn get_raster_pipeline(hash: &RasterHash, pass_index: usize) -> vk::Pipeline {
     if let Some(pipeline) = manager.raster_pipelines.read().unwrap()[pass.index].get(hash) {
         return *pipeline;
     }
-    let module = manager.pass_modules.read().unwrap()[pass_index];
+    let modules = manager.pass_modules.read().unwrap();
+    let module = modules[pass_index];
     let map = &mut manager.raster_pipelines.write().unwrap()[pass.index];
     let cached = map.len();
     *map.entry(hash.clone()).or_insert_with(|| {
@@ -779,6 +672,9 @@ pub mod kind {
 /// A pass's push constants, specialization constants and the resources it accesses, made by
 /// the generated `Pass::push_bindings` (and `constant_bindings` for a pass with
 /// specialization constants).
+///
+/// Building it already moves its images' tracked layouts to the ones it asks for (see
+/// `ImageView::access`), so record it right after building it, and never drop it unrecorded.
 pub struct BindingOutput<K> {
     /// Index into `PASS_MAP`.
     pub(crate) pass: usize,
@@ -1084,6 +980,9 @@ fn append<T, const N: usize>(array: [T; N], item: T) -> [T; N + 1] {
 
 impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS> {
     /// Color attachments come before the draws, since every draw has a blend for each.
+    ///
+    /// Moves the image's tracked layout to the attachment layout right away (see
+    /// `ImageView::access`): record the builder, don't drop it.
     pub fn color_attachment<F: Format, U>(
         self,
         image: ImageView<'a, F, U>,
@@ -1129,6 +1028,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     RasterBuilder<'a, DRAWS, COLOR_ATTACHMENTS>
 {
     /// Depth-tests the draws against `image` (nearer = greater). `clear` resets the depth first.
+    /// Like `color_attachment`, it moves the tracked layout right away.
     pub fn depth_attachment<'b, F: Format, U>(
         mut self,
         image: ImageView<'b, F, U>,
@@ -2150,8 +2050,10 @@ impl PendingAccesses {
     /// Remembers the accesses of a command that was just recorded, so later commands can be
     /// synchronised against them.
     ///
-    /// An older buffer access is only forgotten once a newer access of the same kind covers its
-    /// whole range: a partially overlapped write still has bytes nobody has synchronised with.
+    /// An older buffer access is only forgotten once a newer one covers its whole range: a
+    /// partially overlapped write still has bytes nobody has synchronised with. A covered write
+    /// is forgotten by a newer write, a covered read by a newer write, whose barrier waited for
+    /// it. A newer read doesn't wait for older reads, so it takes over their stages and accesses.
     pub(crate) fn record<'a>(
         &mut self,
         image_acceses: impl Iterator<Item = &'a ImageAccess>,
@@ -2167,10 +2069,19 @@ impl PendingAccesses {
             if writes {
                 self.buffer_writes.retain(|a| !covers(&a.write));
                 self.buffer_writes.push(PendingWrite::new(access.clone()));
+                self.buffer_reads.retain(|a| !covers(a));
             }
             if reads {
-                self.buffer_reads.retain(|a| !covers(a));
-                self.buffer_reads.push(access.clone());
+                let mut read = access.clone();
+                self.buffer_reads.retain(|a| {
+                    let covered = covers(a);
+                    if covered {
+                        read.stage |= a.stage;
+                        read.access |= a.access;
+                    }
+                    !covered
+                });
+                self.buffer_reads.push(read);
             }
         }
 
@@ -2182,10 +2093,19 @@ impl PendingAccesses {
             if writes {
                 self.image_writes.retain(|a| !same_image(&a.write));
                 self.image_writes.push(PendingWrite::new(access.clone()));
+                self.image_reads.retain(|a| !same_image(a));
             }
             if reads {
-                self.image_reads.retain(|a| !same_image(a));
-                self.image_reads.push(access.clone());
+                let mut read = access.clone();
+                self.image_reads.retain(|a| {
+                    let same = same_image(a);
+                    if same {
+                        read.stage |= a.stage;
+                        read.access |= a.access;
+                    }
+                    !same
+                });
+                self.image_reads.push(read);
             }
         }
     }
@@ -2538,6 +2458,45 @@ mod tests {
             .find(|a| a.write.image == vk::Image::from_raw(1))
             .unwrap();
         assert_eq!(first.write.stage, S::TRANSFER);
+    }
+
+    /// Regression: a read replaced the older reads of the same image, so a fragment read
+    /// followed by a compute read let a later write wait for the compute read only.
+    #[test]
+    fn a_write_waits_for_every_earlier_read() {
+        let compute_read = image(
+            1,
+            S::COMPUTE_SHADER,
+            A::SHADER_STORAGE_READ,
+            L::GENERAL,
+            L::GENERAL,
+        );
+        let p = pending(&[], &[image_read(1), compute_read]);
+        assert_eq!(p.image_reads.len(), 1);
+        let barriers = image_barrier(&p, &image_write(1)).unwrap();
+        assert_eq!(
+            barriers.memory.src_stage_mask,
+            S::FRAGMENT_SHADER | S::COMPUTE_SHADER
+        );
+
+        let compute_read = buffer(S::COMPUTE_SHADER, A::SHADER_STORAGE_READ, 0..100);
+        let p = pending(&[read(0..10), compute_read], &[]);
+        assert_eq!(p.buffer_reads.len(), 1);
+        let barriers = buffer_barrier(&p, &write(0..10)).unwrap();
+        assert_eq!(
+            barriers.memory.src_stage_mask,
+            S::VERTEX_SHADER | S::COMPUTE_SHADER
+        );
+    }
+
+    #[test]
+    fn a_write_forgets_the_reads_it_waited_for() {
+        let p = pending(&[], &[image_read(1), image_write(1)]);
+        assert!(p.image_reads.is_empty());
+
+        let p = pending(&[read(0..10), read(20..30), write(0..15)], &[]);
+        assert_eq!(p.buffer_reads.len(), 1);
+        assert_eq!(p.buffer_reads[0].range, (20u64..30).into());
     }
 
     // ---- image hazards and layout transitions --------------------------------------------
@@ -3115,7 +3074,7 @@ mod tests {
         assert_eq!((raw.x, raw.y, raw.z), (5, 6, 7));
     }
 
-    // ---- shader stages and hot reload ----------------------------------------------------
+    // ---- shader stages -------------------------------------------------------------------
 
     #[test]
     fn shader_stage_uses_the_nul_terminated_entry_name() {
@@ -3139,114 +3098,6 @@ mod tests {
             vk::ShaderModule::null(),
             &vk::SpecializationInfo::default(),
         );
-    }
-
-    fn pass(source: &'static str) -> PassEntry {
-        PassEntry {
-            name: "",
-            path: "",
-            source,
-            kind: PassKind::Compute { entry: "main\0" },
-            index: 0,
-            constants: &[],
-            constants_size: 0,
-            regions: &[],
-        }
-    }
-
-    #[test]
-    fn changed_pass_sources_reload_only_those_passes() {
-        let passes = [
-            pass("passes/a.slang"),
-            pass("passes/b.slang"),
-            pass("passes/c.slang"),
-        ];
-        let changed = [
-            PathBuf::from("/repo/shaders/passes/c.slang"),
-            PathBuf::from("/repo/shaders/passes/a.slang"),
-        ];
-        assert_eq!(passes_to_reload(&changed, &passes), [0, 2]);
-        assert!(passes_to_reload(&[], &passes).is_empty());
-    }
-
-    #[test]
-    fn a_changed_include_reloads_every_pass() {
-        let passes = [pass("passes/a.slang"), pass("passes/b.slang")];
-        let changed = [
-            PathBuf::from("/repo/shaders/passes/a.slang"),
-            PathBuf::from("/repo/shaders/include/math.slang"),
-        ];
-        assert_eq!(passes_to_reload(&changed, &passes), [0, 1]);
-    }
-
-    #[test]
-    fn pass_sources_match_on_whole_path_components() {
-        // `xa.slang` is not pass `a.slang`; it counts as an unknown file, i.e. an include.
-        let passes = [pass("passes/a.slang"), pass("passes/b.slang")];
-        let changed = [PathBuf::from("/repo/shaders/passes/xa.slang")];
-        assert_eq!(passes_to_reload(&changed, &passes), [0, 1]);
-    }
-
-    fn watch(events: Vec<notify::Result<notify::Event>>) -> Vec<PathBuf> {
-        let (changed, received) = mpsc::channel();
-        let mut watcher = FileWatcher { changed };
-        for event in events {
-            watcher.handle_event(event);
-        }
-        drop(watcher);
-        received.iter().collect()
-    }
-
-    fn event(kind: notify::EventKind, paths: &[&str]) -> notify::Result<notify::Event> {
-        let mut event = notify::Event::new(kind);
-        for path in paths {
-            event = event.add_path(PathBuf::from(path));
-        }
-        Ok(event)
-    }
-
-    #[test]
-    fn watcher_forwards_modified_and_created_slang_files() {
-        use notify::{
-            EventKind,
-            event::{CreateKind, ModifyKind},
-        };
-        let paths = watch(vec![
-            event(
-                EventKind::Modify(ModifyKind::Any),
-                &["/s/passes/a.slang", "/s/notes.txt"],
-            ),
-            event(
-                EventKind::Create(CreateKind::File),
-                &["/s/include/new.slang"],
-            ),
-        ]);
-        assert_eq!(
-            paths,
-            [
-                PathBuf::from("/s/passes/a.slang"),
-                PathBuf::from("/s/include/new.slang")
-            ]
-        );
-    }
-
-    #[test]
-    fn watcher_ignores_other_events_and_errors() {
-        use notify::{
-            EventKind,
-            event::{AccessKind, RemoveKind},
-        };
-        let paths = watch(vec![
-            event(EventKind::Remove(RemoveKind::File), &["/s/passes/a.slang"]),
-            event(EventKind::Access(AccessKind::Any), &["/s/passes/a.slang"]),
-            Err(notify::Error::generic("watch failed")),
-        ]);
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn pending_reloads_are_empty_before_pipelines_exist() {
-        assert!(apply_pending_reloads().is_empty());
     }
 
     // ---- generated bindings --------------------------------------------------------------

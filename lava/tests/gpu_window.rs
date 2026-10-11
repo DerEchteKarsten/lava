@@ -127,7 +127,7 @@ fn run(event_loop: &ActiveEventLoop) {
     }
     step("swapchain_creation");
 
-    let queue = Queue::<Gfx>::new().unwrap();
+    let queue = Queue::<Gfx>::new();
     let mut semaphores = Vec::new();
     present_frame(&queue, &swapchain, [1.0, 0.0, 0.0, 1.0], &mut semaphores);
     present_frame(&queue, &swapchain, [0.0, 1.0, 0.0, 1.0], &mut semaphores);

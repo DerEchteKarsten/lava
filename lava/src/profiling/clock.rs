@@ -74,17 +74,6 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Makes the counters readable by the host once the submission finished.
-pub(crate) fn host_barrier(cmd: vk::CommandBuffer) {
-    let barrier = [vk::MemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-        .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-        .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-    let info = vk::DependencyInfo::default().memory_barriers(&barrier);
-    unsafe { Ctx::device().cmd_pipeline_barrier2(cmd, &info) };
-}
-
 /// Calls `f` with the ticks of every region that ran since the last call.
 pub fn read(mut f: impl FnMut(RegionTime)) {
     if COUNTERS.get().is_none() {

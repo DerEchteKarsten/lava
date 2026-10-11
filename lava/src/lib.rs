@@ -27,8 +27,12 @@ pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;
 pub mod error;
+#[cfg(feature = "hot-reload")]
+mod hot_reload;
 pub mod image;
 pub mod profiling;
+// Without hot reload only build.rs compiles passes, and the lib needs just its constants.
+#[cfg_attr(not(feature = "hot-reload"), allow(dead_code))]
 mod slang_compile;
 pub mod scratchpad;
 pub mod state;

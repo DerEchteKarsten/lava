@@ -62,6 +62,19 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
         unsafe { std::mem::transmute(self) }
     }
 
+    /// The access of a command that wants the image in `layout`. It takes the image's tracked
+    /// layout as its `old_layout` and sets the tracked layout to `layout` right away, when the
+    /// access is built, not when the command is recorded. That way lava doesn't have to track
+    /// every image's layout per command buffer, but the accesses have to be recorded in the
+    /// order they were built:
+    /// - build bindings (`push_bindings`, `color_attachment`, `depth_attachment`) right before
+    ///   recording them, and don't build one for an image another unrecorded one also uses;
+    /// - don't drop a built binding unrecorded: the image keeps the layout it never got;
+    /// - don't record command buffers that use the same image on several threads at once, or
+    ///   submit them in another order than they were recorded.
+    ///
+    /// Getting this wrong gives a layout transition from the wrong `old_layout`, which the
+    /// validation layer reports.
     pub(crate) fn access(
         &self,
         stage: vk::PipelineStageFlags2,

@@ -62,7 +62,7 @@ static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
         "headless lava init failed; the GPU tests need a Vulkan 1.4 GPU and the Khronos validation layer",
     );
     Mutex::new(Gpu {
-        queue: Queue::new().expect("a graphics queue is available"),
+        queue: Queue::new(),
     })
 });
 

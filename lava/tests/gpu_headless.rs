@@ -30,17 +30,14 @@ use lava::{
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
         slice::AsImage,
         usage::{
-            ColorAttachmentStorageTransferSrcTransferDst, DepthAttachment, Sampled, SampledHostCopy,
-            SampledHostCopyTransferSrc, SampledStorage, SampledTransferDst, SampledTransferSrcTransferDst,
-            StorageTransferSrcTransferDst,
-            Storage as StorageImage,
+            ColorAttachmentStorageTransferSrcTransferDst, DepthAttachment, Sampled,
+            SampledHostCopy, SampledHostCopyTransferSrc, SampledStorage, SampledTransferDst,
+            SampledTransferSrcTransferDst, Storage as StorageImage, StorageTransferSrcTransferDst,
         },
     },
     profiling::{clock, counters},
     state::Ctx,
-    vkobjects::queue::{
-        Binary, Event, Fence, FrameSlot, Gfx, PendingAccesses, Queue, Semaphore, Timeline,
-    },
+    vkobjects::queue::{Binary, FrameSlot, Gfx, PendingAccesses, Queue, Semaphore, Timeline},
 };
 
 // ---- helpers ---------------------------------------------------------------------------------
@@ -185,52 +182,6 @@ fn indexing_past_the_buffer_panics() {
 // ---- queues and synchronisation --------------------------------------------------------------
 
 #[test]
-fn fence_signals_when_the_submission_finished() {
-    let gpu = gpu();
-    let buffer = zeroed_buffer::<u32, Storage>(4);
-    let pool = gpu.queue.create_pool().unwrap();
-    let memory = pool.create_command_buffer().unwrap();
-    let fence = Fence::new().unwrap();
-
-    gpu.queue
-        .execute_command(
-            PendingAccesses::default(),
-            &memory,
-            Some(&fence),
-            &mut None,
-            &mut None,
-            &[],
-            &[],
-            |cmd| {
-                cmd.fill_buffer(buffer.range(..), 7);
-            },
-        )
-        .unwrap();
-    fence.wait().unwrap();
-    assert_eq!(buffer.range(..).as_slice(), [7; 4]);
-
-    // A reset fence can be reused for the next submission.
-    fence.reset().unwrap();
-    pool.reset().unwrap();
-    gpu.queue
-        .execute_command(
-            PendingAccesses::default(),
-            &memory,
-            Some(&fence),
-            &mut None,
-            &mut None,
-            &[],
-            &[],
-            |cmd| {
-                cmd.fill_buffer(buffer.range(..), 8);
-            },
-        )
-        .unwrap();
-    fence.wait().unwrap();
-    assert_eq!(buffer.range(..).as_slice(), [8; 4]);
-}
-
-#[test]
 fn timeline_semaphore_reaches_the_signalled_value() {
     let gpu = gpu();
     let semaphore = Semaphore::<Timeline>::new().unwrap();
@@ -258,36 +209,57 @@ fn binary_semaphore_orders_two_submissions() {
 }
 
 #[test]
-fn event_wait_returns_once_set() {
+fn more_threads_than_queues_submit_in_parallel() {
     let _gpu = gpu();
-    let event = Event::new().unwrap();
-    event.set().unwrap();
-    event.wait().unwrap();
+    let threads = Ctx::num_gfx_queues() as usize + 1;
+    let barrier = std::sync::Barrier::new(threads);
+    std::thread::scope(|scope| {
+        for value in 0..threads as u32 {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let buffer = zeroed_buffer::<u32, Storage>(4);
+                let queue = Queue::<Gfx>::new();
+                let mut slot = FrameSlot::new(&queue).unwrap();
+                barrier.wait();
+                slot.begin()
+                    .unwrap()
+                    .execute(&queue, PendingAccesses::default(), &[], &[], |cmd| {
+                        cmd.fill_buffer(buffer.range(..), value)
+                    })
+                    .unwrap();
+                drop(slot);
+                assert_eq!(buffer.range(..).as_slice(), [value; 4]);
+            });
+        }
+    });
 }
 
 #[test]
-fn queues_are_handed_out_until_the_family_is_exhausted() {
+fn a_reselected_lease_keeps_its_frame_slots_usable() {
     let _gpu = gpu();
-    // The harness holds one queue; the rest of the family is still free.
-    let free = Ctx::num_gfx_queues() as usize - 1;
-    let queues: Vec<Queue<Gfx>> = (0..free).map(|_| Queue::new().unwrap()).collect();
-    assert!(Queue::<Gfx>::new().is_err(), "all queues are in use");
-
-    drop(queues);
-    if free > 0 {
-        // Dropping a queue frees its slot, and the queue is usable.
-        let queue = Queue::<Gfx>::new().unwrap();
-        let buffer = zeroed_buffer::<u32, Storage>(4);
-        let mut slot = FrameSlot::new(&queue).unwrap();
-        slot.begin()
-            .unwrap()
-            .execute(&queue, PendingAccesses::default(), &[], &[], |cmd| {
-                cmd.fill_buffer(buffer.range(..), 9)
-            })
-            .unwrap();
-        drop(slot);
-        assert_eq!(buffer.range(..).as_slice(), [9; 4]);
-    }
+    let buffer = zeroed_buffer::<u32, Storage>(4);
+    // With every queue leased once more, the last lease shares one.
+    let others: Vec<Queue<Gfx>> = (0..Ctx::num_gfx_queues()).map(|_| Queue::new()).collect();
+    let mut queue = Queue::<Gfx>::new();
+    let mut slot = FrameSlot::new(&queue).unwrap();
+    let pending = slot
+        .begin()
+        .unwrap()
+        .execute(&queue, PendingAccesses::default(), &[], &[], |cmd| {
+            cmd.fill_buffer(buffer.range(..), 1)
+        })
+        .unwrap();
+    drop(others);
+    queue.reselect().unwrap();
+    assert!(queue.is_optimal());
+    slot.begin()
+        .unwrap()
+        .execute(&queue, pending, &[], &[], |cmd| {
+            cmd.fill_buffer(buffer.range(2..), 2)
+        })
+        .unwrap();
+    drop(slot);
+    assert_eq!(buffer.range(..).as_slice(), [1, 1, 2, 2]);
 }
 
 #[test]
@@ -374,9 +346,15 @@ fn timestamps_time_scopes_and_passes() {
     let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
     let mut slot = FrameSlot::new(&gpu.queue).unwrap();
     slot.set_timestamps(true);
-    assert!(slot.begin().unwrap().last_timestamps().is_none(), "nothing was submitted yet");
+    assert!(
+        slot.begin().unwrap().last_timestamps().is_none(),
+        "nothing was submitted yet"
+    );
     let frame = submit_profiled(&gpu, &mut slot, &target);
-    let scopes = frame.last_timestamps().expect("the frame was timed").to_vec();
+    let scopes = frame
+        .last_timestamps()
+        .expect("the frame was timed")
+        .to_vec();
     assert!(frame.last_counters().is_none(), "pass queries are off");
     drop(frame);
     let names: Vec<_> = scopes.iter().map(|s| (s.name, s.depth)).collect();
@@ -406,7 +384,11 @@ fn timestamps_time_scopes_and_passes() {
     );
 
     slot.set_timestamps(false);
-    assert!(submit_profiled(&gpu, &mut slot, &target).last_timestamps().is_none());
+    assert!(
+        submit_profiled(&gpu, &mut slot, &target)
+            .last_timestamps()
+            .is_none()
+    );
 }
 
 #[test]
@@ -425,7 +407,10 @@ fn pass_queries_count_passes_and_renderings() {
     let mut slot = FrameSlot::new(&gpu.queue).unwrap();
     slot.set_counters(Some(selection.clone()));
     let frame = submit_profiled(&gpu, &mut slot, &target);
-    let results = frame.last_counters().expect("the frame was counted").clone();
+    let results = frame
+        .last_counters()
+        .expect("the frame was counted")
+        .clone();
     assert!(frame.last_timestamps().is_none(), "timestamps are off");
     drop(frame);
     assert!(std::sync::Arc::ptr_eq(&results.counters, &selection));
@@ -462,7 +447,11 @@ fn pass_queries_count_passes_and_renderings() {
     }
 
     slot.set_counters(None);
-    assert!(submit_profiled(&gpu, &mut slot, &target).last_counters().is_none());
+    assert!(
+        submit_profiled(&gpu, &mut slot, &target)
+            .last_counters()
+            .is_none()
+    );
 }
 
 #[test]
@@ -768,7 +757,8 @@ fn blit_scales_between_differently_sized_regions() {
 #[test]
 fn host_copy_uploads_a_mip_level() {
     let gpu = gpu();
-    let mut image = Image::<R8G8B8A8Unorm, SampledHostCopyTransferSrc>::with_mip_levels(8, 8, 2).unwrap();
+    let mut image =
+        Image::<R8G8B8A8Unorm, SampledHostCopyTransferSrc>::with_mip_levels(8, 8, 2).unwrap();
     let data = pattern(8, 8);
 
     if !Ctx::features().rebar {

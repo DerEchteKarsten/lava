@@ -3,9 +3,10 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     ops::{Index, IndexMut},
+    sync::OnceLock,
 };
 
-use crate::error::Result;
+use crate::{Error, error::Result};
 use ash::vk::{self};
 use bytemuck::Pod;
 use gpu_allocator::{
@@ -60,6 +61,14 @@ impl<'a, T: Copy + Pod, U: BufferUsage> IndexMut<usize> for BufferSlice<'a, T, U
         unsafe { &mut *self.element_ptr(index) }
     }
 }
+
+// static ON_DROP: OnceLock<fn()> = OnceLock::new();
+
+// pub fn on_drop(hook: fn()) -> Result<()> {
+//     ON_DROP
+//         .set(hook)
+//         .map_err(|_| Error::message("the image drop hook is already set"))
+// }
 
 impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     fn drop(&mut self) {

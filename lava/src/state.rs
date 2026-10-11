@@ -4,7 +4,7 @@ use std::{
     ffi::{c_char, c_void},
     fmt::Debug,
     panic::{self, Location},
-    sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicBool},
+    sync::{Mutex, MutexGuard, OnceLock},
 };
 
 use crate::error::{Error, Result};
@@ -20,7 +20,7 @@ use gpu_allocator::{
 use lava_macros::validation_trace;
 use std::ffi::{CStr, CString};
 
-use crate::vkobjects::physical_device::{PhysicalDevice, QueueFamily};
+use crate::vkobjects::{physical_device::PhysicalDevice, queue::FamilyQueues};
 
 pub use ash::vk as raw_vulkan;
 
@@ -36,11 +36,8 @@ pub struct Ctx {
     physical_device: PhysicalDevice,
     allocator: Mutex<Allocator>,
 
-    pub(crate) gfx_queue_familie: QueueFamily,
-    pub(crate) gfx_queues_in_use: Box<[AtomicBool]>,
-
-    pub(crate) transfer_queue_familie: Option<QueueFamily>,
-    pub(crate) transfer_queues_in_use: Option<Box<[AtomicBool]>>,
+    pub(crate) gfx_queues: FamilyQueues,
+    pub(crate) transfer_queues: Option<FamilyQueues>,
 }
 
 use raw_window_handle::RawDisplayHandle;
@@ -63,22 +60,15 @@ impl Ctx {
         &Ctx::get().physical_device.mesh_shader_properties
     }
     pub fn gfx_queue_index() -> u32 {
-        Ctx::get().gfx_queue_familie.index
+        Ctx::get().gfx_queues.family
     }
     pub fn num_gfx_queues() -> u32 {
-        Ctx::get().gfx_queues_in_use.len() as u32
-    }
-    pub(crate) fn transfer_queue_index() -> u32 {
-        Ctx::get()
-            .transfer_queue_familie
-            .as_ref()
-            .map(|e| e.index)
-            .unwrap_or(Ctx::get().gfx_queue_familie.index)
+        Ctx::get().gfx_queues.len() as u32
     }
     /// Presentation always goes through the graphics family; `Surface::new` verifies that the
     /// family can present to the surface it wraps.
     pub fn present_queue_index() -> u32 {
-        Ctx::get().gfx_queue_familie.index
+        Ctx::get().gfx_queues.family
     }
     pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
         Ctx::get()
@@ -247,24 +237,19 @@ impl Ctx {
             })
             .map_err(|_| Error::message("Vulkan functions were already initialized"))?;
 
+        let gfx_queues = FamilyQueues::new(
+            &device,
+            graphics_queue_family.index,
+            graphics_queue_family.num_queues,
+        );
+        let transfer_queues = transfer_queue_familie
+            .map(|family| FamilyQueues::new(&device, family.index, family.num_queues));
         STATE
             .set(Ctx {
                 device,
                 allocator: Mutex::new(allocator),
-                gfx_queues_in_use: (0..graphics_queue_family.num_queues)
-                    .map(|_| AtomicBool::new(false))
-                    .collect(),
-                gfx_queue_familie: graphics_queue_family,
-                transfer_queues_in_use: if let Some(transfer) = &transfer_queue_familie {
-                    Some(
-                        (0..transfer.num_queues)
-                            .map(|_| AtomicBool::new(false))
-                            .collect(),
-                    )
-                } else {
-                    None
-                },
-                transfer_queue_familie,
+                gfx_queues,
+                transfer_queues,
 
                 features: features,
                 physical_device: physical_device,
@@ -628,8 +613,8 @@ pub(super) fn create_device(
     features: &Features,
     instance: &ash::Instance,
 ) -> Result<ash::Device> {
-    // One priority per queue: every queue of a selected family is created, so that
-    // `Queue::new` can hand out all the slots tracked in `*_queues_in_use`.
+    // One priority per queue: every queue of a selected family is created, so that threads
+    // can each get their own (`FamilyQueues`).
     queue_families.sort_unstable();
     queue_families.dedup_by_key(|(index, _)| *index);
     let queue_priorities = queue_families

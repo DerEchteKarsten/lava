@@ -1,13 +1,8 @@
-//! Queue submission and sync: typed queues, semaphores, fences, frame slots, presenting
+//! Queue submission and sync: queue leases, semaphores, fences, frame slots, presenting
 use std::{
-    collections::HashMap,
     fmt::Debug,
-    future::Future,
     marker::PhantomData,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use crate::error::{Error, Result};
@@ -16,10 +11,8 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    command_buffer::{self, BufferAccess, CommandBuffer, ImageAccess},
-    profiling::{
-        Counter, GpuScope, PassCounters, PassQueries, TimestampQueries, clock,
-    },
+    command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
+    profiling::{Counter, GpuScope, PassCounters, PassQueries, TimestampQueries},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -39,42 +32,6 @@ impl<T: SemaphoreType> Default for Semaphore<T> {
 impl<T: SemaphoreType + ?Sized> Drop for Semaphore<T> {
     fn drop(&mut self) {
         unsafe { Ctx::device().destroy_semaphore(self.handle, None) };
-    }
-}
-
-pub struct Event {
-    pub(crate) handle: vk::Event,
-}
-
-impl Event {
-    #[validation_trace]
-    pub fn new() -> Result<Self> {
-        let create_info = vk::EventCreateInfo::default();
-        Ok(Self {
-            handle: unsafe { Ctx::device().create_event(&create_info, None)? },
-        })
-    }
-    #[validation_trace]
-    pub fn wait(&self) -> Result<()> {
-        loop {
-            if unsafe { Ctx::device().get_event_status(self.handle)? } {
-                unsafe { Ctx::device().set_event(self.handle)? };
-                break;
-            }
-            std::thread::yield_now();
-        }
-        Ok(())
-    }
-    #[validation_trace]
-    pub fn set(&self) -> Result<()> {
-        unsafe { Ctx::device().set_event(self.handle)? };
-        Ok(())
-    }
-}
-
-impl Drop for Event {
-    fn drop(&mut self) {
-        unsafe { Ctx::device().destroy_event(self.handle, None) };
     }
 }
 
@@ -196,74 +153,153 @@ impl Fence {
     }
 }
 
+/// A queue family lava submits to. Present always goes through [`Gfx`].
 pub trait QueueFamilie: Debug {
-    fn index() -> u32;
-    fn is_free() -> &'static [AtomicBool];
+    fn queues() -> &'static FamilyQueues;
 }
 
 #[derive(Debug)]
 pub struct Transfer;
 #[derive(Debug)]
-pub struct Present;
-#[derive(Debug)]
 pub struct Gfx;
 
 impl QueueFamilie for Transfer {
-    fn index() -> u32 {
-        Ctx::transfer_queue_index()
-    }
-    fn is_free() -> &'static [AtomicBool] {
-        Ctx::get()
-            .transfer_queues_in_use
-            .as_ref()
-            .unwrap_or(&Ctx::get().gfx_queues_in_use)
-    }
-}
-impl QueueFamilie for Present {
-    fn index() -> u32 {
-        Ctx::present_queue_index()
-    }
-    fn is_free() -> &'static [AtomicBool] {
-        &Ctx::get().gfx_queues_in_use
+    fn queues() -> &'static FamilyQueues {
+        let ctx = Ctx::get();
+        ctx.transfer_queues.as_ref().unwrap_or(&ctx.gfx_queues)
     }
 }
 impl QueueFamilie for Gfx {
-    fn index() -> u32 {
-        Ctx::gfx_queue_index()
-    }
-    fn is_free() -> &'static [AtomicBool] {
-        &Ctx::get().gfx_queues_in_use
+    fn queues() -> &'static FamilyQueues {
+        &Ctx::get().gfx_queues
     }
 }
 
+/// Every queue of one family, handed out as [`Queue`] leases.
+#[derive(Debug)]
+pub struct FamilyQueues {
+    pub(crate) family: u32,
+    /// Vulkan wants submissions to one queue externally synchronised.
+    handles: Box<[Mutex<vk::Queue>]>,
+    /// The leases of each queue.
+    leases: Mutex<Box<[u32]>>,
+}
+
+impl FamilyQueues {
+    pub(crate) fn new(device: &ash::Device, family: u32, count: u32) -> Self {
+        Self {
+            family,
+            handles: (0..count)
+                .map(|i| Mutex::new(unsafe { device.get_device_queue(family, i) }))
+                .collect(),
+            leases: Mutex::new(vec![0; count as usize].into()),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.handles.len()
+    }
+}
+
+/// A lease on one queue of family `Q`: one no other lease holds while there is one, then the
+/// one the fewest leases share, which they take turns submitting to. Whoever submits a frame
+/// loop's [`FrameSlot`]s through one lease gets them executed in order.
 #[derive(Debug)]
 pub struct Queue<Q: QueueFamilie> {
-    pub(crate) handle: vk::Queue,
-    familie: u32,
-    idx: u32,
-    _marker: PhantomData<Q>,
+    family: &'static FamilyQueues,
+    index: usize,
+    _family: PhantomData<Q>,
+}
+
+impl<Q: QueueFamilie> Queue<Q> {
+    pub fn new() -> Self {
+        let family = Q::queues();
+        let index = lease(&mut family.leases.lock().unwrap());
+        Self {
+            family,
+            index,
+            _family: PhantomData,
+        }
+    }
+
+    /// Whether the queue is shared while a less used one of the family exists. Leases taken
+    /// while every queue was taken keep sharing after the others were dropped; this finds out,
+    /// [`Self::reselect`] fixes it.
+    pub fn is_optimal(&self) -> bool {
+        is_optimal(&self.family.leases.lock().unwrap(), self.index)
+    }
+
+    /// Moves the lease to the least used queue of its family. It waits until the old queue is
+    /// idle first, so the submissions through the lease stay in order and its `FrameSlot`s and
+    /// `PendingAccesses` stay valid. Meant for the rare case [`Self::is_optimal`] reports.
+    #[validation_trace]
+    pub fn reselect(&mut self) -> Result<()> {
+        if self.is_optimal() {
+            return Ok(());
+        }
+        self.with(|queue| unsafe { Ctx::device().queue_wait_idle(queue) })?;
+        let mut leases = self.family.leases.lock().unwrap();
+        leases[self.index] -= 1;
+        self.index = lease(&mut leases);
+        Ok(())
+    }
+
+    /// Calls `f` with the queue, locked.
+    fn with<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+        f(*self.family.handles[self.index].lock().unwrap())
+    }
+}
+
+impl<Q: QueueFamilie> Default for Queue<Q> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<Q: QueueFamilie> Drop for Queue<Q> {
     fn drop(&mut self) {
-        Q::is_free()[self.idx as usize].store(false, Ordering::Relaxed);
+        self.family.leases.lock().unwrap()[self.index] -= 1;
     }
 }
 
+/// Leases the queue the fewest leases share.
+fn lease(leases: &mut [u32]) -> usize {
+    let (index, _) = leases
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, count)| count)
+        .expect("a queue family has at least one queue");
+    leases[index] += 1;
+    index
+}
+
+/// Whether moving a lease off queue `index` would leave fewer leases sharing one.
+fn is_optimal(leases: &[u32], index: usize) -> bool {
+    let least = leases.iter().min().copied().unwrap_or(0);
+    leases[index] <= least + 1
+}
+
 #[derive(Debug)]
-pub struct CommandPool {
+pub(crate) struct CommandPool {
     handle: vk::CommandPool,
 }
 impl CommandPool {
     #[validation_trace]
-    pub fn reset(&self) -> Result<()> {
+    pub(crate) fn new(family: u32) -> Result<Self> {
+        let info = vk::CommandPoolCreateInfo::default().queue_family_index(family);
+        Ok(Self {
+            handle: unsafe { Ctx::device().create_command_pool(&info, None)? },
+        })
+    }
+    #[validation_trace]
+    pub(crate) fn reset(&self) -> Result<()> {
         unsafe {
             Ctx::device().reset_command_pool(self.handle, vk::CommandPoolResetFlags::empty())?
         };
         Ok(())
     }
     #[validation_trace]
-    pub fn create_command_buffer(&self) -> Result<CommandBufferMemory> {
+    pub(crate) fn create_command_buffer(&self) -> Result<CommandBufferMemory> {
         let allocate_info = vk::CommandBufferAllocateInfo {
             level: vk::CommandBufferLevel::PRIMARY,
             command_buffer_count: 1,
@@ -285,7 +321,7 @@ impl Drop for CommandPool {
 }
 
 #[derive(Debug)]
-pub struct CommandBufferMemory {
+pub(crate) struct CommandBufferMemory {
     pub(crate) pool: vk::CommandPool,
     pub(crate) handle: vk::CommandBuffer,
 }
@@ -298,6 +334,8 @@ impl Drop for CommandBufferMemory {
     }
 }
 
+/// A command buffer with its pool and fence. Submit its frames through one [`Queue`] lease,
+/// so they reach the GPU in order and the barriers between them hold.
 pub struct FrameSlot {
     retired: Vec<Box<dyn Send + Sync>>,
     buffer: CommandBufferMemory,
@@ -314,7 +352,7 @@ pub struct FrameSlot {
 impl FrameSlot {
     #[validation_trace]
     pub fn new<Q: QueueFamilie>(queue: &Queue<Q>) -> Result<Self> {
-        let pool = queue.create_pool()?;
+        let pool = CommandPool::new(queue.family.family)?;
         let buffer = pool.create_command_buffer()?;
         Ok(Self {
             retired: Vec::new(),
@@ -322,7 +360,7 @@ impl FrameSlot {
             pool,
             fence: Fence::new()?,
             submitted: false,
-            family: queue.familie,
+            family: queue.family.family,
             timestamps_on: false,
             timestamps: None,
             counter_selection: None,
@@ -377,11 +415,9 @@ impl FrameSlot {
                 self.counters = Some(PassQueries::new(self.family, selection.clone())?);
             }
         }
-        let mut frame = Frame { slot: self };
-        for pipeline in command_buffer::apply_pending_reloads() {
-            frame.retire(pipeline);
-        }
-        Ok(frame)
+        #[cfg(feature = "hot-reload")]
+        crate::hot_reload::begin_frame();
+        Ok(Frame { slot: self })
     }
 }
 
@@ -414,7 +450,8 @@ impl Frame<'_> {
         executor: F,
     ) -> Result<PendingAccesses> {
         let slot = self.slot;
-        let result = queue.execute_command(
+        let result = execute_command(
+            queue,
             pending,
             &slot.buffer,
             Some(&slot.fence),
@@ -477,130 +514,77 @@ impl<A> PendingWrite<A> {
     }
 }
 
-impl PendingAccesses {
-    /// Union of the pipeline stages of every access still pending, i.e. the stages a
-    /// submission has to finish before its signal semaphores may fire.
-    pub(crate) fn last_stage(&self) -> vk::PipelineStageFlags2 {
-        let images = self
-            .image_reads
+/// Records `executor` into `buffer` and submits it. With `timestamps`, the recording is
+/// timed: the root scope "frame" around it, plus every pass and `begin_scope`. With
+/// `counters`, every pass is counted.
+#[validation_trace]
+fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
+    queue: &Queue<Q>,
+    pending: PendingAccesses,
+    buffer: &CommandBufferMemory,
+    fence: Option<&Fence>,
+    timestamps: &mut Option<TimestampQueries>,
+    counters: &mut Option<PassQueries>,
+    wait_on: &[SemaphoreInfo],
+    signal: &[SemaphoreInfo],
+    executor: F,
+) -> Result<PendingAccesses> {
+    unsafe {
+        let mut cmd_buffer = CommandBuffer {
+            handle: buffer.handle,
+            pending_accesses: pending,
+            timestamps: timestamps.take(),
+            counters: counters.take(),
+        };
+
+        cmd_buffer.begin()?;
+        if let Some(timestamps) = &mut cmd_buffer.timestamps {
+            timestamps.reset(buffer.handle);
+        }
+        if let Some(counters) = &mut cmd_buffer.counters {
+            counters.reset(buffer.handle);
+        }
+        cmd_buffer.begin_scope("frame");
+        let prev = CALLSITE.replace(None);
+        executor(&mut cmd_buffer);
+        CALLSITE.set(prev);
+        cmd_buffer.end_scope();
+        host_barrier(buffer.handle);
+        *timestamps = cmd_buffer.timestamps.take();
+        *counters = cmd_buffer.counters.take();
+        cmd_buffer.end()?;
+
+        let cmd_buffer_submit_info =
+            vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
+        let wait_infos: SmallVec<[_; 1]> = wait_on
             .iter()
-            .chain(self.image_writes.iter().map(|w| &w.write));
-        let buffers = self
-            .buffer_reads
+            .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
+            .collect();
+        // Untracked work (queries, `flush_all`, host barriers) has to finish too.
+        let signal_infos: SmallVec<[_; 1]> = signal
             .iter()
-            .chain(self.buffer_writes.iter().map(|w| &w.write));
-        images
-            .map(|i| i.stage)
-            .chain(buffers.map(|b| b.stage))
-            .fold(vk::PipelineStageFlags2::empty(), |acc, stage| acc | stage)
+            .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
+            .collect();
+
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info))
+            .wait_semaphore_infos(&wait_infos)
+            .signal_semaphore_infos(&signal_infos);
+
+        queue.with(|handle| {
+            Ctx::device().queue_submit2(
+                handle,
+                std::slice::from_ref(&submit_info),
+                fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
+            )
+        })?;
+
+        Ok(cmd_buffer.pending_accesses)
     }
 }
 
-impl<Q: QueueFamilie> Queue<Q> {
-    #[validation_trace]
-    pub fn new() -> Result<Self> {
-        let mut handle = None;
-        for (i, slot) in Q::is_free().iter().enumerate() {
-            if slot
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                handle = Some((i as u32, unsafe {
-                    Ctx::device().get_device_queue(Q::index(), i as u32)
-                }));
-                break;
-            }
-        }
-        let (idx, handle) = handle.ok_or(Error::message("All queues used up"))?;
-        Ok(Self {
-            handle,
-            idx,
-            familie: Q::index(),
-            _marker: PhantomData,
-        })
-    }
-    #[validation_trace]
-    pub fn create_pool(&self) -> Result<CommandPool> {
-        Ok(CommandPool {
-            handle: unsafe {
-                Ctx::device().create_command_pool(
-                    &vk::CommandPoolCreateInfo {
-                        queue_family_index: self.familie,
-                        ..Default::default()
-                    },
-                    None,
-                )?
-            },
-        })
-    }
-
-    /// Records `executor` into `buffer` and submits it. With `timestamps`, the recording is
-    /// timed: the root scope "frame" around it, plus every pass and `begin_scope`. With
-    /// `counters`, every pass is counted.
-    #[validation_trace]
-    pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
-        &self,
-        pending: PendingAccesses,
-        buffer: &CommandBufferMemory,
-        fence: Option<&Fence>,
-        timestamps: &mut Option<TimestampQueries>,
-        counters: &mut Option<PassQueries>,
-        wait_on: &[SemaphoreInfo],
-        signal: &[SemaphoreInfo],
-        executor: F,
-    ) -> Result<PendingAccesses> {
-        unsafe {
-            let mut cmd_buffer = CommandBuffer {
-                handle: buffer.handle,
-                pending_accesses: pending,
-                timestamps: timestamps.take(),
-                counters: counters.take(),
-            };
-
-            cmd_buffer.begin()?;
-            if let Some(timestamps) = &mut cmd_buffer.timestamps {
-                timestamps.reset(buffer.handle);
-            }
-            if let Some(counters) = &mut cmd_buffer.counters {
-                counters.reset(buffer.handle);
-            }
-            cmd_buffer.begin_scope("frame");
-            let prev = CALLSITE.replace(None);
-            executor(&mut cmd_buffer);
-            CALLSITE.set(prev);
-            cmd_buffer.end_scope();
-            if clock::enabled() {
-                clock::host_barrier(buffer.handle);
-            }
-            *timestamps = cmd_buffer.timestamps.take();
-            *counters = cmd_buffer.counters.take();
-            cmd_buffer.end()?;
-
-            let cmd_buffer_submit_info =
-                vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
-            let wait_infos: SmallVec<[_; 1]> = wait_on
-                .iter()
-                .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
-                .collect();
-            let last_stage = cmd_buffer.pending_accesses.last_stage();
-            let signal_infos: SmallVec<[_; 1]> =
-                signal.iter().map(|sem| sem.to_vk(last_stage)).collect();
-
-            let submit_info = vk::SubmitInfo2::default()
-                .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info))
-                .wait_semaphore_infos(&wait_infos)
-                .signal_semaphore_infos(&signal_infos);
-
-            Ctx::device().queue_submit2(
-                self.handle,
-                std::slice::from_ref(&submit_info),
-                fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
-            )?;
-
-            Ok(cmd_buffer.pending_accesses)
-        }
-    }
-
+impl Queue<Gfx> {
+    /// `Ok(true)` means the swapchain is suboptimal or out of date and should be recreated.
     #[validation_trace]
     pub fn present(
         &self,
@@ -616,7 +600,9 @@ impl<Q: QueueFamilie> Queue<Q> {
             .swapchains(&sc)
             .image_indices(&ii)
             .wait_semaphores(waits.as_slice());
-        match unsafe { Functions::swapchain().queue_present(self.handle, &present_info) } {
+        let presented = self
+            .with(|queue| unsafe { Functions::swapchain().queue_present(queue, &present_info) });
+        match presented {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
             Ok(false) => Ok(false),
             Err(e) => Err(Error::Vulkan(e)),
@@ -624,10 +610,40 @@ impl<Q: QueueFamilie> Queue<Q> {
     }
 }
 
+/// Ends every submission: makes its writes readable by the host once its fence or semaphores
+/// signalled (readbacks, shader clock counters), which they alone don't.
+fn host_barrier(cmd: vk::CommandBuffer) {
+    let barrier = [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+        .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+    let info = vk::DependencyInfo::default().memory_barriers(&barrier);
+    unsafe { Ctx::device().cmd_pipeline_barrier2(cmd, &info) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ash::vk::Handle;
+
+    #[test]
+    fn leases_take_unused_queues_before_sharing_the_least_used() {
+        let mut leases = [1, 0, 1];
+        assert_eq!(lease(&mut leases), 1);
+        assert_eq!(lease(&mut leases), 0);
+        assert_eq!(lease(&mut leases), 1);
+        assert_eq!(leases, [2, 2, 1]);
+    }
+
+    #[test]
+    fn a_shared_queue_is_only_suboptimal_while_a_less_used_one_exists() {
+        assert!(!is_optimal(&[2, 0], 0));
+        assert!(is_optimal(&[2, 0], 1));
+        assert!(is_optimal(&[2, 1], 0));
+        assert!(is_optimal(&[2], 0), "a single queue can't do better");
+        assert!(!is_optimal(&[3, 1], 0));
+    }
 
     #[test]
     fn binary_semaphore_info_has_no_value() {
@@ -645,41 +661,5 @@ mod tests {
         assert_eq!(submit.semaphore, vk::Semaphore::from_raw(9));
         assert_eq!(submit.value, 12);
         assert_eq!(submit.stage_mask, vk::PipelineStageFlags2::ALL_COMMANDS);
-    }
-
-    #[test]
-    fn last_stage_is_empty_without_pending_accesses() {
-        assert!(PendingAccesses::default().last_stage().is_empty());
-    }
-
-    #[test]
-    fn last_stage_is_the_union_over_all_pending_accesses() {
-        use vk::PipelineStageFlags2 as S;
-        let buffer = |stage| BufferAccess {
-            stage,
-            access: vk::AccessFlags2::empty(),
-            range: (0u64..4).into(),
-        };
-        let image = |stage| ImageAccess {
-            stage,
-            access: vk::AccessFlags2::empty(),
-            image: vk::Image::null(),
-            layout: vk::ImageLayout::GENERAL,
-            aspect: vk::ImageAspectFlags::COLOR,
-            old_layout: vk::ImageLayout::GENERAL,
-        };
-        let mut pending = PendingAccesses::default();
-        pending.buffer_reads.push(buffer(S::VERTEX_SHADER));
-        pending
-            .buffer_writes
-            .push(PendingWrite::new(buffer(S::COMPUTE_SHADER)));
-        pending.image_reads.push(image(S::FRAGMENT_SHADER));
-        pending
-            .image_writes
-            .push(PendingWrite::new(image(S::COLOR_ATTACHMENT_OUTPUT)));
-        assert_eq!(
-            pending.last_stage(),
-            S::VERTEX_SHADER | S::COMPUTE_SHADER | S::FRAGMENT_SHADER | S::COLOR_ATTACHMENT_OUTPUT
-        );
     }
 }

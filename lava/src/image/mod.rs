@@ -17,7 +17,6 @@ use crate::{
         usage::{ImageUsage, IsHostCopy, SampledBinding, StorageBinding, UnifiedBinding},
     },
     state::{Ctx, Functions},
-    vkobjects::queue::{CommandBufferMemory, Fence, Gfx, Queue, SemaphoreInfo},
 };
 use glam::UVec2;
 
@@ -33,6 +32,8 @@ pub struct Image<F: Format, U: ImageUsage> {
     pub extent: UVec2,
     pub handle: BindlessHandle,
     pub mip_levels: u32,
+    /// The layout the image will be in once everything built so far is recorded. It changes
+    /// when an access is built (see `ImageView::access`), not when it is recorded.
     pub(crate) layout: AtomicU32,
     _format: PhantomData<F>,
     _usage: PhantomData<U>,
@@ -147,6 +148,9 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
 }
 
 impl<F: Format, U: IsHostCopy> Image<F, U> {
+    /// Writes a whole mip level from the host, right away. Like anything a command buffer
+    /// doesn't record, it isn't synchronised with the GPU: frames in flight that read the image
+    /// may see the old or the new texels, or a mix.
     #[validation_trace]
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
         self.check_host_copy(data, mip_level)?;
@@ -162,8 +166,8 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
         self.host_copy(data, mip_level, UVec2::ZERO, extent)
     }
 
-    /// Like `copy_from`, but only writes the `extent` texels at `offset` of the mip level.
-    /// `data` holds that rectangle, tightly packed.
+    /// Like `copy_from` (also unsynchronised), but only writes the `extent` texels at `offset`
+    /// of the mip level. `data` holds that rectangle, tightly packed.
     #[validation_trace]
     pub fn copy_region_from(
         &mut self,
