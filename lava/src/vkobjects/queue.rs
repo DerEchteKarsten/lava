@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use crate::{
     command_buffer::{self, BufferAccess, CommandBuffer, ImageAccess},
-    profiling::{self, FrameQueries, FrameTimings},
+    profiling::{self, FrameQueries, GpuFrameTimings},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -372,7 +372,7 @@ impl Frame<'_> {
 
     /// The GPU scopes, counters and shader clock regions of the frame this slot submitted
     /// before, if it was profiled.
-    pub fn last_timings(&self) -> Option<&FrameTimings> {
+    pub fn last_timings(&self) -> Option<&GpuFrameTimings> {
         self.slot.queries.as_ref()?.results()
     }
 

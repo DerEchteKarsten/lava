@@ -44,7 +44,7 @@ pub struct GpuScope {
 
 /// What a profiled frame slot read back about the frame it submitted before.
 #[derive(Clone, Debug, Default)]
-pub struct FrameTimings {
+pub struct GpuFrameTimings {
     /// The root scope "frame" first, then passes and `begin_scope` groups in recording order.
     pub scopes: Vec<GpuScope>,
     /// The counters the scopes' values belong to (`counters::selected_counters` when the
@@ -90,7 +90,7 @@ pub struct FrameQueries {
     next_performance: u32,
     /// `counters::generation()` when this was created; a newer selection needs new pools.
     pub(crate) generation: u64,
-    results: FrameTimings,
+    results: GpuFrameTimings,
 }
 
 static OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
@@ -174,7 +174,7 @@ impl FrameQueries {
             open: Vec::new(),
             next_timestamp: 0,
             next_statistic: 0,
-            results: FrameTimings {
+            results: GpuFrameTimings {
                 counters: performance
                     .as_ref()
                     .map_or_else(|| Arc::new([]) as Arc<[_]>, |p| p.counters.clone()),
@@ -359,8 +359,9 @@ impl FrameQueries {
             let performance = performance.as_ref()?;
             let results = &performance.results[query as usize * count..][..count];
             let mut values = [0.0; MAX_COUNTERS];
-            for (value, (counter, result)) in
-                values.iter_mut().zip(performance.counters.iter().zip(results))
+            for (value, (counter, result)) in values
+                .iter_mut()
+                .zip(performance.counters.iter().zip(results))
             {
                 *value = counter.value(result);
             }
@@ -391,7 +392,7 @@ impl FrameQueries {
         Ok(())
     }
 
-    pub(crate) fn results(&self) -> Option<&FrameTimings> {
+    pub(crate) fn results(&self) -> Option<&GpuFrameTimings> {
         (!self.results.scopes.is_empty()).then_some(&self.results)
     }
 }
