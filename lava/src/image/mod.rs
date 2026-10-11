@@ -92,8 +92,7 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
                 U::VK
             } else {
                 U::VK & !vk::ImageUsageFlags::HOST_TRANSFER_EXT
-            } | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST,
+            },
             initial_layout: vk::ImageLayout::UNDEFINED,
             ..Default::default()
         };

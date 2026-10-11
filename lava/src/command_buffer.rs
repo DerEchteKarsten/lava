@@ -29,7 +29,7 @@ use crate::{
     image::{
         format::{ColorAspect, DepthAspect, Format},
         slice::{ImageSlice, ImageView},
-        usage::{ImageUsage, IsColorAttachment, IsDepthAttachment},
+        usage::{ImageUsage, IsColorAttachment, IsDepthAttachment, IsTransferDst, IsTransferSrc},
     },
     profiling::{PassQueries, TimestampQueries},
     slang_compile,
@@ -1510,7 +1510,7 @@ impl CommandBuffer {
     }
 
     #[validation_trace]
-    pub fn clear_image<'a, F: Format, U: ImageUsage>(
+    pub fn clear_image<'a, F: Format, U: IsTransferDst>(
         &'a mut self,
         image: ImageView<'a, F, U>,
         clear_color: F::Texels,
@@ -1559,7 +1559,7 @@ impl CommandBuffer {
         };
     }
     #[validation_trace]
-    pub fn blit_image<'a, F: Format, U: ImageUsage, F2: Format, U2: ImageUsage>(
+    pub fn blit_image<'a, F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst>(
         &mut self,
         src: ImageSlice<'a, F, U>,
         dst: ImageSlice<'a, F2, U2>,
@@ -1635,7 +1635,7 @@ impl CommandBuffer {
     }
 
     #[validation_trace]
-    pub fn copy_buffer_to_image<'a, T: Copy + Pod, F: Format, U: ImageUsage>(
+    pub fn copy_buffer_to_image<'a, T: Copy + Pod, F: Format, U: IsTransferDst>(
         &mut self,
         src: BufferSlice<'a, T>,
         dst: ImageSlice<'a, F, U>,
@@ -1683,7 +1683,7 @@ impl CommandBuffer {
 
     /// Copies the texels of `src` (its first mip level) into `dst`, tightly packed row by row.
     #[validation_trace]
-    pub fn copy_image_to_buffer<'a, T: Copy + Pod, F: Format, U: ImageUsage, BU: BufferUsage>(
+    pub fn copy_image_to_buffer<'a, T: Copy + Pod, F: Format, U: IsTransferSrc, BU: BufferUsage>(
         &mut self,
         src: ImageSlice<'a, F, U>,
         dst: BufferSlice<'a, T, BU>,

@@ -30,7 +30,9 @@ use lava::{
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
         slice::AsImage,
         usage::{
-            ColorAttachmentStorage, DepthAttachment, Sampled, SampledHostCopy, SampledStorage,
+            ColorAttachmentStorageTransferSrcTransferDst, DepthAttachment, Sampled, SampledHostCopy,
+            SampledHostCopyTransferSrc, SampledStorage, SampledTransferDst, SampledTransferSrcTransferDst,
+            StorageTransferSrcTransferDst,
             Storage as StorageImage,
         },
     },
@@ -48,7 +50,7 @@ const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
 const BLACK: [u8; 4] = [0, 0, 0, 255];
 
-type Target = Image<R8G8B8A8Unorm, ColorAttachmentStorage>;
+type Target = Image<R8G8B8A8Unorm, ColorAttachmentStorageTransferSrcTransferDst>;
 
 /// Clears a fresh target to opaque black, lets `record` draw into it, and reads it back.
 fn render(gpu: &common::Gpu, record: impl FnOnce(&mut CommandBuffer, &Target)) -> Vec<u8> {
@@ -644,7 +646,7 @@ fn dropped_images_report_their_handle() {
 #[test]
 fn clear_image_sets_every_texel() {
     let gpu = gpu();
-    let image = Image::<R8G8B8A8Unorm, StorageImage>::new(8, 8).unwrap();
+    let image = Image::<R8G8B8A8Unorm, StorageTransferSrcTransferDst>::new(8, 8).unwrap();
     let readback = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
     gpu.submit(|cmd| {
         cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.5, 1.0]);
@@ -663,7 +665,7 @@ fn buffer_to_image_and_back_round_trips() {
     let gpu = gpu();
     let data = pattern(8, 8);
     let upload = buffer_with::<u8, Storage>(&data);
-    let image = Image::<R8G8B8A8Unorm, Sampled>::new(8, 8).unwrap();
+    let image = Image::<R8G8B8A8Unorm, SampledTransferSrcTransferDst>::new(8, 8).unwrap();
     let readback = zeroed_buffer::<u8, Storage>(data.len());
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), image.whole());
@@ -677,7 +679,7 @@ fn image_region_copies_address_the_sub_rectangle() {
     let gpu = gpu();
     let data = pattern(8, 8);
     let upload = buffer_with::<u8, Storage>(&data);
-    let image = Image::<R8G8B8A8Unorm, Sampled>::new(8, 8).unwrap();
+    let image = Image::<R8G8B8A8Unorm, SampledTransferSrcTransferDst>::new(8, 8).unwrap();
     let readback = zeroed_buffer::<u8, Storage>(3 * 2 * 4);
     let region = image
         .whole_view()
@@ -704,8 +706,8 @@ fn blit_copies_between_offset_regions() {
     let gpu = gpu();
     let data = pattern(8, 8);
     let upload = buffer_with::<u8, Storage>(&data);
-    let src = Image::<R8G8B8A8Unorm, Sampled>::new(8, 8).unwrap();
-    let dst = Image::<R8G8B8A8Unorm, Sampled>::new(8, 8).unwrap();
+    let src = Image::<R8G8B8A8Unorm, SampledTransferSrcTransferDst>::new(8, 8).unwrap();
+    let dst = Image::<R8G8B8A8Unorm, SampledTransferSrcTransferDst>::new(8, 8).unwrap();
     let readback = zeroed_buffer::<u8, Storage>(data.len());
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), src.whole());
@@ -745,8 +747,8 @@ fn blit_scales_between_differently_sized_regions() {
     ]
     .concat();
     let upload = buffer_with::<u8, Storage>(&data);
-    let src = Image::<R8G8B8A8Unorm, Sampled>::new(2, 2).unwrap();
-    let dst = Image::<R8G8B8A8Unorm, Sampled>::new(8, 8).unwrap();
+    let src = Image::<R8G8B8A8Unorm, SampledTransferSrcTransferDst>::new(2, 2).unwrap();
+    let dst = Image::<R8G8B8A8Unorm, SampledTransferSrcTransferDst>::new(8, 8).unwrap();
     let readback = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), src.whole());
@@ -766,7 +768,7 @@ fn blit_scales_between_differently_sized_regions() {
 #[test]
 fn host_copy_uploads_a_mip_level() {
     let gpu = gpu();
-    let mut image = Image::<R8G8B8A8Unorm, SampledHostCopy>::with_mip_levels(8, 8, 2).unwrap();
+    let mut image = Image::<R8G8B8A8Unorm, SampledHostCopyTransferSrc>::with_mip_levels(8, 8, 2).unwrap();
     let data = pattern(8, 8);
 
     if !Ctx::features().rebar {
@@ -800,7 +802,7 @@ fn host_copy_uploads_a_mip_level() {
 #[test]
 fn host_copy_writes_only_the_region() {
     let gpu = gpu();
-    let mut image = Image::<R8G8B8A8Unorm, SampledHostCopy>::new(8, 8).unwrap();
+    let mut image = Image::<R8G8B8A8Unorm, SampledHostCopyTransferSrc>::new(8, 8).unwrap();
     let (offset, extent) = (UVec2::new(4, 5), UVec2::new(3, 2));
     let patch = vec![200u8; 3 * 2 * 4];
 
@@ -1520,7 +1522,7 @@ fn indexed_draw_samples_a_bindless_texture() {
     ]
     .concat();
     let upload = buffer_with::<u8, Storage>(&texels);
-    let texture = Image::<R8G8B8A8Unorm, Sampled>::new_sampled(2, 2, 1, 0).unwrap();
+    let texture = Image::<R8G8B8A8Unorm, SampledTransferDst>::new_sampled(2, 2, 1, 0).unwrap();
 
     let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
         position: Vec2::new(x, y),
@@ -1584,7 +1586,7 @@ fn batched_bindings_are_sampled_from_their_slots() {
     ];
     let mut textures: Vec<_> = colors
         .iter()
-        .map(|_| Image::<R8G8B8A8Unorm, Sampled>::new(1, 1).unwrap())
+        .map(|_| Image::<R8G8B8A8Unorm, SampledTransferDst>::new(1, 1).unwrap())
         .collect();
     let mut writes = BindlessWrites::default();
     for (i, texture) in textures.iter_mut().enumerate() {

@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 
 use crate::{
     bindless::BindlessWrites,
-    image::{format, slice::ImageView, usage::ColorAttachmentStorage},
+    image::{format, slice::ImageView, usage::{ColorAttachmentStorageTransferDst, ImageUsage}},
     state::{Ctx, Functions},
     vkobjects::{
         queue::{Binary, Fence, Semaphore},
@@ -42,7 +42,7 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn image(&self, index: u32) -> ImageView<'_, format::Swapchain, ColorAttachmentStorage> {
+    pub fn image(&self, index: u32) -> ImageView<'_, format::Swapchain, ColorAttachmentStorageTransferDst> {
         let image = &self.images[index as usize];
         ImageView {
             image: image.image,
@@ -84,11 +84,7 @@ impl Swapchain {
                 .image_color_space(format.color_space)
                 .image_extent(extent)
                 .image_array_layers(1)
-                .image_usage(
-                    vk::ImageUsageFlags::STORAGE
-                        | vk::ImageUsageFlags::TRANSFER_DST
-                        | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                );
+                .image_usage(ColorAttachmentStorageTransferDst::VK);
 
             builder = if Ctx::gfx_queue_index() != Ctx::present_queue_index() {
                 builder
