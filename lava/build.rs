@@ -359,7 +359,7 @@ struct SConst<'a> {
 /// The pass's specialization constants by id. `SCONST(T, name)` (`bindless.slang`) declares a
 /// `uint64_t name_sconst` whose `SConst` attribute names `T`, a buffer or image handle; any
 /// other one is a plain scalar. `CLOCK_REGION_IDS` (`profile.slang`) get the hashes of the
-/// pass's clock `regions`.
+/// pass's clock `regions`, which `constant_bindings` sets while `clock::enabled()`.
 fn sconsts<'a>(
     layout: &'a slang::reflection::Shader,
     file: &str,
@@ -622,7 +622,14 @@ impl {pass_name} {{
             structs,
             stage,
         );
-        let baked = consts.iter().filter_map(|c| Some(format!("{}: {:#x}", c.name, c.value?)));
+        // Only the clock regions' hashes are baked, and only while clocks are on.
+        let baked = consts.iter().filter_map(|c| match c.value? {
+            0 => Some(format!("{}: 0", c.name)),
+            hash => Some(format!(
+                "{}: if crate::profiling::clock::enabled() {{ {hash:#x} }} else {{ 0 }}",
+                c.name
+            )),
+        });
         let gpu_inits: Vec<String> = new.gpu_inits.iter().cloned().chain(baked).collect();
         let fields: Vec<String> = consts
             .iter()

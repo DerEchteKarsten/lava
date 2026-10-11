@@ -56,6 +56,12 @@ impl Ctx {
     pub(crate) fn physical_device() -> &'static PhysicalDevice {
         &Ctx::get().physical_device
     }
+    pub fn device_properties() -> &'static vk::PhysicalDeviceProperties {
+        &Ctx::get().physical_device.properties
+    }
+    pub fn mesh_shader_properties() -> &'static vk::PhysicalDeviceMeshShaderPropertiesEXT<'static> {
+        &Ctx::get().physical_device.mesh_shader_properties
+    }
     pub fn gfx_queue_index() -> u32 {
         Ctx::get().gfx_queue_familie.index
     }
@@ -793,8 +799,17 @@ mod tests {
             Default::default();
         let (mut clock, mut performance) = Default::default();
         features.features(
-            &mut vk11, &mut vk12, &mut vk13, &mut dn3, &mut dy2, &mut mesh, &mut ray, &mut acc,
-            &mut hic, &mut clock, &mut performance,
+            &mut vk11,
+            &mut vk12,
+            &mut vk13,
+            &mut dn3,
+            &mut dy2,
+            &mut mesh,
+            &mut ray,
+            &mut acc,
+            &mut hic,
+            &mut clock,
+            &mut performance,
         );
         // Detach the copies from the pNext chain that borrowed them.
         vk12.p_next = std::ptr::null_mut();
@@ -813,7 +828,10 @@ mod tests {
         assert_eq!(vk12.runtime_descriptor_array, vk::TRUE);
         assert_eq!(vk12.descriptor_binding_partially_bound, vk::TRUE);
         assert_eq!(vk12.descriptor_binding_variable_descriptor_count, vk::TRUE);
-        assert_eq!(vk12.descriptor_binding_update_unused_while_pending, vk::TRUE);
+        assert_eq!(
+            vk12.descriptor_binding_update_unused_while_pending,
+            vk::TRUE
+        );
         assert_eq!(vk12.timeline_semaphore, vk::TRUE);
         assert_eq!(vk12.scalar_block_layout, vk::TRUE);
         assert_eq!(vk13.synchronization2, vk::TRUE);

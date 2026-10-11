@@ -34,7 +34,7 @@ use lava::{
             Storage as StorageImage,
         },
     },
-    profiling::counters,
+    profiling::{clock, counters},
     state::Ctx,
     vkobjects::queue::{
         Binary, Event, Fence, FrameSlot, Gfx, PendingAccesses, Queue, Semaphore, Timeline,
@@ -196,6 +196,7 @@ fn fence_signals_when_the_submission_finished() {
             &memory,
             Some(&fence),
             &mut None,
+            &mut None,
             &[],
             &[],
             |cmd| {
@@ -214,6 +215,7 @@ fn fence_signals_when_the_submission_finished() {
             PendingAccesses::default(),
             &memory,
             Some(&fence),
+            &mut None,
             &mut None,
             &[],
             &[],
@@ -323,59 +325,58 @@ fn frame_slot_can_be_reused_and_keeps_retired_values_until_the_frame_is_done() {
     assert_eq!(buffer.range(..).as_slice(), [3; 4]);
 }
 
-#[test]
+/// A group of two compute passes, then a rendering if the device has mesh shaders.
 #[cfg(feature = "profiling")]
-fn profiled_frame_slot_times_scopes_and_passes() {
-    let gpu = gpu();
-    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
-    let mesh = Ctx::features().mesh;
-    // One counter, which always fits a single pass; the slot records it per pass. A time
-    // counter, if the device has one, can't be 0 for a pass.
-    let all = counters::counters();
-    let counter = (all
-        .iter()
-        .find(|c| c.unit == counters::CounterUnit::Nanoseconds))
-    .or(all.first());
-    counters::set_counters(counter.as_slice()).unwrap();
-    let mut slot = FrameSlot::new(&gpu.queue).unwrap();
-    slot.set_profiling(true);
-    let frame = slot.begin().unwrap();
-    assert!(frame.last_timings().is_none(), "nothing was submitted yet");
-    frame
+fn record_profiled(cmd: &mut CommandBuffer, target: &Target) {
+    cmd.begin_scope("group");
+    for color in [Vec4::ONE, Vec4::ZERO] {
+        cmd.compute(
+            TestComputeImage::push_bindings(target.whole_view(), color, UVec2::ZERO, EXTENT)
+                .constant_bindings(),
+            [SIZE / 8, SIZE / 8, 1],
+        );
+    }
+    cmd.end_scope();
+    if Ctx::features().mesh {
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .launch(
+                TestMesh::push_bindings(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
+                [2, 1, 1],
+                RasterState::default().backface_culling(false),
+            )
+            .record("TestMesh");
+    }
+}
+
+/// Submits `record_profiled` from `slot` and begins it again, which reads the results back.
+#[cfg(feature = "profiling")]
+fn submit_profiled<'a>(
+    gpu: &common::Gpu,
+    slot: &'a mut FrameSlot,
+    target: &Target,
+) -> lava::vkobjects::queue::Frame<'a> {
+    slot.begin()
+        .unwrap()
         .execute(&gpu.queue, PendingAccesses::default(), &[], &[], |cmd| {
-            cmd.begin_scope("group");
-            for color in [Vec4::ONE, Vec4::ZERO] {
-                cmd.compute(
-                    TestComputeImage::push_bindings(
-                        target.whole_view(),
-                        color,
-                        UVec2::ZERO,
-                        EXTENT,
-                    )
-                    .constant_bindings(),
-                    [SIZE / 8, SIZE / 8, 1],
-                );
-            }
-            cmd.end_scope();
-            if mesh {
-                cmd.raster(EXTENT)
-                    .color_attachment(target.whole_view(), None)
-                    .launch(
-                        TestMesh::push_bindings(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
-                        [2, 1, 1],
-                        RasterState::default().backface_culling(false),
-                    )
-                    .record("TestMesh");
-            }
+            record_profiled(cmd, target)
         })
         .unwrap();
+    slot.begin().unwrap()
+}
 
-    let frame = slot.begin().unwrap();
-    let timings = frame
-        .last_timings()
-        .expect("the frame was profiled")
-        .clone();
-    let scopes = timings.scopes;
+#[test]
+#[cfg(feature = "profiling")]
+fn timestamps_time_scopes_and_passes() {
+    let gpu = gpu();
+    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let mut slot = FrameSlot::new(&gpu.queue).unwrap();
+    slot.set_timestamps(true);
+    assert!(slot.begin().unwrap().last_timestamps().is_none(), "nothing was submitted yet");
+    let frame = submit_profiled(&gpu, &mut slot, &target);
+    let scopes = frame.last_timestamps().expect("the frame was timed").to_vec();
+    assert!(frame.last_counters().is_none(), "pass queries are off");
+    drop(frame);
     let names: Vec<_> = scopes.iter().map(|s| (s.name, s.depth)).collect();
     let mut expected = vec![
         ("frame", 0),
@@ -383,7 +384,7 @@ fn profiled_frame_slot_times_scopes_and_passes() {
         ("TestComputeImage", 2),
         ("TestComputeImage", 2),
     ];
-    if mesh {
+    if Ctx::features().mesh {
         expected.push(("TestMesh", 1));
     }
     assert_eq!(names, expected);
@@ -402,58 +403,95 @@ fn profiled_frame_slot_times_scopes_and_passes() {
         "passes run in order"
     );
 
-    // Statistics are counted for passes only.
-    assert!(scopes[..2].iter().all(|s| s.stats.is_none()));
+    slot.set_timestamps(false);
+    assert!(submit_profiled(&gpu, &mut slot, &target).last_timestamps().is_none());
+}
+
+#[test]
+#[cfg(feature = "profiling")]
+fn pass_queries_count_passes_and_renderings() {
+    let gpu = gpu();
+    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let mesh = Ctx::features().mesh;
+    // One counter, which always fits a single pass. A time counter, if the device has one,
+    // can't be 0 for a pass.
+    let all = counters::counters();
+    let counter = (all.iter())
+        .find(|c| c.unit == counters::CounterUnit::Nanoseconds)
+        .or(all.first());
+    let selection: std::sync::Arc<[&'static counters::Counter]> = counter.into_iter().collect();
+    let mut slot = FrameSlot::new(&gpu.queue).unwrap();
+    slot.set_counters(Some(selection.clone()));
+    let frame = submit_profiled(&gpu, &mut slot, &target);
+    let results = frame.last_counters().expect("the frame was counted").clone();
+    assert!(frame.last_timestamps().is_none(), "timestamps are off");
+    drop(frame);
+    assert!(std::sync::Arc::ptr_eq(&results.counters, &selection));
+
+    // Groups aren't counted, only passes and renderings.
+    let names: Vec<_> = results.passes.iter().map(|p| p.name).collect();
+    let mut expected = vec!["TestComputeImage", "TestComputeImage"];
+    if mesh {
+        expected.push("TestMesh");
+    }
+    assert_eq!(names, expected);
     if Ctx::features().pipeline_statistics {
-        for pass in &scopes[2..4] {
+        for pass in &results.passes[..2] {
             let stats = pass.stats.unwrap();
             assert_eq!(stats.compute, (SIZE * SIZE) as u64);
             assert_eq!(stats.fragment, 0);
         }
         if mesh {
-            let stats = scopes[4].stats.unwrap();
+            let stats = results.passes[2].stats.unwrap();
             assert!(stats.fragment > 0 && stats.compute == 0);
             if Ctx::features().mesh_queries {
                 assert!(stats.mesh > 0);
             }
         }
     }
-
-    // Counters are read for passes and renderings only.
-    assert_eq!(timings.counters.len(), counter.is_some() as usize);
-    assert!(scopes[..2].iter().all(|s| s.counters.is_none()));
-    if counter.is_some() {
-        for pass in &scopes[2..] {
-            let value = pass.counters.expect("passes read the counters")[0];
-            assert!(value.is_finite() && value >= 0.0, "{value}");
-            if counter.unwrap().unit == counters::CounterUnit::Nanoseconds {
-                assert!(value > 0.0, "{}: {value}", pass.name);
+    for pass in &results.passes {
+        assert_eq!(pass.values.is_some(), counter.is_some(), "{}", pass.name);
+        if let (Some(values), Some(counter)) = (pass.values, counter) {
+            assert!(values[0].is_finite() && values[0] >= 0.0, "{}", values[0]);
+            if counter.unit == counters::CounterUnit::Nanoseconds {
+                assert!(values[0] > 0.0, "{}: {}", pass.name, values[0]);
             }
         }
     }
 
-    // `test_compute_image.slang` has the one clock region "fill"; the other passes have none.
-    if Ctx::features().shader_clock {
-        let regions: Vec<_> = timings.regions.iter().map(|r| (r.pass, r.region)).collect();
-        assert_eq!(regions, [("TestComputeImage", "fill")]);
-        let time = &timings.regions[0];
-        // Both dispatches, at most one subgroup per invocation.
-        assert!(time.subgroups >= 2 && time.subgroups <= 2 * (SIZE * SIZE) as u64);
-        assert!(time.ticks > 0);
-    }
-    drop(frame);
-    counters::set_counters(&[]).unwrap();
+    slot.set_counters(None);
+    assert!(submit_profiled(&gpu, &mut slot, &target).last_counters().is_none());
+}
 
-    // Without profiling the slot reports nothing.
-    slot.set_profiling(false);
-    let frame = slot.begin().unwrap();
-    frame
-        .execute(&gpu.queue, PendingAccesses::default(), &[], &[], |cmd| {
-            cmd.begin_scope("group");
-            cmd.end_scope();
-        })
-        .unwrap();
-    assert!(slot.begin().unwrap().last_timings().is_none());
+#[test]
+#[cfg(feature = "profiling")]
+fn shader_clocks_count_only_while_enabled() {
+    if !Ctx::features().shader_clock {
+        return;
+    }
+    let gpu = gpu();
+    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let read = || {
+        let mut times = Vec::new();
+        clock::read(|time| times.push(time));
+        times
+    };
+    // `test_compute_image.slang` has the one clock region "fill"; the other passes have none.
+    clock::set_enabled(true);
+    read();
+    gpu.submit(|cmd| record_profiled(cmd, &target));
+    let times = read();
+    let regions: Vec<_> = times.iter().map(|r| (r.pass, r.region)).collect();
+    assert_eq!(regions, [("TestComputeImage", "fill")]);
+    // Both dispatches, at most one subgroup per invocation.
+    let time = &times[0];
+    assert!(time.subgroups >= 2 && time.subgroups <= 2 * (SIZE * SIZE) as u64);
+    assert!(time.ticks > 0);
+
+    // Off, the passes are built without their region names and count nothing.
+    clock::set_enabled(false);
+    gpu.submit(|cmd| record_profiled(cmd, &target));
+    assert!(read().is_empty());
 }
 
 // ---- buffer commands -------------------------------------------------------------------------

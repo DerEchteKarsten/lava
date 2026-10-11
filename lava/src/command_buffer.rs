@@ -31,7 +31,7 @@ use crate::{
         slice::{ImageSlice, ImageView},
         usage::{ImageUsage, IsColorAttachment, IsDepthAttachment},
     },
-    profiling::FrameQueries,
+    profiling::{PassQueries, TimestampQueries},
     slang_compile,
     state::{Ctx, Functions},
     vkobjects::{
@@ -70,7 +70,8 @@ pub(crate) struct ImageAccess {
 pub struct CommandBuffer {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) pending_accesses: PendingAccesses,
-    pub(crate) queries: Option<FrameQueries>,
+    pub(crate) timestamps: Option<TimestampQueries>,
+    pub(crate) counters: Option<PassQueries>,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Default)]
@@ -1386,7 +1387,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
 
         let device = Ctx::device();
         let handle = self.cmd_buf.handle;
-        self.cmd_buf.open_scope(name, true);
+        self.cmd_buf.begin_pass(name);
         unsafe {
             device.cmd_begin_rendering(handle, &rendering_info);
             device.cmd_set_viewport(
@@ -1475,7 +1476,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             }
         }
         unsafe { device.cmd_end_rendering(handle) };
-        self.cmd_buf.end_scope();
+        self.cmd_buf.end_pass();
     }
 }
 
@@ -1766,7 +1767,7 @@ impl CommandBuffer {
 
         let pipeline = pipelines().compute(bindings.pass, &bindings.constants);
 
-        self.open_scope(pass.name, true);
+        self.begin_pass(pass.name);
         unsafe {
             Ctx::device().cmd_bind_pipeline(self.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
             if let Some(slice) = indirect_buffer {
@@ -1775,7 +1776,7 @@ impl CommandBuffer {
                 Ctx::device().cmd_dispatch(self.handle, dispatch[0], dispatch[1], dispatch[2]);
             }
         }
-        self.end_scope();
+        self.end_pass();
     }
 
     #[validation_trace]
@@ -1797,7 +1798,7 @@ impl CommandBuffer {
         self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
         self.push_constants(&bindings.push_constants);
 
-        self.open_scope(pass.name, true);
+        self.begin_pass(pass.name);
         pipelines().ray_tracing(bindings.pass, &bindings.constants, |pipeline| unsafe {
             Ctx::device().cmd_bind_pipeline(
                 self.handle,
@@ -1816,7 +1817,7 @@ impl CommandBuffer {
                 1,
             );
         });
-        self.end_scope();
+        self.end_pass();
     }
 
     #[validation_trace]
@@ -1890,21 +1891,32 @@ impl CommandBuffer {
     /// frames time it (see `FrameSlot::set_profiling`), and debug builds label it for
     /// RenderDoc/Nsight. Every pass is such a scope on its own.
     pub fn begin_scope(&mut self, name: &'static str) {
-        self.open_scope(name, false);
+        Functions::cmd_start_label(&self.handle, name);
+        if let Some(timestamps) = &mut self.timestamps {
+            timestamps.begin(self.handle, name);
+        }
     }
 
     pub fn end_scope(&mut self) {
-        if let Some(queries) = &mut self.queries {
-            queries.end(self.handle);
+        if let Some(timestamps) = &mut self.timestamps {
+            timestamps.end(self.handle);
         }
         Functions::cmd_end_label(&self.handle);
     }
 
-    fn open_scope(&mut self, name: &'static str, statistics: bool) {
-        Functions::cmd_start_label(&self.handle, name);
-        if let Some(queries) = &mut self.queries {
-            queries.begin(self.handle, name, statistics);
+    /// A scope that the pass queries count too.
+    fn begin_pass(&mut self, name: &'static str) {
+        self.begin_scope(name);
+        if let Some(counters) = &mut self.counters {
+            counters.begin(self.handle, name);
         }
+    }
+
+    fn end_pass(&mut self) {
+        if let Some(counters) = &mut self.counters {
+            counters.end(self.handle);
+        }
+        self.end_scope();
     }
 
     pub(crate) fn begin(&mut self) -> Result<()> {
@@ -2334,7 +2346,8 @@ mod tests {
         CommandBuffer {
             handle: vk::CommandBuffer::null(),
             pending_accesses: PendingAccesses::default(),
-            queries: None,
+            timestamps: None,
+            counters: None,
         }
     }
 

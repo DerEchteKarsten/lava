@@ -185,7 +185,7 @@ impl Bindless {
             .immutable_samplers(&samplers),
             vk::DescriptorSetLayoutBinding {
                 binding: samplers.len() as u32,
-                descriptor_count: Ctx::physical_device()
+                descriptor_count: Ctx::device_properties()
                     .limits
                     .max_descriptor_set_sampled_images,
                 descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
@@ -208,7 +208,7 @@ impl Bindless {
 
         let bindings = [vk::DescriptorSetLayoutBinding {
             binding: 0,
-            descriptor_count: Ctx::physical_device()
+            descriptor_count: Ctx::device_properties()
                 .limits
                 .max_descriptor_set_storage_images,
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
@@ -235,7 +235,7 @@ impl Bindless {
 
         // Every pass pushes this many bytes.
         let size = MAX_PUSH_CONSTANTS_SIZE as u32;
-        assert!(Ctx::physical_device().limits.max_push_constants_size >= size);
+        assert!(Ctx::device_properties().limits.max_push_constants_size >= size);
         let ranges = [vk::PushConstantRange {
             offset: 0,
             size,
@@ -248,7 +248,7 @@ impl Bindless {
 
         let pool_sizes = [
             vk::DescriptorPoolSize {
-                descriptor_count: Ctx::physical_device()
+                descriptor_count: Ctx::device_properties()
                     .limits
                     .max_descriptor_set_sampled_images
                     .min(10000),
@@ -259,7 +259,7 @@ impl Bindless {
                 ty: vk::DescriptorType::SAMPLER,
             },
             vk::DescriptorPoolSize {
-                descriptor_count: Ctx::physical_device()
+                descriptor_count: Ctx::device_properties()
                     .limits
                     .max_descriptor_set_storage_images
                     .min(10000),
@@ -278,11 +278,11 @@ impl Bindless {
         let pool = unsafe { Ctx::device().create_descriptor_pool(&pool_info, None) }?;
 
         let desc_counts = [
-            Ctx::physical_device()
+            Ctx::device_properties()
                 .limits
                 .max_descriptor_set_sampled_images
                 .min(10000),
-            Ctx::physical_device()
+            Ctx::device_properties()
                 .limits
                 .max_descriptor_set_storage_images
                 .min(10000),

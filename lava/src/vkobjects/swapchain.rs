@@ -175,7 +175,7 @@ impl Swapchain {
 
     #[validation_trace]
     pub fn aquire_image(&self, wait_on: &Semaphore<Binary>, fence: Option<&Fence>) -> Result<u32> {
-        let _span = tracing::info_span!("wait for swapchain image", wait = true).entered();
+        let _span = tracing::info_span!("wait for swapchain image").entered();
         let (image_index, _suboptimal) = unsafe {
             Functions::swapchain().acquire_next_image(
                 self.handle,

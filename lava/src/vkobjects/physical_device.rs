@@ -47,8 +47,8 @@ pub struct PhysicalDevice {
     pub handel: vk::PhysicalDevice,
     pub name: String,
     pub mem_properties: vk::PhysicalDeviceMemoryProperties,
-    pub device_type: vk::PhysicalDeviceType,
-    pub limits: vk::PhysicalDeviceLimits,
+    pub properties: vk::PhysicalDeviceProperties,
+    pub mesh_shader_properties: vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>,
     pub queue_families: Vec<QueueFamily>,
     pub supported_extensions: Vec<String>,
     pub supported_features: Features,
@@ -64,16 +64,13 @@ impl PhysicalDevice {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Self> {
-        let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let properties = unsafe { instance.get_physical_device_properties(physical_device) };
 
         let name = unsafe {
-            CStr::from_ptr(props.device_name.as_ptr())
+            CStr::from_ptr(properties.device_name.as_ptr())
                 .to_str()?
                 .to_owned()
         };
-
-        let device_type = props.device_type;
-        let limits = props.limits;
 
         let queue_family_properties =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
@@ -107,6 +104,7 @@ impl PhysicalDevice {
         let mut rt_pipeline_properties =
             vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut features12)
@@ -120,8 +118,11 @@ impl PhysicalDevice {
 
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut rt_pipeline_properties)
-            .push_next(&mut acc_properties);
+            .push_next(&mut acc_properties)
+            .push_next(&mut mesh_shader_properties);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
+        // Detach it from the chain on this stack.
+        mesh_shader_properties.p_next = std::ptr::null_mut();
 
         let mem_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -153,11 +154,11 @@ impl PhysicalDevice {
         };
 
         Ok(Self {
+            properties,
+            mesh_shader_properties,
             mem_properties,
             handel: physical_device,
             name,
-            device_type,
-            limits,
             queue_families,
             supported_extensions,
 
@@ -202,7 +203,7 @@ impl PhysicalDevice {
             .map(|pd| PhysicalDevice::new(instance, pd))
             .collect::<Result<Vec<PhysicalDevice>>>()?;
 
-        physical_devices.sort_by_key(|pd| match pd.device_type {
+        physical_devices.sort_by_key(|pd| match pd.properties.device_type {
             vk::PhysicalDeviceType::DISCRETE_GPU => 0,
             vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
             _ => 2,
@@ -239,8 +240,8 @@ impl PhysicalDevice {
         let (device, (graphics, transfer_queue)) = devices
             .iter()
             .filter(|device| {
-                device.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-                    || device.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+                device.properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                    || device.properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
             })
             .find_map(|device| Some((device, device.pick_queue_families()?)))
             .ok_or_else(|| Error::message("Could not find a suitable device"))?;
@@ -312,11 +313,14 @@ mod tests {
         queue_families: Vec<QueueFamily>,
     ) -> PhysicalDevice {
         PhysicalDevice {
+            properties: vk::PhysicalDeviceProperties {
+                device_type,
+                ..Default::default()
+            },
+            mesh_shader_properties: Default::default(),
             handel: vk::PhysicalDevice::null(),
             name: "test device".into(),
             mem_properties: Default::default(),
-            device_type,
-            limits: Default::default(),
             queue_families,
             supported_extensions: Vec::new(),
             supported_features: Features::default(),

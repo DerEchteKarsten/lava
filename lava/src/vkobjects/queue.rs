@@ -4,7 +4,10 @@ use std::{
     fmt::Debug,
     future::Future,
     marker::PhantomData,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::error::{Error, Result};
@@ -14,7 +17,9 @@ use smallvec::SmallVec;
 
 use crate::{
     command_buffer::{self, BufferAccess, CommandBuffer, ImageAccess},
-    profiling::{self, FrameQueries, GpuFrameTimings},
+    profiling::{
+        Counter, GpuScope, PassCounters, PassQueries, TimestampQueries, clock,
+    },
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -300,8 +305,10 @@ pub struct FrameSlot {
     fence: Fence,
     submitted: bool,
     family: u32,
-    profiling: bool,
-    queries: Option<FrameQueries>,
+    timestamps_on: bool,
+    timestamps: Option<TimestampQueries>,
+    counter_selection: Option<Arc<[&'static Counter]>>,
+    counters: Option<PassQueries>,
 }
 
 impl FrameSlot {
@@ -316,25 +323,36 @@ impl FrameSlot {
             fence: Fence::new()?,
             submitted: false,
             family: queue.familie,
-            profiling: false,
-            queries: None,
+            timestamps_on: false,
+            timestamps: None,
+            counter_selection: None,
+            counters: None,
         })
     }
 
-    /// Times the scopes of the frames begun from now on; see [`Frame::last_timings`]. Does
+    /// Times the scopes of the frames begun from now on; see [`Frame::last_timestamps`]. Does
     /// nothing without the `profiling` feature.
-    pub fn set_profiling(&mut self, profiling: bool) {
-        self.profiling = profiling && cfg!(feature = "profiling");
+    pub fn set_timestamps(&mut self, on: bool) {
+        self.timestamps_on = on && cfg!(feature = "profiling");
+    }
+
+    /// Counts every pass and rendering of the frames begun from now on, with pipeline
+    /// statistics and the hardware counters of `selection` (`None`: no pass queries); see
+    /// [`Frame::last_counters`]. A selection of more than `MAX_COUNTERS` or more than one pass
+    /// fails the next `begin`. Does nothing without the `profiling` feature.
+    pub fn set_counters(&mut self, selection: Option<Arc<[&'static Counter]>>) {
+        self.counter_selection = selection.filter(|_| cfg!(feature = "profiling"));
     }
 
     #[validation_trace]
     pub fn begin(&mut self) -> Result<Frame<'_>> {
         if self.submitted {
-            // `wait`: the profiler doesn't count it as CPU work.
-            tracing::info_span!("wait for frame slot", wait = true)
-                .in_scope(|| self.fence.wait())?;
-            if let Some(queries) = &mut self.queries {
-                queries.read()?;
+            tracing::info_span!("wait for frame slot").in_scope(|| self.fence.wait())?;
+            if let Some(timestamps) = &mut self.timestamps {
+                timestamps.read()?;
+            }
+            if let Some(counters) = &mut self.counters {
+                counters.read()?;
             }
             self.fence.reset()?;
             self.pool.reset()?;
@@ -342,16 +360,22 @@ impl FrameSlot {
             self.retired.clear();
         }
         // The pools are idle now. A new counter selection needs new ones.
-        if !self.profiling
-            || self
-                .queries
-                .as_ref()
-                .is_some_and(|queries| queries.generation != profiling::counters::generation())
-        {
-            self.queries = None;
+        if !self.timestamps_on {
+            self.timestamps = None;
+        } else if self.timestamps.is_none() {
+            self.timestamps = Some(TimestampQueries::new(self.family)?);
         }
-        if self.profiling && self.queries.is_none() {
-            self.queries = Some(FrameQueries::new(self.family)?);
+        let selection = &self.counter_selection;
+        let current = |counters: &PassQueries| {
+            selection
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, counters.selection()))
+        };
+        if !self.counters.as_ref().is_some_and(current) {
+            self.counters = None;
+            if let Some(selection) = selection {
+                self.counters = Some(PassQueries::new(self.family, selection.clone())?);
+            }
         }
         let mut frame = Frame { slot: self };
         for pipeline in command_buffer::apply_pending_reloads() {
@@ -370,10 +394,14 @@ impl Frame<'_> {
         self.slot.retired.push(Box::new(value));
     }
 
-    /// The GPU scopes, counters and shader clock regions of the frame this slot submitted
-    /// before, if it was profiled.
-    pub fn last_timings(&self) -> Option<&GpuFrameTimings> {
-        self.slot.queries.as_ref()?.results()
+    /// The GPU scopes of the frame this slot submitted before, if it was timed.
+    pub fn last_timestamps(&self) -> Option<&[GpuScope]> {
+        self.slot.timestamps.as_ref()?.results()
+    }
+
+    /// The pass queries of the frame this slot submitted before, if it was counted.
+    pub fn last_counters(&self) -> Option<&PassCounters> {
+        self.slot.counters.as_ref()?.results()
     }
 
     #[validation_trace]
@@ -390,7 +418,8 @@ impl Frame<'_> {
             pending,
             &slot.buffer,
             Some(&slot.fence),
-            &mut slot.queries,
+            &mut slot.timestamps,
+            &mut slot.counters,
             wait_on,
             signal,
             executor,
@@ -505,15 +534,17 @@ impl<Q: QueueFamilie> Queue<Q> {
         })
     }
 
-    /// Records `executor` into `buffer` and submits it. With `queries`, the recording is
-    /// timed: the root scope "frame" around it, plus every pass and `begin_scope`.
+    /// Records `executor` into `buffer` and submits it. With `timestamps`, the recording is
+    /// timed: the root scope "frame" around it, plus every pass and `begin_scope`. With
+    /// `counters`, every pass is counted.
     #[validation_trace]
     pub fn execute_command<F: FnOnce(&mut CommandBuffer)>(
         &self,
         pending: PendingAccesses,
         buffer: &CommandBufferMemory,
         fence: Option<&Fence>,
-        queries: &mut Option<FrameQueries>,
+        timestamps: &mut Option<TimestampQueries>,
+        counters: &mut Option<PassQueries>,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
         executor: F,
@@ -522,22 +553,27 @@ impl<Q: QueueFamilie> Queue<Q> {
             let mut cmd_buffer = CommandBuffer {
                 handle: buffer.handle,
                 pending_accesses: pending,
-                queries: queries.take(),
+                timestamps: timestamps.take(),
+                counters: counters.take(),
             };
 
             cmd_buffer.begin()?;
-            if let Some(queries) = &mut cmd_buffer.queries {
-                queries.reset(buffer.handle);
+            if let Some(timestamps) = &mut cmd_buffer.timestamps {
+                timestamps.reset(buffer.handle);
+            }
+            if let Some(counters) = &mut cmd_buffer.counters {
+                counters.reset(buffer.handle);
             }
             cmd_buffer.begin_scope("frame");
             let prev = CALLSITE.replace(None);
             executor(&mut cmd_buffer);
             CALLSITE.set(prev);
             cmd_buffer.end_scope();
-            if let Some(queries) = &cmd_buffer.queries {
-                queries.finish(buffer.handle);
+            if clock::enabled() {
+                clock::host_barrier(buffer.handle);
             }
-            *queries = cmd_buffer.queries.take();
+            *timestamps = cmd_buffer.timestamps.take();
+            *counters = cmd_buffer.counters.take();
             cmd_buffer.end()?;
 
             let cmd_buffer_submit_info =
@@ -575,7 +611,7 @@ impl<Q: QueueFamilie> Queue<Q> {
         let sc = [swapchain.handle];
         let ii = [image_index];
         let waits: Vec<_> = wait_on.iter().map(|sem| sem.handle).collect();
-        let _span = tracing::info_span!("present", wait = true).entered();
+        let _span = tracing::info_span!("present").entered();
         let present_info = vk::PresentInfoKHR::default()
             .swapchains(&sc)
             .image_indices(&ii)

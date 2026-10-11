@@ -1,7 +1,7 @@
 #pragma once
 // Shader clock regions for lava's profiler (`lava/src/profiling/clock.rs`), a debugging aid:
 // `CLOCK_REGION("name")` at the start of a block adds, per subgroup, the clock ticks until the
-// block ends to that region's counter of the pass, while a profiled frame slot exists. The
+// block ends to that region's counter of the pass, while `clock::set_enabled(true)`. The
 // profiler reports each region's ticks and subgroups. One region per block; at most 8 per pass.
 // Not in fragment shaders: a fragment shader that writes a buffer loses early depth testing.
 //
@@ -11,10 +11,11 @@
 // `PASS_MAP`, for every pass.
 
 #ifdef USE_CLOCKS
-// The hashes of the pass's region names in slot order, 0 for unused slots (and without
-// `PROFILING`). Declared with `USE_CLOCKS` alone, so a pass's generated bindings don't depend on
-// the feature: `build.rs` bakes the hashes into its `constant_bindings`, which takes no
-// parameters for them. The driver folds the comparisons in `clock_region_slot`.
+// The hashes of the pass's region names in slot order, 0 for unused slots, and 0 for all of
+// them while clocks are off (and without `PROFILING`), which folds every region away. Declared
+// with `USE_CLOCKS` alone, so a pass's generated bindings don't depend on the feature:
+// `build.rs` bakes the hashes into its `constant_bindings`, which takes no parameters for
+// them. The driver folds the comparisons in `clock_region_slot`.
 [vk::constant_id(901)] const uint CLOCK_REGION_0 = 0;
 [vk::constant_id(902)] const uint CLOCK_REGION_1 = 0;
 [vk::constant_id(903)] const uint CLOCK_REGION_2 = 0;
@@ -27,12 +28,10 @@
 
 #if defined(PROFILING) && defined(USE_CLOCKS)
 
-// `CLOCK_FLAG_WORDS` words of flags (word 0: profiled frame slots alive), then per pass, region
-// and stripe one counter: the summed ticks in its low `CLOCK_TICK_BITS` bits and the number of
+// Per pass, region and stripe one counter: the summed ticks in its low `CLOCK_TICK_BITS` bits and the number of
 // subgroups above them, so a subgroup adds both with one atomic. Mirrored by `clock.rs`.
 [vk::binding(0, 2)] RWStructuredBuffer<uint64_t> ProfileCounters;
 
-static const uint CLOCK_FLAG_WORDS = 8;
 static const uint CLOCK_MAX_REGIONS = 8;
 // Subgroups spread their atomics over this many copies of a counter, each in its own cache
 // line (`CLOCK_STRIPE_WORDS`): the L2 serialises the atomics to a line, about 200 cycles
@@ -68,11 +67,11 @@ uint64_t subgroup_clock()
 void clock_region_end(uint hash, uint64_t start)
 {
     let region = clock_region_slot(hash);
-    if (!WaveIsFirstLane() || region == CLOCK_MAX_REGIONS || ProfileCounters[0] == 0)
+    if (!WaveIsFirstLane() || region == CLOCK_MAX_REGIONS)
         return;
     let ticks = subgroup_clock() - start;
     let stripe = uint(start) % CLOCK_STRIPES;
-    let slot = CLOCK_FLAG_WORDS + ((PROFILE_PASS * CLOCK_MAX_REGIONS + region) * CLOCK_STRIPES + stripe) * CLOCK_STRIPE_WORDS;
+    let slot = ((PROFILE_PASS * CLOCK_MAX_REGIONS + region) * CLOCK_STRIPES + stripe) * CLOCK_STRIPE_WORDS;
     InterlockedAdd(ProfileCounters[slot], ticks + (1ull << CLOCK_TICK_BITS));
 }
 
