@@ -251,8 +251,17 @@ mod tests {
         assert!(host_copy::<SampledHostCopy>().contains(F::HOST_TRANSFER_EXT));
         assert!(src::<ColorAttachmentTransferSrc>().contains(F::TRANSFER_SRC));
         assert!(dst::<SampledHostCopyTransferDst>().contains(F::TRANSFER_DST));
-        assert_eq!(sampled_binding::<SampledTransferDst>(), F::SAMPLED | F::TRANSFER_DST);
-        assert_eq!(storage_binding::<DepthAttachmentStorage>(), F::DEPTH_STENCIL_ATTACHMENT | F::STORAGE);
-        assert_eq!(unified_binding::<SampledStorageTransferSrc>(), F::SAMPLED | F::STORAGE | F::TRANSFER_SRC);
+        assert_eq!(
+            sampled_binding::<SampledTransferDst>(),
+            F::SAMPLED | F::TRANSFER_DST
+        );
+        assert_eq!(
+            storage_binding::<DepthAttachmentStorage>(),
+            F::DEPTH_STENCIL_ATTACHMENT | F::STORAGE
+        );
+        assert_eq!(
+            unified_binding::<SampledStorageTransferSrc>(),
+            F::SAMPLED | F::STORAGE | F::TRANSFER_SRC
+        );
     }
 }

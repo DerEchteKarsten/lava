@@ -229,7 +229,8 @@ impl PipelineManager {
         let PassKind::Compute { entry } = pass.kind else {
             unreachable!("{} is a compute pass", pass.name)
         };
-        let module = self.pass_modules.read().unwrap()[pass_index];
+        let lock = self.pass_modules.read().unwrap();
+        let module = lock[pass_index];
         let mut maps = self.specialized_compute_pipelines.write().unwrap();
         let map = &mut maps[pass.index];
         let cached = map.len();
@@ -308,11 +309,11 @@ impl PipelineManager {
                 let mut pipelines = self.specialized_compute_pipelines.write().unwrap();
                 for (constants, pipeline) in pipelines[pass.index].iter_mut() {
                     let new = create_compute_pipeline(
-                module,
-                entry,
-                pass.constants,
-                &constants[..pass.constants_size],
-            );
+                        module,
+                        entry,
+                        pass.constants,
+                        &constants[..pass.constants_size],
+                    );
                     retired.push(RetiredPipeline {
                         pipeline: std::mem::replace(pipeline, new),
                         _sbt: None,
@@ -352,14 +353,8 @@ impl PipelineManager {
                 ray_closest,
                 ray_gen,
             } => {
-                let pipeline = create_raytracing_pipeline(
-                    module,
-                    ray_any,
-                    ray_closest,
-                    ray_gen,
-                    &[],
-                    &[],
-                );
+                let pipeline =
+                    create_raytracing_pipeline(module, ray_any, ray_closest, ray_gen, &[], &[]);
                 let mut pipelines = self.raytracing_pipelines.write().unwrap();
                 if let Some(old) = pipelines[pass.index].replace(pipeline) {
                     retired.push(RetiredPipeline::ray_tracing(old));
@@ -1489,7 +1484,11 @@ fn indirect_access<T: Copy + Pod, U: BufferUsage>(buffer: BufferSlice<'_, T, U>)
 
 impl CommandBuffer {
     #[validation_trace]
-    pub fn fill_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: u32) {
+    pub fn fill_buffer<'a, T: Copy + Pod, U: BufferUsage>(
+        &mut self,
+        buffer: BufferSlice<'a, T, U>,
+        data: u32,
+    ) {
         self.flush_pending(
             std::iter::empty(),
             std::iter::once(&BufferAccess {
@@ -1600,19 +1599,19 @@ impl CommandBuffer {
     }
     #[validation_trace]
 
-    pub fn copy_buffer<'a, T: Copy + Pod>(
+    pub fn copy_buffer<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
         &mut self,
-        src: BufferSlice<'a, T>,
-        dst: BufferSlice<'a, T>,
+        src: BufferSlice<'a, T, U>,
+        dst: BufferSlice<'a, T, U2>,
     ) {
         self.copy_buffer_regions(src, dst, &[src.region(dst)]);
     }
     #[validation_trace]
 
-    pub fn copy_buffer_regions<'a, T: Copy + Pod>(
+    pub fn copy_buffer_regions<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
         &mut self,
-        src: BufferSlice<'a, T>,
-        dst: BufferSlice<'a, T>,
+        src: BufferSlice<'a, T, U>,
+        dst: BufferSlice<'a, T, U2>,
         regions: &[BufferCopy],
     ) {
         self.flush_pending(
@@ -1635,9 +1634,9 @@ impl CommandBuffer {
     }
 
     #[validation_trace]
-    pub fn copy_buffer_to_image<'a, T: Copy + Pod, F: Format, U: IsTransferDst>(
+    pub fn copy_buffer_to_image<'a, T: Copy + Pod, BU: BufferUsage, F: Format, U: IsTransferDst>(
         &mut self,
-        src: BufferSlice<'a, T>,
+        src: BufferSlice<'a, T, BU>,
         dst: ImageSlice<'a, F, U>,
     ) where
         F: ColorAspect,

@@ -1,120 +1,16 @@
-//! Type-level buffer usage markers mapping to Vulkan buffer usage flags
+//! Type-level buffer usage markers, one per combination of usages, mapping to Vulkan buffer usage flags
 use ash::vk;
 
+/// Every buffer also gets `SHADER_DEVICE_ADDRESS`, `TRANSFER_SRC` and `TRANSFER_DST` (`Buffer::new`):
+/// leaving the transfer usages out of buffers that don't need them made no measurable difference.
 pub trait BufferUsage: 'static + Copy + Clone {
     const VK: vk::BufferUsageFlags;
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Unknown;
-
-#[derive(Clone, Copy, Debug)]
-pub struct Storage;
-#[derive(Clone, Copy, Debug)]
-pub struct Uniform;
-#[derive(Clone, Copy, Debug)]
-pub struct Vertex;
-#[derive(Clone, Copy, Debug)]
-pub struct Index;
-#[derive(Clone, Copy, Debug)]
-pub struct Indirect;
-
-#[derive(Clone, Copy, Debug)]
-pub struct StorageUniform;
-#[derive(Clone, Copy, Debug)]
-pub struct StorageIndirect;
-#[derive(Clone, Copy, Debug)]
-pub struct UniformIndirect;
-#[derive(Clone, Copy, Debug)]
-pub struct StorageUniformIndirect;
-#[derive(Clone, Copy, Debug)]
-pub struct VertexIndex;
-#[derive(Clone, Copy, Debug)]
-pub struct StorageVertex;
-#[derive(Clone, Copy, Debug)]
-pub struct StorageIndex;
-#[derive(Clone, Copy, Debug)]
-pub struct UniformVertex;
-#[derive(Clone, Copy, Debug)]
-pub struct UniformIndex;
-
-impl BufferUsage for Unknown {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::empty();
-}
-
-impl BufferUsage for Storage {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::STORAGE_BUFFER;
-}
-impl BufferUsage for Uniform {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::UNIFORM_BUFFER;
-}
-impl BufferUsage for Vertex {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::VERTEX_BUFFER;
-}
-impl BufferUsage for Index {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::INDEX_BUFFER;
-}
-impl BufferUsage for Indirect {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::INDIRECT_BUFFER;
-}
-
-impl BufferUsage for StorageUniform {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
-            | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for StorageIndirect {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
-            | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for UniformIndirect {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
-            | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for StorageUniformIndirect {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
-            | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
-            | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for VertexIndex {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::VERTEX_BUFFER.as_raw() | vk::BufferUsageFlags::INDEX_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for StorageVertex {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
-            | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for StorageIndex {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::STORAGE_BUFFER.as_raw() | vk::BufferUsageFlags::INDEX_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for UniformVertex {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
-            | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw(),
-    );
-}
-impl BufferUsage for UniformIndex {
-    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-        vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw() | vk::BufferUsageFlags::INDEX_BUFFER.as_raw(),
-    );
-}
-
-/// Marker for buffers that can be bound as uniform buffers.
-pub trait IsUniform: BufferUsage {}
 /// Marker for buffers that can be bound as storage buffers.
 pub trait IsStorage: BufferUsage {}
+/// Marker for buffers that can be bound as uniform buffers.
+pub trait IsUniform: BufferUsage {}
 /// Marker for buffers usable as vertex buffers.
 pub trait IsVertex: BufferUsage {}
 /// Marker for buffers usable as index buffers.
@@ -122,129 +18,131 @@ pub trait IsIndex: BufferUsage {}
 /// Marker for buffers usable as indirect buffers.
 pub trait IsIndirect: BufferUsage {}
 
-impl IsStorage for Storage {}
-impl IsStorage for StorageUniform {}
-impl IsStorage for StorageIndirect {}
-impl IsStorage for StorageUniformIndirect {}
-impl IsStorage for StorageVertex {}
-impl IsStorage for StorageIndex {}
+/// No usage but the ones every buffer has.
+#[derive(Clone, Copy, Debug)]
+pub struct Unknown;
+impl BufferUsage for Unknown {
+    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::empty();
+}
 
-impl IsUniform for Uniform {}
-impl IsUniform for StorageUniform {}
-impl IsUniform for UniformIndirect {}
-impl IsUniform for StorageUniformIndirect {}
-impl IsUniform for UniformVertex {}
-impl IsUniform for UniformIndex {}
+/// Defines one usage per `Name: Flag...;` line: its Vulkan flags and a marker trait per flag.
+macro_rules! usages {
+    (@flag Storage) => { vk::BufferUsageFlags::STORAGE_BUFFER };
+    (@flag Uniform) => { vk::BufferUsageFlags::UNIFORM_BUFFER };
+    (@flag Vertex) => { vk::BufferUsageFlags::VERTEX_BUFFER };
+    (@flag Index) => { vk::BufferUsageFlags::INDEX_BUFFER };
+    (@flag Indirect) => { vk::BufferUsageFlags::INDIRECT_BUFFER };
 
-impl IsVertex for Vertex {}
-impl IsVertex for VertexIndex {}
-impl IsVertex for StorageVertex {}
-impl IsVertex for UniformVertex {}
+    (@trait $name:ident Storage) => { impl IsStorage for $name {} };
+    (@trait $name:ident Uniform) => { impl IsUniform for $name {} };
+    (@trait $name:ident Vertex) => { impl IsVertex for $name {} };
+    (@trait $name:ident Index) => { impl IsIndex for $name {} };
+    (@trait $name:ident Indirect) => { impl IsIndirect for $name {} };
 
-impl IsIndex for Index {}
-impl IsIndex for VertexIndex {}
-impl IsIndex for StorageIndex {}
-impl IsIndex for UniformIndex {}
+    ($($name:ident: $($flag:ident)+;)*) => {
+        $(
+            #[derive(Clone, Copy, Debug)]
+            pub struct $name;
+            impl BufferUsage for $name {
+                const VK: vk::BufferUsageFlags =
+                    vk::BufferUsageFlags::from_raw(0 $(| usages!(@flag $flag).as_raw())+);
+            }
+            $(usages!(@trait $name $flag);)+
+        )*
 
-impl IsIndirect for Indirect {}
-impl IsIndirect for StorageIndirect {}
-impl IsIndirect for UniformIndirect {}
-impl IsIndirect for StorageUniformIndirect {}
+        #[cfg(test)]
+        const ALL: &[(&str, vk::BufferUsageFlags)] = &[$((stringify!($name), $name::VK)),*];
+    };
+}
+
+// Vulkan allows every combination of buffer usages.
+usages! {
+    Storage: Storage;
+    Uniform: Uniform;
+    StorageUniform: Storage Uniform;
+    Vertex: Vertex;
+    StorageVertex: Storage Vertex;
+    UniformVertex: Uniform Vertex;
+    StorageUniformVertex: Storage Uniform Vertex;
+    Index: Index;
+    StorageIndex: Storage Index;
+    UniformIndex: Uniform Index;
+    StorageUniformIndex: Storage Uniform Index;
+    VertexIndex: Vertex Index;
+    StorageVertexIndex: Storage Vertex Index;
+    UniformVertexIndex: Uniform Vertex Index;
+    StorageUniformVertexIndex: Storage Uniform Vertex Index;
+    Indirect: Indirect;
+    StorageIndirect: Storage Indirect;
+    UniformIndirect: Uniform Indirect;
+    StorageUniformIndirect: Storage Uniform Indirect;
+    VertexIndirect: Vertex Indirect;
+    StorageVertexIndirect: Storage Vertex Indirect;
+    UniformVertexIndirect: Uniform Vertex Indirect;
+    StorageUniformVertexIndirect: Storage Uniform Vertex Indirect;
+    IndexIndirect: Index Indirect;
+    StorageIndexIndirect: Storage Index Indirect;
+    UniformIndexIndirect: Uniform Index Indirect;
+    StorageUniformIndexIndirect: Storage Uniform Index Indirect;
+    VertexIndexIndirect: Vertex Index Indirect;
+    StorageVertexIndexIndirect: Storage Vertex Index Indirect;
+    UniformVertexIndexIndirect: Uniform Vertex Index Indirect;
+    StorageUniformVertexIndexIndirect: Storage Uniform Vertex Index Indirect;
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use vk::BufferUsageFlags as F;
 
+    const FLAGS: [(&str, F); 5] = [
+        ("Storage", F::STORAGE_BUFFER),
+        ("Uniform", F::UNIFORM_BUFFER),
+        ("Vertex", F::VERTEX_BUFFER),
+        ("Index", F::INDEX_BUFFER),
+        ("Indirect", F::INDIRECT_BUFFER),
+    ];
+
     #[test]
-    fn single_usages_map_to_their_flag() {
+    fn names_list_their_flags() {
+        for (name, flags) in ALL {
+            let expected: String = FLAGS
+                .iter()
+                .filter(|(_, flag)| flags.contains(*flag))
+                .map(|(name, _)| *name)
+                .collect();
+            assert_eq!(*name, expected);
+        }
+    }
+
+    #[test]
+    fn every_combination_exists_once() {
+        let mut all: Vec<F> = ALL.iter().map(|(_, flags)| *flags).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), (1 << FLAGS.len()) - 1);
         assert_eq!(Unknown::VK, F::empty());
-        assert_eq!(Storage::VK, F::STORAGE_BUFFER);
-        assert_eq!(Uniform::VK, F::UNIFORM_BUFFER);
-        assert_eq!(Vertex::VK, F::VERTEX_BUFFER);
-        assert_eq!(Index::VK, F::INDEX_BUFFER);
-        assert_eq!(Indirect::VK, F::INDIRECT_BUFFER);
     }
 
-    #[test]
-    fn combined_usages_are_the_union_of_their_parts() {
-        assert_eq!(StorageUniform::VK, F::STORAGE_BUFFER | F::UNIFORM_BUFFER);
-        assert_eq!(StorageIndirect::VK, F::STORAGE_BUFFER | F::INDIRECT_BUFFER);
-        assert_eq!(UniformIndirect::VK, F::UNIFORM_BUFFER | F::INDIRECT_BUFFER);
-        assert_eq!(
-            StorageUniformIndirect::VK,
-            F::STORAGE_BUFFER | F::UNIFORM_BUFFER | F::INDIRECT_BUFFER
-        );
-        assert_eq!(VertexIndex::VK, F::VERTEX_BUFFER | F::INDEX_BUFFER);
-        assert_eq!(StorageVertex::VK, F::STORAGE_BUFFER | F::VERTEX_BUFFER);
-        assert_eq!(StorageIndex::VK, F::STORAGE_BUFFER | F::INDEX_BUFFER);
-        assert_eq!(UniformVertex::VK, F::UNIFORM_BUFFER | F::VERTEX_BUFFER);
-        assert_eq!(UniformIndex::VK, F::UNIFORM_BUFFER | F::INDEX_BUFFER);
-    }
-
-    /// The `Is*` marker traits must agree with the flags: a type may only claim a capability
-    /// its Vulkan usage actually contains.
     #[test]
     fn marker_traits_match_the_flags() {
         fn storage<U: IsStorage>() -> F {
             U::VK
         }
-        fn uniform<U: IsUniform>() -> F {
-            U::VK
-        }
-        fn vertex<U: IsVertex>() -> F {
-            U::VK
-        }
         fn index<U: IsIndex>() -> F {
             U::VK
         }
-        fn indirect<U: IsIndirect>() -> F {
+        fn uniform<U: IsUniform>() -> F {
             U::VK
         }
-
-        for flags in [
-            storage::<Storage>(),
-            storage::<StorageUniform>(),
+        assert_eq!(
             storage::<StorageIndirect>(),
-            storage::<StorageUniformIndirect>(),
-            storage::<StorageVertex>(),
-            storage::<StorageIndex>(),
-        ] {
-            assert!(flags.contains(F::STORAGE_BUFFER));
-        }
-        for flags in [
-            uniform::<Uniform>(),
-            uniform::<StorageUniform>(),
-            uniform::<UniformIndirect>(),
-            uniform::<StorageUniformIndirect>(),
-            uniform::<UniformVertex>(),
-            uniform::<UniformIndex>(),
-        ] {
-            assert!(flags.contains(F::UNIFORM_BUFFER));
-        }
-        for flags in [
-            vertex::<Vertex>(),
-            vertex::<VertexIndex>(),
-            vertex::<StorageVertex>(),
-            vertex::<UniformVertex>(),
-        ] {
-            assert!(flags.contains(F::VERTEX_BUFFER));
-        }
-        for flags in [
-            index::<Index>(),
-            index::<VertexIndex>(),
-            index::<StorageIndex>(),
-            index::<UniformIndex>(),
-        ] {
-            assert!(flags.contains(F::INDEX_BUFFER));
-        }
-        for flags in [
-            indirect::<Indirect>(),
-            indirect::<StorageIndirect>(),
-            indirect::<UniformIndirect>(),
-            indirect::<StorageUniformIndirect>(),
-        ] {
-            assert!(flags.contains(F::INDIRECT_BUFFER));
-        }
+            F::STORAGE_BUFFER | F::INDIRECT_BUFFER
+        );
+        assert_eq!(index::<VertexIndex>(), F::VERTEX_BUFFER | F::INDEX_BUFFER);
+        assert_eq!(
+            uniform::<UniformVertexIndirect>(),
+            F::UNIFORM_BUFFER | F::VERTEX_BUFFER | F::INDIRECT_BUFFER
+        );
     }
 }

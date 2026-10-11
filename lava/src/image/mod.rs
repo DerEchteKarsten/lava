@@ -8,7 +8,6 @@ use crate::error::{Error, Result};
 use ash::vk::{self, ComponentSwizzle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use lava_macros::validation_trace;
-use smallvec::SmallVec;
 
 use crate::{
     bindless::{BindlessHandle, BindlessWrites},
