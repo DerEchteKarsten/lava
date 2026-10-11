@@ -15,7 +15,7 @@ use crate::{
     image::{
         format::{Format, Undefined, bc_block},
         slice::AsImage,
-        usage::{ImageUsage, SampledBinding, StorageBinding, UnifiedBinding},
+        usage::{ImageUsage, IsHostCopy, SampledBinding, StorageBinding, UnifiedBinding},
     },
     state::{Ctx, Functions},
     vkobjects::queue::{CommandBufferMemory, Fence, Gfx, Queue, SemaphoreInfo},
@@ -87,14 +87,13 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
-            usage: U::VK
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | if Ctx::features().rebar {
-                    vk::ImageUsageFlags::HOST_TRANSFER_EXT
-                } else {
-                    vk::ImageUsageFlags::empty()
-                },
+            // Without rebar the host image copy extension is off; `copy_from` then fails.
+            usage: if Ctx::features().rebar {
+                U::VK
+            } else {
+                U::VK & !vk::ImageUsageFlags::HOST_TRANSFER_EXT
+            } | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
             initial_layout: vk::ImageLayout::UNDEFINED,
             ..Default::default()
         };
@@ -140,6 +139,16 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
         Ok(s)
     }
 
+    pub fn mip_extent(&self, level: u32) -> UVec2 {
+        mip_extent(self.extent, level)
+    }
+
+    pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<NF, NU> {
+        unsafe { std::mem::transmute(self) }
+    }
+}
+
+impl<F: Format, U: IsHostCopy> Image<F, U> {
     #[validation_trace]
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
         self.check_host_copy(data, mip_level)?;
@@ -248,14 +257,6 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
             .regions(&regions);
         unsafe { Functions::host_image_copy().copy_memory_to_image(&info)? };
         Ok(())
-    }
-
-    pub fn mip_extent(&self, level: u32) -> UVec2 {
-        mip_extent(self.extent, level)
-    }
-
-    pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<NF, NU> {
-        unsafe { std::mem::transmute(self) }
     }
 }
 

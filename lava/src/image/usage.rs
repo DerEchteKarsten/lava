@@ -23,6 +23,8 @@ pub struct DepthAttachmentSampled;
 pub struct SampledStorage;
 #[derive(Clone, Copy, Debug)]
 pub struct ColorAttachmentSampledStorage;
+#[derive(Clone, Copy, Debug)]
+pub struct SampledHostCopy;
 
 impl ImageUsage for Sampled {
     const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::SAMPLED;
@@ -65,16 +67,24 @@ impl ImageUsage for ColorAttachmentSampledStorage {
     );
 }
 
+impl ImageUsage for SampledHostCopy {
+    const VK: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+        vk::ImageUsageFlags::SAMPLED.as_raw() | vk::ImageUsageFlags::HOST_TRANSFER_EXT.as_raw(),
+    );
+}
+
 pub trait IsSampled: ImageUsage {}
 pub trait IsStorage: ImageUsage {}
 pub trait IsColorAttachment: ImageUsage {}
 pub trait IsDepthAttachment: ImageUsage {}
+pub trait IsHostCopy: ImageUsage {}
 
 impl IsSampled for Sampled {}
 impl IsSampled for ColorAttachmentSampled {}
 impl IsSampled for DepthAttachmentSampled {}
 impl IsSampled for SampledStorage {}
 impl IsSampled for ColorAttachmentSampledStorage {}
+impl IsSampled for SampledHostCopy {}
 
 impl IsStorage for Storage {}
 impl IsStorage for ColorAttachmentStorage {}
@@ -89,6 +99,8 @@ impl IsColorAttachment for ColorAttachmentSampledStorage {}
 impl IsDepthAttachment for DepthAttachment {}
 impl IsDepthAttachment for DepthAttachmentSampled {}
 
+impl IsHostCopy for SampledHostCopy {}
+
 /// Usages bound only in the sampled set.
 pub trait SampledBinding: IsSampled {}
 /// Usages bound only in the storage set.
@@ -99,6 +111,7 @@ pub trait UnifiedBinding: IsSampled + IsStorage {}
 impl SampledBinding for Sampled {}
 impl SampledBinding for ColorAttachmentSampled {}
 impl SampledBinding for DepthAttachmentSampled {}
+impl SampledBinding for SampledHostCopy {}
 
 impl StorageBinding for Storage {}
 impl StorageBinding for ColorAttachmentStorage {}
@@ -128,6 +141,7 @@ mod tests {
             ColorAttachmentSampledStorage::VK,
             F::COLOR_ATTACHMENT | F::SAMPLED | F::STORAGE
         );
+        assert_eq!(SampledHostCopy::VK, F::SAMPLED | F::HOST_TRANSFER_EXT);
     }
 
     #[test]
@@ -150,6 +164,7 @@ mod tests {
             sampled::<DepthAttachmentSampled>(),
             sampled::<SampledStorage>(),
             sampled::<ColorAttachmentSampledStorage>(),
+            sampled::<SampledHostCopy>(),
         ] {
             assert!(flags.contains(F::SAMPLED));
         }

@@ -30,7 +30,7 @@ use lava::{
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
         slice::AsImage,
         usage::{
-            ColorAttachmentStorage, DepthAttachment, Sampled, SampledStorage,
+            ColorAttachmentStorage, DepthAttachment, Sampled, SampledHostCopy, SampledStorage,
             Storage as StorageImage,
         },
     },
@@ -766,7 +766,7 @@ fn blit_scales_between_differently_sized_regions() {
 #[test]
 fn host_copy_uploads_a_mip_level() {
     let gpu = gpu();
-    let mut image = Image::<R8G8B8A8Unorm, Sampled>::with_mip_levels(8, 8, 2).unwrap();
+    let mut image = Image::<R8G8B8A8Unorm, SampledHostCopy>::with_mip_levels(8, 8, 2).unwrap();
     let data = pattern(8, 8);
 
     if !Ctx::features().rebar {
@@ -800,7 +800,7 @@ fn host_copy_uploads_a_mip_level() {
 #[test]
 fn host_copy_writes_only_the_region() {
     let gpu = gpu();
-    let mut image = Image::<R8G8B8A8Unorm, Sampled>::new(8, 8).unwrap();
+    let mut image = Image::<R8G8B8A8Unorm, SampledHostCopy>::new(8, 8).unwrap();
     let (offset, extent) = (UVec2::new(4, 5), UVec2::new(3, 2));
     let patch = vec![200u8; 3 * 2 * 4];
 
@@ -1665,7 +1665,7 @@ fn host_copy_uploads_block_compressed_mips() {
         bc7_block([127, 127, 0, 127], 1),
     ]
     .concat();
-    let mut texture = Image::<BC7UnormBlock, Sampled>::new_sampled(8, 8, 4, 0).unwrap();
+    let mut texture = Image::<BC7UnormBlock, SampledHostCopy>::new_sampled(8, 8, 4, 0).unwrap();
     texture.copy_from(&blocks, 0).unwrap();
     // The smaller levels are one block each, even the ones smaller than a block.
     for level in 1..4 {
