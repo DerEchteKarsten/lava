@@ -1,7 +1,10 @@
 //! Swapchain creation, image acquisition, and resize-driven recreation
 use std::{ffi::CStr, sync::atomic::AtomicU32};
 
-use crate::{bindless::BindlessHandle, error::Result};
+use crate::{
+    bindless::BindlessHandle,
+    error::{Error, Result},
+};
 use ash::vk::{self};
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
@@ -66,14 +69,33 @@ impl Swapchain {
 
     /// The images are unbound; the caller binds them. The image count can change between
     /// swapchains of one surface, e.g. with the present mode (Mailbox often needs one more).
+    /// `size` is clamped to what the surface allows right now (its capabilities are
+    /// re-queried); a surface without any extent (a minimised window) is an error.
     #[validation_trace]
-    pub fn new(surface: &Surface, old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
+    pub fn new(
+        surface: &mut Surface,
+        old: Option<&Swapchain>,
+        size: Option<[u32; 2]>,
+    ) -> Result<Self> {
+        surface.refresh_capabilities()?;
         let format = select_surface_format(&surface.formats);
 
         let present_modes = supported_present_modes(&surface.present_modes);
         let present_mode_index = old.map_or(0, |old| old.present_mode.min(present_modes.len() - 1));
         let present_mode = present_modes[present_mode_index].0;
         let extent = select_extent(size, &surface.capabilities);
+        if extent.width == 0 || extent.height == 0 {
+            return Err(Error::message(
+                "the surface has no extent to create a swapchain for (a minimised window?)",
+            ));
+        }
+        let usage = ColorAttachmentStorageTransferDst::VK;
+        let supported = surface.capabilities.supported_usage_flags;
+        if !supported.contains(usage) {
+            return Err(Error::message(format!(
+                "the surface supports the image usages {supported:?}, swapchain images need {usage:?}"
+            )));
+        }
 
         let image_count = surface.capabilities.min_image_count;
 
@@ -87,7 +109,7 @@ impl Swapchain {
                 .image_color_space(format.color_space)
                 .image_extent(extent)
                 .image_array_layers(1)
-                .image_usage(ColorAttachmentStorageTransferDst::VK);
+                .image_usage(usage);
 
             builder = if Ctx::gfx_queue_index() != Ctx::present_queue_index() {
                 builder
@@ -188,9 +210,10 @@ impl Swapchain {
         Ok(image_index)
     }
 
-    /// The new images are unbound (see `new`); bind them again.
+    /// The new images are unbound (see `new`); bind them again. On an error (see `new`) the
+    /// old swapchain stays.
     #[validation_trace]
-    pub fn recreate(&mut self, surface: &Surface, size: [u32; 2]) -> Result<()> {
+    pub fn recreate(&mut self, surface: &mut Surface, size: [u32; 2]) -> Result<()> {
         let _span = tracing::info_span!("Swapchain Recreation").entered();
         let swapchain = Swapchain::new(surface, Some(self), Some(size))?;
         // Dropping the old swapchain waits for the device and destroys it.
@@ -249,18 +272,23 @@ pub(crate) fn supported_present_modes(
         .collect()
 }
 
-/// The requested size, else the surface's current extent, else (when the surface leaves the
-/// size to the swapchain, signalled by `u32::MAX`) its minimum extent.
+/// The requested size clamped to the surface's extent range, else the surface's current
+/// extent, else (when the surface leaves the size to the swapchain, signalled by `u32::MAX`)
+/// its minimum extent.
 pub(crate) fn select_extent(
     size: Option<[u32; 2]>,
     capabilities: &vk::SurfaceCapabilitiesKHR,
 ) -> vk::Extent2D {
+    let (min, max) = (capabilities.min_image_extent, capabilities.max_image_extent);
     if let Some([width, height]) = size {
-        vk::Extent2D { width, height }
+        vk::Extent2D {
+            width: width.clamp(min.width, max.width.max(min.width)),
+            height: height.clamp(min.height, max.height.max(min.height)),
+        }
     } else if capabilities.current_extent.width != u32::MAX {
         capabilities.current_extent
     } else {
-        capabilities.min_image_extent
+        min
     }
 }
 
@@ -336,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn extent_prefers_the_requested_size() {
+    fn extent_prefers_the_requested_size_within_the_surfaces_range() {
         let caps = vk::SurfaceCapabilitiesKHR {
             current_extent: vk::Extent2D {
                 width: 800,
@@ -346,6 +374,10 @@ mod tests {
                 width: 1,
                 height: 1,
             },
+            max_image_extent: vk::Extent2D {
+                width: 4096,
+                height: 4096,
+            },
             ..Default::default()
         };
         let requested = select_extent(Some([320, 240]), &caps);
@@ -353,6 +385,17 @@ mod tests {
 
         let current = select_extent(None, &caps);
         assert_eq!((current.width, current.height), (800, 600));
+
+        // A window size the surface can't take (an X11 window that just changed, or a
+        // minimised one with a 0 maximum) is clamped.
+        let clamped = select_extent(Some([8192, 0]), &caps);
+        assert_eq!((clamped.width, clamped.height), (4096, 1));
+        let minimised = vk::SurfaceCapabilitiesKHR {
+            max_image_extent: vk::Extent2D::default(),
+            ..caps
+        };
+        let none = select_extent(Some([800, 600]), &minimised);
+        assert_eq!((none.width, none.height), (1, 1));
     }
 
     #[test]

@@ -1,10 +1,5 @@
 //! Compiles Slang passes to SPIR-V and generates typed pass bindings from reflection
-use std::{
-    collections::BTreeMap,
-    env, fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 use shader_slang::{
     self as slang, ParameterCategory as Cat, ScalarType, Stage, TypeKind,
@@ -491,6 +486,7 @@ fn generate_pass(
     pipelines: &mut Pipelines,
     path_dir: &PathBuf,
     source: &str,
+    layout_hash: u64,
 ) -> GeneratedPass {
     let gpu_name = format!("C{pass_name}Bindings");
     let consts_name = format!("C{pass_name}Constants");
@@ -509,7 +505,15 @@ fn generate_pass(
         ["fragment", "vertex"] => PassKind::RasterVertex,
         ["fragment", "mesh"] | ["amplification", "fragment", "mesh"] => PassKind::RasterMesh,
         ["compute"] => PassKind::Compute,
-        ["closest_hit", "raygen"] | ["any_hit", "closest_hit", "raygen"] => PassKind::RayTracing,
+        // Raygen, with any of miss, closest hit and any hit.
+        stages
+            if stages.contains(&"raygen")
+                && stages
+                    .iter()
+                    .all(|s| ["raygen", "miss", "closest_hit", "any_hit"].contains(s)) =>
+        {
+            PassKind::RayTracing
+        }
         other => panic!("entry points {other:?} in pass {pass_name} don't match any pass pattern"),
     };
     let stage = kind.stage();
@@ -535,10 +539,16 @@ fn generate_pass(
             format!("Compute {{ entry: \"{compute}\\0\" }}")
         }
         PassKind::RayTracing => {
-            let (raygen, closest) = (entry("raygen").unwrap(), entry("closest_hit").unwrap());
-            let any = entry("any_hit").unwrap_or(closest);
+            let optional = |stage: &str| match entry(stage) {
+                Some(name) => format!("Some(\"{name}\\0\")"),
+                None => "None".to_string(),
+            };
             format!(
-                "RayTracing {{ ray_gen: \"{raygen}\\0\", ray_any: \"{any}\\0\", ray_closest: \"{closest}\\0\" }}"
+                "RayTracing {{ raygen: \"{}\\0\", miss: {}, closest_hit: {}, any_hit: {} }}",
+                entry("raygen").unwrap(),
+                optional("miss"),
+                optional("closest_hit"),
+                optional("any_hit"),
             )
         }
     };
@@ -574,6 +584,7 @@ fn generate_pass(
         constants: {constants},
         constants_size: {constants_size},
         regions: &{regions:?},
+        layout: {layout_hash:#x},
     }},"#
     ));
 
@@ -794,17 +805,10 @@ fn main() {
         pass_files.extend(list_passes(&tests, "shaders"));
     }
 
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, (secs % 60));
-    let mut bindings = format!(
+    let mut bindings = String::from(
         r#"
-//{h}:{m}:{s}
-use std::sync::OnceLock;
 use glam::*;
-use bytemuck::{{Pod, Zeroable}};
+use bytemuck::{Pod, Zeroable};
 use crate::bindless::BindlessHandle;
 use crate::buffer::slice::*;
 use crate::image::format::*;
@@ -814,8 +818,6 @@ use crate::image;
 use crate::command_buffer::*;
 use crate::pipeline::*;
 use ash::vk;
-use std::path::PathBuf;
-use std::str::FromStr;
 
 "#,
     );
@@ -874,6 +876,7 @@ use std::str::FromStr;
             &mut pipelines,
             &out,
             &source,
+            slang_compile::layout_hash(layout),
         );
         max_images = max_images.max(pass.images);
         max_buffers = max_buffers.max(pass.buffers);
@@ -946,7 +949,11 @@ const _: () = assert!(MAX_SPECIALIZATION_CONSTANTS_SIZE < 128, "Keep SConstants 
     } else {
         PathBuf::from(manifest_dir).join("src/bindings.rs")
     };
-    fs::write(bindings_path, bindings).unwrap();
+    // Only a changed file makes cargo rebuild the crates that use the bindings: with
+    // `hot-reload` a shader edit then rebuilds nothing (without it the SPIR-V is built in).
+    if fs::read(&bindings_path).ok().as_deref() != Some(bindings.as_bytes()) {
+        fs::write(bindings_path, bindings).unwrap();
+    }
 }
 
 fn stage_name(stage: Stage) -> &'static str {

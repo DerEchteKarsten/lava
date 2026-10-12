@@ -62,6 +62,51 @@ pub fn clock_regions(program: &slang::ComponentType) -> Vec<String> {
     layout.hashed_strings().map(str::to_string).collect()
 }
 
+/// A hash of what the generated bindings of a pass depend on: its push constant fields (name,
+/// offset, size), its specialization constants (id, size) and its entry points (stage, name).
+/// A reload whose hash differs from the baked one would run against stale bindings.
+pub fn layout_hash(layout: &slang::reflection::Shader) -> u64 {
+    use slang::ParameterCategory as Cat;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for parameter in layout.parameters() {
+        match parameter.category() {
+            Some(Cat::PushConstantBuffer) => {
+                let Some(fields) = parameter
+                    .type_layout()
+                    .and_then(|t| t.element_type_layout())
+                else {
+                    continue;
+                };
+                fields.size(Cat::Uniform).hash(&mut hasher);
+                for field in fields.fields() {
+                    field.variable().and_then(|v| v.name()).hash(&mut hasher);
+                    field.offset(Cat::Uniform).hash(&mut hasher);
+                    field
+                        .type_layout()
+                        .map(|t| t.size(Cat::Uniform))
+                        .hash(&mut hasher);
+                }
+            }
+            Some(Cat::SpecializationConstant) => {
+                parameter
+                    .offset(Cat::SpecializationConstant)
+                    .hash(&mut hasher);
+                parameter
+                    .type_layout()
+                    .map(|t| t.size(Cat::Uniform))
+                    .hash(&mut hasher);
+            }
+            _ => {}
+        }
+    }
+    for entry in layout.entry_points() {
+        format!("{:?}", entry.stage()).hash(&mut hasher);
+        entry.name().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// The pass in `source` with all its entry points, linked.
 pub fn link(session: &slang::Session, source: &str) -> slang::Result<slang::ComponentType> {
     let module = session.load_module(source)?;

@@ -189,12 +189,17 @@ fn release_lock() {
 const QUERIES: u32 = 128;
 
 /// Invocation counts of one pass. `task` and `mesh` stay 0 without `mesh_queries`.
+///
+/// Also the layout of a query's results: the statistics come in the order of their flag
+/// bits (fragment, compute, task, mesh), one `u64` each, and the pool is read straight into
+/// a `Vec` of these.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct PipelineStats {
-    pub task: u64,
-    pub mesh: u64,
     pub fragment: u64,
     pub compute: u64,
+    pub task: u64,
+    pub mesh: u64,
 }
 
 /// What the queries of one pass or rendering counted.

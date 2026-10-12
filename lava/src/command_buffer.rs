@@ -830,14 +830,14 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
                         max_count,
                         size_of::<vk::DrawIndirectCommand>() as u32,
                     ),
-                    DrawCommand::Launch([x, y, z]) => Functions::mesh()
-                        .unwrap()
-                        .cmd_draw_mesh_tasks(handle, x, y, z),
+                    DrawCommand::Launch([x, y, z]) => {
+                        mesh_functions().cmd_draw_mesh_tasks(handle, x, y, z)
+                    }
                     DrawCommand::LaunchIndirect {
                         buffer,
                         offset,
                         count,
-                    } => Functions::mesh().unwrap().cmd_draw_mesh_tasks_indirect(
+                    } => mesh_functions().cmd_draw_mesh_tasks_indirect(
                         handle,
                         buffer,
                         offset,
@@ -850,6 +850,12 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         unsafe { device.cmd_end_rendering(handle) };
         self.cmd_buf.end_pass();
     }
+}
+
+fn mesh_functions() -> &'static ash::ext::mesh_shader::Device {
+    Functions::mesh().expect(
+        "mesh shaders aren't supported by this device (`Ctx::features().mesh`), so a mesh pass can't be launched",
+    )
 }
 
 /// The access of an indirect command read from `buffer`, which has to be `IsIndirect`.
@@ -894,8 +900,8 @@ impl CommandBuffer {
             Functions::raytracing_pipeline().unwrap().cmd_trace_rays(
                 self.handle,
                 &sbt.raygen_region,
-                &sbt.hit_region,
                 &sbt.miss_region,
+                &sbt.hit_region,
                 &call_region,
                 x,
                 y,
@@ -1279,8 +1285,11 @@ impl CommandBuffer {
             buffer_acceses.clone(),
         );
         if let Some(barriers) = barriers {
-            let memory = [barriers.memory];
-            let mut info = vk::DependencyInfo::default().memory_barriers(&memory);
+            let mut info = vk::DependencyInfo::default();
+            let memory = barriers.memory.map(|memory| [memory]);
+            if let Some(memory) = &memory {
+                info = info.memory_barriers(memory);
+            }
             if !barriers.images.is_empty() {
                 info = info.image_memory_barriers(&barriers.images);
             }
@@ -1361,7 +1370,9 @@ pub(crate) const ATTACHMENT_LAYOUT: vk::ImageLayout = vk::ImageLayout::ATTACHMEN
 
 /// Barriers one command needs before it may run, given what is still pending.
 pub(crate) struct Barriers {
-    pub(crate) memory: vk::MemoryBarrier2<'static>,
+    /// The dependency on the pending accesses the command conflicts with; `None` without a
+    /// hazard, when only a layout transition is needed, since that carries its own stages.
+    pub(crate) memory: Option<vk::MemoryBarrier2<'static>>,
     /// Layout transitions; empty when every image already is in the requested layout.
     pub(crate) images: SmallVec<[vk::ImageMemoryBarrier2<'static>; 1]>,
 }
@@ -1452,10 +1463,12 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
         });
     }
 
-    if src_stage.is_empty() && dst_stage.is_empty() && image_barriers.is_empty() {
+    let hazard = !src_stage.is_empty() || !dst_stage.is_empty();
+    if !hazard && image_barriers.is_empty() {
         return None;
     }
 
+    // A hazard with an access of no stage (`present`) waits for, or holds back, everything.
     if src_stage.is_empty() {
         src_stage = vk::PipelineStageFlags2::ALL_COMMANDS;
     }
@@ -1467,11 +1480,13 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
     }
 
     Some(Barriers {
-        memory: vk::MemoryBarrier2::default()
-            .src_stage_mask(src_stage)
-            .src_access_mask(src_access)
-            .dst_stage_mask(dst_stage)
-            .dst_access_mask(dst_access),
+        memory: hazard.then(|| {
+            vk::MemoryBarrier2::default()
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)
+        }),
         images: image_barriers,
     })
 }
@@ -1541,18 +1556,20 @@ impl PendingAccesses {
     /// A memory barrier covers every write of its source stages and access types, also those
     /// it wasn't recorded for.
     pub(crate) fn made_visible(&mut self, barriers: &Barriers) {
-        let m = &barriers.memory;
-        let memory = (
-            m.src_stage_mask,
-            m.src_access_mask,
-            m.dst_stage_mask,
-            m.dst_access_mask,
-        );
-        for w in &mut self.buffer_writes {
-            let (src_stage, src_access, dst_stage, dst_access) = memory;
-            if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
-                w.visible_stages |= dst_stage;
-                w.visible_access |= dst_access;
+        let memory = barriers.memory.map(|m| {
+            (
+                m.src_stage_mask,
+                m.src_access_mask,
+                m.dst_stage_mask,
+                m.dst_access_mask,
+            )
+        });
+        if let Some((src_stage, src_access, dst_stage, dst_access)) = memory {
+            for w in &mut self.buffer_writes {
+                if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
+                    w.visible_stages |= dst_stage;
+                    w.visible_access |= dst_access;
+                }
             }
         }
         for w in &mut self.image_writes {
@@ -1570,7 +1587,7 @@ impl PendingAccesses {
                     )
                 });
             for (src_stage, src_access, dst_stage, dst_access) in
-                iter::once(memory).chain(transitions)
+                memory.into_iter().chain(transitions)
             {
                 if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
                     w.visible_stages |= dst_stage;
@@ -1872,10 +1889,16 @@ mod tests {
     #[test]
     fn read_after_write_needs_a_barrier_from_the_writer_to_the_reader() {
         let barriers = buffer_barrier(&pending(&[write(0..100)], &[]), &read(10..20)).unwrap();
-        assert_eq!(barriers.memory.src_stage_mask, S::COMPUTE_SHADER);
-        assert_eq!(barriers.memory.src_access_mask, A::SHADER_STORAGE_WRITE);
-        assert_eq!(barriers.memory.dst_stage_mask, S::VERTEX_SHADER);
-        assert_eq!(barriers.memory.dst_access_mask, A::SHADER_STORAGE_READ);
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(
+            barriers.memory.unwrap().src_access_mask,
+            A::SHADER_STORAGE_WRITE
+        );
+        assert_eq!(barriers.memory.unwrap().dst_stage_mask, S::VERTEX_SHADER);
+        assert_eq!(
+            barriers.memory.unwrap().dst_access_mask,
+            A::SHADER_STORAGE_READ
+        );
         assert!(barriers.images.is_empty());
     }
 
@@ -1883,17 +1906,20 @@ mod tests {
     fn write_after_write_needs_a_barrier() {
         let transfer = buffer(S::TRANSFER, A::TRANSFER_WRITE, 50..60);
         let barriers = buffer_barrier(&pending(&[write(0..100)], &[]), &transfer).unwrap();
-        assert_eq!(barriers.memory.src_stage_mask, S::COMPUTE_SHADER);
-        assert_eq!(barriers.memory.dst_stage_mask, S::TRANSFER);
-        assert_eq!(barriers.memory.dst_access_mask, A::TRANSFER_WRITE);
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(barriers.memory.unwrap().dst_stage_mask, S::TRANSFER);
+        assert_eq!(barriers.memory.unwrap().dst_access_mask, A::TRANSFER_WRITE);
     }
 
     #[test]
     fn write_after_read_needs_a_barrier_from_the_reader() {
         let barriers = buffer_barrier(&pending(&[read(0..100)], &[]), &write(0..8)).unwrap();
-        assert_eq!(barriers.memory.src_stage_mask, S::VERTEX_SHADER);
-        assert_eq!(barriers.memory.src_access_mask, A::SHADER_STORAGE_READ);
-        assert_eq!(barriers.memory.dst_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::VERTEX_SHADER);
+        assert_eq!(
+            barriers.memory.unwrap().src_access_mask,
+            A::SHADER_STORAGE_READ
+        );
+        assert_eq!(barriers.memory.unwrap().dst_stage_mask, S::COMPUTE_SHADER);
     }
 
     #[test]
@@ -1924,11 +1950,11 @@ mod tests {
         );
         let barriers = buffer_barrier(&pending, &read(0..20)).unwrap();
         assert_eq!(
-            barriers.memory.src_stage_mask,
+            barriers.memory.unwrap().src_stage_mask,
             S::COMPUTE_SHADER | S::TRANSFER
         );
         assert_eq!(
-            barriers.memory.src_access_mask,
+            barriers.memory.unwrap().src_access_mask,
             A::SHADER_STORAGE_WRITE | A::TRANSFER_WRITE
         );
     }
@@ -1988,10 +2014,16 @@ mod tests {
 
         let barriers =
             buffer_barrier(&pending, &read(0..10)).expect("the first write is unsynchronised");
-        assert_eq!(barriers.memory.src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
 
         let barriers = buffer_barrier(&pending, &read(52..58)).unwrap();
-        assert!(barriers.memory.src_stage_mask.contains(S::TRANSFER));
+        assert!(
+            barriers
+                .memory
+                .unwrap()
+                .src_stage_mask
+                .contains(S::TRANSFER)
+        );
     }
 
     #[test]
@@ -2022,7 +2054,7 @@ mod tests {
         assert_eq!(p.image_reads.len(), 1);
         let barriers = image_barrier(&p, &image_write(1)).unwrap();
         assert_eq!(
-            barriers.memory.src_stage_mask,
+            barriers.memory.unwrap().src_stage_mask,
             S::FRAGMENT_SHADER | S::COMPUTE_SHADER
         );
 
@@ -2031,7 +2063,7 @@ mod tests {
         assert_eq!(p.buffer_reads.len(), 1);
         let barriers = buffer_barrier(&p, &write(0..10)).unwrap();
         assert_eq!(
-            barriers.memory.src_stage_mask,
+            barriers.memory.unwrap().src_stage_mask,
             S::VERTEX_SHADER | S::COMPUTE_SHADER
         );
     }
@@ -2052,8 +2084,8 @@ mod tests {
     fn image_hazards_are_per_image() {
         let pending = pending(&[], &[image_write(1)]);
         let barriers = image_barrier(&pending, &image_read(1)).unwrap();
-        assert_eq!(barriers.memory.src_stage_mask, S::COMPUTE_SHADER);
-        assert_eq!(barriers.memory.dst_stage_mask, S::FRAGMENT_SHADER);
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(barriers.memory.unwrap().dst_stage_mask, S::FRAGMENT_SHADER);
         assert!(barriers.images.is_empty(), "same layout: no transition");
 
         assert!(image_barrier(&pending, &image_read(2)).is_none());
@@ -2175,6 +2207,26 @@ mod tests {
     }
 
     #[test]
+    fn a_transition_without_a_hazard_needs_no_memory_barrier() {
+        let access = image(7, S::TRANSFER, A::TRANSFER_WRITE, L::UNDEFINED, L::GENERAL);
+        let barriers = image_barrier(&PendingAccesses::default(), &access).unwrap();
+        assert!(barriers.memory.is_none());
+        assert_eq!(barriers.images.len(), 1);
+        // A hazard with the image makes one, and the transition still has its own stages.
+        let pending = pending(&[], &[image_write(7)]);
+        let access = image(
+            7,
+            S::TRANSFER,
+            A::TRANSFER_READ,
+            L::GENERAL,
+            L::TRANSFER_SRC_OPTIMAL,
+        );
+        let barriers = image_barrier(&pending, &access).unwrap();
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(barriers.images[0].src_stage_mask, S::COMPUTE_SHADER);
+    }
+
+    #[test]
     fn transition_of_an_untracked_image_waits_for_everything() {
         let access = image(
             7,
@@ -2217,7 +2269,7 @@ mod tests {
         let indirect = buffer(S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ, 0..10);
         let barriers =
             flush(&mut pending, &[], &[indirect]).expect("not visible to indirect reads yet");
-        assert_eq!(barriers.memory.src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
     }
 
     #[test]

@@ -839,7 +839,7 @@ fn host_copy_uploads_a_mip_level() {
             .unwrap();
     let data = pattern(8, 8);
 
-    if !Ctx::features().rebar {
+    if !Ctx::features().host_image_copy {
         // Host image copies need host-visible device memory.
         assert!(image.copy_from(&data, 0).is_err());
         return;
@@ -875,7 +875,7 @@ fn host_copy_writes_only_the_region() {
     let (offset, extent) = (UVec2::new(4, 5), UVec2::new(3, 2));
     let patch = vec![200u8; 3 * 2 * 4];
 
-    if !Ctx::features().rebar {
+    if !Ctx::features().host_image_copy {
         assert!(image.copy_region_from(&patch, 0, offset, extent).is_err());
         return;
     }
@@ -1795,7 +1795,7 @@ fn volumes_are_uploaded_sampled_and_copied() {
 
     // A host copy into the second slice: its offset is three-dimensional.
     let mut volume = volume;
-    if Ctx::features().rebar {
+    if Ctx::features().host_image_copy {
         let patch = [7u8; 4 * 4 * 4];
         let offset = UVec3::new(0, 0, 1);
         volume
@@ -1829,7 +1829,7 @@ fn bc7_block(channels: [u8; 4], low_bit: u8) -> [u8; 16] {
 #[test]
 fn host_copy_uploads_block_compressed_mips() {
     let gpu = gpu();
-    if !Ctx::features().rebar {
+    if !Ctx::features().host_image_copy {
         return;
     }
     // 8x8 texels are 2x2 blocks: red, green / blue, yellow.

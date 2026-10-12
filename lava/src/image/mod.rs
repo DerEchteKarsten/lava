@@ -7,7 +7,7 @@ use std::{
 
 use crate::error::{Error, Result};
 use ash::vk;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
 
 use crate::{
@@ -51,8 +51,8 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
-            // Without rebar the host image copy extension is off; `copy_from` then fails.
-            usage: if Ctx::features().rebar {
+            // Without the extension `copy_from` fails, and the flag isn't allowed.
+            usage: if Ctx::features().host_image_copy {
                 usage.flags()
             } else {
                 usage.flags() & !vk::ImageUsageFlags::HOST_TRANSFER_EXT
@@ -62,10 +62,27 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
         };
 
         let image = unsafe { Ctx::device().create_image(&create_info, None) }?;
-        let requirements = unsafe { Ctx::device().get_image_memory_requirements(image) };
+        let mut dedicated = vk::MemoryDedicatedRequirements::default();
+        let requirements = {
+            let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+            unsafe {
+                Ctx::device().get_image_memory_requirements2(
+                    &vk::ImageMemoryRequirementsInfo2::default().image(image),
+                    &mut requirements,
+                )
+            };
+            requirements.memory_requirements
+        };
+        let allocation_scheme = if dedicated.requires_dedicated_allocation == vk::TRUE
+            || dedicated.prefers_dedicated_allocation == vk::TRUE
+        {
+            AllocationScheme::DedicatedImage(image)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
 
         let desc = AllocationCreateDesc {
-            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            allocation_scheme,
             linear: false,
             location: gpu_allocator::MemoryLocation::GpuOnly,
             name: "ImageMemory",
@@ -491,9 +508,9 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
 
     fn check_host_copy(&self, data: &[u8], mip_level: u32) -> Result<()> {
         self.usage_check(vk::ImageUsageFlags::HOST_TRANSFER_EXT);
-        if !Ctx::features().rebar {
+        if !Ctx::features().host_image_copy {
             return Err(Error::message(
-                "host image copies need host-visible device memory, which this device lacks",
+                "host image copies need VK_EXT_host_image_copy on host-visible device memory, which this device lacks",
             ));
         }
         if mip_level >= self.raw.mip_levels {

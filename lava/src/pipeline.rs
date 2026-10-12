@@ -21,6 +21,7 @@ use crate::{
     },
     bindless::Bindless,
     command_buffer::Blend,
+    error::Result,
     state::{Ctx, Functions},
     vkobjects::rt_pipeline::{
         RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
@@ -32,10 +33,13 @@ pub enum PassKind {
     Compute {
         entry: &'static str,
     },
+    /// One raygen group, a miss group if there is a miss shader, and a triangle hit group
+    /// if there is a closest-hit or any-hit shader.
     RayTracing {
-        ray_gen: &'static str,
-        ray_any: &'static str,
-        ray_closest: &'static str,
+        raygen: &'static str,
+        miss: Option<&'static str>,
+        closest_hit: Option<&'static str>,
+        any_hit: Option<&'static str>,
     },
     RasterVertex {
         vertex: &'static str,
@@ -68,6 +72,10 @@ pub struct PassEntry {
     /// The names of its shader clock regions (`CLOCK_REGION` in `profile.slang`) in slot
     /// order, whose hashes its `constant_bindings` sets. New names need a `cargo build`.
     pub regions: &'static [&'static str],
+    /// `slang_compile::layout_hash` of the push constants, specialization constants and
+    /// entry points the bindings were generated from; a hot reload refuses a pass whose
+    /// hash changed, since the Rust side can't follow.
+    pub layout: u64,
 }
 
 impl PassEntry {
@@ -139,18 +147,20 @@ impl PipelineManager {
     fn new() -> Self {
         let modules: Box<[_]> = PASS_MAP
             .iter()
-            .map(|pass| create_module(pass.spirv()))
+            .map(|pass| must(pass, create_module(pass.spirv())))
             .collect();
         Self {
             compute_pipelines: RwLock::new(create_unspecialized(false, |pass_index, pass| {
-                create_compute_pipeline(modules[pass_index], pass, &NO_CONSTANTS)
+                must(
+                    pass,
+                    create_compute_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
+                )
             })),
             specialized_compute_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raytracing_pipelines: RwLock::new(create_unspecialized(true, |pass_index, pass| {
-                Some(create_raytracing_pipeline(
-                    modules[pass_index],
+                Some(must(
                     pass,
-                    &NO_CONSTANTS,
+                    create_raytracing_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
                 ))
             })),
             specialized_raytracing_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
@@ -167,7 +177,7 @@ impl PipelineManager {
         }
         let module = self.shader_modules[pass_index];
         cached(&self.specialized_compute_pipelines, pass, constants, || {
-            create_compute_pipeline(module, pass, constants)
+            must(pass, create_compute_pipeline(module, pass, constants))
         })
     }
 
@@ -194,7 +204,7 @@ impl PipelineManager {
             let cached = map.len();
             map.entry(*constants).or_insert_with(|| {
                 note_new_pipeline(pass, cached);
-                create_raytracing_pipeline(module, pass, constants)
+                must(pass, create_raytracing_pipeline(module, pass, constants))
             });
         }
         record(&maps.read().unwrap()[pass.index][constants])
@@ -203,8 +213,9 @@ impl PipelineManager {
     /// The pipeline of raster pass `pass_index` for `hash`.
     pub(crate) fn raster(&self, hash: &RasterHash, pass_index: usize) -> vk::Pipeline {
         let module = self.shader_modules[pass_index];
-        cached(&self.raster_pipelines, &PASS_MAP[pass_index], hash, || {
-            create_raster_pipeline(module, hash, pass_index)
+        let pass = &PASS_MAP[pass_index];
+        cached(&self.raster_pipelines, pass, hash, || {
+            must(pass, create_raster_pipeline(module, hash, pass_index))
         })
     }
 }
@@ -261,20 +272,19 @@ impl PipelineManager {
     fn new() -> Self {
         let modules: Vec<_> = PASS_MAP
             .iter()
-            .map(|pass| create_module(&pass.spirv()))
+            .map(|pass| must(pass, create_module(&pass.spirv())))
             .collect();
         Self {
             compute_pipelines: RwLock::new(create_unspecialized(false, |pass_index, pass| {
-                generic(create_compute_pipeline(
-                    modules[pass_index],
+                generic(must(
                     pass,
-                    &NO_CONSTANTS,
+                    create_compute_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
                 ))
             })),
             specialized_compute_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raytracing_pipelines: RwLock::new(create_unspecialized(true, |pass_index, pass| {
                 let pipeline = create_raytracing_pipeline(modules[pass_index], pass, &NO_CONSTANTS);
-                Some(generic_ray_tracing(pipeline))
+                Some(generic_ray_tracing(must(pass, pipeline)))
             })),
             specialized_raytracing_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raster_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
@@ -289,9 +299,10 @@ impl PipelineManager {
             return self.compute_pipelines.read().unwrap()[pass.index].clone();
         }
         // Held until the pipeline exists, so a reload can't destroy the module before.
-        let module = self.shader_modules.read().unwrap()[pass_index];
+        let modules = self.shader_modules.read().unwrap();
+        let module = modules[pass_index];
         cached(&self.specialized_compute_pipelines, pass, constants, || {
-            generic(create_compute_pipeline(module, pass, constants))
+            generic(must(pass, create_compute_pipeline(module, pass, constants)))
         })
     }
 
@@ -307,64 +318,108 @@ impl PipelineManager {
                 .clone()
                 .unwrap();
         }
-        let module = self.shader_modules.read().unwrap()[pass_index];
+        let modules = self.shader_modules.read().unwrap();
+        let module = modules[pass_index];
         cached(
             &self.specialized_raytracing_pipelines,
             pass,
             constants,
-            || generic_ray_tracing(create_raytracing_pipeline(module, pass, constants)),
+            || {
+                generic_ray_tracing(must(
+                    pass,
+                    create_raytracing_pipeline(module, pass, constants),
+                ))
+            },
         )
     }
 
     /// The pipeline of raster pass `pass_index` for `hash`.
     pub(crate) fn raster(&self, hash: &RasterHash, pass_index: usize) -> Arc<GenericPipeline> {
-        let module = self.shader_modules.read().unwrap()[pass_index];
-        cached(&self.raster_pipelines, &PASS_MAP[pass_index], hash, || {
-            generic(create_raster_pipeline(module, hash, pass_index))
+        let modules = self.shader_modules.read().unwrap();
+        let module = modules[pass_index];
+        let pass = &PASS_MAP[pass_index];
+        cached(&self.raster_pipelines, pass, hash, || {
+            generic(must(pass, create_raster_pipeline(module, hash, pass_index)))
         })
     }
 
     /// Replaces the pass's module and every pipeline made from it. A replaced pipeline is
-    /// destroyed once no pending command buffer uses it.
-    pub(crate) fn reload_pass(&self, pass_index: usize, spirv: &[u8]) {
+    /// destroyed once no pending command buffer uses it. If the driver rejects the module or
+    /// one of the pipelines, nothing is replaced: every new pipeline is made before any is
+    /// swapped in, and no lock is held while one fails.
+    pub(crate) fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Result<()> {
         let pass = &PASS_MAP[pass_index];
-        let module = create_module(spirv);
-        let mut modules = self.shader_modules.write().unwrap();
-        let old = std::mem::replace(&mut modules[pass_index], module);
-        unsafe { Ctx::device().destroy_shader_module(old, None) };
-
+        let module = create_module(spirv)?;
+        let destroy_module = |module| unsafe { Ctx::device().destroy_shader_module(module, None) };
         let unspecialized = pass.constants.is_empty();
-        match pass.kind {
-            PassKind::Compute { .. } if unspecialized => {
-                let pipeline = create_compute_pipeline(module, pass, &NO_CONSTANTS);
-                self.compute_pipelines.write().unwrap()[pass.index] = generic(pipeline);
-            }
-            PassKind::Compute { .. } => {
-                let mut maps = self.specialized_compute_pipelines.write().unwrap();
-                for (constants, pipeline) in &mut maps[pass.index] {
-                    *pipeline = generic(create_compute_pipeline(module, pass, constants));
+
+        // Every pipeline of the pass with the new module, then the swap.
+        let result: Result<()> = (|| {
+            match pass.kind {
+                PassKind::Compute { .. } if unspecialized => {
+                    let pipeline = generic(create_compute_pipeline(module, pass, &NO_CONSTANTS)?);
+                    self.compute_pipelines.write().unwrap()[pass.index] = pipeline;
+                }
+                PassKind::Compute { .. } => {
+                    let maps = &self.specialized_compute_pipelines;
+                    let keys: Vec<Constants> =
+                        maps.read().unwrap()[pass.index].keys().copied().collect();
+                    let mut new = Vec::with_capacity(keys.len());
+                    for constants in &keys {
+                        new.push(generic(create_compute_pipeline(module, pass, constants)?));
+                    }
+                    let map = &mut maps.write().unwrap()[pass.index];
+                    map.extend(keys.into_iter().zip(new));
+                }
+                PassKind::RayTracing { .. } if unspecialized => {
+                    let pipeline = create_raytracing_pipeline(module, pass, &NO_CONSTANTS)?;
+                    self.raytracing_pipelines.write().unwrap()[pass.index] =
+                        Some(generic_ray_tracing(pipeline));
+                }
+                PassKind::RayTracing { .. } => {
+                    let maps = &self.specialized_raytracing_pipelines;
+                    let keys: Vec<Constants> =
+                        maps.read().unwrap()[pass.index].keys().copied().collect();
+                    let mut new = Vec::with_capacity(keys.len());
+                    for constants in &keys {
+                        let pipeline = create_raytracing_pipeline(module, pass, constants)?;
+                        new.push(generic_ray_tracing(pipeline));
+                    }
+                    let map = &mut maps.write().unwrap()[pass.index];
+                    map.extend(keys.into_iter().zip(new));
+                }
+                PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. } => {
+                    let maps = &self.raster_pipelines;
+                    let keys: Vec<RasterHash> =
+                        maps.read().unwrap()[pass.index].keys().cloned().collect();
+                    let mut new = Vec::with_capacity(keys.len());
+                    for hash in &keys {
+                        new.push(generic(create_raster_pipeline(module, hash, pass_index)?));
+                    }
+                    let map = &mut maps.write().unwrap()[pass.index];
+                    map.extend(keys.into_iter().zip(new));
                 }
             }
-            PassKind::RayTracing { .. } if unspecialized => {
-                let pipeline = create_raytracing_pipeline(module, pass, &NO_CONSTANTS);
-                self.raytracing_pipelines.write().unwrap()[pass.index] =
-                    Some(generic_ray_tracing(pipeline));
-            }
-            PassKind::RayTracing { .. } => {
-                let mut maps = self.specialized_raytracing_pipelines.write().unwrap();
-                for (constants, pipeline) in &mut maps[pass.index] {
-                    let new = create_raytracing_pipeline(module, pass, constants);
-                    *pipeline = generic_ray_tracing(new);
-                }
-            }
-            PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. } => {
-                let mut maps = self.raster_pipelines.write().unwrap();
-                for (hash, pipeline) in &mut maps[pass.index] {
-                    *pipeline = generic(create_raster_pipeline(module, hash, pass_index));
-                }
-            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            destroy_module(module);
+            return Err(err);
         }
+        let old = std::mem::replace(
+            &mut self.shader_modules.write().unwrap()[pass_index],
+            module,
+        );
+        // Pipelines don't keep their module alive, so it can go as soon as it is unused.
+        destroy_module(old);
+        Ok(())
     }
+}
+
+/// A pipeline lava can't do without: created at start or at a pass's first use, so a
+/// driver that rejects it ends the program with the pass's name.
+fn must<T>(pass: &PassEntry, result: Result<T>) -> T {
+    result.unwrap_or_else(|err| panic!("pass `{}`: {err}", pass.name))
 }
 
 /// `create` called for every compute (or ray tracing) pass without specialization constants,
@@ -425,15 +480,10 @@ fn note_new_pipeline(pass: &PassEntry, cached: usize) {
     }
 }
 
-fn create_module(bytes: &[u8]) -> vk::ShaderModule {
-    let decoded_code = ash::util::read_spv(&mut std::io::Cursor::new(bytes)).unwrap();
+fn create_module(bytes: &[u8]) -> Result<vk::ShaderModule> {
+    let decoded_code = ash::util::read_spv(&mut std::io::Cursor::new(bytes))?;
     let create_info = vk::ShaderModuleCreateInfo::default().code(&decoded_code);
-
-    unsafe {
-        Ctx::device()
-            .create_shader_module(&create_info, None)
-            .unwrap()
-    }
+    Ok(unsafe { Ctx::device().create_shader_module(&create_info, None)? })
 }
 
 /// `pass.constants` places the pass's specialization constants in `constants`; a pass without
@@ -442,7 +492,7 @@ fn create_compute_pipeline(
     module: vk::ShaderModule,
     pass: &PassEntry,
     constants: &Constants,
-) -> vk::Pipeline {
+) -> Result<vk::Pipeline> {
     let PassKind::Compute { entry } = pass.kind else {
         unreachable!("{} is a compute pass", pass.name)
     };
@@ -456,22 +506,22 @@ fn create_compute_pipeline(
     let pipeline = unsafe {
         Ctx::device()
             .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
-            .unwrap()
+            .map_err(|(_, err)| err)?
     }[0];
     Functions::set_debug_name(entry, pipeline);
-    pipeline
+    Ok(pipeline)
 }
 
-/// The entry points are mapped to stages as before this file existed; see BUGS.md.
 fn create_raytracing_pipeline(
     module: vk::ShaderModule,
     pass: &PassEntry,
     constants: &Constants,
-) -> RaytracingPipeline {
+) -> Result<RaytracingPipeline> {
     let PassKind::RayTracing {
-        ray_gen,
-        ray_any,
-        ray_closest,
+        raygen,
+        miss,
+        closest_hit,
+        any_hit,
     } = pass.kind
     else {
         unreachable!("{} is a ray tracing pass", pass.name)
@@ -480,27 +530,31 @@ fn create_raytracing_pipeline(
         .map_entries(pass.constants)
         .data(&constants[..pass.constants_size]);
     let stage = |entry, flags| make_shader_stage(entry, flags, module, &info);
-    let raygen = stage(ray_any, vk::ShaderStageFlags::RAYGEN_KHR);
-    let hit = stage(ray_closest, vk::ShaderStageFlags::CLOSEST_HIT_KHR);
-    let miss = stage(ray_gen, vk::ShaderStageFlags::MISS_KHR);
-    RaytracingPipeline::new(
-        Bindless::layout(),
-        &[
-            RayTracingShaderCreateInfo {
-                stages: std::slice::from_ref(&raygen),
-                group: RayTracingShaderGroup::RayGen,
-            },
-            RayTracingShaderCreateInfo {
-                stages: std::slice::from_ref(&hit),
-                group: RayTracingShaderGroup::Hit,
-            },
-            RayTracingShaderCreateInfo {
-                stages: std::slice::from_ref(&miss),
-                group: RayTracingShaderGroup::Miss,
-            },
-        ],
-    )
-    .unwrap()
+    let raygen = [stage(raygen, vk::ShaderStageFlags::RAYGEN_KHR)];
+    let miss = miss.map(|miss| [stage(miss, vk::ShaderStageFlags::MISS_KHR)]);
+    // A hit group's stages: closest hit first, then any hit (see `RaytracingPipeline::new`).
+    let hit: SmallVec<[_; 2]> = closest_hit
+        .map(|entry| stage(entry, vk::ShaderStageFlags::CLOSEST_HIT_KHR))
+        .into_iter()
+        .chain(any_hit.map(|entry| stage(entry, vk::ShaderStageFlags::ANY_HIT_KHR)))
+        .collect();
+    let mut groups = vec![RayTracingShaderCreateInfo {
+        stages: &raygen,
+        group: RayTracingShaderGroup::RayGen,
+    }];
+    if let Some(miss) = &miss {
+        groups.push(RayTracingShaderCreateInfo {
+            stages: miss,
+            group: RayTracingShaderGroup::Miss,
+        });
+    }
+    if !hit.is_empty() {
+        groups.push(RayTracingShaderCreateInfo {
+            stages: &hit,
+            group: RayTracingShaderGroup::Hit,
+        });
+    }
+    RaytracingPipeline::new(Bindless::layout(), &groups)
 }
 
 fn make_shader_stage<'a>(
@@ -520,7 +574,7 @@ fn create_raster_pipeline(
     module: vk::ShaderModule,
     hash: &RasterHash,
     pass_index: usize,
-) -> vk::Pipeline {
+) -> Result<vk::Pipeline> {
     let _span = tracing::info_span!("create raster pipeline").entered();
 
     let pass = &PASS_MAP[pass_index];
@@ -675,10 +729,9 @@ fn create_raster_pipeline(
     let pipeline = unsafe {
         Ctx::device()
             .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
-            .unwrap()
+            .map_err(|(_, err)| err)?
     }[0];
-
-    pipeline
+    Ok(pipeline)
 }
 
 #[cfg(test)]
@@ -746,9 +799,10 @@ mod tests {
                     amp.into_iter().chain([mesh, fragment]).collect()
                 }
                 PassKind::RayTracing {
-                    ray_gen,
-                    ray_any,
-                    ray_closest,
+                    raygen,
+                    miss,
+                    closest_hit,
+                    any_hit,
                 } => {
                     if specialized {
                         &mut specialized_raytracing
@@ -756,7 +810,10 @@ mod tests {
                         &mut raytracing
                     }
                     .push(pass.index);
-                    vec![ray_gen, ray_any, ray_closest]
+                    [Some(raygen), miss, closest_hit, any_hit]
+                        .into_iter()
+                        .flatten()
+                        .collect()
                 }
             };
             for name in names {

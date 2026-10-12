@@ -337,6 +337,8 @@ unsafe extern "system" fn vulkan_debug_callback(
 #[derive(Default, Debug, Clone)]
 pub struct Features {
     pub rebar: bool,
+    /// `VK_EXT_host_image_copy` on host-visible device memory (`rebar`): `Image::copy_from`.
+    pub host_image_copy: bool,
     pub present: bool,
     pub device_debug_utils: bool,
     pub debug_utils: bool,
@@ -358,11 +360,8 @@ pub struct Features {
 }
 impl Features {
     pub fn extensions(&self) -> Vec<&CStr> {
-        let mut extensions = vec![
-            ash::ext::extended_dynamic_state3::NAME,
-            // unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_KHR_unified_image_layouts\0") }
-        ];
-        if self.rebar {
+        let mut extensions = vec![];
+        if self.host_image_copy {
             extensions.push(ash::ext::host_image_copy::NAME);
         }
         if self.present {
@@ -399,8 +398,6 @@ impl Features {
         vk11: &'a mut vk::PhysicalDeviceVulkan11Features,
         vk12: &'a mut vk::PhysicalDeviceVulkan12Features,
         vk13: &'a mut vk::PhysicalDeviceVulkan13Features,
-        dn3: &'a mut vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
-        dy2: &'a mut vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT,
         mesh: &'a mut vk::PhysicalDeviceMeshShaderFeaturesEXT,
         ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
@@ -449,25 +446,16 @@ impl Features {
             .pipeline_statistics_query(self.pipeline_statistics)
             .vertex_pipeline_stores_and_atomics(true);
 
-        *dn3 = dn3
-            .extended_dynamic_state3_depth_clamp_enable(true)
-            .extended_dynamic_state3_polygon_mode(true)
-            .extended_dynamic_state3_logic_op_enable(true)
-            .extended_dynamic_state3_color_blend_equation(true)
-            .extended_dynamic_state3_color_write_mask(true)
-            .extended_dynamic_state3_color_blend_enable(true);
-        *dy2 = dy2.extended_dynamic_state2_logic_op(true);
-
-        *host_image_copy =
-            vk::PhysicalDeviceHostImageCopyFeaturesEXT::default().host_image_copy(true);
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(phfeatures)
             .push_next(vk11)
             .push_next(vk12)
-            .push_next(vk13)
-            .push_next(dy2)
-            .push_next(host_image_copy)
-            .push_next(dn3);
+            .push_next(vk13);
+        if self.host_image_copy {
+            *host_image_copy =
+                vk::PhysicalDeviceHostImageCopyFeaturesEXT::default().host_image_copy(true);
+            features = features.push_next(host_image_copy);
+        }
         if self.mesh {
             *mesh = mesh
                 .task_shader(true)
@@ -637,25 +625,13 @@ pub(super) fn create_device(
         .map(|e| e.as_ptr() as *const i8)
         .collect::<Vec<_>>();
 
-    let (
-        mut vk11,
-        mut vk12,
-        mut vk13,
-        mut dy2,
-        mut dn3,
-        mut mesh,
-        mut ray,
-        mut acc,
-        mut host_image_copy,
-        mut clock,
-    ) = Default::default();
+    let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut host_image_copy, mut clock) =
+        Default::default();
     let mut performance = Default::default();
     let mut features = features.features(
         &mut vk11,
         &mut vk12,
         &mut vk13,
-        &mut dn3,
-        &mut dy2,
         &mut mesh,
         &mut ray,
         &mut acc,
@@ -690,16 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn headless_devices_need_only_the_dynamic_state_extension() {
-        assert_eq!(
-            names(&Features::default()),
-            ["VK_EXT_extended_dynamic_state3"]
-        );
+    fn headless_devices_need_no_extension() {
+        assert!(names(&Features::default()).is_empty());
     }
 
     #[test]
     fn each_feature_adds_its_device_extensions() {
-        let only = |f: Features| names(&f)[1..].to_vec();
+        let only = |f: Features| names(&f);
         assert_eq!(
             only(Features {
                 present: true,
@@ -709,7 +682,7 @@ mod tests {
         );
         assert_eq!(
             only(Features {
-                rebar: true,
+                host_image_copy: true,
                 ..Default::default()
             }),
             ["VK_EXT_host_image_copy"]
@@ -780,15 +753,13 @@ mod tests {
         vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
         vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
     ) {
-        let (mut vk11, mut vk12, mut vk13, mut dn3, mut dy2, mut mesh, mut ray, mut acc, mut hic) =
+        let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut hic) =
             Default::default();
         let (mut clock, mut performance) = Default::default();
         features.features(
             &mut vk11,
             &mut vk12,
             &mut vk13,
-            &mut dn3,
-            &mut dy2,
             &mut mesh,
             &mut ray,
             &mut acc,

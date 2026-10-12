@@ -50,7 +50,18 @@ impl RaytracingPipeline {
         let mut stages = vec![];
         let mut groups = vec![];
 
-        for shader in shaders_create_info.iter() {
+        // The shader group handles come back in group order, and the binding table lays its
+        // regions out raygen, miss, hit, so the groups are created in that order.
+        let order = |group: RayTracingShaderGroup| match group {
+            RayTracingShaderGroup::RayGen => 0,
+            RayTracingShaderGroup::Miss => 1,
+            RayTracingShaderGroup::Hit => 2,
+        };
+        let mut shaders_create_info: Vec<&RayTracingShaderCreateInfo> =
+            shaders_create_info.iter().collect();
+        shaders_create_info.sort_by_key(|shader| order(shader.group));
+
+        for shader in shaders_create_info {
             match shader.group {
                 RayTracingShaderGroup::RayGen => shader_group_info.raygen_shader_count += 1,
                 RayTracingShaderGroup::Miss => shader_group_info.miss_shader_count += 1,
@@ -69,22 +80,23 @@ impl RaytracingPipeline {
                 RayTracingShaderGroup::RayGen | RayTracingShaderGroup::Miss => {
                     group.general_shader(shader_index as _)
                 }
+                // A triangle hit group: its stages are closest hit and any hit, by stage flag.
                 RayTracingShaderGroup::Hit => {
-                    group = group
-                        .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                        .closest_hit_shader(shader_index as _);
-                    if shader.stages.len() >= 2 {
-                        group = group
-                            .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                            .any_hit_shader((shader_index as u32) + 1);
+                    group = group.ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP);
+                    for (i, stage) in shader.stages.iter().enumerate() {
+                        let index = (shader_index + i) as u32;
+                        group = match stage.stage {
+                            vk::ShaderStageFlags::CLOSEST_HIT_KHR => {
+                                group.closest_hit_shader(index)
+                            }
+                            vk::ShaderStageFlags::ANY_HIT_KHR => group.any_hit_shader(index),
+                            other => {
+                                return Err(Error::message(format!(
+                                    "a hit group can't hold a {other:?} stage"
+                                )));
+                            }
+                        };
                     }
-                    if shader.stages.len() >= 3 {
-                        group = group
-                            .ty(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP)
-                            .any_hit_shader((shader_index as u32) + 1)
-                            .intersection_shader((shader_index as u32) + 2);
-                    }
-
                     group
                 }
             };

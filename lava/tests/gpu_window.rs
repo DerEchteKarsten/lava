@@ -104,7 +104,7 @@ fn run(event_loop: &ActiveEventLoop) {
     assert!(surface.capabilities.min_image_count >= 1);
     step("surface_reports_formats_modes_and_capabilities");
 
-    let mut swapchain = Swapchain::new(&surface, None, Some(SIZE)).unwrap();
+    let mut swapchain = Swapchain::new(&mut surface, None, Some(SIZE)).unwrap();
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
     swapchain.bind_storage(0);
     assert_eq!(swapchain.size, SIZE);
@@ -131,8 +131,7 @@ fn run(event_loop: &ActiveEventLoop) {
     step("acquire_clear_present");
 
     let new_size = [SIZE[0] / 2, SIZE[1] / 2];
-    surface.refresh_capabilities().unwrap();
-    swapchain.recreate(&surface, new_size).unwrap();
+    swapchain.recreate(&mut surface, new_size).unwrap();
     assert_eq!(swapchain.size, new_size);
     // Binding is left to the application, which may have to reserve slots for more images.
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
@@ -144,8 +143,8 @@ fn run(event_loop: &ActiveEventLoop) {
     step("swapchain_recreate_is_unbound");
 
     let second_window = create_window(event_loop, "lava test 2");
-    let second_surface = surface_for(&second_window).unwrap();
-    let mut second_swapchain = Swapchain::new(&second_surface, None, Some(SIZE)).unwrap();
+    let mut second_surface = surface_for(&second_window).unwrap();
+    let mut second_swapchain = Swapchain::new(&mut second_surface, None, Some(SIZE)).unwrap();
     second_swapchain.bind_storage(8);
     assert_eq!(second_swapchain.image(0).handle.descriptor_index_set1, 8);
     assert_ne!(second_surface.handle, surface.handle);

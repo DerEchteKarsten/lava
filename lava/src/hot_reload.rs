@@ -19,24 +19,36 @@ use crate::{
 pub(crate) fn watch(manager: &'static PipelineManager) {
     use notify::Watcher;
 
-    static WATCHER: OnceLock<notify::RecommendedWatcher> = OnceLock::new();
+    static WATCHER: OnceLock<Option<notify::RecommendedWatcher>> = OnceLock::new();
     let _ = WATCHER.get_or_init(|| {
-        let (changed, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("shader_hot_reload".into())
-            .spawn(move || compile_changed_passes(manager, rx))
-            .unwrap();
-
-        let mut watcher = notify::recommended_watcher(FileWatcher { changed }).unwrap();
-        for dir in ["passes", "include"] {
-            watcher
-                .watch(
-                    &Path::new(SHADER_DIR).join(dir),
-                    notify::RecursiveMode::Recursive,
-                )
-                .unwrap();
+        let watch = || -> std::result::Result<notify::RecommendedWatcher, String> {
+            // The source directory of the build machine: a moved binary has no shaders to
+            // watch, and keeps the pipelines it started with.
+            let dirs = ["passes", "include"].map(|dir| Path::new(SHADER_DIR).join(dir));
+            if let Some(missing) = dirs.iter().find(|dir| !dir.is_dir()) {
+                return Err(format!("{} is not a directory", missing.display()));
+            }
+            let (changed, rx) = mpsc::channel();
+            let mut watcher =
+                notify::recommended_watcher(FileWatcher { changed }).map_err(|e| e.to_string())?;
+            for dir in &dirs {
+                watcher
+                    .watch(dir, notify::RecursiveMode::Recursive)
+                    .map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            std::thread::Builder::new()
+                .name("shader_hot_reload".into())
+                .spawn(move || compile_changed_passes(manager, rx))
+                .map_err(|e| e.to_string())?;
+            Ok(watcher)
+        };
+        match watch() {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                tracing::error!(target: "shader_file_watcher", "shader hot reload is off: {e}");
+                None
+            }
         }
-        watcher
     });
 }
 
@@ -79,14 +91,14 @@ fn compile_changed_passes(manager: &'static PipelineManager, changed: mpsc::Rece
         for pass_index in passes_to_reload(&paths, &PASS_MAP) {
             let pass = &PASS_MAP[pass_index];
 
-            match compile_pass(&global, pass_index) {
-                Ok(spirv) => {
-                    tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
-                    manager.reload_pass(pass_index, spirv.as_slice());
-                }
-                Err(e) => {
-                    tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
-                }
+            let reloaded = compile_pass(&global, pass_index).and_then(|spirv| {
+                tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
+                manager
+                    .reload_pass(pass_index, spirv.as_slice())
+                    .map_err(|e| e.to_string())
+            });
+            if let Err(e) = reloaded {
+                tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
             }
         }
     }
@@ -108,14 +120,29 @@ fn passes_to_reload(changed: &[PathBuf], passes: &[PassEntry]) -> Vec<usize> {
         .collect()
 }
 
-fn compile_pass(global: &slang::GlobalSession, pass_index: usize) -> slang::Result<slang::Blob> {
+/// The pass's new SPIR-V, unless its push constants, specialization constants or entry
+/// points changed, which only `cargo build` can follow.
+fn compile_pass(
+    global: &slang::GlobalSession,
+    pass_index: usize,
+) -> std::result::Result<slang::Blob, String> {
+    let pass = &PASS_MAP[pass_index];
     let options = slang_compile::Options {
         test_passes: cfg!(feature = "test-passes"),
         profiling: cfg!(feature = "profiling"),
         pass_index,
     };
     let session = slang_compile::session(global, &options);
-    slang_compile::link(&session, PASS_MAP[pass_index].source)?.target_code(0)
+    let program = slang_compile::link(&session, pass.source).map_err(|e| e.to_string())?;
+    let layout = program.layout(0).map_err(|e| e.to_string())?;
+    if slang_compile::layout_hash(layout) != pass.layout {
+        return Err(
+            "its push constants, specialization constants or entry points changed, \
+                    which the generated bindings can't follow: run `cargo build`"
+                .to_string(),
+        );
+    }
+    program.target_code(0).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -133,6 +160,7 @@ mod tests {
             constants: &[],
             constants_size: 0,
             regions: &[],
+            layout: 0,
         }
     }
 

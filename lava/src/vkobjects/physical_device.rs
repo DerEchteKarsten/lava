@@ -49,6 +49,8 @@ pub struct PhysicalDevice {
     pub mem_properties: vk::PhysicalDeviceMemoryProperties,
     pub properties: vk::PhysicalDeviceProperties,
     pub mesh_shader_properties: vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>,
+    /// The update-after-bind descriptor limits, which the bindless sets are sized by.
+    pub vk12_properties: vk::PhysicalDeviceVulkan12Properties<'static>,
     pub queue_families: Vec<QueueFamily>,
     pub supported_extensions: Vec<String>,
     pub supported_features: Features,
@@ -101,6 +103,8 @@ impl PhysicalDevice {
         let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let mut clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
         let mut performance = vk::PhysicalDevicePerformanceQueryFeaturesKHR::default();
+        let mut host_image_copy = vk::PhysicalDeviceHostImageCopyFeaturesEXT::default();
+        let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
         let mut rt_pipeline_properties =
             vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -112,17 +116,20 @@ impl PhysicalDevice {
             .push_next(&mut acceleration_struct_feature)
             .push_next(&mut mesh_shading)
             .push_next(&mut clock)
-            .push_next(&mut performance);
+            .push_next(&mut performance)
+            .push_next(&mut host_image_copy);
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
         let pipeline_statistics = features2.features.pipeline_statistics_query == vk::TRUE;
 
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut rt_pipeline_properties)
             .push_next(&mut acc_properties)
-            .push_next(&mut mesh_shader_properties);
+            .push_next(&mut mesh_shader_properties)
+            .push_next(&mut vk12_properties);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
-        // Detach it from the chain on this stack.
+        // Detach them from the chain on this stack.
         mesh_shader_properties.p_next = std::ptr::null_mut();
+        vk12_properties.p_next = std::ptr::null_mut();
 
         let mem_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -134,6 +141,9 @@ impl PhysicalDevice {
         };
         let features = Features {
             rebar,
+            host_image_copy: rebar
+                && has_extension(ash::ext::host_image_copy::NAME)
+                && host_image_copy.host_image_copy == vk::TRUE,
             present: true,
             debug_utils: true,
             device_debug_utils: supported_extensions.contains(
@@ -156,6 +166,7 @@ impl PhysicalDevice {
         Ok(Self {
             properties,
             mesh_shader_properties,
+            vk12_properties,
             mem_properties,
             handel: physical_device,
             name,
@@ -256,6 +267,7 @@ impl PhysicalDevice {
         features.mesh = device.supported_features.mesh;
         features.raytracing = device.supported_features.raytracing;
         features.rebar = device.supported_features.rebar;
+        features.host_image_copy = device.supported_features.host_image_copy;
         features.pipeline_statistics = device.supported_features.pipeline_statistics;
         features.mesh_queries = device.supported_features.mesh_queries;
         features.memory_budget = device.supported_features.memory_budget;
@@ -318,6 +330,7 @@ mod tests {
                 ..Default::default()
             },
             mesh_shader_properties: Default::default(),
+            vk12_properties: Default::default(),
             handel: vk::PhysicalDevice::null(),
             name: "test device".into(),
             mem_properties: Default::default(),
@@ -475,6 +488,7 @@ mod tests {
         let mut dev = device(DISCRETE, vec![gfx_family(0, 1)]);
         dev.supported_features = Features {
             rebar: true,
+            host_image_copy: true,
             present: true,
             device_debug_utils: true,
             debug_utils: true,
@@ -490,7 +504,7 @@ mod tests {
         // Without validation the device debug utils stay off, and `present` is the caller's.
         let mut features = Features::default();
         PhysicalDevice::select_suitable_physical_device(&[dev.clone()], &mut features).unwrap();
-        assert!(features.mesh && features.rebar);
+        assert!(features.mesh && features.rebar && features.host_image_copy);
         assert!(features.pipeline_statistics && features.memory_budget);
         assert!(!features.raytracing && !features.mesh_queries);
         assert!(!features.device_debug_utils);

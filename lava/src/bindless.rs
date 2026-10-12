@@ -146,6 +146,7 @@ impl Bindless {
     }
     pub(crate) fn init() -> Result<()> {
         let mut layouts = [vk::DescriptorSetLayout::default(); 3];
+        // Sampler 0: nearest texel of the nearest mip, clamped to a white border.
         let sci2 = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST)
@@ -154,9 +155,9 @@ impl Bindless {
             .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
             .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
             .border_color(BorderColor::FLOAT_OPAQUE_WHITE)
-            .anisotropy_enable(false)
-            .compare_enable(false);
+            .max_lod(vk::LOD_CLAMP_NONE);
 
+        // Sampler 1: bilinear within the nearest mip, clamped to a white border.
         let sci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -164,7 +165,8 @@ impl Bindless {
             .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
             .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
             .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
-            .mipmap_mode(SamplerMipmapMode::NEAREST);
+            .mipmap_mode(SamplerMipmapMode::NEAREST)
+            .max_lod(vk::LOD_CLAMP_NONE);
 
         // Sampler 2: trilinear + repeat, what mipmapped material textures use.
         let sci3 = vk::SamplerCreateInfo::default()
@@ -188,6 +190,19 @@ impl Bindless {
                 | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT
                 | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING,
         ];
+        // The arrays are update-after-bind and used by every stage, so the smaller of those
+        // limits bounds them (the plain limits may be smaller than the update-after-bind ones).
+        let limits = &Ctx::physical_device().vk12_properties;
+        let desc_counts = [
+            limits
+                .max_descriptor_set_update_after_bind_sampled_images
+                .min(limits.max_per_stage_descriptor_update_after_bind_sampled_images)
+                .min(10000),
+            limits
+                .max_descriptor_set_update_after_bind_storage_images
+                .min(limits.max_per_stage_descriptor_update_after_bind_storage_images)
+                .min(10000),
+        ];
         let bindings = [
             vk::DescriptorSetLayoutBinding {
                 binding: 0,
@@ -199,9 +214,7 @@ impl Bindless {
             .immutable_samplers(&samplers),
             vk::DescriptorSetLayoutBinding {
                 binding: samplers.len() as u32,
-                descriptor_count: Ctx::device_properties()
-                    .limits
-                    .max_descriptor_set_sampled_images,
+                descriptor_count: desc_counts[0],
                 descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                 stage_flags: vk::ShaderStageFlags::ALL,
                 ..Default::default()
@@ -222,9 +235,7 @@ impl Bindless {
 
         let bindings = [vk::DescriptorSetLayoutBinding {
             binding: 0,
-            descriptor_count: Ctx::device_properties()
-                .limits
-                .max_descriptor_set_storage_images,
+            descriptor_count: desc_counts[1],
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
             stage_flags: vk::ShaderStageFlags::ALL,
             ..Default::default()
@@ -291,16 +302,6 @@ impl Bindless {
             .pool_sizes(&pool_sizes);
         let pool = unsafe { Ctx::device().create_descriptor_pool(&pool_info, None) }?;
 
-        let desc_counts = [
-            Ctx::device_properties()
-                .limits
-                .max_descriptor_set_sampled_images
-                .min(10000),
-            Ctx::device_properties()
-                .limits
-                .max_descriptor_set_storage_images
-                .min(10000),
-        ];
         // The counter set has no variable-sized binding, so its count is ignored.
         let variable_counts = [desc_counts[0], desc_counts[1], 0];
         let mut alloc_info = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
@@ -369,9 +370,7 @@ impl Bindless {
             for i in s.layouts {
                 Ctx::device().destroy_descriptor_set_layout(i, None);
             }
-            if let Err(err) = Ctx::device().free_descriptor_sets(s.pool, &s.sets) {
-                tracing::error!(%err, "failed to free bindless descriptor sets");
-            }
+            // The pool isn't created with the free flag; destroying it frees its sets.
             Ctx::device().destroy_descriptor_pool(s.pool, None);
         }
     }

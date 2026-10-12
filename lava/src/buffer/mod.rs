@@ -12,7 +12,7 @@ use ash::vk::{self};
 use bytemuck::Pod;
 use gpu_allocator::{
     MemoryLocation,
-    vulkan::{Allocation, AllocationCreateDesc},
+    vulkan::{Allocation, AllocationCreateDesc, AllocationScheme},
 };
 use lava_macros::validation_trace;
 
@@ -130,10 +130,27 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         let create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(flags);
         let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
-        let mut requirements = unsafe { Ctx::device().get_buffer_memory_requirements(buffer) };
+        let mut dedicated = vk::MemoryDedicatedRequirements::default();
+        let mut requirements = {
+            let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+            unsafe {
+                Ctx::device().get_buffer_memory_requirements2(
+                    &vk::BufferMemoryRequirementsInfo2::default().buffer(buffer),
+                    &mut requirements,
+                )
+            };
+            requirements.memory_requirements
+        };
         if let Some(a) = alignment {
-            requirements.alignment = a as u64;
+            requirements.alignment = requirements.alignment.max(a as u64);
         }
+        let allocation_scheme = if dedicated.requires_dedicated_allocation == vk::TRUE
+            || dedicated.prefers_dedicated_allocation == vk::TRUE
+        {
+            AllocationScheme::DedicatedBuffer(buffer)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
 
         let allocation = {
             let mut allocator = Ctx::allocator();
@@ -146,9 +163,16 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
                     MemoryLocation::GpuOnly
                 },
                 linear: true,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+                allocation_scheme,
             })
-        }?;
+        };
+        let allocation = match allocation {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                unsafe { Ctx::device().destroy_buffer(buffer, None) };
+                return Err(err.into());
+            }
+        };
 
         unsafe {
             Ctx::device().bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?
