@@ -58,6 +58,13 @@ pub fn init(
     Ok(())
 }
 
+/// Waits until the device finished everything submitted so far, e.g. before dropping the
+/// last swapchain. A stall; frames in flight retire resources instead (`Frame::retire`).
+pub fn wait_idle() -> Result<()> {
+    unsafe { Ctx::device().device_wait_idle()? };
+    Ok(())
+}
+
 #[track_caller]
 pub fn destroy() {
     CALLSITE.set(Some(Location::caller().clone()));

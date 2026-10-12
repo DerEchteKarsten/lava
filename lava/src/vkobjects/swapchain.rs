@@ -6,6 +6,7 @@ use crate::{
     error::{Error, Result},
 };
 use ash::vk::{self};
+use glam::UVec2;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -33,7 +34,7 @@ struct SwapchainImage {
 
 #[derive(Debug)]
 pub struct Swapchain {
-    pub size: [u32; 2],
+    pub size: UVec2,
     /// Picked from what the surface supports; a recreated swapchain may pick another.
     pub format: format::Dynamic,
     /// The surface's supported modes of `PRESENT_MODES`, FIFO first, with their names.
@@ -54,7 +55,7 @@ impl Swapchain {
             image: image.image,
             view: image.view,
             mip_range: (0..1).into(),
-            extent: self.size.into(),
+            extent: self.size,
             handle: image.handle,
             layouts: std::slice::from_ref(&image.layout),
             format: self.format,
@@ -70,12 +71,12 @@ impl Swapchain {
     /// The images are unbound; the caller binds them. The image count can change between
     /// swapchains of one surface, e.g. with the present mode (Mailbox often needs one more).
     /// `size` is clamped to what the surface allows right now (its capabilities are
-    /// re-queried); a surface without any extent (a minimised window) is an error.
+    /// re-queried); a surface without any extent (`Surface::is_minimised`) is an error.
     #[validation_trace]
     pub fn new(
         surface: &mut Surface,
         old: Option<&Swapchain>,
-        size: Option<[u32; 2]>,
+        size: Option<UVec2>,
     ) -> Result<Self> {
         surface.refresh_capabilities()?;
         let format = select_surface_format(&surface.formats);
@@ -86,7 +87,7 @@ impl Swapchain {
         let extent = select_extent(size, &surface.capabilities);
         if extent.width == 0 || extent.height == 0 {
             return Err(Error::message(
-                "the surface has no extent to create a swapchain for (a minimised window?)",
+                "the surface has no extent to create a swapchain for (a minimised window)",
             ));
         }
         let usage = ColorAttachmentStorageTransferDst::VK;
@@ -178,7 +179,7 @@ impl Swapchain {
             handle,
             format: format::Dynamic(format.format),
             images,
-            size: [extent.width, extent.height],
+            size: UVec2::new(extent.width, extent.height),
             present_modes,
             present_mode: present_mode_index,
         })
@@ -210,24 +211,23 @@ impl Swapchain {
         Ok(image_index)
     }
 
-    /// The new images are unbound (see `new`); bind them again. On an error (see `new`) the
-    /// old swapchain stays.
+    /// Replaces the swapchain with one of `size` and returns the old one, whose images frames
+    /// in flight may still use: retire it with the next frame (`Frame::retire`), which drops
+    /// it once that frame, and so every earlier one, has finished. The new images are unbound
+    /// (see `new`); bind them again. On an error (see `new`) the old swapchain stays.
     #[validation_trace]
-    pub fn recreate(&mut self, surface: &mut Surface, size: [u32; 2]) -> Result<()> {
+    pub fn recreate(&mut self, surface: &mut Surface, size: UVec2) -> Result<Swapchain> {
         let _span = tracing::info_span!("Swapchain Recreation").entered();
         let swapchain = Swapchain::new(surface, Some(self), Some(size))?;
-        // Dropping the old swapchain waits for the device and destroys it.
-        *self = swapchain;
-        Ok(())
+        Ok(std::mem::replace(self, swapchain))
     }
 }
 
+/// Destroys the swapchain, which no pending frame may use anymore: retire a replaced one
+/// (`recreate`), and wait for the device (`lava::wait_idle`) before dropping the last.
 impl Drop for Swapchain {
     fn drop(&mut self) {
         unsafe {
-            if let Err(err) = Ctx::device().device_wait_idle() {
-                tracing::error!(%err, "failed to wait for the device before destroying a swapchain");
-            }
             for image in &self.images {
                 Ctx::device().destroy_image_view(image.view, None);
             }
@@ -276,14 +276,14 @@ pub(crate) fn supported_present_modes(
 /// extent, else (when the surface leaves the size to the swapchain, signalled by `u32::MAX`)
 /// its minimum extent.
 pub(crate) fn select_extent(
-    size: Option<[u32; 2]>,
+    size: Option<UVec2>,
     capabilities: &vk::SurfaceCapabilitiesKHR,
 ) -> vk::Extent2D {
     let (min, max) = (capabilities.min_image_extent, capabilities.max_image_extent);
-    if let Some([width, height]) = size {
+    if let Some(size) = size {
         vk::Extent2D {
-            width: width.clamp(min.width, max.width.max(min.width)),
-            height: height.clamp(min.height, max.height.max(min.height)),
+            width: size.x.clamp(min.width, max.width.max(min.width)),
+            height: size.y.clamp(min.height, max.height.max(min.height)),
         }
     } else if capabilities.current_extent.width != u32::MAX {
         capabilities.current_extent
@@ -380,7 +380,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let requested = select_extent(Some([320, 240]), &caps);
+        let requested = select_extent(Some(UVec2::new(320, 240)), &caps);
         assert_eq!((requested.width, requested.height), (320, 240));
 
         let current = select_extent(None, &caps);
@@ -388,13 +388,13 @@ mod tests {
 
         // A window size the surface can't take (an X11 window that just changed, or a
         // minimised one with a 0 maximum) is clamped.
-        let clamped = select_extent(Some([8192, 0]), &caps);
+        let clamped = select_extent(Some(UVec2::new(8192, 0)), &caps);
         assert_eq!((clamped.width, clamped.height), (4096, 1));
         let minimised = vk::SurfaceCapabilitiesKHR {
             max_image_extent: vk::Extent2D::default(),
             ..caps
         };
-        let none = select_extent(Some([800, 600]), &minimised);
+        let none = select_extent(Some(UVec2::new(800, 600)), &minimised);
         assert_eq!((none.width, none.height), (1, 1));
     }
 

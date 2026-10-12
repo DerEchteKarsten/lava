@@ -61,6 +61,13 @@ impl Surface {
         Ok(surface)
     }
 
+    /// Whether the surface has no extent to create a swapchain for right now (a minimised
+    /// window), as of the last `refresh_capabilities`.
+    pub fn is_minimised(&self) -> bool {
+        let max = self.capabilities.max_image_extent;
+        max.width == 0 || max.height == 0
+    }
+
     /// Re-queries the capabilities, which change when the window is resized.
     pub fn refresh_capabilities(&mut self) -> Result<()> {
         self.capabilities = unsafe {

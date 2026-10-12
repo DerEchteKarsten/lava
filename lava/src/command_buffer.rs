@@ -472,7 +472,10 @@ impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS>
                 } else {
                     vk::AccessFlags2::empty()
                 },
-            ATTACHMENT_LAYOUT,
+            // Attachments are drawn to in this layout; every other access asks for `GENERAL`,
+            // which costs nothing when sampling but can keep a driver from compressing a
+            // framebuffer.
+            vk::ImageLayout::ATTACHMENT_OPTIMAL,
         );
         RasterBuilder {
             cmd_buf: self.cmd_buf,
@@ -524,7 +527,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
-            ATTACHMENT_LAYOUT,
+            vk::ImageLayout::ATTACHMENT_OPTIMAL,
         ));
         self
     }
@@ -715,7 +718,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
 
         let color_attachments = self.color_attachments.map(|(view, clear)| {
             let ret = vk::RenderingAttachmentInfo::default()
-                .image_layout(ATTACHMENT_LAYOUT)
+                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                 .image_view(view)
                 .store_op(vk::AttachmentStoreOp::STORE);
             if let Some(clear_value) = clear {
@@ -738,7 +741,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
                 .access
                 .contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE);
             depth_info = vk::RenderingAttachmentInfo::default()
-                .image_layout(ATTACHMENT_LAYOUT)
+                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                 .image_view(self.depth_attachment)
                 .store_op(if written {
                     vk::AttachmentStoreOp::STORE
@@ -1362,11 +1365,6 @@ impl CommandBuffer {
         Ok(())
     }
 }
-
-/// The layout of colour and depth attachments while they are drawn to. Every other access
-/// asks for `GENERAL`, which costs nothing when sampling but can keep a driver from
-/// compressing a framebuffer.
-pub(crate) const ATTACHMENT_LAYOUT: vk::ImageLayout = vk::ImageLayout::ATTACHMENT_OPTIMAL;
 
 /// Barriers one command needs before it may run, given what is still pending.
 pub(crate) struct Barriers {
@@ -2129,7 +2127,7 @@ mod tests {
             L::UNDEFINED,
             L::UNDEFINED,
             L::GENERAL,
-            ATTACHMENT_LAYOUT,
+            vk::ImageLayout::ATTACHMENT_OPTIMAL,
             L::UNDEFINED,
         ]
         .map(layout);
@@ -2159,19 +2157,19 @@ mod tests {
             transitions(&access(0..5, L::GENERAL)),
             [
                 (0, 2, L::UNDEFINED),
-                (3, 1, ATTACHMENT_LAYOUT),
+                (3, 1, vk::ImageLayout::ATTACHMENT_OPTIMAL),
                 (4, 1, L::UNDEFINED)
             ]
         );
         assert_eq!(transitions(&access(0..5, L::GENERAL)), []);
         // A view of one mip moves only that mip.
         assert_eq!(
-            transitions(&access(3..4, ATTACHMENT_LAYOUT)),
+            transitions(&access(3..4, vk::ImageLayout::ATTACHMENT_OPTIMAL)),
             [(3, 1, L::GENERAL)]
         );
         assert_eq!(
             transitions(&access(2..5, L::GENERAL)),
-            [(3, 1, ATTACHMENT_LAYOUT)]
+            [(3, 1, vk::ImageLayout::ATTACHMENT_OPTIMAL)]
         );
     }
 
@@ -2340,7 +2338,7 @@ mod tests {
         let attachment = image.access(
             S::COLOR_ATTACHMENT_OUTPUT,
             A::COLOR_ATTACHMENT_WRITE,
-            ATTACHMENT_LAYOUT,
+            vk::ImageLayout::ATTACHMENT_OPTIMAL,
         );
         drop(image.access(S::TRANSFER, A::TRANSFER_READ, L::TRANSFER_SRC_OPTIMAL));
 
@@ -2352,8 +2350,14 @@ mod tests {
             };
             (transition.old_layout, transition.new_layout)
         };
-        assert_eq!(transition(&attachment), (L::UNDEFINED, ATTACHMENT_LAYOUT));
-        assert_eq!(transition(&sampled), (ATTACHMENT_LAYOUT, L::GENERAL));
+        assert_eq!(
+            transition(&attachment),
+            (L::UNDEFINED, vk::ImageLayout::ATTACHMENT_OPTIMAL)
+        );
+        assert_eq!(
+            transition(&sampled),
+            (vk::ImageLayout::ATTACHMENT_OPTIMAL, L::GENERAL)
+        );
     }
 
     #[test]
@@ -2532,7 +2536,7 @@ mod tests {
         assert_eq!(access.stage, S::COLOR_ATTACHMENT_OUTPUT);
         // Cleared attachments are not read.
         assert_eq!(access.access, A::COLOR_ATTACHMENT_WRITE);
-        assert_eq!(access.layout, ATTACHMENT_LAYOUT);
+        assert_eq!(access.layout, vk::ImageLayout::ATTACHMENT_OPTIMAL);
     }
 
     /// An image is only in the attachment layout while it is drawn to: sampling it in
@@ -2556,7 +2560,10 @@ mod tests {
             })
         };
         let mut cmd = offline_cmd();
-        assert_eq!(draw(&mut cmd), [(L::GENERAL, ATTACHMENT_LAYOUT); 2]);
+        assert_eq!(
+            draw(&mut cmd),
+            [(L::GENERAL, vk::ImageLayout::ATTACHMENT_OPTIMAL); 2]
+        );
         // A second rendering finds them there.
         assert_eq!(draw(&mut cmd), []);
         let sampled = view::<R8G8B8A8Unorm, ColorAttachment>(&color).access(
@@ -2566,8 +2573,11 @@ mod tests {
         );
         let mut old = None;
         sampled.take_layouts(|_, layout| old = Some(layout));
-        assert_eq!(old, Some(ATTACHMENT_LAYOUT));
-        assert_eq!(draw(&mut cmd), [(L::GENERAL, ATTACHMENT_LAYOUT)]);
+        assert_eq!(old, Some(vk::ImageLayout::ATTACHMENT_OPTIMAL));
+        assert_eq!(
+            draw(&mut cmd),
+            [(L::GENERAL, vk::ImageLayout::ATTACHMENT_OPTIMAL)]
+        );
     }
 
     #[test]

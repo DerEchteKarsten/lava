@@ -26,14 +26,14 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const SIZE: [u32; 2] = [256, 256];
+const SIZE: glam::UVec2 = glam::UVec2::new(256, 256);
 
 fn create_window(event_loop: &ActiveEventLoop, title: &str) -> Window {
     event_loop
         .create_window(
             Window::default_attributes()
                 .with_title(title)
-                .with_inner_size(PhysicalSize::new(SIZE[0], SIZE[1])),
+                .with_inner_size(PhysicalSize::new(SIZE.x, SIZE.y)),
         )
         .expect("failed to create a window")
 }
@@ -130,8 +130,11 @@ fn run(event_loop: &ActiveEventLoop) {
     present_frame(&queue, &swapchain, [0.0, 1.0, 0.0, 1.0], &mut semaphores);
     step("acquire_clear_present");
 
-    let new_size = [SIZE[0] / 2, SIZE[1] / 2];
-    swapchain.recreate(&mut surface, new_size).unwrap();
+    let new_size = SIZE / 2;
+    // The old swapchain is handed back for the application to retire with a frame; here the
+    // slot of its last frame was waited for already.
+    let old = swapchain.recreate(&mut surface, new_size).unwrap();
+    assert_eq!(old.size, SIZE);
     assert_eq!(swapchain.size, new_size);
     // Binding is left to the application, which may have to reserve slots for more images.
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
@@ -140,6 +143,7 @@ fn run(event_loop: &ActiveEventLoop) {
         assert_eq!(swapchain.image(i as u32).handle, *handle);
     }
     present_frame(&queue, &swapchain, [0.0, 0.0, 1.0, 1.0], &mut semaphores);
+    drop(old);
     step("swapchain_recreate_is_unbound");
 
     let second_window = create_window(event_loop, "lava test 2");
@@ -157,12 +161,13 @@ fn run(event_loop: &ActiveEventLoop) {
     present_frame(&queue, &swapchain, [1.0, 0.0, 1.0, 1.0], &mut semaphores);
     step("second_window_has_its_own_surface_and_swapchain");
 
-    // Swapchains go before their surfaces, surfaces before their windows.
+    // Swapchains go before their surfaces, surfaces before their windows, and the last use of
+    // a swapchain has to be over before it is dropped.
+    lava::wait_idle().unwrap();
     drop(second_swapchain);
     drop(second_surface);
     drop(swapchain);
     drop(surface);
-    // Destroying the swapchains waited for the device, so the semaphores are idle now.
     drop(semaphores);
     step("teardown");
 
