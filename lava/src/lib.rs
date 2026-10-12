@@ -32,6 +32,7 @@ pub mod error;
 #[cfg(feature = "hot-reload")]
 mod hot_reload;
 pub mod image;
+pub mod pipeline;
 pub mod profiling;
 // Without hot reload only build.rs compiles passes, and the lib needs just its constants.
 #[cfg_attr(not(feature = "hot-reload"), allow(dead_code))]
@@ -51,7 +52,7 @@ pub fn init(
     Ctx::init(display, enable_validation, enable_gpu_assited_validation)?;
     Bindless::init()?;
     profiling::init()?;
-    command_buffer::init();
+    pipeline::init();
     Ok(())
 }
 

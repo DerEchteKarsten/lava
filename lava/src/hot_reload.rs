@@ -1,8 +1,8 @@
-//! Shader hot reload (the `hot-reload` feature, a debugging aid): recompiles the passes whose sources change and swaps their pipelines at the next frame
+//! Shader hot reload (the `hot-reload` feature, a debugging aid): recompiles the passes whose sources change and replaces their pipelines right away
 use std::{
     iter,
     path::{Path, PathBuf},
-    sync::{OnceLock, atomic::Ordering, mpsc},
+    sync::{OnceLock, mpsc},
     time::Duration,
 };
 
@@ -11,30 +11,9 @@ use shader_slang as slang;
 
 use crate::{
     bindings::PASS_MAP,
-    command_buffer::{PIPELINES, PassEntry, PipelineManager},
+    pipeline::{PassEntry, PipelineManager},
     slang_compile::{self, SHADER_DIR},
 };
-
-/// Frames begun after a reload before the pipelines it replaced are destroyed. Frames begun
-/// before the reload may still use them, so this has to exceed the frames any loop keeps in
-/// flight, counted over every `FrameSlot`.
-const RETIRED_FRAMES: u64 = 8;
-
-/// Called by every `FrameSlot::begin`: swaps in the passes compiled since, and destroys the
-/// pipelines swapped out `RETIRED_FRAMES` frames ago.
-pub(crate) fn begin_frame() {
-    let Some(manager) = PIPELINES.get() else {
-        return;
-    };
-    let frame = manager.frame.fetch_add(1, Ordering::Relaxed);
-    let pending = std::mem::take(&mut *manager.pending_reloads.lock().unwrap());
-    let mut retired = manager.retired.lock().unwrap();
-    retired.retain(|(at, _)| at + RETIRED_FRAMES > frame);
-    for (pass_index, spirv) in pending {
-        let replaced = manager.reload_pass(pass_index, &spirv);
-        retired.extend(replaced.into_iter().map(|pipeline| (frame, pipeline)));
-    }
-}
 
 /// Watches the shader directory and compiles changed passes on a thread of its own.
 pub(crate) fn watch(manager: &'static PipelineManager) {
@@ -103,12 +82,7 @@ fn compile_changed_passes(manager: &'static PipelineManager, changed: mpsc::Rece
             match compile_pass(&global, pass_index) {
                 Ok(spirv) => {
                     tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
-                    match manager.pending_reloads.lock() {
-                        Ok(mut pending) => pending.push((pass_index, spirv.as_slice().to_vec())),
-                        Err(_) => {
-                            tracing::error!(target: "shader_file_watcher", "failed to acquire lock on pending shader reloads")
-                        }
-                    }
+                    manager.reload_pass(pass_index, spirv.as_slice());
                 }
                 Err(e) => {
                     tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
@@ -147,7 +121,7 @@ fn compile_pass(global: &slang::GlobalSession, pass_index: usize) -> slang::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command_buffer::PassKind;
+    use crate::pipeline::PassKind;
 
     fn pass(source: &'static str) -> PassEntry {
         PassEntry {

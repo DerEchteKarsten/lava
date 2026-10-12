@@ -551,7 +551,10 @@ fn generate_pass(
     pass_map.push(format!(
         r#"    PassEntry {{
         name: "{pass_name}",
+        #[cfg(feature = "hot-reload")]
         path: {path_dir:?},
+        #[cfg(not(feature = "hot-reload"))]
+        spirv: include_bytes!({path_dir:?}),
         source: {source:?},
         kind: PassKind::{kind_fields},
         index: {pipeline_index},
@@ -794,6 +797,7 @@ use crate::image::slice::*;
 use crate::buffer;
 use crate::image;
 use crate::command_buffer::*;
+use crate::pipeline::*;
 use ash::vk;
 use std::path::PathBuf;
 use std::str::FromStr;

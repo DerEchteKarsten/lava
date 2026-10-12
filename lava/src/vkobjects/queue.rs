@@ -10,6 +10,8 @@ use ash::vk;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
+#[cfg(feature = "hot-reload")]
+use crate::pipeline::GenericPipeline;
 use crate::{
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
     profiling::{Counter, GpuScope, PassCounters, PassQueries, TimestampQueries},
@@ -338,6 +340,9 @@ impl Drop for CommandBufferMemory {
 /// so they reach the GPU in order and the barriers between them hold.
 pub struct FrameSlot {
     retired: Vec<Box<dyn Send + Sync>>,
+    /// The pipelines the last frame recorded, which a shader reload may have replaced since.
+    #[cfg(feature = "hot-reload")]
+    pipelines: Vec<Arc<GenericPipeline>>,
     buffer: CommandBufferMemory,
     pool: CommandPool,
     fence: Fence,
@@ -356,6 +361,8 @@ impl FrameSlot {
         let buffer = pool.create_command_buffer()?;
         Ok(Self {
             retired: Vec::new(),
+            #[cfg(feature = "hot-reload")]
+            pipelines: Vec::new(),
             buffer,
             pool,
             fence: Fence::new()?,
@@ -397,6 +404,9 @@ impl FrameSlot {
             self.submitted = false;
             self.retired.clear();
         }
+        // Also after a frame that failed before it was submitted.
+        #[cfg(feature = "hot-reload")]
+        self.pipelines.clear();
         // The pools are idle now. A new counter selection needs new ones.
         if !self.timestamps_on {
             self.timestamps = None;
@@ -415,8 +425,6 @@ impl FrameSlot {
                 self.counters = Some(PassQueries::new(self.family, selection.clone())?);
             }
         }
-        #[cfg(feature = "hot-reload")]
-        crate::hot_reload::begin_frame();
         Ok(Frame { slot: self })
     }
 }
@@ -450,17 +458,7 @@ impl Frame<'_> {
         executor: F,
     ) -> Result<PendingAccesses> {
         let slot = self.slot;
-        let result = execute_command(
-            queue,
-            pending,
-            &slot.buffer,
-            Some(&slot.fence),
-            &mut slot.timestamps,
-            &mut slot.counters,
-            wait_on,
-            signal,
-            executor,
-        );
+        let result = execute_command(queue, pending, slot, wait_on, signal, executor);
         match result {
             Ok(_) => slot.submitted = true,
             Err(_) => slot.pool.reset()?,
@@ -521,20 +519,20 @@ impl<A> PendingWrite<A> {
 fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     queue: &Queue<Q>,
     pending: PendingAccesses,
-    buffer: &CommandBufferMemory,
-    fence: Option<&Fence>,
-    timestamps: &mut Option<TimestampQueries>,
-    counters: &mut Option<PassQueries>,
+    slot: &mut FrameSlot,
     wait_on: &[SemaphoreInfo],
     signal: &[SemaphoreInfo],
     executor: F,
 ) -> Result<PendingAccesses> {
+    let buffer = &slot.buffer;
     unsafe {
         let mut cmd_buffer = CommandBuffer {
             handle: buffer.handle,
             pending_accesses: pending,
-            timestamps: timestamps.take(),
-            counters: counters.take(),
+            timestamps: slot.timestamps.take(),
+            counters: slot.counters.take(),
+            #[cfg(feature = "hot-reload")]
+            pipelines: std::mem::take(&mut slot.pipelines),
         };
 
         cmd_buffer.begin()?;
@@ -550,8 +548,12 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         CALLSITE.set(prev);
         cmd_buffer.end_scope();
         host_barrier(buffer.handle);
-        *timestamps = cmd_buffer.timestamps.take();
-        *counters = cmd_buffer.counters.take();
+        slot.timestamps = cmd_buffer.timestamps.take();
+        slot.counters = cmd_buffer.counters.take();
+        #[cfg(feature = "hot-reload")]
+        {
+            slot.pipelines = std::mem::take(&mut cmd_buffer.pipelines);
+        }
         cmd_buffer.end()?;
 
         let cmd_buffer_submit_info =
@@ -575,7 +577,7 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
             Ctx::device().queue_submit2(
                 handle,
                 std::slice::from_ref(&submit_info),
-                fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
+                slot.fence.handle,
             )
         })?;
 
