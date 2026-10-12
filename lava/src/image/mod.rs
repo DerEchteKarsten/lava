@@ -1,6 +1,6 @@
-//! Format- and usage-typed GPU images with mip levels and host uploads
+//! Format- and usage-typed GPU images with mip levels and host uploads, their type erasure and drop hook
 use std::{
-    marker::PhantomData,
+    mem::{self, ManuallyDrop},
     sync::{OnceLock, atomic::AtomicU32},
 };
 
@@ -10,11 +10,10 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use lava_macros::validation_trace;
 
 use crate::{
-    bindless::{BindlessHandle, BindlessWrites},
+    bindless::{self, BindlessHandle},
     image::{
-        format::{Format, Undefined, bc_block},
-        slice::AsImage,
-        usage::{ImageUsage, IsHostCopy, SampledBinding, StorageBinding, UnifiedBinding},
+        format::{Format, StaticFormat, bc_block},
+        usage::{ImageUsage, IsHostCopy, IsSampled, IsStorage, StaticUsage},
     },
     state::{Ctx, Functions},
 };
@@ -24,6 +23,9 @@ pub mod format;
 pub mod slice;
 pub mod usage;
 
+/// A 2D image. Its format and usage are types (`format::R8Unorm`, `usage::Sampled`), which
+/// the command buffer's bounds check at compile time, or `format::Dynamic`/`usage::Dynamic`
+/// values, which it checks at runtime (`aspect_check`, `texel_check`, `usage_check`).
 #[derive(Debug)]
 pub struct Image<F: Format, U: ImageUsage> {
     pub(crate) image: vk::Image,
@@ -35,15 +37,19 @@ pub struct Image<F: Format, U: ImageUsage> {
     /// The layout the image will be in once everything built so far is recorded. It changes
     /// when an access is built (see `ImageView::access`), not when it is recorded.
     pub(crate) layout: AtomicU32,
-    _format: PhantomData<F>,
-    _usage: PhantomData<U>,
+    pub(crate) format: F,
+    pub(crate) usage: U,
 }
 
-static ON_DROP: OnceLock<fn(BindlessHandle)> = OnceLock::new();
+/// An image whose format and usage are runtime values (`Image::erase`).
+pub type DynamicImage = Image<format::Dynamic, usage::Dynamic>;
 
-/// Sets the function every dropped image calls with its handle, so whoever picked its
-/// bindless indices can hand them out again. It can be set once.
-pub fn on_drop(hook: fn(BindlessHandle)) -> Result<()> {
+static ON_DROP: OnceLock<fn(&DynamicImage)> = OnceLock::new();
+
+/// Sets the function every dropped image calls with itself, erased, right before it is
+/// destroyed, so whoever picked its bindless indices can hand them out again. It can be set
+/// once.
+pub fn on_drop(hook: fn(&DynamicImage)) -> Result<()> {
     ON_DROP
         .set(hook)
         .map_err(|_| Error::message("the image drop hook is already set"))
@@ -51,21 +57,26 @@ pub fn on_drop(hook: fn(BindlessHandle)) -> Result<()> {
 
 impl<F: Format, U: ImageUsage> Drop for Image<F, U> {
     fn drop(&mut self) {
+        if let Some(hook) = ON_DROP.get() {
+            let format = format::Dynamic(self.format.vk_format());
+            let usage = usage::Dynamic(self.usage.flags());
+            // Lent to the hook and never dropped: the memory comes back to be freed below.
+            let mut image = ManuallyDrop::new(self.take(format, usage));
+            hook(&image);
+            self.allocation = mem::take(&mut image.allocation);
+        }
         unsafe {
             Ctx::device().destroy_image_view(self.whole_view, None);
             Ctx::device().destroy_image(self.image, None);
         }
-        if let Some(hook) = ON_DROP.get() {
-            hook(self.handle);
-        }
-        let alloc = std::mem::take(&mut self.allocation);
+        let alloc = mem::take(&mut self.allocation);
         if let Err(err) = Ctx::allocator().free(alloc) {
             tracing::error!(%err, "failed to free image allocation");
         }
     }
 }
 
-impl<F: Format, U: ImageUsage> Image<F, U> {
+impl<F: StaticFormat, U: StaticUsage> Image<F, U> {
     /// Creates an image that is not bound in any bindless set: its `handle` is null.
     #[validation_trace]
     pub fn new(width: u32, height: u32) -> Result<Self> {
@@ -73,6 +84,20 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
     }
     #[validation_trace]
     pub fn with_mip_levels(width: u32, height: u32, mip_levels: u32) -> Result<Self> {
+        Self::with_params(F::default(), U::default(), width, height, mip_levels)
+    }
+}
+
+impl<F: Format, U: ImageUsage> Image<F, U> {
+    /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included.
+    #[validation_trace]
+    pub fn with_params(
+        format: F,
+        usage: U,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+    ) -> Result<Self> {
         let extent = vk::Extent3D {
             width,
             height,
@@ -81,7 +106,7 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
         let create_info = vk::ImageCreateInfo {
             array_layers: 1,
             extent,
-            format: F::format(),
+            format: format.vk_format(),
             image_type: vk::ImageType::TYPE_2D,
             mip_levels,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
@@ -89,9 +114,9 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
             tiling: vk::ImageTiling::OPTIMAL,
             // Without rebar the host image copy extension is off; `copy_from` then fails.
             usage: if Ctx::features().rebar {
-                U::VK
+                usage.flags()
             } else {
-                U::VK & !vk::ImageUsageFlags::HOST_TRANSFER_EXT
+                usage.flags() & !vk::ImageUsageFlags::HOST_TRANSFER_EXT
             },
             initial_layout: vk::ImageLayout::UNDEFINED,
             ..Default::default()
@@ -114,8 +139,8 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
         };
 
         let mut s = Self {
-            _format: PhantomData,
-            _usage: PhantomData,
+            format,
+            usage,
             handle: BindlessHandle::none(),
             allocation,
             extent: UVec2::new(width, height),
@@ -142,8 +167,57 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
         mip_extent(self.extent, level)
     }
 
-    pub fn cast<NF: Format, NU: ImageUsage>(self) -> Image<NF, NU> {
-        unsafe { std::mem::transmute(self) }
+    pub fn format(&self) -> F {
+        self.format
+    }
+
+    pub fn usage(&self) -> U {
+        self.usage
+    }
+
+    /// Panics unless the format has the `required` aspects; does nothing for a static format.
+    pub fn aspect_check(&self, required: vk::ImageAspectFlags) {
+        self.format.aspect_check(required);
+    }
+
+    /// Panics unless the format's texels have the type `T`; does nothing for a static format.
+    pub fn texel_check<T: 'static>(&self) {
+        self.format.texel_check::<T>();
+    }
+
+    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
+    pub fn usage_check(&self, required: vk::ImageUsageFlags) {
+        self.usage.check(required);
+    }
+
+    /// The same image with another format and usage, unchecked: the image still has the
+    /// format and usage it was created with.
+    pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> Image<NF, NU> {
+        ManuallyDrop::new(self).take(format, usage)
+    }
+
+    /// The same image with its format and usage as runtime values, e.g. to keep images of
+    /// different types together. Commands check them at runtime.
+    pub fn erase(self) -> DynamicImage {
+        let format = format::Dynamic(self.format.vk_format());
+        let usage = usage::Dynamic(self.usage.flags());
+        self.cast(format, usage)
+    }
+
+    /// Moves the image into one of another format and usage, leaving `self` without memory;
+    /// `self` must not destroy its handles unless it gets the memory back.
+    fn take<NF: Format, NU: ImageUsage>(&mut self, format: NF, usage: NU) -> Image<NF, NU> {
+        Image {
+            image: self.image,
+            whole_view: self.whole_view,
+            allocation: mem::take(&mut self.allocation),
+            extent: self.extent,
+            handle: self.handle,
+            mip_levels: self.mip_levels,
+            layout: AtomicU32::new(*self.layout.get_mut()),
+            format,
+            usage,
+        }
     }
 }
 
@@ -155,7 +229,11 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
         self.check_host_copy(data, mip_level)?;
         let extent = self.mip_extent(mip_level);
-        let expected = expected_data_len(extent, F::TEXEL_SIZE, bc_block(F::FORMAT));
+        let expected = expected_data_len(
+            extent,
+            self.format.texel_size(),
+            bc_block(self.format.vk_format()),
+        );
         if expected.is_some_and(|expected| data.len() != expected) {
             return Err(Error::message(format!(
                 "mip level {mip_level} holds {} bytes but {} were given",
@@ -183,7 +261,11 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
                 "region {extent} at {offset} does not fit mip level {mip_level} of size {mip_extent}"
             )));
         }
-        let expected = expected_data_len(extent, F::TEXEL_SIZE, bc_block(F::FORMAT));
+        let expected = expected_data_len(
+            extent,
+            self.format.texel_size(),
+            bc_block(self.format.vk_format()),
+        );
         if expected.is_some_and(|expected| data.len() != expected) {
             return Err(Error::message(format!(
                 "the region holds {} bytes but {} were given",
@@ -195,6 +277,7 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
     }
 
     fn check_host_copy(&self, data: &[u8], mip_level: u32) -> Result<()> {
+        self.usage_check(vk::ImageUsageFlags::HOST_TRANSFER_EXT);
         if !Ctx::features().rebar {
             return Err(Error::message(
                 "host image copies need host-visible device memory, which this device lacks",
@@ -244,7 +327,7 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
                 depth: 1,
             })
             .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: F::ASPECTS,
+                aspect_mask: self.format.aspects(),
                 mip_level,
                 base_array_layer: 0,
                 layer_count: 1,
@@ -262,79 +345,25 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
     }
 }
 
-impl<F: Format, U: SampledBinding> Image<F, U> {
-    /// Creates the image and binds it at `sampled_index` of the sampled set.
+impl<F: Format, U: IsSampled> Image<F, U> {
+    /// Binds the image at `index` of the sampled set, right away:
+    /// `Image::new(w, h)?.bind_sampled(index)`.
     #[validation_trace]
-    pub fn new_sampled(
-        width: u32,
-        height: u32,
-        mip_levels: u32,
-        sampled_index: u32,
-    ) -> Result<Self> {
-        let mut image = Self::with_mip_levels(width, height, mip_levels)?;
-        let mut writes = BindlessWrites::default();
-        image.bind_sampled(sampled_index, &mut writes);
-        writes.submit();
-        Ok(image)
-    }
-
-    pub fn bind_sampled(&mut self, sampled_index: u32, writes: &mut BindlessWrites) {
-        self.handle.descriptor_index_set0 = sampled_index;
-        writes.sampled(self.whole_view(), sampled_index);
+    pub fn bind_sampled(mut self, index: u32) -> Self {
+        self.handle.descriptor_index_set0 = index;
+        bindless::bind([self.whole_view()], [BindlessHandle::sampled(index)]);
+        self
     }
 }
 
-impl<F: Format, U: StorageBinding> Image<F, U> {
-    /// Creates the image and binds it at `storage_index` of the storage set.
+impl<F: Format, U: IsStorage> Image<F, U> {
+    /// Binds the image at `index` of the storage set, right away. An image with both usages
+    /// can be bound in both sets: `.bind_sampled(a).bind_storage(b)`.
     #[validation_trace]
-    pub fn new_storage(
-        width: u32,
-        height: u32,
-        mip_levels: u32,
-        storage_index: u32,
-    ) -> Result<Self> {
-        let mut image = Self::with_mip_levels(width, height, mip_levels)?;
-        let mut writes = BindlessWrites::default();
-        image.bind_storage(storage_index, &mut writes);
-        writes.submit();
-        Ok(image)
-    }
-
-    pub fn bind_storage(&mut self, storage_index: u32, writes: &mut BindlessWrites) {
-        self.handle.descriptor_index_set1 = storage_index;
-        writes.storage(self.whole_view(), storage_index);
-    }
-}
-
-impl<F: Format, U: UnifiedBinding> Image<F, U> {
-    /// Creates the image and binds it in both sets.
-    #[validation_trace]
-    pub fn new_unified(
-        width: u32,
-        height: u32,
-        mip_levels: u32,
-        storage_index: u32,
-        sampled_index: u32,
-    ) -> Result<Self> {
-        let mut image = Self::with_mip_levels(width, height, mip_levels)?;
-        let mut writes = BindlessWrites::default();
-        image.bind_unified(storage_index, sampled_index, &mut writes);
-        writes.submit();
-        Ok(image)
-    }
-
-    pub fn bind_unified(
-        &mut self,
-        storage_index: u32,
-        sampled_index: u32,
-        writes: &mut BindlessWrites,
-    ) {
-        self.handle = BindlessHandle {
-            descriptor_index_set0: sampled_index,
-            descriptor_index_set1: storage_index,
-        };
-        writes.sampled(self.whole_view(), sampled_index);
-        writes.storage(self.whole_view(), storage_index);
+    pub fn bind_storage(mut self, index: u32) -> Self {
+        self.handle.descriptor_index_set1 = index;
+        bindless::bind([self.whole_view()], [BindlessHandle::storage(index)]);
+        self
     }
 }
 

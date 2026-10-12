@@ -1,9 +1,19 @@
-//! Type-level buffer usage markers, one per combination of usages, mapping to Vulkan buffer usage flags
+//! Buffer usages: one marker type per combination of usages, mapping to Vulkan buffer usage flags, and `Dynamic`, whose usage is only known at runtime
 use ash::vk;
 
-/// Every buffer also gets `SHADER_DEVICE_ADDRESS`, `TRANSFER_SRC` and `TRANSFER_DST` (`Buffer::new`):
+/// Every buffer also gets `SHADER_DEVICE_ADDRESS`, `TRANSFER_SRC` and `TRANSFER_DST` (`Buffer::raw`):
 /// leaving the transfer usages out of buffers that don't need them made no measurable difference.
-pub trait BufferUsage: 'static + Copy + Clone {
+pub trait BufferUsage: 'static + Copy + std::fmt::Debug {
+    fn flags(&self) -> vk::BufferUsageFlags;
+    /// Panics unless the usage has every flag of `required`. The command buffer calls it with
+    /// what its trait bounds (`IsStorage`, `IsIndirect`, ...) require. A static usage's type
+    /// already guarantees that, so its `check` does nothing and compiles away; `Dynamic` meets
+    /// every bound and checks at runtime instead.
+    fn check(&self, required: vk::BufferUsageFlags);
+}
+
+/// Every usage but `Dynamic`: the type alone says what the usage is.
+pub trait StaticUsage: BufferUsage + Default {
     const VK: vk::BufferUsageFlags;
 }
 
@@ -19,11 +29,55 @@ pub trait IsIndex: BufferUsage {}
 pub trait IsIndirect: BufferUsage {}
 
 /// No usage but the ones every buffer has.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Unknown;
-impl BufferUsage for Unknown {
+impl StaticUsage for Unknown {
     const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::empty();
 }
+impl BufferUsage for Unknown {
+    fn flags(&self) -> vk::BufferUsageFlags {
+        Self::VK
+    }
+    fn check(&self, _: vk::BufferUsageFlags) {}
+}
+
+/// The shader binding table of a ray tracing pipeline.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShaderBindingTable;
+impl StaticUsage for ShaderBindingTable {
+    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR;
+}
+impl BufferUsage for ShaderBindingTable {
+    fn flags(&self) -> vk::BufferUsageFlags {
+        Self::VK
+    }
+    fn check(&self, _: vk::BufferUsageFlags) {}
+}
+
+/// A usage only known at runtime. It meets every usage bound, and `check` panics where the
+/// bound wouldn't have compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dynamic(pub vk::BufferUsageFlags);
+
+impl BufferUsage for Dynamic {
+    fn flags(&self) -> vk::BufferUsageFlags {
+        self.0
+    }
+    fn check(&self, required: vk::BufferUsageFlags) {
+        assert!(
+            self.0.contains(required),
+            "a buffer with usage {:?} lacks {:?}",
+            self.0,
+            required & !self.0
+        );
+    }
+}
+
+impl IsStorage for Dynamic {}
+impl IsUniform for Dynamic {}
+impl IsVertex for Dynamic {}
+impl IsIndex for Dynamic {}
+impl IsIndirect for Dynamic {}
 
 /// Defines one usage per `Name: Flag...;` line: its Vulkan flags and a marker trait per flag.
 macro_rules! usages {
@@ -41,11 +95,17 @@ macro_rules! usages {
 
     ($($name:ident: $($flag:ident)+;)*) => {
         $(
-            #[derive(Clone, Copy, Debug)]
+            #[derive(Clone, Copy, Debug, Default)]
             pub struct $name;
-            impl BufferUsage for $name {
+            impl StaticUsage for $name {
                 const VK: vk::BufferUsageFlags =
                     vk::BufferUsageFlags::from_raw(0 $(| usages!(@flag $flag).as_raw())+);
+            }
+            impl BufferUsage for $name {
+                fn flags(&self) -> vk::BufferUsageFlags {
+                    Self::VK
+                }
+                fn check(&self, _: vk::BufferUsageFlags) {}
             }
             $(usages!(@trait $name $flag);)+
         )*
@@ -126,13 +186,13 @@ mod tests {
 
     #[test]
     fn marker_traits_match_the_flags() {
-        fn storage<U: IsStorage>() -> F {
+        fn storage<U: IsStorage + StaticUsage>() -> F {
             U::VK
         }
-        fn index<U: IsIndex>() -> F {
+        fn index<U: IsIndex + StaticUsage>() -> F {
             U::VK
         }
-        fn uniform<U: IsUniform>() -> F {
+        fn uniform<U: IsUniform + StaticUsage>() -> F {
             U::VK
         }
         assert_eq!(
@@ -144,5 +204,12 @@ mod tests {
             uniform::<UniformVertexIndirect>(),
             F::UNIFORM_BUFFER | F::VERTEX_BUFFER | F::INDIRECT_BUFFER
         );
+    }
+
+    #[test]
+    fn dynamic_usage_checks_its_flags() {
+        let usage = Dynamic(F::STORAGE_BUFFER | F::INDIRECT_BUFFER);
+        usage.check(F::INDIRECT_BUFFER);
+        assert!(std::panic::catch_unwind(|| usage.check(F::INDEX_BUFFER)).is_err());
     }
 }

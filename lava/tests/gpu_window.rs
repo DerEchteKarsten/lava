@@ -8,8 +8,8 @@ mod common;
 use std::process::ExitCode;
 
 use lava::{
-    bindless::{BindlessHandle, BindlessWrites},
-    image::format::{self, Format},
+    bindless::BindlessHandle,
+    image::format::{ClearValue, Format},
     state::Ctx,
     vkobjects::{
         queue::{Binary, FrameSlot, Gfx, PendingAccesses, Queue, Semaphore},
@@ -67,7 +67,7 @@ fn present_frame(
             &[image_available.info()],
             &[render_finished.info()],
             |cmd| {
-                cmd.clear_image(swapchain.image(index), color);
+                cmd.clear_image(swapchain.image(index), ClearValue::Float(color));
                 cmd.present(swapchain.image(index));
             },
         )
@@ -106,17 +106,14 @@ fn run(event_loop: &ActiveEventLoop) {
 
     let mut swapchain = Swapchain::new(&surface, None, Some(SIZE)).unwrap();
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
-    let mut writes = BindlessWrites::default();
-    swapchain.bind_storage(0, &mut writes);
-    writes.submit();
+    swapchain.bind_storage(0);
     assert_eq!(swapchain.size, SIZE);
     assert!(swapchain.num_images() >= surface.capabilities.min_image_count as usize);
-    // Creating a swapchain fixes the format behind `format::Swapchain`.
     assert!(
         surface
             .formats
             .iter()
-            .any(|f| f.format == format::Swapchain::format())
+            .any(|f| f.format == swapchain.format.vk_format())
     );
     let handles: Vec<_> = (0..swapchain.num_images() as u32)
         .map(|i| swapchain.image(i).handle)
@@ -139,9 +136,7 @@ fn run(event_loop: &ActiveEventLoop) {
     assert_eq!(swapchain.size, new_size);
     // Binding is left to the application, which may have to reserve slots for more images.
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
-    let mut writes = BindlessWrites::default();
-    swapchain.bind_storage(0, &mut writes);
-    writes.submit();
+    swapchain.bind_storage(0);
     for (i, handle) in handles.iter().enumerate().take(swapchain.num_images()) {
         assert_eq!(swapchain.image(i as u32).handle, *handle);
     }
@@ -151,9 +146,7 @@ fn run(event_loop: &ActiveEventLoop) {
     let second_window = create_window(event_loop, "lava test 2");
     let second_surface = surface_for(&second_window).unwrap();
     let mut second_swapchain = Swapchain::new(&second_surface, None, Some(SIZE)).unwrap();
-    let mut writes = BindlessWrites::default();
-    second_swapchain.bind_storage(8, &mut writes);
-    writes.submit();
+    second_swapchain.bind_storage(8);
     assert_eq!(second_swapchain.image(0).handle.descriptor_index_set1, 8);
     assert_ne!(second_surface.handle, surface.handle);
     present_frame(

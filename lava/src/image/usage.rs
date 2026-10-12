@@ -1,7 +1,17 @@
-//! Type-level image usage markers, one per combination of usages Vulkan allows, mapping to Vulkan flags and the bindless sets they can be bound in
+//! Image usages: one marker type per combination of usages Vulkan allows, mapping to Vulkan flags and the bindless sets they can be bound in, and `Dynamic`, whose usage is only known at runtime
 use ash::vk;
 
-pub trait ImageUsage: 'static + Copy + Clone {
+pub trait ImageUsage: 'static + Copy + std::fmt::Debug {
+    fn flags(&self) -> vk::ImageUsageFlags;
+    /// Panics unless the usage has every flag of `required`. The command buffer calls it with
+    /// what its trait bounds (`IsSampled`, `IsTransferDst`, ...) require. A static usage's type
+    /// already guarantees that, so its `check` does nothing and compiles away; `Dynamic` meets
+    /// every bound and checks at runtime instead.
+    fn check(&self, required: vk::ImageUsageFlags);
+}
+
+/// Every usage but `Dynamic`: the type alone says what the usage is.
+pub trait StaticUsage: ImageUsage + Default {
     const VK: vk::ImageUsageFlags;
 }
 
@@ -17,15 +27,11 @@ pub trait IsTransferSrc: ImageUsage {}
 /// Usages that can be the destination of a copy, blit or clear.
 pub trait IsTransferDst: ImageUsage {}
 
-/// Usages bound only in the sampled set.
-pub trait SampledBinding: IsSampled {}
-/// Usages bound only in the storage set.
-pub trait StorageBinding: IsStorage {}
-/// Usages bound in both sets.
+/// Usages that can be bound in both sets, which a `MutTex2D` needs.
 pub trait UnifiedBinding: IsSampled + IsStorage {}
+impl<U: IsSampled + IsStorage> UnifiedBinding for U {}
 
-/// Defines one usage per `Name: Flag...;` line: its Vulkan flags, a marker trait per flag,
-/// and the binding trait its sampled and storage flags pick.
+/// Defines one usage per `Name: Flag...;` line: its Vulkan flags and a marker trait per flag.
 macro_rules! usages {
     (@flag ColorAttachment) => { vk::ImageUsageFlags::COLOR_ATTACHMENT };
     (@flag DepthAttachment) => { vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT };
@@ -43,30 +49,21 @@ macro_rules! usages {
     (@trait $name:ident TransferSrc) => { impl IsTransferSrc for $name {} };
     (@trait $name:ident TransferDst) => { impl IsTransferDst for $name {} };
 
-    (@bind $name:ident $sampled:tt $storage:tt; Sampled $($rest:ident)*) => {
-        usages!(@bind $name yes $storage; $($rest)*);
-    };
-    (@bind $name:ident $sampled:tt $storage:tt; Storage $($rest:ident)*) => {
-        usages!(@bind $name $sampled yes; $($rest)*);
-    };
-    (@bind $name:ident $sampled:tt $storage:tt; $other:ident $($rest:ident)*) => {
-        usages!(@bind $name $sampled $storage; $($rest)*);
-    };
-    (@bind $name:ident yes no;) => { impl SampledBinding for $name {} };
-    (@bind $name:ident no yes;) => { impl StorageBinding for $name {} };
-    (@bind $name:ident yes yes;) => { impl UnifiedBinding for $name {} };
-    (@bind $name:ident no no;) => {};
-
     ($($name:ident: $($flag:ident)+;)*) => {
         $(
-            #[derive(Clone, Copy, Debug)]
+            #[derive(Clone, Copy, Debug, Default)]
             pub struct $name;
-            impl ImageUsage for $name {
+            impl StaticUsage for $name {
                 const VK: vk::ImageUsageFlags =
                     vk::ImageUsageFlags::from_raw(0 $(| usages!(@flag $flag).as_raw())+);
             }
+            impl ImageUsage for $name {
+                fn flags(&self) -> vk::ImageUsageFlags {
+                    Self::VK
+                }
+                fn check(&self, _: vk::ImageUsageFlags) {}
+            }
             $(usages!(@trait $name $flag);)+
-            usages!(@bind $name no no; $($flag)+);
         )*
 
         #[cfg(test)]
@@ -175,6 +172,33 @@ usages! {
     SampledStorageHostCopyTransferSrcTransferDst: Sampled Storage HostCopy TransferSrc TransferDst;
 }
 
+/// A usage only known at runtime. It meets every usage bound, and `check` panics where the
+/// bound wouldn't have compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dynamic(pub vk::ImageUsageFlags);
+
+impl ImageUsage for Dynamic {
+    fn flags(&self) -> vk::ImageUsageFlags {
+        self.0
+    }
+    fn check(&self, required: vk::ImageUsageFlags) {
+        assert!(
+            self.0.contains(required),
+            "an image with usage {:?} lacks {:?}",
+            self.0,
+            required & !self.0
+        );
+    }
+}
+
+impl IsSampled for Dynamic {}
+impl IsStorage for Dynamic {}
+impl IsColorAttachment for Dynamic {}
+impl IsDepthAttachment for Dynamic {}
+impl IsHostCopy for Dynamic {}
+impl IsTransferSrc for Dynamic {}
+impl IsTransferDst for Dynamic {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,28 +246,22 @@ mod tests {
 
     #[test]
     fn marker_traits_match_the_flags() {
-        fn sampled<U: IsSampled>() -> F {
+        fn sampled<U: IsSampled + StaticUsage>() -> F {
             U::VK
         }
-        fn storage<U: IsStorage>() -> F {
+        fn storage<U: IsStorage + StaticUsage>() -> F {
             U::VK
         }
-        fn host_copy<U: IsHostCopy>() -> F {
+        fn host_copy<U: IsHostCopy + StaticUsage>() -> F {
             U::VK
         }
-        fn src<U: IsTransferSrc>() -> F {
+        fn src<U: IsTransferSrc + StaticUsage>() -> F {
             U::VK
         }
-        fn dst<U: IsTransferDst>() -> F {
+        fn dst<U: IsTransferDst + StaticUsage>() -> F {
             U::VK
         }
-        fn sampled_binding<U: SampledBinding>() -> F {
-            U::VK
-        }
-        fn storage_binding<U: StorageBinding>() -> F {
-            U::VK
-        }
-        fn unified_binding<U: UnifiedBinding>() -> F {
+        fn unified_binding<U: UnifiedBinding + StaticUsage>() -> F {
             U::VK
         }
         assert!(sampled::<DepthAttachmentSampledTransferSrc>().contains(F::SAMPLED));
@@ -252,16 +270,18 @@ mod tests {
         assert!(src::<ColorAttachmentTransferSrc>().contains(F::TRANSFER_SRC));
         assert!(dst::<SampledHostCopyTransferDst>().contains(F::TRANSFER_DST));
         assert_eq!(
-            sampled_binding::<SampledTransferDst>(),
-            F::SAMPLED | F::TRANSFER_DST
-        );
-        assert_eq!(
-            storage_binding::<DepthAttachmentStorage>(),
-            F::DEPTH_STENCIL_ATTACHMENT | F::STORAGE
-        );
-        assert_eq!(
             unified_binding::<SampledStorageTransferSrc>(),
             F::SAMPLED | F::STORAGE | F::TRANSFER_SRC
         );
+    }
+
+    #[test]
+    fn dynamic_usage_checks_its_flags() {
+        let usage = Dynamic(F::SAMPLED | F::TRANSFER_DST);
+        usage.check(F::SAMPLED);
+        usage.check(F::SAMPLED | F::TRANSFER_DST);
+        assert!(std::panic::catch_unwind(|| usage.check(F::STORAGE)).is_err());
+        // Static usages are checked by their type.
+        Sampled.check(F::STORAGE);
     }
 }

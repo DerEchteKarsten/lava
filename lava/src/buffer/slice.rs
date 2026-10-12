@@ -29,12 +29,13 @@ pub struct BufferSlice<'a, T: Copy + Pod, U: BufferUsage = Storage> {
     pub cpu_ptr: usize,
     pub gpu_ptr: u64,
     pub base_address: u64,
+    pub(crate) usage: U,
     pub(crate) _marker: PhantomData<T>,
-    pub(crate) _usage: PhantomData<U>,
     pub(crate) _lifetime: PhantomData<&'a ()>,
 }
 
 fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
+    usage: U,
     handle: vk::Buffer,
     index: R,
     cpu_ptr: usize,
@@ -71,8 +72,8 @@ fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
         },
         gpu_ptr: address + start_offset,
         base_address,
+        usage,
         _marker: PhantomData,
-        _usage: PhantomData,
         _lifetime: PhantomData,
     }
 }
@@ -80,6 +81,7 @@ fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
 impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
     pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T, U> {
         new_slice(
+            self.usage(),
             self.handle,
             index,
             self.allocation
@@ -93,6 +95,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
     }
     pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, u8, U> {
         new_slice::<u8, R, U>(
+            self.usage(),
             self.handle,
             index.into(),
             self.allocation
@@ -124,6 +127,7 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     }
     pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T, U> {
         new_slice(
+            self.usage,
             self.handle,
             index,
             self.cpu_ptr,
@@ -134,6 +138,7 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     }
     pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, u8, U> {
         new_slice::<u8, R, U>(
+            self.usage,
             self.handle,
             index,
             self.cpu_ptr,
@@ -160,7 +165,23 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
         self.gpu_ptr - self.base_address
     }
     pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B, U> {
-        unsafe { std::mem::transmute(self) }
+        BufferSlice {
+            handle: self.handle,
+            size: self.size,
+            cpu_ptr: self.cpu_ptr,
+            gpu_ptr: self.gpu_ptr,
+            base_address: self.base_address,
+            usage: self.usage,
+            _marker: PhantomData,
+            _lifetime: PhantomData,
+        }
+    }
+    pub fn usage(&self) -> U {
+        self.usage
+    }
+    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
+    pub fn usage_check(&self, required: vk::BufferUsageFlags) {
+        self.usage.check(required);
     }
     pub fn is_mapped(&self) -> bool {
         self.cpu_ptr != 0
@@ -201,6 +222,7 @@ mod tests {
     /// A slice over host memory: everything except GPU commands works on it without a device.
     fn host_slice(data: &mut [u32]) -> BufferSlice<'_, u32, Storage> {
         new_slice(
+            Storage,
             vk::Buffer::null(),
             ..,
             data.as_mut_ptr() as usize,
@@ -212,7 +234,7 @@ mod tests {
 
     /// A slice of `len` u32s without host mapping, as for GPU-only memory.
     fn unmapped_slice(len: u64) -> BufferSlice<'static, u32, Storage> {
-        new_slice(vk::Buffer::null(), .., 0, len * 4, BASE, BASE)
+        new_slice(Storage, vk::Buffer::null(), .., 0, len * 4, BASE, BASE)
     }
 
     #[test]

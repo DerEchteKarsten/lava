@@ -14,6 +14,8 @@ pub use crate::error::{Error, Result};
 pub use ash::vk::Pipeline as VkPipeline;
 pub use ash::vk::ShaderModule as VkShaderModule;
 pub use ash::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
+/// What `format::Dynamic`, `image::usage::Dynamic` and `buffer::usage::Dynamic` hold.
+pub use ash::vk::{BufferUsageFlags, Format as VkFormat, ImageUsageFlags};
 
 #[cfg(not(feature = "test-passes"))]
 pub mod bindings;

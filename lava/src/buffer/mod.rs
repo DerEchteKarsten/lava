@@ -1,12 +1,13 @@
-//! Typed, usage-tagged GPU buffers backed by host-mapped gpu-allocator memory
+//! Typed, usage-tagged GPU buffers backed by host-mapped gpu-allocator memory, their type erasure and drop hook
 use std::{
     fmt::Debug,
     marker::PhantomData,
+    mem::{self, ManuallyDrop},
     ops::{Index, IndexMut},
     sync::OnceLock,
 };
 
-use crate::{Error, error::Result};
+use crate::error::{Error, Result};
 use ash::vk::{self};
 use bytemuck::Pod;
 use gpu_allocator::{
@@ -18,7 +19,7 @@ use lava_macros::validation_trace;
 use crate::{
     buffer::{
         slice::BufferSlice,
-        usage::{BufferUsage, Storage},
+        usage::{BufferUsage, StaticUsage, Storage},
     },
     state::Ctx,
 };
@@ -26,14 +27,30 @@ use crate::{
 pub mod slice;
 pub mod usage;
 
+/// A buffer of `T`s (`u8` when untyped). Its usage is a type (`usage::Storage`), which the
+/// command buffer's bounds check at compile time, or a `usage::Dynamic` value, which it checks
+/// at runtime (`usage_check`).
 #[derive(Debug)]
 pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
     pub handle: vk::Buffer,
     pub address: u64,
     pub allocation: Allocation,
     num_bytes: u64,
+    usage: U,
     _type_marker: PhantomData<T>,
-    _usage_marker: PhantomData<U>,
+}
+
+/// A buffer of bytes whose usage is a runtime value (`Buffer::erase`).
+pub type DynamicBuffer = Buffer<u8, usage::Dynamic>;
+
+static ON_DROP: OnceLock<fn(&DynamicBuffer)> = OnceLock::new();
+
+/// Sets the function every dropped buffer calls with itself, erased, right before it is
+/// destroyed. It can be set once.
+pub fn on_drop(hook: fn(&DynamicBuffer)) -> Result<()> {
+    ON_DROP
+        .set(hook)
+        .map_err(|_| Error::message("the buffer drop hook is already set"))
 }
 
 impl<T: Copy + Pod, U: BufferUsage> Index<usize> for Buffer<T, U> {
@@ -62,18 +79,16 @@ impl<'a, T: Copy + Pod, U: BufferUsage> IndexMut<usize> for BufferSlice<'a, T, U
     }
 }
 
-// static ON_DROP: OnceLock<fn()> = OnceLock::new();
-
-// pub fn on_drop(hook: fn()) -> Result<()> {
-//     ON_DROP
-//         .set(hook)
-//         .map_err(|_| Error::message("the image drop hook is already set"))
-// }
-
 impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     fn drop(&mut self) {
+        if let Some(hook) = ON_DROP.get() {
+            // Lent to the hook and never dropped: the memory comes back to be freed below.
+            let mut buffer = ManuallyDrop::new(self.take(usage::Dynamic(self.usage.flags())));
+            hook(&buffer);
+            self.allocation = mem::take(&mut buffer.allocation);
+        }
         unsafe { Ctx::device().destroy_buffer(self.handle, None) };
-        let alloc = std::mem::take(&mut self.allocation);
+        let alloc = mem::take(&mut self.allocation);
         if let Err(err) = Ctx::allocator().free(alloc) {
             tracing::error!(%err, "failed to free buffer allocation");
         }
@@ -86,15 +101,34 @@ impl<'a, T: Copy + Pod, U: BufferUsage> Into<BufferSlice<'a, T, U>> for &'a Buff
     }
 }
 
+impl<T: Copy + Pod, U: StaticUsage> Buffer<T, U> {
+    /// A buffer of `size` elements.
+    #[validation_trace]
+    pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
+        Self::with_usage(U::default(), size, cpu_writable)
+    }
+}
+
 impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
+    /// Like `new`, for any usage, `Dynamic` ones included.
+    #[validation_trace]
+    pub fn with_usage(usage: U, size: usize, cpu_writable: bool) -> Result<Self> {
+        Self::raw(usage, cpu_writable, (size * size_of::<T>()) as u64, None)
+    }
+
+    /// A buffer of `num_bytes`, aligned to `alignment` or what the device requires.
     #[validation_trace]
     pub fn raw(
-        usage: vk::BufferUsageFlags,
+        usage: U,
         cpu_writable: bool,
         num_bytes: u64,
         alignment: Option<u32>,
     ) -> Result<Self> {
-        let create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(usage);
+        let flags = usage.flags()
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        let create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(flags);
         let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
         let mut requirements = unsafe { Ctx::device().get_buffer_memory_requirements(buffer) };
         if let Some(a) = alignment {
@@ -123,7 +157,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         let address = unsafe { Ctx::device().get_buffer_device_address(&addr_info) };
         Ok(Self {
             _type_marker: PhantomData,
-            _usage_marker: PhantomData,
+            usage,
             address,
             num_bytes,
             allocation: allocation,
@@ -135,24 +169,41 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         self.num_bytes
     }
 
-    #[validation_trace]
-    pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
-        Self::raw(
-            U::VK
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            cpu_writable,
-            (size * size_of::<T>()) as u64,
-            None,
-        )
-    }
-
     pub fn len(&self) -> usize {
         (self.size() / size_of::<T>() as u64) as usize
     }
 
+    pub fn usage(&self) -> U {
+        self.usage
+    }
+
+    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
+    pub fn usage_check(&self, required: vk::BufferUsageFlags) {
+        self.usage.check(required);
+    }
+
     pub fn cast<B: Copy + Pod>(self) -> Buffer<B, U> {
-        unsafe { std::mem::transmute(self) }
+        let usage = self.usage;
+        ManuallyDrop::new(self).take(usage)
+    }
+
+    /// The same buffer as bytes with its usage as a runtime value, e.g. to keep buffers of
+    /// different types together. Commands check the usage at runtime.
+    pub fn erase(self) -> DynamicBuffer {
+        let usage = usage::Dynamic(self.usage.flags());
+        ManuallyDrop::new(self).take(usage)
+    }
+
+    /// Moves the buffer into one of another element type and usage, leaving `self` without
+    /// memory; `self` must not destroy its handle unless it gets the memory back.
+    fn take<B: Copy + Pod, NU: BufferUsage>(&mut self, usage: NU) -> Buffer<B, NU> {
+        Buffer {
+            handle: self.handle,
+            address: self.address,
+            allocation: mem::take(&mut self.allocation),
+            num_bytes: self.num_bytes,
+            usage,
+            _type_marker: PhantomData,
+        }
     }
 }

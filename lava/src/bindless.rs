@@ -8,11 +8,7 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindings::MAX_PUSH_CONSTANTS_SIZE,
-    image::{
-        format::Format,
-        slice::ImageView,
-        usage::{IsSampled, IsStorage},
-    },
+    image::{format::Format, slice::ImageView, usage::ImageUsage},
     state::Ctx,
 };
 
@@ -44,6 +40,22 @@ impl BindlessHandle {
             descriptor_index_set1: NULL_HANDLE,
         }
     }
+
+    /// Only `index` of the sampled set.
+    pub fn sampled(index: u32) -> Self {
+        Self {
+            descriptor_index_set0: index,
+            ..Self::none()
+        }
+    }
+
+    /// Only `index` of the storage set.
+    pub fn storage(index: u32) -> Self {
+        Self {
+            descriptor_index_set1: index,
+            ..Self::none()
+        }
+    }
 }
 
 impl Default for BindlessHandle {
@@ -62,60 +74,62 @@ pub fn max_storage_images() -> u32 {
     Bindless::get().counts[1]
 }
 
-/// Descriptor writes collected for one `vkUpdateDescriptorSets`. The caller picks every index;
-/// a slot may only be rewritten while no pending command buffer uses it.
-#[derive(Default)]
-pub struct BindlessWrites {
-    writes: Vec<(usize, u32, vk::DescriptorImageInfo)>,
-}
-
-impl BindlessWrites {
-    pub fn sampled<F: Format, U: IsSampled>(&mut self, view: ImageView<F, U>, index: u32) {
-        self.push(0, index, view.view);
-    }
-
-    pub fn storage<F: Format, U: IsStorage>(&mut self, view: ImageView<F, U>, index: u32) {
-        self.push(1, index, view.view);
-    }
-
-    fn push(&mut self, set: usize, index: u32, view: vk::ImageView) {
-        let info = vk::DescriptorImageInfo {
-            image_layout: vk::ImageLayout::GENERAL,
-            image_view: view,
-            ..Default::default()
-        };
-        self.writes.push((set, index, info));
-    }
-
-    #[validation_trace]
-    pub fn submit(self) {
-        if self.writes.is_empty() {
-            return;
+/// Writes each image into the slots of the handle at the same position: the sampled set at
+/// `descriptor_index_set0` and the storage set at `descriptor_index_set1`, skipping
+/// `NULL_HANDLE`s, all in one `vkUpdateDescriptorSets`. The caller picks every index; a slot may
+/// only be rewritten while no pending command buffer uses it. Panics if an image lacks the
+/// usage of a set it is written to, or an index is outside its set.
+#[validation_trace]
+pub fn bind<'a, F: Format, U: ImageUsage>(
+    images: impl IntoIterator<Item = ImageView<'a, F, U>>,
+    handles: impl IntoIterator<Item = BindlessHandle>,
+) {
+    let bindless = Bindless::get();
+    let mut infos = Vec::new();
+    for (image, handle) in images.into_iter().zip(handles) {
+        let indices = [handle.descriptor_index_set0, handle.descriptor_index_set1];
+        let usages = [vk::ImageUsageFlags::SAMPLED, vk::ImageUsageFlags::STORAGE];
+        for (set, (index, usage)) in indices.into_iter().zip(usages).enumerate() {
+            if index == NULL_HANDLE {
+                continue;
+            }
+            let flags = image.usage().flags();
+            assert!(
+                flags.contains(usage),
+                "an image with usage {flags:?} can't be bound in the {usage:?} set"
+            );
+            assert!(
+                index < bindless.counts[set],
+                "bindless index {index} is outside set {set} of {} descriptors",
+                bindless.counts[set]
+            );
+            let info = vk::DescriptorImageInfo {
+                image_layout: vk::ImageLayout::GENERAL,
+                image_view: image.view,
+                ..Default::default()
+            };
+            infos.push((set, index, info));
         }
-        let bindless = Bindless::get();
-        let writes: Vec<_> = self
-            .writes
-            .iter()
-            .map(|(set, index, info)| {
-                assert!(
-                    *index < bindless.counts[*set],
-                    "bindless index {index} is outside set {set} of {} descriptors",
-                    bindless.counts[*set]
-                );
-                let (binding, ty) = match set {
-                    0 => (bindless.num_samplers, vk::DescriptorType::SAMPLED_IMAGE),
-                    _ => (0, vk::DescriptorType::STORAGE_IMAGE),
-                };
-                vk::WriteDescriptorSet::default()
-                    .dst_set(bindless.sets[*set])
-                    .dst_binding(binding)
-                    .dst_array_element(*index)
-                    .descriptor_type(ty)
-                    .image_info(std::slice::from_ref(info))
-            })
-            .collect();
-        unsafe { Ctx::device().update_descriptor_sets(&writes, &[]) };
     }
+    if infos.is_empty() {
+        return;
+    }
+    let writes: Vec<_> = infos
+        .iter()
+        .map(|(set, index, info)| {
+            let (binding, ty) = match set {
+                0 => (bindless.num_samplers, vk::DescriptorType::SAMPLED_IMAGE),
+                _ => (0, vk::DescriptorType::STORAGE_IMAGE),
+            };
+            vk::WriteDescriptorSet::default()
+                .dst_set(bindless.sets[*set])
+                .dst_binding(binding)
+                .dst_array_element(*index)
+                .descriptor_type(ty)
+                .image_info(std::slice::from_ref(info))
+        })
+        .collect();
+    unsafe { Ctx::device().update_descriptor_sets(&writes, &[]) };
 }
 
 impl Bindless {

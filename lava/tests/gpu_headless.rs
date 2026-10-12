@@ -14,9 +14,7 @@ use lava::{
         TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster,
         TestRasterTextured, TestTexturedVertex, TestVertex,
     },
-    bindless::{
-        BindlessHandle, BindlessWrites, NULL_HANDLE, max_sampled_images, max_storage_images,
-    },
+    bindless::{BindlessHandle, NULL_HANDLE, max_sampled_images, max_storage_images},
     buffer::{
         Buffer,
         usage::{Index, Indirect, Storage},
@@ -28,7 +26,6 @@ use lava::{
     image::{
         Image,
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
-        slice::AsImage,
         usage::{
             ColorAttachmentStorageTransferSrcTransferDst, DepthAttachment, Sampled,
             SampledHostCopy, SampledHostCopyTransferSrc, SampledStorage, SampledTransferDst,
@@ -51,7 +48,7 @@ type Target = Image<R8G8B8A8Unorm, ColorAttachmentStorageTransferSrcTransferDst>
 
 /// Clears a fresh target to opaque black, lets `record` draw into it, and reads it back.
 fn render(gpu: &common::Gpu, record: impl FnOnce(&mut CommandBuffer, &Target)) -> Vec<u8> {
-    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let target = Target::new(SIZE, SIZE).unwrap().bind_storage(0);
     let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);
     gpu.submit(|cmd| {
         cmd.clear_image(target.whole_view(), [0.0, 0.0, 0.0, 1.0]);
@@ -343,7 +340,7 @@ fn submit_profiled<'a>(
 #[cfg(feature = "profiling")]
 fn timestamps_time_scopes_and_passes() {
     let gpu = gpu();
-    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let target = Target::new(SIZE, SIZE).unwrap().bind_storage(0);
     let mut slot = FrameSlot::new(&gpu.queue).unwrap();
     slot.set_timestamps(true);
     assert!(
@@ -395,7 +392,7 @@ fn timestamps_time_scopes_and_passes() {
 #[cfg(feature = "profiling")]
 fn pass_queries_count_passes_and_renderings() {
     let gpu = gpu();
-    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let target = Target::new(SIZE, SIZE).unwrap().bind_storage(0);
     let mesh = Ctx::features().mesh;
     // One counter, which always fits a single pass. A time counter, if the device has one,
     // can't be 0 for a pass.
@@ -461,7 +458,7 @@ fn shader_clocks_count_only_while_enabled() {
         return;
     }
     let gpu = gpu();
-    let target = Target::new_storage(SIZE, SIZE, 1, 0).unwrap();
+    let target = Target::new(SIZE, SIZE).unwrap().bind_storage(0);
     let read = || {
         let mut times = Vec::new();
         clock::read(|time| times.push(time));
@@ -587,9 +584,16 @@ fn image_reports_extent_and_mip_chain() {
 #[test]
 fn bound_constructors_set_the_given_indices() {
     let _gpu = gpu();
-    let sampled = Image::<R8G8B8A8Unorm, Sampled>::new_sampled(4, 4, 1, 3).unwrap();
-    let storage = Image::<R8G8B8A8Unorm, StorageImage>::new_storage(4, 4, 1, 4).unwrap();
-    let both = Image::<R8G8B8A8Unorm, SampledStorage>::new_unified(4, 4, 1, 5, 6).unwrap();
+    let sampled = Image::<R8G8B8A8Unorm, Sampled>::new(4, 4)
+        .unwrap()
+        .bind_sampled(3);
+    let storage = Image::<R8G8B8A8Unorm, StorageImage>::new(4, 4)
+        .unwrap()
+        .bind_storage(4);
+    let both = Image::<R8G8B8A8Unorm, SampledStorage>::new(4, 4)
+        .unwrap()
+        .bind_sampled(6)
+        .bind_storage(5);
     let unbound = Image::<R8G8B8A8Unorm, Sampled>::new(4, 4).unwrap();
 
     assert_eq!(
@@ -615,21 +619,69 @@ fn bound_constructors_set_the_given_indices() {
     );
     assert_eq!(unbound.handle, BindlessHandle::none());
     assert!(max_sampled_images() > 6 && max_storage_images() > 5);
+
+    // `bind` checks the usage at runtime, static types included.
+    let refused = std::panic::catch_unwind(|| {
+        lava::bindless::bind([unbound.whole_view()], [BindlessHandle::storage(7)])
+    });
+    assert!(
+        refused.is_err(),
+        "a sampled image can't be bound as storage"
+    );
 }
 
 #[test]
-fn dropped_images_report_their_handle() {
-    static DROPPED: std::sync::Mutex<Vec<BindlessHandle>> = std::sync::Mutex::new(Vec::new());
+fn dropped_images_go_to_the_hook_erased() {
+    type Dropped = (BindlessHandle, lava::VkFormat, lava::ImageUsageFlags);
+    static DROPPED: std::sync::Mutex<Vec<Dropped>> = std::sync::Mutex::new(Vec::new());
     let _gpu = gpu();
-    lava::image::on_drop(|handle| DROPPED.lock().unwrap().push(handle)).unwrap();
+    lava::image::on_drop(|image| {
+        let dropped = (image.handle, image.format().0, image.usage().0);
+        DROPPED.lock().unwrap().push(dropped)
+    })
+    .unwrap();
     assert!(
         lava::image::on_drop(|_| {}).is_err(),
         "the hook can be set once"
     );
-    let image = Image::<R8G8B8A8Unorm, Sampled>::new_sampled(4, 4, 1, 42).unwrap();
+    let image = Image::<R8G8B8A8Unorm, Sampled>::new(4, 4)
+        .unwrap()
+        .bind_sampled(42);
     let handle = image.handle;
     drop(image);
-    assert!(DROPPED.lock().unwrap().contains(&handle));
+    let dropped = (
+        handle,
+        lava::VkFormat::R8G8B8A8_UNORM,
+        lava::ImageUsageFlags::SAMPLED,
+    );
+    assert!(DROPPED.lock().unwrap().contains(&dropped));
+
+    // An erased image goes to the hook too.
+    let erased = Image::<D32Sfloat, DepthAttachment>::new(4, 4)
+        .unwrap()
+        .erase();
+    assert_eq!(erased.format().0, lava::VkFormat::D32_SFLOAT);
+    drop(erased);
+    let dropped = DROPPED.lock().unwrap().last().copied().unwrap();
+    assert_eq!(dropped.2, lava::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT);
+}
+
+#[test]
+fn dropped_buffers_go_to_the_hook_erased() {
+    static DROPPED: std::sync::Mutex<Vec<(u64, lava::BufferUsageFlags)>> =
+        std::sync::Mutex::new(Vec::new());
+    let _gpu = gpu();
+    lava::buffer::on_drop(|buffer| {
+        let dropped = (buffer.size(), buffer.usage().0);
+        DROPPED.lock().unwrap().push(dropped)
+    })
+    .unwrap();
+    let buffer = zeroed_buffer::<u32, Storage>(4);
+    let erased = buffer.erase();
+    assert_eq!((erased.len(), erased.size()), (16, 16));
+    drop(erased);
+    let dropped = (16, lava::BufferUsageFlags::STORAGE_BUFFER);
+    assert!(DROPPED.lock().unwrap().contains(&dropped));
 }
 
 #[test]
@@ -970,8 +1022,8 @@ fn specialization_constants_pick_the_pipeline() {
         zeroed_buffer::<u32, Storage>(8),
     );
     let (image_a, image_b) = (
-        Target::new_storage(SIZE, SIZE, 1, 0).unwrap(),
-        Target::new_storage(SIZE, SIZE, 1, 1).unwrap(),
+        Target::new(SIZE, SIZE).unwrap().bind_storage(0),
+        Target::new(SIZE, SIZE).unwrap().bind_storage(1),
     );
     let pixels = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4 * 2) as usize);
     let half = (SIZE * SIZE * 4) as usize;
@@ -1290,7 +1342,7 @@ fn blend_modes_combine_overlapping_fragments() {
 fn skipped_attachment_keeps_its_content() {
     let gpu = gpu();
     let vertices = overlapping_triangles();
-    let second = Target::new_storage(SIZE, SIZE, 1, 1).unwrap();
+    let second = Target::new(SIZE, SIZE).unwrap().bind_storage(1);
     let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster(EXTENT)
@@ -1512,7 +1564,9 @@ fn indexed_draw_samples_a_bindless_texture() {
     ]
     .concat();
     let upload = buffer_with::<u8, Storage>(&texels);
-    let texture = Image::<R8G8B8A8Unorm, SampledTransferDst>::new_sampled(2, 2, 1, 0).unwrap();
+    let texture = Image::<R8G8B8A8Unorm, SampledTransferDst>::new(2, 2)
+        .unwrap()
+        .bind_sampled(0);
 
     let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
         position: Vec2::new(x, y),
@@ -1566,7 +1620,7 @@ fn indexed_draw_samples_a_bindless_texture() {
 
 /// Images created unbound and bound later with one batch are sampled from their slots.
 #[test]
-fn batched_bindings_are_sampled_from_their_slots() {
+fn bound_textures_are_sampled_from_their_slots() {
     let gpu = gpu();
     let colors = [
         [255, 0, 0, 255],
@@ -1574,15 +1628,13 @@ fn batched_bindings_are_sampled_from_their_slots() {
         [0, 0, 255, 255],
         [255, 255, 0, 255],
     ];
-    let mut textures: Vec<_> = colors
-        .iter()
-        .map(|_| Image::<R8G8B8A8Unorm, SampledTransferDst>::new(1, 1).unwrap())
+    let textures: Vec<_> = (0..colors.len() as u32)
+        .map(|i| {
+            Image::<R8G8B8A8Unorm, SampledTransferDst>::new(1, 1)
+                .unwrap()
+                .bind_sampled(10 + i)
+        })
         .collect();
-    let mut writes = BindlessWrites::default();
-    for (i, texture) in textures.iter_mut().enumerate() {
-        texture.bind_sampled(10 + i as u32, &mut writes);
-    }
-    writes.submit();
     let uploads: Vec<_> = colors
         .iter()
         .map(|color| buffer_with::<u8, Storage>(color))
@@ -1657,7 +1709,9 @@ fn host_copy_uploads_block_compressed_mips() {
         bc7_block([127, 127, 0, 127], 1),
     ]
     .concat();
-    let mut texture = Image::<BC7UnormBlock, SampledHostCopy>::new_sampled(8, 8, 4, 0).unwrap();
+    let mut texture = Image::<BC7UnormBlock, SampledHostCopy>::with_mip_levels(8, 8, 4)
+        .unwrap()
+        .bind_sampled(0);
     texture.copy_from(&blocks, 0).unwrap();
     // The smaller levels are one block each, even the ones smaller than a block.
     for level in 1..4 {

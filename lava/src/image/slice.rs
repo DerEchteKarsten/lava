@@ -1,6 +1,5 @@
 //! Borrowed image views and 2D slices, with per-image layout tracking for barriers
 use std::{
-    marker::PhantomData,
     range::Range,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -14,11 +13,7 @@ use crate::{
     bindless::BindlessHandle,
     command_buffer::ImageAccess,
     error::Result,
-    image::{
-        Image,
-        format::{Format, Undefined},
-        usage::{ImageUsage, IsSampled, IsStorage},
-    },
+    image::{Image, format::Format, usage::ImageUsage},
     state::Ctx,
 };
 
@@ -29,14 +24,14 @@ pub struct ImageView<'a, F: Format, U: ImageUsage> {
     pub mip_range: Range<u32>,
     pub handle: BindlessHandle,
     pub(crate) layout: &'a AtomicU32,
-    pub(crate) _marker: PhantomData<F>,
-    pub(crate) _marker2: PhantomData<U>,
+    pub(crate) format: F,
+    pub(crate) usage: U,
 }
 
 impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
-            aspect_mask: F::ASPECTS,
+            aspect_mask: self.format.aspects(),
             base_mip_level: self.mip_range.start,
             level_count: self.mip_range.end - self.mip_range.start,
             base_array_layer: 0,
@@ -45,8 +40,8 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
     }
     pub fn subresource_layers(&self, mip_level: u32) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
-            aspect_mask: F::ASPECTS,
-            mip_level: mip_level,
+            aspect_mask: self.format.aspects(),
+            mip_level,
             base_array_layer: 0,
             layer_count: 1,
         }
@@ -58,8 +53,40 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
             extend,
         }
     }
-    pub fn cast<NF: Format, NU: ImageUsage>(self) -> ImageView<'a, NF, NU> {
-        unsafe { std::mem::transmute(self) }
+    pub fn format(&self) -> F {
+        self.format
+    }
+
+    pub fn usage(&self) -> U {
+        self.usage
+    }
+
+    /// Panics unless the format has the `required` aspects; does nothing for a static format.
+    pub fn aspect_check(&self, required: vk::ImageAspectFlags) {
+        self.format.aspect_check(required);
+    }
+
+    /// Panics unless the format's texels have the type `T`; does nothing for a static format.
+    pub fn texel_check<T: 'static>(&self) {
+        self.format.texel_check::<T>();
+    }
+
+    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
+    pub fn usage_check(&self, required: vk::ImageUsageFlags) {
+        self.usage.check(required);
+    }
+
+    /// The same view with another format and usage, unchecked (see `Image::cast`).
+    pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> ImageView<'a, NF, NU> {
+        ImageView {
+            image: self.image,
+            view: self.view,
+            mip_range: self.mip_range,
+            handle: self.handle,
+            layout: self.layout,
+            format,
+            usage,
+        }
     }
 
     /// The access of a command that wants the image in `layout`. It takes the image's tracked
@@ -89,7 +116,7 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
             access,
             image: self.image,
             layout,
-            aspect: F::ASPECTS,
+            aspect: self.format.aspects(),
             old_layout,
         }
     }
@@ -113,60 +140,42 @@ impl<'a, F: Format, U: ImageUsage> ImageSlice<'a, F, U> {
         self
     }
 
-    pub fn cast<NF: Format, NU: ImageUsage>(self) -> ImageSlice<'a, NF, NU> {
-        unsafe { std::mem::transmute(self) }
-    }
-}
-
-impl<F: Format, U: ImageUsage> AsImage for Image<F, U> {
-    type Format = F;
-    type Usage = U;
-
-    fn mip_range(&self) -> Range<u32> {
-        (0..self.mip_levels).into()
-    }
-    fn get_ref(&self) -> &Image<Self::Format, Self::Usage> {
-        self
-    }
-    fn get_mut(&mut self) -> &mut Image<Self::Format, Self::Usage> {
-        self
-    }
-}
-
-pub trait AsImage {
-    type Format: Format;
-    type Usage: ImageUsage;
-
-    fn mip_range(&self) -> Range<u32>;
-    fn get_ref(&self) -> &Image<Self::Format, Self::Usage>;
-    fn get_mut(&mut self) -> &mut Image<Self::Format, Self::Usage>;
-
-    fn whole_view<'a>(&'a self) -> ImageView<'a, Self::Format, Self::Usage> {
-        let mip_range = self.mip_range();
-        let image = self.get_ref();
-        ImageView {
-            image: image.image,
-            view: image.whole_view,
-            mip_range: mip_range,
-            handle: image.handle,
-            layout: &image.layout,
-            _marker: PhantomData,
-            _marker2: PhantomData,
+    /// The same slice with another format and usage, unchecked (see `Image::cast`).
+    pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> ImageSlice<'a, NF, NU> {
+        ImageSlice {
+            view: self.view.cast(format, usage),
+            offset: self.offset,
+            extend: self.extend,
         }
     }
-    fn create_new_view<'a>(
-        &'a self,
+}
+
+impl<F: Format, U: ImageUsage> Image<F, U> {
+    pub fn whole_view(&self) -> ImageView<'_, F, U> {
+        ImageView {
+            image: self.image,
+            view: self.whole_view,
+            mip_range: (0..self.mip_levels).into(),
+            handle: self.handle,
+            layout: &self.layout,
+            format: self.format,
+            usage: self.usage,
+        }
+    }
+
+    #[validation_trace]
+    pub fn create_new_view(
+        &self,
         mip_range: Range<u32>,
         swizzel: vk::ComponentMapping,
-    ) -> Result<ImageView<'a, Self::Format, Self::Usage>> {
-        let image = self.get_ref();
+    ) -> Result<ImageView<'_, F, U>> {
         let create_info = vk::ImageViewCreateInfo::default()
             .components(swizzel)
-            .format(Self::Format::format())
-            .image(image.image)
+            .format(self.format.vk_format())
+            .image(self.image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: Self::Format::ASPECTS,
+                aspect_mask: self.format.aspects(),
                 base_array_layer: 0,
                 layer_count: 1,
                 base_mip_level: mip_range.start,
@@ -174,21 +183,16 @@ pub trait AsImage {
             });
         let view = unsafe { Ctx::device().create_image_view(&create_info, None)? };
         Ok(ImageView {
-            image: image.image,
             view,
-            mip_range: mip_range,
-            handle: image.handle,
-            layout: &image.layout,
-            _marker: PhantomData,
-            _marker2: PhantomData,
+            mip_range,
+            ..self.whole_view()
         })
     }
 
-    fn whole<'a>(&'a self) -> ImageSlice<'a, Self::Format, Self::Usage> {
-        let image = self.get_ref();
+    pub fn whole(&self) -> ImageSlice<'_, F, U> {
         ImageSlice {
             view: self.whole_view(),
-            extend: image.extent,
+            extend: self.extent,
             offset: IVec2::ZERO,
         }
     }
@@ -198,13 +202,13 @@ pub trait AsImage {
 mod tests {
     use super::*;
     use crate::image::{
-        format::{D32SfloatS8Uint, R8G8B8A8Unorm},
-        usage::{DepthAttachment, Sampled},
+        format::{D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
+        usage::{DepthAttachment, Sampled, StaticUsage, Storage},
     };
     use ash::vk::Handle;
 
     /// A view over a fake image: layout tracking and region math need no device.
-    fn view<F: Format, U: ImageUsage>(
+    fn view<F: StaticFormat, U: StaticUsage>(
         layout: &AtomicU32,
         mips: std::ops::Range<u32>,
     ) -> ImageView<'_, F, U> {
@@ -214,8 +218,8 @@ mod tests {
             mip_range: mips.into(),
             handle: BindlessHandle::none(),
             layout,
-            _marker: PhantomData,
-            _marker2: PhantomData,
+            format: F::default(),
+            usage: U::default(),
         }
     }
 
@@ -305,7 +309,7 @@ mod tests {
         let layout = undefined();
         let a = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
         let b = a;
-        let c = a.cast::<R8G8B8A8Unorm, crate::image::usage::Storage>();
+        let c = a.cast(R8G8B8A8Unorm, Storage);
 
         a.access(
             vk::PipelineStageFlags2::TRANSFER,

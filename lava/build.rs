@@ -274,6 +274,9 @@ struct NewFn {
     gpu_inits: Vec<String>,
     buffer_accesses: Vec<String>,
     image_accesses: Vec<String>,
+    /// `format_check`/`usage_check` calls: what the generics' bounds check at compile time,
+    /// checked at runtime for dynamic formats and usages.
+    checks: Vec<String>,
 }
 
 fn build_new_fn<'a>(
@@ -288,6 +291,7 @@ fn build_new_fn<'a>(
         gpu_inits: Vec::new(),
         buffer_accesses: Vec::new(),
         image_accesses: Vec::new(),
+        checks: Vec::new(),
     };
 
     for (name, t) in fields {
@@ -297,19 +301,23 @@ fn build_new_fn<'a>(
                 out.lifetime = true;
                 let format_bound = match image_texel(t) {
                     Some((texel, components)) => {
-                        format!("F{suffix}: Format<Texels = [{texel}; {components}]>")
+                        let texels = format!("[{texel}; {components}]");
+                        out.checks
+                            .push(format!("{name}.texel_check::<{texels}>();"));
+                        format!("F{suffix}: HasTexels<{texels}>")
                     }
                     None => format!("F{suffix}: Format"),
                 };
                 out.generics.push(format_bound);
-                out.generics.push(format!(
-                    "U{suffix}: {}",
-                    match usage {
-                        0 => "image::usage::IsSampled",
-                        3 => "image::usage::UnifiedBinding",
-                        _ => "image::usage::IsStorage",
-                    }
-                ));
+                let (usage_bound, flags) = match usage {
+                    0 => ("IsSampled", "SAMPLED"),
+                    3 => ("UnifiedBinding", "SAMPLED | vk::ImageUsageFlags::STORAGE"),
+                    _ => ("IsStorage", "STORAGE"),
+                };
+                out.generics
+                    .push(format!("U{suffix}: image::usage::{usage_bound}"));
+                out.checks
+                    .push(format!("{name}.usage_check(vk::ImageUsageFlags::{flags});"));
                 out.params
                     .push(format!("{name}: ImageView<'a, F{suffix}, U{suffix}>"));
                 out.gpu_inits.push(format!("{name}: {name}.handle"));
@@ -325,6 +333,9 @@ fn build_new_fn<'a>(
                 let ty = format!("BufferSlice<'a, {inner}, U{suffix}>");
                 out.generics
                     .push(format!("U{suffix}: buffer::usage::IsStorage"));
+                out.checks.push(format!(
+                    "{name}.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);"
+                ));
                 out.params.push(format!("{name}: {ty}"));
                 out.gpu_inits.push(format!("{name}: {name}.gpu_ptr"));
                 let access = if type_name(t) == "MutBuf" {
@@ -606,12 +617,14 @@ pub struct {pass_name};
 
 impl {pass_name} {{
     pub fn push_bindings{generics}({params}) -> {returns} {{
+        {checks}
         {body}
     }}
 }}
 "#,
         generics = fn_generics(&push),
         params = push.params.join(", "),
+        checks = push.checks.join("\n        "),
     ));
     let (mut images, mut buffers) = (push.image_accesses.len(), push.buffer_accesses.len());
 
@@ -651,6 +664,7 @@ pub struct {incomplete}({output});
 
 impl {incomplete} {{
     pub fn constant_bindings{generics}(self, {params}) -> {output} {{
+        {checks}
         self.0.with_constants(
             &{consts_name} {{
                 {gpu_inits}
@@ -668,6 +682,7 @@ impl {incomplete} {{
             fields = fields.join("\n"),
             generics = fn_generics(&new),
             params = new.params.join(", "),
+            checks = new.checks.join("\n        "),
             gpu_inits = gpu_inits.join(", "),
             image_accesses = new.image_accesses.join(",\n"),
             buffer_accesses = new.buffer_accesses.join(",\n"),

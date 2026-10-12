@@ -747,6 +747,7 @@ impl<K> BindingOutput<K> {
         self,
         image: ImageView<'_, F, U>,
     ) -> Self {
+        image.usage_check(vk::ImageUsageFlags::SAMPLED);
         self.with_image(image, vk::AccessFlags2::SHADER_SAMPLED_READ)
     }
 
@@ -756,6 +757,7 @@ impl<K> BindingOutput<K> {
         self,
         image: ImageView<'_, F, U>,
     ) -> Self {
+        image.usage_check(vk::ImageUsageFlags::STORAGE);
         self.with_image(image, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
@@ -764,6 +766,7 @@ impl<K> BindingOutput<K> {
         self,
         image: ImageView<'_, F, U>,
     ) -> Self {
+        image.usage_check(vk::ImageUsageFlags::STORAGE);
         self.with_image(
             image,
             vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
@@ -775,6 +778,7 @@ impl<K> BindingOutput<K> {
         self,
         buffer: BufferSlice<'_, V, U>,
     ) -> Self {
+        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
         self.with_buffer(buffer, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
@@ -783,6 +787,7 @@ impl<K> BindingOutput<K> {
         self,
         buffer: BufferSlice<'_, V, U>,
     ) -> Self {
+        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
         self.with_buffer(
             buffer,
             vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
@@ -992,7 +997,8 @@ impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS>
         U: IsColorAttachment,
         F: ColorAspect,
     {
-        assert!(F::ASPECTS.contains(vk::ImageAspectFlags::COLOR));
+        image.aspect_check(vk::ImageAspectFlags::COLOR);
+        image.usage_check(vk::ImageUsageFlags::COLOR_ATTACHMENT);
         let access = image.access(
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
@@ -1008,10 +1014,13 @@ impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS>
             extent: self.extent,
             viewport: self.viewport,
             scissors: self.scissors,
-            color_formats: append(self.color_formats, F::format()),
+            color_formats: append(self.color_formats, image.format().vk_format()),
             color_attachments: append(
                 self.color_attachments,
-                (image.view, clear.map(|e| F::clear_value(e))),
+                (
+                    image.view,
+                    clear.map(|e| image.format().clear_value(e).into()),
+                ),
             ),
             color_accesses: append(self.color_accesses, access),
             depth_format: self.depth_format,
@@ -1038,13 +1047,15 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         U: IsDepthAttachment,
         F: DepthAspect,
     {
-        assert!(F::ASPECTS.contains(vk::ImageAspectFlags::DEPTH));
-        self.depth_format = F::format();
-        if F::ASPECTS.contains(vk::ImageAspectFlags::STENCIL) {
-            self.stencil_format = F::format();
+        image.aspect_check(vk::ImageAspectFlags::DEPTH);
+        image.usage_check(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT);
+        let format = image.format();
+        self.depth_format = format.vk_format();
+        if format.aspects().contains(vk::ImageAspectFlags::STENCIL) {
+            self.stencil_format = format.vk_format();
         }
         self.depth_attachment = image.view;
-        self.clear_depth = clear.map(|e| F::clear_value(e));
+        self.clear_depth = clear.map(|e| format.clear_value(e).into());
         self.depth_access = Some(image.access(
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
@@ -1087,6 +1098,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         instances: u32,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
+        index_buffer.usage_check(vk::BufferUsageFlags::INDEX_BUFFER);
         let mut bindings = bindings.erase();
         bindings.buffers.push(index_buffer.access(
             vk::PipelineStageFlags2::INDEX_INPUT,
@@ -1375,7 +1387,9 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     }
 }
 
-fn indirect_access<T: Copy + Pod, U: BufferUsage>(buffer: BufferSlice<'_, T, U>) -> BufferAccess {
+/// The access of an indirect command read from `buffer`, which has to be `IsIndirect`.
+fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<'_, T, U>) -> BufferAccess {
+    buffer.usage_check(vk::BufferUsageFlags::INDIRECT_BUFFER);
     buffer.access(
         vk::PipelineStageFlags2::DRAW_INDIRECT,
         vk::AccessFlags2::INDIRECT_COMMAND_READ,
@@ -1416,6 +1430,8 @@ impl CommandBuffer {
     ) where
         F: ColorAspect,
     {
+        image.aspect_check(vk::ImageAspectFlags::COLOR);
+        image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         self.flush_pending(
             std::iter::once(&image.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -1429,7 +1445,7 @@ impl CommandBuffer {
                 self.handle,
                 image.image,
                 vk::ImageLayout::GENERAL,
-                &F::clear_value(clear_color).color,
+                &vk::ClearValue::from(image.format().clear_value(clear_color)).color,
                 &[image.subresource_range()],
             )
         };
@@ -1467,6 +1483,10 @@ impl CommandBuffer {
         F: ColorAspect,
         F2: ColorAspect,
     {
+        src.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
+        dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         self.flush_pending(
             [
                 src.view.access(
@@ -1541,6 +1561,8 @@ impl CommandBuffer {
     ) where
         F: ColorAspect,
     {
+        dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         self.flush_pending(
             iter::once(&dst.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -1589,6 +1611,8 @@ impl CommandBuffer {
     ) where
         F: ColorAspect,
     {
+        src.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         self.flush_pending(
             iter::once(&src.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -2190,8 +2214,8 @@ fn all_read_access() -> vk::AccessFlags2 {
 mod tests {
     use super::*;
     use crate::image::{
-        format::{D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
-        usage::{ColorAttachment, DepthAttachment, Sampled},
+        format::{self, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
+        usage::{self, ColorAttachment, DepthAttachment, Sampled, StaticUsage},
     };
     use ash::vk::Handle;
     use std::sync::atomic::AtomicU32;
@@ -2270,15 +2294,23 @@ mod tests {
         }
     }
 
-    fn view<F: Format, U: ImageUsage>(layout: &AtomicU32) -> ImageView<'_, F, U> {
+    fn view<F: StaticFormat, U: StaticUsage>(layout: &AtomicU32) -> ImageView<'_, F, U> {
+        dynamic_view(layout, F::default(), U::default())
+    }
+
+    fn dynamic_view<F: Format, U: ImageUsage>(
+        layout: &AtomicU32,
+        format: F,
+        usage: U,
+    ) -> ImageView<'_, F, U> {
         ImageView {
             image: vk::Image::from_raw(1),
             view: vk::ImageView::from_raw(2),
             mip_range: (0..1).into(),
             handle: crate::bindless::BindlessHandle::none(),
             layout,
-            _marker: PhantomData,
-            _marker2: PhantomData,
+            format,
+            usage,
         }
     }
 
@@ -2730,15 +2762,18 @@ mod tests {
         BindingOutput::new(0, &0u32, S::VERTEX_SHADER, [], [])
     }
 
-    fn slice<T: Pod, U: BufferUsage>(gpu_ptr: u64, len: u64) -> BufferSlice<'static, T, U> {
+    fn slice<T: Pod, U: crate::buffer::usage::StaticUsage>(
+        gpu_ptr: u64,
+        len: u64,
+    ) -> BufferSlice<'static, T, U> {
         BufferSlice {
             handle: vk::Buffer::null(),
             size: len * size_of::<T>() as u64,
             cpu_ptr: 0,
             gpu_ptr,
             base_address: gpu_ptr,
+            usage: U::default(),
             _marker: PhantomData,
-            _usage: PhantomData,
             _lifetime: PhantomData,
         }
     }
@@ -2961,6 +2996,72 @@ mod tests {
         assert_eq!(
             builder.depth_access().unwrap().access,
             A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE
+        );
+    }
+
+    #[test]
+    fn dynamic_attachments_work_like_static_ones() {
+        let (color, depth) = (layout(L::UNDEFINED), layout(L::UNDEFINED));
+        let mut cmd = offline_cmd();
+        let clear = format::ClearValue::Float([0.0, 0.5, 1.0, 1.0]);
+        let builder = cmd
+            .raster(EXTENT)
+            .color_attachment(
+                dynamic_view(
+                    &color,
+                    format::Dynamic(vk::Format::R8G8B8A8_UNORM),
+                    usage::Dynamic(vk::ImageUsageFlags::COLOR_ATTACHMENT),
+                ),
+                Some(clear),
+            )
+            .depth_attachment(
+                dynamic_view(
+                    &depth,
+                    format::Dynamic(vk::Format::D32_SFLOAT_S8_UINT),
+                    DepthAttachment,
+                ),
+                None,
+            );
+        assert_eq!(
+            builder.color_formats.as_slice(),
+            [vk::Format::R8G8B8A8_UNORM]
+        );
+        let (_, color_clear) = builder.color_attachments[0];
+        assert_eq!(
+            unsafe { color_clear.unwrap().color.float32 },
+            [0.0, 0.5, 1.0, 1.0]
+        );
+        assert_eq!(builder.depth_format, vk::Format::D32_SFLOAT_S8_UINT);
+        assert_eq!(builder.stencil_format, vk::Format::D32_SFLOAT_S8_UINT);
+    }
+
+    #[test]
+    #[should_panic(expected = "lacks COLOR_ATTACHMENT")]
+    fn dynamic_usage_without_the_attachment_flag_panics() {
+        let state = layout(L::UNDEFINED);
+        let mut cmd = offline_cmd();
+        let _ = cmd.raster(EXTENT).color_attachment(
+            dynamic_view(
+                &state,
+                R8G8B8A8Unorm,
+                usage::Dynamic(vk::ImageUsageFlags::SAMPLED),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "lacks the aspects DEPTH")]
+    fn dynamic_colour_format_as_depth_attachment_panics() {
+        let state = layout(L::UNDEFINED);
+        let mut cmd = offline_cmd();
+        let _ = cmd.raster(EXTENT).depth_attachment(
+            dynamic_view(
+                &state,
+                format::Dynamic(vk::Format::R8G8B8A8_UNORM),
+                DepthAttachment,
+            ),
+            None,
         );
     }
 

@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use bytemuck::Pod;
 use lava::{
-    buffer::{Buffer, usage::BufferUsage},
+    buffer::{Buffer, usage::StaticUsage},
     command_buffer::CommandBuffer,
     vkobjects::queue::{FrameSlot, Gfx, PendingAccesses, Queue, SemaphoreInfo},
 };
@@ -129,13 +129,13 @@ impl Gpu {
 }
 
 /// A host-readable buffer holding `data`.
-pub fn buffer_with<T: Pod, U: BufferUsage>(data: &[T]) -> Buffer<T, U> {
+pub fn buffer_with<T: Pod, U: StaticUsage>(data: &[T]) -> Buffer<T, U> {
     let buffer = Buffer::new(data.len(), true).unwrap();
     buffer.range(..).copy_from(data);
     buffer
 }
 
 /// A host-readable buffer of `len` zeroed elements.
-pub fn zeroed_buffer<T: Pod, U: BufferUsage>(len: usize) -> Buffer<T, U> {
+pub fn zeroed_buffer<T: Pod, U: StaticUsage>(len: usize) -> Buffer<T, U> {
     buffer_with(&vec![T::zeroed(); len])
 }

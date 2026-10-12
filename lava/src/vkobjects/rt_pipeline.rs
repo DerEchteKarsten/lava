@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use ash::vk;
 
 use crate::{
-    buffer::Buffer,
+    buffer::{Buffer, usage},
     state::{Ctx, Functions},
 };
 
@@ -126,7 +126,7 @@ impl RaytracingPipeline {
 }
 
 pub struct ShaderBindingTable {
-    pub _buffer: Buffer<u8>,
+    pub _buffer: Buffer<u8, usage::ShaderBindingTable>,
     pub raygen_region: vk::StridedDeviceAddressRegionKHR,
     pub miss_region: vk::StridedDeviceAddressRegionKHR,
     pub hit_region: vk::StridedDeviceAddressRegionKHR,
@@ -182,10 +182,8 @@ impl ShaderBindingTable {
             desc.hit_shader_count,
         ];
 
-        let buffer_usage = vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR;
-
-        let buffer: Buffer<u8> = Buffer::raw(
-            buffer_usage,
+        let buffer = Buffer::raw(
+            usage::ShaderBindingTable,
             true,
             buffer_size as _,
             Some(rt_properties.shader_group_base_alignment),

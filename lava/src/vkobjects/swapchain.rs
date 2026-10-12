@@ -1,9 +1,5 @@
 //! Swapchain creation, image acquisition, and resize-driven recreation
-use std::{
-    ffi::CStr,
-    marker::PhantomData,
-    sync::{OnceLock, atomic::AtomicU32},
-};
+use std::{ffi::CStr, sync::atomic::AtomicU32};
 
 use crate::{bindless::BindlessHandle, error::Result};
 use ash::vk::{self};
@@ -11,16 +7,18 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    bindless::BindlessWrites,
-    image::{format, slice::ImageView, usage::{ColorAttachmentStorageTransferDst, ImageUsage}},
+    bindless,
+    image::{
+        format,
+        slice::ImageView,
+        usage::{ColorAttachmentStorageTransferDst, StaticUsage},
+    },
     state::{Ctx, Functions},
     vkobjects::{
         queue::{Binary, Fence, Semaphore},
         surface::Surface,
     },
 };
-
-pub static FORMAT: OnceLock<vk::Format> = OnceLock::new();
 
 #[derive(Debug)]
 struct SwapchainImage {
@@ -33,6 +31,8 @@ struct SwapchainImage {
 #[derive(Debug)]
 pub struct Swapchain {
     pub size: [u32; 2],
+    /// Picked from what the surface supports; a recreated swapchain may pick another.
+    pub format: format::Dynamic,
     /// The surface's supported modes of `PRESENT_MODES`, FIFO first, with their names.
     pub present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,
     /// Index into `present_modes`; set it and `recreate` to switch. A recreated swapchain keeps it.
@@ -42,7 +42,10 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
-    pub fn image(&self, index: u32) -> ImageView<'_, format::Swapchain, ColorAttachmentStorageTransferDst> {
+    pub fn image(
+        &self,
+        index: u32,
+    ) -> ImageView<'_, format::Dynamic, ColorAttachmentStorageTransferDst> {
         let image = &self.images[index as usize];
         ImageView {
             image: image.image,
@@ -50,8 +53,8 @@ impl Swapchain {
             mip_range: (0..1).into(),
             handle: image.handle,
             layout: &image.layout,
-            _marker: PhantomData,
-            _marker2: PhantomData,
+            format: self.format,
+            usage: ColorAttachmentStorageTransferDst,
         }
     }
 
@@ -64,8 +67,6 @@ impl Swapchain {
     #[validation_trace]
     pub fn new(surface: &Surface, old: Option<&Swapchain>, size: Option<[u32; 2]>) -> Result<Self> {
         let format = select_surface_format(&surface.formats);
-
-        let _ = FORMAT.set(format.format);
 
         let present_modes = supported_present_modes(&surface.present_modes);
         let present_mode_index = old.map_or(0, |old| old.present_mode.min(present_modes.len() - 1));
@@ -151,6 +152,7 @@ impl Swapchain {
 
         Ok(Self {
             handle,
+            format: format::Dynamic(format.format),
             images,
             size: [extent.width, extent.height],
             present_modes,
@@ -159,14 +161,15 @@ impl Swapchain {
     }
 
     /// Binds image `i` at `first_storage_index + i` of the storage set.
-    pub fn bind_storage(&mut self, first_storage_index: u32, writes: &mut BindlessWrites) {
+    pub fn bind_storage(&mut self, first_storage_index: u32) {
         for (i, image) in self.images.iter_mut().enumerate() {
-            image.handle.descriptor_index_set1 = first_storage_index + i as u32;
+            image.handle = BindlessHandle::storage(first_storage_index + i as u32);
         }
-        for i in 0..self.images.len() as u32 {
-            let view = self.image(i);
-            writes.storage(view, view.handle.descriptor_index_set1);
-        }
+        let images = 0..self.images.len() as u32;
+        bindless::bind(
+            images.clone().map(|i| self.image(i)),
+            images.map(|i| self.image(i).handle),
+        );
     }
 
     #[validation_trace]
