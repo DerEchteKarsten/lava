@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use crate::{
     bindless,
     image::{
-        format,
+        D2, format,
         slice::ImageView,
         usage::{ColorAttachmentStorageTransferDst, StaticUsage},
     },
@@ -51,10 +51,12 @@ impl Swapchain {
             image: image.image,
             view: image.view,
             mip_range: (0..1).into(),
+            extent: self.size.into(),
             handle: image.handle,
-            layout: &image.layout,
+            layouts: std::slice::from_ref(&image.layout),
             format: self.format,
             usage: ColorAttachmentStorageTransferDst,
+            dim: D2,
         }
     }
 

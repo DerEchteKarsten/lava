@@ -8,7 +8,7 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindings::MAX_PUSH_CONSTANTS_SIZE,
-    image::{format::Format, slice::ImageView, usage::ImageUsage},
+    image::{Dim, format::Format, slice::ImageView, usage::ImageUsage},
     state::Ctx,
 };
 
@@ -80,8 +80,8 @@ pub fn max_storage_images() -> u32 {
 /// only be rewritten while no pending command buffer uses it. Panics if an image lacks the
 /// usage of a set it is written to, or an index is outside its set.
 #[validation_trace]
-pub fn bind<'a, F: Format, U: ImageUsage>(
-    images: impl IntoIterator<Item = ImageView<'a, F, U>>,
+pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
+    images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
     handles: impl IntoIterator<Item = BindlessHandle>,
 ) {
     let bindless = Bindless::get();

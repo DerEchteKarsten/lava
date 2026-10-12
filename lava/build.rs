@@ -204,6 +204,21 @@ fn image_access(usage: u64) -> &'static str {
     }
 }
 
+/// The Rust dimension marker of an `Img<E, Shape, U>`'s shape.
+fn image_dim(t: &TypeLayout) -> &'static str {
+    let generics = t.ty().unwrap().generic_container().unwrap();
+    let shape = generics
+        .type_parameters()
+        .find(|tp| tp.name() == Some("Shape"))
+        .and_then(|tp| generics.concrete_type(tp))
+        .and_then(|shape| shape.name());
+    match shape {
+        Some("__Shape2D") => "image::D2",
+        Some("__Shape3D") => "image::D3",
+        other => panic!("image shape {other:?} has no Rust dimension"),
+    }
+}
+
 fn image_texel(t: &TypeLayout) -> Option<(&'static str, usize)> {
     let generics = t.ty().unwrap().generic_container().unwrap();
     let element = generics
@@ -315,8 +330,10 @@ fn build_new_fn<'a>(
                     .push(format!("U{suffix}: image::usage::{usage_bound}"));
                 out.checks
                     .push(format!("{name}.usage_check(vk::ImageUsageFlags::{flags});"));
-                out.params
-                    .push(format!("{name}: ImageView<'a, F{suffix}, U{suffix}>"));
+                out.params.push(format!(
+                    "{name}: ImageView<'a, F{suffix}, U{suffix}, {}>",
+                    image_dim(t)
+                ));
                 out.gpu_inits.push(format!("{name}: {name}.handle"));
                 out.image_accesses.push(format!(
                     "{name}.access({stage}, {access}, vk::ImageLayout::GENERAL)",

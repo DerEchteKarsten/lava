@@ -1,31 +1,38 @@
-//! Borrowed image views and 2D slices, with per-image layout tracking for barriers
+//! Borrowed image views of a mip range and their slices, the only image types commands take, with the layouts they track for barriers
 use std::{range::Range, sync::atomic::AtomicU32};
 
-use ash::vk::{self, Offset3D};
-use bytemuck::Zeroable;
-use glam::{IVec2, UVec2};
-use lava_macros::validation_trace;
+use ash::vk;
 
 use crate::{
     bindless::BindlessHandle,
     command_buffer::{ImageAccess, ImageUse},
-    error::Result,
-    image::{Image, format::Format, usage::ImageUsage},
-    state::Ctx,
+    image::{
+        Image, Views,
+        dim::{D2, Dim},
+        format::Format,
+        usage::ImageUsage,
+    },
 };
 
+/// A borrowed view of `mip_range` of an image. Commands, bindless binds and generated bindings
+/// take these, whichever kind of image they come from (a swapchain's included).
 #[derive(Clone, Copy, Debug)]
-pub struct ImageView<'a, F: Format, U: ImageUsage> {
+pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     pub image: vk::Image,
     pub view: vk::ImageView,
     pub mip_range: Range<u32>,
+    /// The extent of mip `mip_range.start`.
+    pub extent: D::Extent,
     pub handle: BindlessHandle,
-    pub(crate) layout: &'a AtomicU32,
+    /// The tracked layouts: one for all of `mip_range` (an image with one view, or a swapchain
+    /// image), or one per mip.
+    pub(crate) layouts: &'a [AtomicU32],
     pub(crate) format: F,
     pub(crate) usage: U,
+    pub(crate) dim: D,
 }
 
-impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
+impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
             aspect_mask: self.format.aspects(),
@@ -43,10 +50,15 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
             layer_count: 1,
         }
     }
-    pub fn region(self, extend: UVec2) -> ImageSlice<'a, F, U> {
+    /// All of mip `mip_range.start`, which copies and blits of the slice touch.
+    pub fn whole(self) -> ImageSlice<'a, F, U, D> {
+        self.region(self.extent)
+    }
+    /// The `extend` texels at the origin of mip `mip_range.start`.
+    pub fn region(self, extend: D::Extent) -> ImageSlice<'a, F, U, D> {
         ImageSlice {
             view: self,
-            offset: IVec2::ZERO,
+            offset: D::Offset::default(),
             extend,
         }
     }
@@ -74,20 +86,26 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
     }
 
     /// The same view with another format and usage, unchecked (see `Image::cast`).
-    pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> ImageView<'a, NF, NU> {
+    pub fn cast<NF: Format, NU: ImageUsage>(
+        self,
+        format: NF,
+        usage: NU,
+    ) -> ImageView<'a, NF, NU, D> {
         ImageView {
             image: self.image,
             view: self.view,
             mip_range: self.mip_range,
+            extent: self.extent,
             handle: self.handle,
-            layout: self.layout,
+            layouts: self.layouts,
             format,
             usage,
+            dim: self.dim,
         }
     }
 
-    /// The access of a command that wants the image in `layout`. It borrows the image's
-    /// tracked layout, which moves to `layout` only when the command is recorded.
+    /// The access of a command that wants the view's mips in `layout`. It borrows their
+    /// tracked layouts, which move to `layout` only when the command is recorded.
     pub(crate) fn access(
         &self,
         stage: vk::PipelineStageFlags2,
@@ -101,32 +119,38 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
                 image: self.image,
                 layout,
                 aspect: self.format.aspects(),
+                mip_range: self.mip_range,
             },
-            tracked_layout: self.layout,
+            layouts: self.layouts,
         }
     }
 }
 
+/// A box of texels of one mip: `extend` texels at `offset` of the view's first mip.
 #[derive(Clone, Copy)]
-pub struct ImageSlice<'a, F: Format, U: ImageUsage> {
-    pub view: ImageView<'a, F, U>,
-    pub offset: IVec2,
-    pub extend: UVec2,
+pub struct ImageSlice<'a, F: Format, U: ImageUsage, D: Dim = D2> {
+    pub view: ImageView<'a, F, U, D>,
+    pub offset: D::Offset,
+    pub extend: D::Extent,
 }
 
-impl<'a, F: Format, U: ImageUsage> ImageSlice<'a, F, U> {
-    pub fn offset(mut self, offset: IVec2) -> ImageSlice<'a, F, U> {
-        self.offset += offset;
+impl<'a, F: Format, U: ImageUsage, D: Dim> ImageSlice<'a, F, U, D> {
+    pub fn offset(mut self, offset: D::Offset) -> Self {
+        self.offset = self.offset + offset;
         self
     }
 
-    pub fn grow(mut self, extend: UVec2) -> ImageSlice<'a, F, U> {
-        self.extend += extend;
+    pub fn grow(mut self, extend: D::Extent) -> Self {
+        self.extend = self.extend + extend;
         self
     }
 
     /// The same slice with another format and usage, unchecked (see `Image::cast`).
-    pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> ImageSlice<'a, NF, NU> {
+    pub fn cast<NF: Format, NU: ImageUsage>(
+        self,
+        format: NF,
+        usage: NU,
+    ) -> ImageSlice<'a, NF, NU, D> {
         ImageSlice {
             view: self.view.cast(format, usage),
             offset: self.offset,
@@ -135,51 +159,10 @@ impl<'a, F: Format, U: ImageUsage> ImageSlice<'a, F, U> {
     }
 }
 
-impl<F: Format, U: ImageUsage> Image<F, U> {
-    pub fn whole_view(&self) -> ImageView<'_, F, U> {
-        ImageView {
-            image: self.image,
-            view: self.whole_view,
-            mip_range: (0..self.mip_levels).into(),
-            handle: self.handle,
-            layout: &self.layout,
-            format: self.format,
-            usage: self.usage,
-        }
-    }
-
-    #[validation_trace]
-    pub fn create_new_view(
-        &self,
-        mip_range: Range<u32>,
-        swizzel: vk::ComponentMapping,
-    ) -> Result<ImageView<'_, F, U>> {
-        let create_info = vk::ImageViewCreateInfo::default()
-            .components(swizzel)
-            .format(self.format.vk_format())
-            .image(self.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: self.format.aspects(),
-                base_array_layer: 0,
-                layer_count: 1,
-                base_mip_level: mip_range.start,
-                level_count: mip_range.end - mip_range.start,
-            });
-        let view = unsafe { Ctx::device().create_image_view(&create_info, None)? };
-        Ok(ImageView {
-            view,
-            mip_range,
-            ..self.whole_view()
-        })
-    }
-
-    pub fn whole(&self) -> ImageSlice<'_, F, U> {
-        ImageSlice {
-            view: self.whole_view(),
-            extend: self.extent,
-            offset: IVec2::ZERO,
-        }
+impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
+    /// All of mip 0: `whole_view().whole()`.
+    pub fn whole(&self) -> ImageSlice<'_, F, U, D> {
+        self.whole_view().whole()
     }
 }
 
@@ -191,6 +174,7 @@ mod tests {
         usage::{DepthAttachment, Sampled, StaticUsage, Storage},
     };
     use ash::vk::Handle;
+    use glam::{IVec2, UVec2};
     use std::sync::atomic::Ordering;
 
     /// A view over a fake image: layout tracking and region math need no device.
@@ -202,10 +186,12 @@ mod tests {
             image: vk::Image::from_raw(42),
             view: vk::ImageView::null(),
             mip_range: mips.into(),
+            extent: UVec2::new(64, 32),
             handle: BindlessHandle::none(),
-            layout,
+            layouts: std::slice::from_ref(layout),
             format: F::default(),
             usage: U::default(),
+            dim: D2,
         }
     }
 
@@ -253,9 +239,24 @@ mod tests {
     }
 
     #[test]
+    fn whole_covers_the_views_first_mip() {
+        let layout = undefined();
+        let slice = view::<R8G8B8A8Unorm, Sampled>(&layout, 1..2).whole();
+        assert_eq!(
+            (slice.offset, slice.extend),
+            (IVec2::ZERO, UVec2::new(64, 32))
+        );
+    }
+
+    #[test]
     fn taking_an_access_layout_reports_the_previous_one_and_stores_the_new_one() {
         let layout = undefined();
         let view = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
+        let taken = |access: &ImageUse| {
+            let mut old = None;
+            access.take_layouts(|_, layout| old = Some(layout));
+            old
+        };
 
         let first = view.access(
             vk::PipelineStageFlags2::TRANSFER,
@@ -278,44 +279,41 @@ mod tests {
             vk::ImageLayout::UNDEFINED.as_raw() as u32
         );
 
-        assert_eq!(first.take_layout(), vk::ImageLayout::UNDEFINED);
+        assert_eq!(taken(&first), Some(vk::ImageLayout::UNDEFINED));
         // Same layout again: no transition.
-        assert_eq!(first.take_layout(), vk::ImageLayout::GENERAL);
-        assert_eq!(present.take_layout(), vk::ImageLayout::GENERAL);
+        assert_eq!(taken(&first), None);
+        assert_eq!(taken(&present), Some(vk::ImageLayout::GENERAL));
         assert_eq!(
             layout.load(Ordering::Relaxed),
             vk::ImageLayout::PRESENT_SRC_KHR.as_raw() as u32
         );
     }
 
-    /// Views are `Copy`; all copies (and casts) of a view must track one layout per image.
+    /// Views are `Copy`; all copies (and casts) of a view must track the same layouts.
     #[test]
     fn copies_and_casts_share_the_layout_state() {
         let layout = undefined();
         let a = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
         let b = a;
         let c = a.cast(R8G8B8A8Unorm, Storage);
+        let taken = |access: ImageUse| {
+            let mut old = None;
+            access.take_layouts(|_, layout| old = Some(layout));
+            old
+        };
 
-        a.access(
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::ImageLayout::GENERAL,
-        )
-        .take_layout();
-        let from_copy = b.access(
+        let general = vk::ImageLayout::GENERAL;
+        let (stage, read) = (
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_READ,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         );
-        assert_eq!(from_copy.take_layout(), vk::ImageLayout::GENERAL);
-        let from_cast = c.access(
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_READ,
-            vk::ImageLayout::GENERAL,
-        );
+        taken(a.access(stage, vk::AccessFlags2::TRANSFER_WRITE, general));
+        let from_copy = b.access(stage, read, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        assert_eq!(taken(from_copy), Some(general));
+        let from_cast = c.access(stage, read, general);
         assert_eq!(
-            from_cast.take_layout(),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            taken(from_cast),
+            Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         );
     }
 }

@@ -21,6 +21,7 @@ use crate::{
     },
     error::Result,
     image::{
+        dim::Dim,
         format::{ColorAspect, DepthAspect, Format},
         slice::{ImageSlice, ImageView},
         usage::{ImageUsage, IsColorAttachment, IsDepthAttachment, IsTransferDst, IsTransferSrc},
@@ -50,21 +51,54 @@ pub(crate) struct ImageAccess {
     pub(crate) image: vk::Image,
     pub(crate) layout: vk::ImageLayout,
     pub(crate) aspect: vk::ImageAspectFlags,
+    pub(crate) mip_range: Range<u32>,
 }
 
-/// An image access of a command that isn't recorded yet, with the image's tracked layout,
-/// which only moves when the command is recorded (see [`compute_barriers`]).
+/// An image access of a command that isn't recorded yet, with the tracked layouts of its mips,
+/// which only move when the command is recorded (see [`compute_barriers`]).
 #[derive(Debug, Clone)]
 pub(crate) struct ImageUse<'a> {
     pub(crate) access: ImageAccess,
-    pub(crate) tracked_layout: &'a AtomicU32,
+    /// One layout for all of `access.mip_range`, or one per mip.
+    pub(crate) layouts: &'a [AtomicU32],
 }
 
 impl ImageUse<'_> {
-    /// Moves the image's tracked layout to the one the access asks for and returns the old one.
-    pub(crate) fn take_layout(&self) -> vk::ImageLayout {
-        let layout = self.access.layout.as_raw() as u32;
-        vk::ImageLayout::from_raw(self.tracked_layout.swap(layout, Ordering::Relaxed) as i32)
+    /// Moves the tracked layouts of the access's mips to the one it asks for, and calls
+    /// `transition(mips, old_layout)` once per run of neighbouring mips that had the same old
+    /// layout and need a transition.
+    pub(crate) fn take_layouts(&self, mut transition: impl FnMut(Range<u32>, vk::ImageLayout)) {
+        let new = self.access.layout;
+        let swap = |layout: &AtomicU32| {
+            vk::ImageLayout::from_raw(layout.swap(new.as_raw() as u32, Ordering::Relaxed) as i32)
+        };
+        let mips = self.access.mip_range;
+        if let [layout] = self.layouts {
+            let old = swap(layout);
+            if old != new {
+                transition(mips, old);
+            }
+            return;
+        }
+        let mut run: Option<(u32, vk::ImageLayout)> = None;
+        for (mip, layout) in (mips.start..).zip(self.layouts) {
+            let old = swap(layout);
+            match run {
+                Some((_, run_old)) if run_old == old => {}
+                Some((start, run_old)) => {
+                    if run_old != new {
+                        transition((start..mip).into(), run_old);
+                    }
+                    run = Some((mip, old));
+                }
+                None => run = Some((mip, old)),
+            }
+        }
+        if let Some((start, old)) = run
+            && old != new
+        {
+            transition((start..mips.end).into(), old);
+        }
     }
 }
 
@@ -177,9 +211,9 @@ impl<'a, K> BindingOutput<'a, K> {
 /// barriers recorded before the pass.
 impl<'a, K> BindingOutput<'a, K> {
     /// The pass samples `image` (`Tex2D`, or a `DynImg` with a sampled index).
-    pub fn sampled_read<F: Format, U: crate::image::usage::IsSampled>(
+    pub fn sampled_read<F: Format, U: crate::image::usage::IsSampled, D: Dim>(
         self,
-        image: ImageView<'a, F, U>,
+        image: ImageView<'a, F, U, D>,
     ) -> Self {
         image.usage_check(vk::ImageUsageFlags::SAMPLED);
         self.with_image(image, vk::AccessFlags2::SHADER_SAMPLED_READ)
@@ -187,18 +221,18 @@ impl<'a, K> BindingOutput<'a, K> {
 
     /// The pass loads from `image` as a storage image (`Image2D`, or a `DynImg` without a
     /// sampled index).
-    pub fn storage_read<F: Format, U: crate::image::usage::IsStorage>(
+    pub fn storage_read<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
         self,
-        image: ImageView<'a, F, U>,
+        image: ImageView<'a, F, U, D>,
     ) -> Self {
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         self.with_image(image, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
     /// The pass loads from and stores to `image` (`MutImage2D`).
-    pub fn storage_write<F: Format, U: crate::image::usage::IsStorage>(
+    pub fn storage_write<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
         self,
-        image: ImageView<'a, F, U>,
+        image: ImageView<'a, F, U, D>,
     ) -> Self {
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         self.with_image(
@@ -228,9 +262,9 @@ impl<'a, K> BindingOutput<'a, K> {
         )
     }
 
-    fn with_image<F: Format, U: ImageUsage>(
+    fn with_image<F: Format, U: ImageUsage, D: Dim>(
         mut self,
-        image: ImageView<'a, F, U>,
+        image: ImageView<'a, F, U, D>,
         access: vk::AccessFlags2,
     ) -> Self {
         self.images
@@ -896,9 +930,9 @@ impl CommandBuffer {
     }
 
     #[validation_trace]
-    pub fn clear_image<'a, F: Format, U: IsTransferDst>(
+    pub fn clear_image<'a, F: Format, U: IsTransferDst, D: Dim>(
         &'a mut self,
-        image: ImageView<'a, F, U>,
+        image: ImageView<'a, F, U, D>,
         clear_color: F::Texels,
     ) where
         F: ColorAspect,
@@ -947,10 +981,10 @@ impl CommandBuffer {
         };
     }
     #[validation_trace]
-    pub fn blit_image<'a, F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst>(
+    pub fn blit_image<'a, F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst, D: Dim>(
         &mut self,
-        src: ImageSlice<'a, F, U>,
-        dst: ImageSlice<'a, F2, U2>,
+        src: ImageSlice<'a, F, U, D>,
+        dst: ImageSlice<'a, F2, U2, D>,
         filter: Filter,
     ) where
         F: ColorAspect,
@@ -1027,10 +1061,17 @@ impl CommandBuffer {
     }
 
     #[validation_trace]
-    pub fn copy_buffer_to_image<'a, T: Copy + Pod, BU: BufferUsage, F: Format, U: IsTransferDst>(
+    pub fn copy_buffer_to_image<
+        'a,
+        T: Copy + Pod,
+        BU: BufferUsage,
+        F: Format,
+        U: IsTransferDst,
+        D: Dim,
+    >(
         &mut self,
         src: BufferSlice<'a, T, BU>,
-        dst: ImageSlice<'a, F, U>,
+        dst: ImageSlice<'a, F, U, D>,
     ) where
         F: ColorAspect,
     {
@@ -1049,20 +1090,12 @@ impl CommandBuffer {
             }),
         );
         let regions = [vk::BufferImageCopy {
-            image_extent: vk::Extent3D {
-                width: dst.extend.x,
-                height: dst.extend.y,
-                depth: 1,
-            },
+            image_extent: D::extent_3d(dst.extend),
             image_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
             buffer_image_height: 0,
             buffer_offset: src.offset(),
             buffer_row_length: 0,
-            image_offset: vk::Offset3D {
-                x: dst.offset.x,
-                y: dst.offset.y,
-                z: 0,
-            },
+            image_offset: D::offset_3d(dst.offset),
         }];
         unsafe {
             Ctx::device().cmd_copy_buffer_to_image(
@@ -1075,11 +1108,19 @@ impl CommandBuffer {
         };
     }
 
-    /// Copies the texels of `src` (its first mip level) into `dst`, tightly packed row by row.
+    /// Copies the texels of `src` (its view's first mip level) into `dst`, tightly packed row
+    /// by row (and slice by slice).
     #[validation_trace]
-    pub fn copy_image_to_buffer<'a, T: Copy + Pod, F: Format, U: IsTransferSrc, BU: BufferUsage>(
+    pub fn copy_image_to_buffer<
+        'a,
+        T: Copy + Pod,
+        F: Format,
+        U: IsTransferSrc,
+        BU: BufferUsage,
+        D: Dim,
+    >(
         &mut self,
-        src: ImageSlice<'a, F, U>,
+        src: ImageSlice<'a, F, U, D>,
         dst: BufferSlice<'a, T, BU>,
     ) where
         F: ColorAspect,
@@ -1099,20 +1140,12 @@ impl CommandBuffer {
             }),
         );
         let regions = [vk::BufferImageCopy {
-            image_extent: vk::Extent3D {
-                width: src.extend.x,
-                height: src.extend.y,
-                depth: 1,
-            },
+            image_extent: D::extent_3d(src.extend),
             image_subresource: src.view.subresource_layers(src.view.mip_range.start),
             buffer_image_height: 0,
             buffer_offset: dst.offset(),
             buffer_row_length: 0,
-            image_offset: vk::Offset3D {
-                x: src.offset.x,
-                y: src.offset.y,
-                z: 0,
-            },
+            image_offset: D::offset_3d(src.offset),
         }];
         unsafe {
             Ctx::device().cmd_copy_image_to_buffer(
@@ -1414,64 +1447,9 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
 
     let mut image_barriers: SmallVec<[vk::ImageMemoryBarrier2; 1]> = SmallVec::new();
     for image in image_acceses {
-        let old_layout = image.take_layout();
-        let image_access = &image.access;
-        if old_layout == image_access.layout {
-            continue;
-        }
-
-        // The transition waits for the image's tracked accesses. Without any, the image may
-        // still be in use by an earlier submission, or wait for a semaphore when it comes from
-        // the presentation engine, so it waits for everything.
-        let mut src_stage = vk::PipelineStageFlags2::NONE;
-        let mut src_access = vk::AccessFlags2::NONE;
-        for p in pending
-            .image_reads
-            .iter()
-            .chain(pending.image_writes.iter().map(|w| &w.write))
-            .filter(|r| r.image == image_access.image)
-        {
-            src_stage |= p.stage;
-            src_access |= p.access;
-        }
-        if src_stage.is_empty() || old_layout == vk::ImageLayout::PRESENT_SRC_KHR {
-            src_stage = vk::PipelineStageFlags2::ALL_COMMANDS;
-            src_access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
-        }
-
-        let mut dst_stage = image_access.stage;
-        let mut dst_access = image_access.access;
-        if dst_stage.is_empty() {
-            dst_stage = vk::PipelineStageFlags2::ALL_COMMANDS;
-        }
-        if dst_access.is_empty() {
-            dst_access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
-        }
-
-        if old_layout == vk::ImageLayout::PRESENT_SRC_KHR {
-            src_access = vk::AccessFlags2::NONE;
-        }
-        if image_access.layout == vk::ImageLayout::PRESENT_SRC_KHR {
-            dst_access = vk::AccessFlags2::NONE;
-        }
-
-        image_barriers.push(
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(src_stage)
-                .src_access_mask(src_access)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access)
-                .old_layout(old_layout)
-                .new_layout(image_access.layout)
-                .image(image_access.image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: image_access.aspect,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                }),
-        );
+        image.take_layouts(|mips, old_layout| {
+            image_barriers.push(transition_barrier(pending, &image.access, mips, old_layout))
+        });
     }
 
     if src_stage.is_empty() && dst_stage.is_empty() && image_barriers.is_empty() {
@@ -1496,6 +1474,66 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
             .dst_access_mask(dst_access),
         images: image_barriers,
     })
+}
+
+/// The barrier that moves `mips` of the image `image_access` accesses from `old_layout` into
+/// the layout it asks for.
+fn transition_barrier(
+    pending: &PendingAccesses,
+    image_access: &ImageAccess,
+    mips: Range<u32>,
+    old_layout: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier2<'static> {
+    // The transition waits for the image's tracked accesses. Without any, the image may
+    // still be in use by an earlier submission, or wait for a semaphore when it comes from
+    // the presentation engine, so it waits for everything.
+    let mut src_stage = vk::PipelineStageFlags2::NONE;
+    let mut src_access = vk::AccessFlags2::NONE;
+    for p in pending
+        .image_reads
+        .iter()
+        .chain(pending.image_writes.iter().map(|w| &w.write))
+        .filter(|r| r.image == image_access.image)
+    {
+        src_stage |= p.stage;
+        src_access |= p.access;
+    }
+    if src_stage.is_empty() || old_layout == vk::ImageLayout::PRESENT_SRC_KHR {
+        src_stage = vk::PipelineStageFlags2::ALL_COMMANDS;
+        src_access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
+    }
+
+    let mut dst_stage = image_access.stage;
+    let mut dst_access = image_access.access;
+    if dst_stage.is_empty() {
+        dst_stage = vk::PipelineStageFlags2::ALL_COMMANDS;
+    }
+    if dst_access.is_empty() {
+        dst_access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
+    }
+
+    if old_layout == vk::ImageLayout::PRESENT_SRC_KHR {
+        src_access = vk::AccessFlags2::NONE;
+    }
+    if image_access.layout == vk::ImageLayout::PRESENT_SRC_KHR {
+        dst_access = vk::AccessFlags2::NONE;
+    }
+
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(old_layout)
+        .new_layout(image_access.layout)
+        .image(image_access.image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: image_access.aspect,
+            base_array_layer: 0,
+            layer_count: 1,
+            base_mip_level: mips.start,
+            level_count: mips.end - mips.start,
+        })
 }
 
 impl PendingAccesses {
@@ -1607,21 +1645,19 @@ impl PendingAccesses {
 }
 
 /// Blit region covering the two slices: from each slice's offset to offset + extent.
-fn blit_region<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage>(
-    src: &ImageSlice<'_, F, U>,
-    dst: &ImageSlice<'_, F2, U2>,
+fn blit_region<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
+    src: &ImageSlice<'_, F, U, D>,
+    dst: &ImageSlice<'_, F2, U2, D>,
 ) -> vk::ImageBlit {
-    let corners = |offset: IVec2, extend: UVec2| {
+    let corners = |offset: D::Offset, extend: D::Extent| {
+        let start = D::offset_3d(offset);
+        let size = D::extent_3d(extend);
         [
+            start,
             vk::Offset3D {
-                x: offset.x,
-                y: offset.y,
-                z: 0,
-            },
-            vk::Offset3D {
-                x: offset.x + extend.x as i32,
-                y: offset.y + extend.y as i32,
-                z: 1,
+                x: start.x + size.width as i32,
+                y: start.y + size.height as i32,
+                z: start.z + size.depth as i32,
             },
         ]
     };
@@ -1719,8 +1755,9 @@ mod tests {
                 image: vk::Image::from_raw(id),
                 layout,
                 aspect: vk::ImageAspectFlags::COLOR,
+                mip_range: (0..1).into(),
             },
-            tracked_layout: Box::leak(Box::new(self::layout(old_layout))),
+            layouts: std::slice::from_ref(Box::leak(Box::new(self::layout(old_layout)))),
         }
     }
 
@@ -1783,10 +1820,12 @@ mod tests {
             image: vk::Image::from_raw(1),
             view: vk::ImageView::from_raw(2),
             mip_range: (0..1).into(),
+            extent: EXTENT,
             handle: crate::bindless::BindlessHandle::none(),
-            layout,
+            layouts: std::slice::from_ref(layout),
             format,
             usage,
+            dim: crate::image::D2,
         }
     }
 
@@ -2044,13 +2083,63 @@ mod tests {
             transition.subresource_range.aspect_mask,
             vk::ImageAspectFlags::COLOR
         );
+        // The access's mips: the helper's image has one.
+        let range = transition.subresource_range;
+        assert_eq!((range.base_mip_level, range.level_count), (0, 1));
+        assert_eq!((range.base_array_layer, range.layer_count), (0, 1));
+    }
+
+    /// Mips of a per-mip image that are in different layouts get one transition per run of
+    /// neighbours in the same layout, and the mips already in the wanted layout none.
+    #[test]
+    fn transitions_cover_runs_of_mips_in_the_same_layout() {
+        let layouts = [
+            L::UNDEFINED,
+            L::UNDEFINED,
+            L::GENERAL,
+            ATTACHMENT_LAYOUT,
+            L::UNDEFINED,
+        ]
+        .map(layout);
+        let access = |mips: std::ops::Range<u32>, wanted: L| {
+            let mut access = image(
+                7,
+                S::COMPUTE_SHADER,
+                A::SHADER_SAMPLED_READ,
+                L::GENERAL,
+                wanted,
+            );
+            access.access.mip_range = mips.clone().into();
+            access.layouts = &layouts[mips.start as usize..mips.end as usize];
+            access
+        };
+        let transitions = |access: &ImageUse| {
+            let barriers = image_barrier(&PendingAccesses::default(), access);
+            barriers.map_or(vec![], |barriers| {
+                let ranges = barriers.images.iter().map(|b| {
+                    let range = b.subresource_range;
+                    (range.base_mip_level, range.level_count, b.old_layout)
+                });
+                ranges.collect()
+            })
+        };
         assert_eq!(
-            transition.subresource_range.level_count,
-            vk::REMAINING_MIP_LEVELS
+            transitions(&access(0..5, L::GENERAL)),
+            [
+                (0, 2, L::UNDEFINED),
+                (3, 1, ATTACHMENT_LAYOUT),
+                (4, 1, L::UNDEFINED)
+            ]
+        );
+        assert_eq!(transitions(&access(0..5, L::GENERAL)), []);
+        // A view of one mip moves only that mip.
+        assert_eq!(
+            transitions(&access(3..4, ATTACHMENT_LAYOUT)),
+            [(3, 1, L::GENERAL)]
         );
         assert_eq!(
-            transition.subresource_range.layer_count,
-            vk::REMAINING_ARRAY_LAYERS
+            transitions(&access(2..5, L::GENERAL)),
+            [(3, 1, ATTACHMENT_LAYOUT)]
         );
     }
 
@@ -2423,7 +2512,9 @@ mod tests {
             A::SHADER_SAMPLED_READ,
             L::GENERAL,
         );
-        assert_eq!(sampled.take_layout(), ATTACHMENT_LAYOUT);
+        let mut old = None;
+        sampled.take_layouts(|_, layout| old = Some(layout));
+        assert_eq!(old, Some(ATTACHMENT_LAYOUT));
         assert_eq!(draw(&mut cmd), [(L::GENERAL, ATTACHMENT_LAYOUT)]);
     }
 

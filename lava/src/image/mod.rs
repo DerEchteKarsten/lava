@@ -1,113 +1,52 @@
-//! Format- and usage-typed GPU images with mip levels and host uploads, their type erasure and drop hook
+//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip, host uploads, type erasure and the drop hook
 use std::{
     mem::{self, ManuallyDrop},
+    range::Range,
     sync::{OnceLock, atomic::AtomicU32},
 };
 
 use crate::error::{Error, Result};
-use ash::vk::{self, ComponentSwizzle};
+use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use lava_macros::validation_trace;
 
 use crate::{
     bindless::{self, BindlessHandle},
+    command_buffer::{ImageAccess, ImageUse},
     image::{
         format::{Format, StaticFormat, bc_block},
+        slice::ImageView,
         usage::{ImageUsage, IsHostCopy, IsSampled, IsStorage, StaticUsage},
     },
     state::{Ctx, Functions},
 };
-use glam::UVec2;
 
+pub mod dim;
 pub mod format;
 pub mod slice;
 pub mod usage;
 
-/// A 2D image. Its format and usage are types (`format::R8Unorm`, `usage::Sampled`), which
-/// the command buffer's bounds check at compile time, or `format::Dynamic`/`usage::Dynamic`
-/// values, which it checks at runtime (`aspect_check`, `texel_check`, `usage_check`).
+pub use dim::{D2, D3, Dim};
+
+/// The `vk::Image` and its memory, shared by every kind of image. It has no public
+/// constructor, so only lava implements [`Views`].
 #[derive(Debug)]
-pub struct Image<F: Format, U: ImageUsage> {
-    pub(crate) image: vk::Image,
-    pub(crate) whole_view: vk::ImageView,
-    pub(crate) allocation: Allocation,
-    pub extent: UVec2,
-    pub handle: BindlessHandle,
-    pub mip_levels: u32,
-    /// The layout the image will be in once everything built so far is recorded. It changes
-    /// when an access is built (see `ImageView::access`), not when it is recorded.
-    pub(crate) layout: AtomicU32,
-    pub(crate) format: F,
-    pub(crate) usage: U,
+pub struct RawImage<F: Format, U: ImageUsage, D: Dim> {
+    image: vk::Image,
+    allocation: Allocation,
+    extent: D::Extent,
+    mip_levels: u32,
+    format: F,
+    usage: U,
 }
 
-/// An image whose format and usage are runtime values (`Image::erase`).
-pub type DynamicImage = Image<format::Dynamic, usage::Dynamic>;
-
-static ON_DROP: OnceLock<fn(&DynamicImage)> = OnceLock::new();
-
-/// Sets the function every dropped image calls with itself, erased, right before it is
-/// destroyed, so whoever picked its bindless indices can hand them out again. It can be set
-/// once.
-pub fn on_drop(hook: fn(&DynamicImage)) -> Result<()> {
-    ON_DROP
-        .set(hook)
-        .map_err(|_| Error::message("the image drop hook is already set"))
-}
-
-impl<F: Format, U: ImageUsage> Drop for Image<F, U> {
-    fn drop(&mut self) {
-        if let Some(hook) = ON_DROP.get() {
-            let format = format::Dynamic(self.format.vk_format());
-            let usage = usage::Dynamic(self.usage.flags());
-            // Lent to the hook and never dropped: the memory comes back to be freed below.
-            let mut image = ManuallyDrop::new(self.take(format, usage));
-            hook(&image);
-            self.allocation = mem::take(&mut image.allocation);
-        }
-        unsafe {
-            Ctx::device().destroy_image_view(self.whole_view, None);
-            Ctx::device().destroy_image(self.image, None);
-        }
-        let alloc = mem::take(&mut self.allocation);
-        if let Err(err) = Ctx::allocator().free(alloc) {
-            tracing::error!(%err, "failed to free image allocation");
-        }
-    }
-}
-
-impl<F: StaticFormat, U: StaticUsage> Image<F, U> {
-    /// Creates an image that is not bound in any bindless set: its `handle` is null.
-    #[validation_trace]
-    pub fn new(width: u32, height: u32) -> Result<Self> {
-        Self::with_mip_levels(width, height, 1)
-    }
-    #[validation_trace]
-    pub fn with_mip_levels(width: u32, height: u32, mip_levels: u32) -> Result<Self> {
-        Self::with_params(F::default(), U::default(), width, height, mip_levels)
-    }
-}
-
-impl<F: Format, U: ImageUsage> Image<F, U> {
-    /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included.
-    #[validation_trace]
-    pub fn with_params(
-        format: F,
-        usage: U,
-        width: u32,
-        height: u32,
-        mip_levels: u32,
-    ) -> Result<Self> {
-        let extent = vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        };
+impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
+    fn new(format: F, usage: U, extent: D::Extent, mip_levels: u32) -> Result<Self> {
         let create_info = vk::ImageCreateInfo {
             array_layers: 1,
-            extent,
+            extent: D::extent_3d(extent),
             format: format.vk_format(),
-            image_type: vk::ImageType::TYPE_2D,
+            image_type: D::IMAGE_TYPE,
             mip_levels,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
@@ -132,96 +71,392 @@ impl<F: Format, U: ImageUsage> Image<F, U> {
             name: "ImageMemory",
             requirements,
         };
-        let allocation = Ctx::allocator().allocate(&desc)?;
-
-        unsafe {
-            Ctx::device().bind_image_memory(image, allocation.memory(), allocation.offset())?
+        let allocation = match Ctx::allocator().allocate(&desc) {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                unsafe { Ctx::device().destroy_image(image, None) };
+                return Err(err.into());
+            }
         };
-
-        let mut s = Self {
+        // From here on `Drop` frees the image and its memory.
+        let raw = Self {
+            image,
+            allocation,
+            extent,
+            mip_levels,
             format,
             usage,
-            handle: BindlessHandle::none(),
-            allocation,
-            extent: UVec2::new(width, height),
-            mip_levels,
-            image,
-            whole_view: vk::ImageView::null(),
-            layout: AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32),
         };
-        s.whole_view = s
-            .create_new_view(
-                (0..mip_levels).into(),
-                vk::ComponentMapping {
-                    r: ComponentSwizzle::R,
-                    g: ComponentSwizzle::G,
-                    b: ComponentSwizzle::B,
-                    a: ComponentSwizzle::A,
-                },
+        unsafe {
+            Ctx::device().bind_image_memory(
+                image,
+                raw.allocation.memory(),
+                raw.allocation.offset(),
             )?
-            .view;
-        Ok(s)
+        };
+        Ok(raw)
     }
 
-    pub fn mip_extent(&self, level: u32) -> UVec2 {
-        mip_extent(self.extent, level)
+    fn create_view(&self, mips: Range<u32>) -> Result<vk::ImageView> {
+        let info = vk::ImageViewCreateInfo::default()
+            .image(self.image)
+            .view_type(D::VIEW_TYPE)
+            .format(self.format.vk_format())
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: self.format.aspects(),
+                base_mip_level: mips.start,
+                level_count: mips.end - mips.start,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        Ok(unsafe { Ctx::device().create_image_view(&info, None)? })
     }
 
-    pub fn format(&self) -> F {
-        self.format
-    }
-
-    pub fn usage(&self) -> U {
-        self.usage
-    }
-
-    /// Panics unless the format has the `required` aspects; does nothing for a static format.
-    pub fn aspect_check(&self, required: vk::ImageAspectFlags) {
-        self.format.aspect_check(required);
-    }
-
-    /// Panics unless the format's texels have the type `T`; does nothing for a static format.
-    pub fn texel_check<T: 'static>(&self) {
-        self.format.texel_check::<T>();
-    }
-
-    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
-    pub fn usage_check(&self, required: vk::ImageUsageFlags) {
-        self.usage.check(required);
-    }
-
-    /// The same image with another format and usage, unchecked: the image still has the
-    /// format and usage it was created with.
-    pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> Image<NF, NU> {
-        ManuallyDrop::new(self).take(format, usage)
-    }
-
-    /// The same image with its format and usage as runtime values, e.g. to keep images of
-    /// different types together. Commands check them at runtime.
-    pub fn erase(self) -> DynamicImage {
-        let format = format::Dynamic(self.format.vk_format());
-        let usage = usage::Dynamic(self.usage.flags());
-        self.cast(format, usage)
-    }
-
-    /// Moves the image into one of another format and usage, leaving `self` without memory;
-    /// `self` must not destroy its handles unless it gets the memory back.
-    fn take<NF: Format, NU: ImageUsage>(&mut self, format: NF, usage: NU) -> Image<NF, NU> {
-        Image {
-            image: self.image,
-            whole_view: self.whole_view,
-            allocation: mem::take(&mut self.allocation),
-            extent: self.extent,
-            handle: self.handle,
-            mip_levels: self.mip_levels,
-            layout: AtomicU32::new(*self.layout.get_mut()),
+    fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> RawImage<NF, NU, D> {
+        let mut this = ManuallyDrop::new(self);
+        RawImage {
+            image: this.image,
+            allocation: mem::take(&mut this.allocation),
+            extent: this.extent,
+            mip_levels: this.mip_levels,
             format,
             usage,
         }
     }
 }
 
-impl<F: Format, U: IsHostCopy> Image<F, U> {
+impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
+    /// Runs after the views are destroyed: `Image` declares `views` before `raw`.
+    fn drop(&mut self) {
+        unsafe { Ctx::device().destroy_image(self.image, None) };
+        if let Err(err) = Ctx::allocator().free(mem::take(&mut self.allocation)) {
+            tracing::error!(%err, "failed to free image allocation");
+        }
+    }
+}
+
+/// What an image keeps per view: [`Single`] or [`PerMip`]. Only lava implements it.
+pub trait Views: std::fmt::Debug + Send + Sync + 'static + Sized {
+    #[doc(hidden)]
+    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self>;
+    /// The view over every mip, its handle and the layouts it covers.
+    #[doc(hidden)]
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]);
+    #[doc(hidden)]
+    fn whole_handle(&mut self) -> &mut BindlessHandle;
+}
+
+/// One view over every mip, with one handle and one layout for all of them: render targets,
+/// and textures, whose mips are only sampled together and written by the host.
+#[derive(Debug)]
+pub struct Single {
+    view: vk::ImageView,
+    handle: BindlessHandle,
+    layout: AtomicU32,
+}
+
+/// The view over every mip plus one view per mip, each with its handle, and a layout per mip:
+/// for images whose mips the GPU accesses one at a time.
+#[derive(Debug)]
+pub struct PerMip {
+    view: vk::ImageView,
+    handle: BindlessHandle,
+    mips: Box<[MipView]>,
+    layouts: Box<[AtomicU32]>,
+}
+
+#[derive(Debug)]
+struct MipView {
+    view: vk::ImageView,
+    handle: BindlessHandle,
+}
+
+fn undefined() -> AtomicU32 {
+    AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32)
+}
+
+impl Views for Single {
+    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
+        Ok(Single {
+            view: raw.create_view((0..raw.mip_levels).into())?,
+            handle: BindlessHandle::none(),
+            layout: undefined(),
+        })
+    }
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
+        (self.view, self.handle, std::slice::from_ref(&self.layout))
+    }
+    fn whole_handle(&mut self) -> &mut BindlessHandle {
+        &mut self.handle
+    }
+}
+
+impl Views for PerMip {
+    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
+        // Built up front, so `Drop` destroys whatever was created before an error.
+        let mut views = PerMip {
+            view: vk::ImageView::null(),
+            handle: BindlessHandle::none(),
+            mips: Box::new([]),
+            layouts: (0..raw.mip_levels).map(|_| undefined()).collect(),
+        };
+        views.view = raw.create_view((0..raw.mip_levels).into())?;
+        let mut mips = Vec::with_capacity(raw.mip_levels as usize);
+        for mip in 0..raw.mip_levels {
+            match raw.create_view((mip..mip + 1).into()) {
+                Ok(view) => mips.push(MipView {
+                    view,
+                    handle: BindlessHandle::none(),
+                }),
+                Err(err) => {
+                    views.mips = mips.into();
+                    return Err(err);
+                }
+            }
+        }
+        views.mips = mips.into();
+        Ok(views)
+    }
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
+        (self.view, self.handle, &self.layouts)
+    }
+    fn whole_handle(&mut self) -> &mut BindlessHandle {
+        &mut self.handle
+    }
+}
+
+static ON_DROP: OnceLock<fn(BindlessHandle)> = OnceLock::new();
+
+/// Sets the function a dropped image calls with each handle it has that isn't null (its whole
+/// view's, then each mip's), right before the view is destroyed, so whoever picked the indices
+/// can hand them out again. It can be set once.
+pub fn on_drop(hook: fn(BindlessHandle)) -> Result<()> {
+    ON_DROP
+        .set(hook)
+        .map_err(|_| Error::message("the image drop hook is already set"))
+}
+
+fn release(view: vk::ImageView, handle: BindlessHandle) {
+    if handle != BindlessHandle::none()
+        && let Some(hook) = ON_DROP.get()
+    {
+        hook(handle);
+    }
+    unsafe { Ctx::device().destroy_image_view(view, None) };
+}
+
+impl Drop for Single {
+    fn drop(&mut self) {
+        release(self.view, self.handle);
+    }
+}
+
+impl Drop for PerMip {
+    fn drop(&mut self) {
+        release(self.view, self.handle);
+        for mip in &self.mips {
+            release(mip.view, mip.handle);
+        }
+    }
+}
+
+/// An image of format `F`, usage `U` and dimension `D`. Its format and usage are types
+/// (`format::R8Unorm`, `usage::Sampled`), which the command buffer's bounds check at compile
+/// time, or `format::Dynamic`/`usage::Dynamic` values, which it checks at runtime
+/// (`aspect_check`, `texel_check`, `usage_check`). A [`Single`] image (the default) has one view
+/// over all its mips, a [`MipChain`] also one per mip.
+#[derive(Debug)]
+pub struct Image<F: Format, U: ImageUsage, D: Dim = D2, V: Views = Single> {
+    // Dropped in this order: the views and their handles first, then the image.
+    views: V,
+    raw: RawImage<F, U, D>,
+}
+
+/// An image whose mips the GPU accesses one at a time ([`Image::mip_view`]).
+pub type MipChain<F, U, D = D2> = Image<F, U, D, PerMip>;
+
+/// An image whose format and usage are runtime values (`Image::erase`). The dimension stays a
+/// type: shaders declare it, so nothing needs it at runtime.
+pub type DynamicImage<D = D2, V = Single> = Image<format::Dynamic, usage::Dynamic, D, V>;
+
+impl<F: StaticFormat, U: StaticUsage, D: Dim, V: Views> Image<F, U, D, V> {
+    /// Creates an image that is not bound in any bindless set: its handles are null.
+    #[validation_trace]
+    pub fn new(extent: D::Extent) -> Result<Self> {
+        Self::with_mip_levels(extent, 1)
+    }
+    #[validation_trace]
+    pub fn with_mip_levels(extent: D::Extent, mip_levels: u32) -> Result<Self> {
+        Self::with_params(F::default(), U::default(), extent, mip_levels)
+    }
+}
+
+impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
+    /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included.
+    #[validation_trace]
+    pub fn with_params(format: F, usage: U, extent: D::Extent, mip_levels: u32) -> Result<Self> {
+        let raw = RawImage::new(format, usage, extent, mip_levels)?;
+        Ok(Image {
+            views: V::create(&raw)?,
+            raw,
+        })
+    }
+
+    /// The extent of mip 0.
+    pub fn extent(&self) -> D::Extent {
+        self.raw.extent
+    }
+
+    pub fn mip_levels(&self) -> u32 {
+        self.raw.mip_levels
+    }
+
+    pub fn mip_extent(&self, level: u32) -> D::Extent {
+        D::mip_extent(self.raw.extent, level)
+    }
+
+    pub fn format(&self) -> F {
+        self.raw.format
+    }
+
+    pub fn usage(&self) -> U {
+        self.raw.usage
+    }
+
+    /// The whole view's handle.
+    pub fn handle(&self) -> BindlessHandle {
+        self.views.whole().1
+    }
+
+    /// Panics unless the format has the `required` aspects; does nothing for a static format.
+    pub fn aspect_check(&self, required: vk::ImageAspectFlags) {
+        self.raw.format.aspect_check(required);
+    }
+
+    /// Panics unless the format's texels have the type `T`; does nothing for a static format.
+    pub fn texel_check<T: 'static>(&self) {
+        self.raw.format.texel_check::<T>();
+    }
+
+    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
+    pub fn usage_check(&self, required: vk::ImageUsageFlags) {
+        self.raw.usage.check(required);
+    }
+
+    /// The view over every mip.
+    pub fn whole_view(&self) -> ImageView<'_, F, U, D> {
+        let (view, handle, layouts) = self.views.whole();
+        self.view(view, (0..self.raw.mip_levels).into(), handle, layouts)
+    }
+
+    fn view<'a>(
+        &'a self,
+        view: vk::ImageView,
+        mip_range: Range<u32>,
+        handle: BindlessHandle,
+        layouts: &'a [AtomicU32],
+    ) -> ImageView<'a, F, U, D> {
+        ImageView {
+            image: self.raw.image,
+            view,
+            mip_range,
+            extent: self.mip_extent(mip_range.start),
+            handle,
+            layouts,
+            format: self.raw.format,
+            usage: self.raw.usage,
+            dim: D::default(),
+        }
+    }
+
+    /// The same image with another format and usage, unchecked: the image still has the
+    /// format and usage it was created with.
+    pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> Image<NF, NU, D, V> {
+        Image {
+            views: self.views,
+            raw: self.raw.cast(format, usage),
+        }
+    }
+
+    /// The same image with its format and usage as runtime values, e.g. to keep images of
+    /// different types together. Commands check them at runtime.
+    pub fn erase(self) -> DynamicImage<D, V> {
+        let format = format::Dynamic(self.raw.format.vk_format());
+        let usage = usage::Dynamic(self.raw.usage.flags());
+        self.cast(format, usage)
+    }
+}
+
+impl<F: Format, U: IsSampled, D: Dim, V: Views> Image<F, U, D, V> {
+    /// Binds the whole view at `index` of the sampled set, right away:
+    /// `Image::new(extent)?.bind_sampled(index)`.
+    #[validation_trace]
+    pub fn bind_sampled(mut self, index: u32) -> Self {
+        self.views.whole_handle().descriptor_index_set0 = index;
+        bindless::bind([self.whole_view()], [BindlessHandle::sampled(index)]);
+        self
+    }
+}
+
+impl<F: Format, U: IsStorage, D: Dim, V: Views> Image<F, U, D, V> {
+    /// Binds the whole view at `index` of the storage set, right away. An image with both
+    /// usages can be bound in both sets: `.bind_sampled(a).bind_storage(b)`.
+    #[validation_trace]
+    pub fn bind_storage(mut self, index: u32) -> Self {
+        self.views.whole_handle().descriptor_index_set1 = index;
+        bindless::bind([self.whole_view()], [BindlessHandle::storage(index)]);
+        self
+    }
+}
+
+impl<F: Format, U: ImageUsage, D: Dim> MipChain<F, U, D> {
+    /// The view of mip `level` alone, sized `mip_extent(level)`: for a storage write, an
+    /// attachment or a copy of one mip. The whole view samples across mips.
+    pub fn mip_view(&self, level: u32) -> ImageView<'_, F, U, D> {
+        let mip = &self.views.mips[level as usize];
+        let layouts = std::slice::from_ref(&self.views.layouts[level as usize]);
+        self.view(mip.view, (level..level + 1).into(), mip.handle, layouts)
+    }
+
+    /// Binds mip `i`'s view at `first + i` of the sampled (`sampled`) or the storage set.
+    fn bind_mips(mut self, first: u32, sampled: bool) -> Self {
+        for (i, mip) in self.views.mips.iter_mut().enumerate() {
+            let index = first + i as u32;
+            if sampled {
+                mip.handle.descriptor_index_set0 = index;
+            } else {
+                mip.handle.descriptor_index_set1 = index;
+            }
+        }
+        let levels = 0..self.mip_levels();
+        bindless::bind(
+            levels.clone().map(|level| self.mip_view(level)),
+            levels.map(|level| match sampled {
+                true => BindlessHandle::sampled(first + level),
+                false => BindlessHandle::storage(first + level),
+            }),
+        );
+        self
+    }
+}
+
+impl<F: Format, U: IsSampled, D: Dim> MipChain<F, U, D> {
+    /// Binds mip `i`'s view at `first + i` of the sampled set, right away.
+    #[validation_trace]
+    pub fn bind_mips_sampled(self, first: u32) -> Self {
+        self.bind_mips(first, true)
+    }
+}
+
+impl<F: Format, U: IsStorage, D: Dim> MipChain<F, U, D> {
+    /// Binds mip `i`'s view at `first + i` of the storage set, right away.
+    #[validation_trace]
+    pub fn bind_mips_storage(self, first: u32) -> Self {
+        self.bind_mips(first, false)
+    }
+}
+
+impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
     /// Writes a whole mip level from the host, right away. Like anything a command buffer
     /// doesn't record, it isn't synchronised with the GPU: frames in flight that read the image
     /// may see the old or the new texels, or a mix.
@@ -229,50 +464,28 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
         self.check_host_copy(data, mip_level)?;
         let extent = self.mip_extent(mip_level);
-        let expected = expected_data_len(
-            extent,
-            self.format.texel_size(),
-            bc_block(self.format.vk_format()),
-        );
-        if expected.is_some_and(|expected| data.len() != expected) {
-            return Err(Error::message(format!(
-                "mip level {mip_level} holds {} bytes but {} were given",
-                expected.unwrap_or_default(),
-                data.len()
-            )));
-        }
-        self.host_copy(data, mip_level, UVec2::ZERO, extent)
+        self.check_data_len(data, extent, || format!("mip level {mip_level}"))?;
+        self.host_copy(data, mip_level, D::ZERO, extent)
     }
 
     /// Like `copy_from` (also unsynchronised), but only writes the `extent` texels at `offset`
-    /// of the mip level. `data` holds that rectangle, tightly packed.
+    /// of the mip level. `data` holds that box, tightly packed.
     #[validation_trace]
     pub fn copy_region_from(
         &mut self,
         data: &[u8],
         mip_level: u32,
-        offset: UVec2,
-        extent: UVec2,
+        offset: D::Extent,
+        extent: D::Extent,
     ) -> Result<()> {
         self.check_host_copy(data, mip_level)?;
         let mip_extent = self.mip_extent(mip_level);
-        if !region_fits(mip_extent, offset, extent) {
+        if !D::region_fits(mip_extent, offset, extent) {
             return Err(Error::message(format!(
-                "region {extent} at {offset} does not fit mip level {mip_level} of size {mip_extent}"
+                "region {extent:?} at {offset:?} does not fit mip level {mip_level} of size {mip_extent:?}"
             )));
         }
-        let expected = expected_data_len(
-            extent,
-            self.format.texel_size(),
-            bc_block(self.format.vk_format()),
-        );
-        if expected.is_some_and(|expected| data.len() != expected) {
-            return Err(Error::message(format!(
-                "the region holds {} bytes but {} were given",
-                expected.unwrap_or_default(),
-                data.len()
-            )));
-        }
+        self.check_data_len(data, extent, || "the region".to_string())?;
         self.host_copy(data, mip_level, offset, extent)
     }
 
@@ -283,10 +496,10 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
                 "host image copies need host-visible device memory, which this device lacks",
             ));
         }
-        if mip_level >= self.mip_levels {
+        if mip_level >= self.raw.mip_levels {
             return Err(Error::message(format!(
                 "mip level {mip_level} is out of range for an image with {} levels",
-                self.mip_levels
+                self.raw.mip_levels
             )));
         }
         if data.is_empty() {
@@ -295,39 +508,76 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
         Ok(())
     }
 
+    fn check_data_len(
+        &self,
+        data: &[u8],
+        extent: D::Extent,
+        what: impl FnOnce() -> String,
+    ) -> Result<()> {
+        let format = self.raw.format;
+        let expected = expected_data_len(
+            D::extent_3d(extent),
+            format.texel_size(),
+            bc_block(format.vk_format()),
+        );
+        match expected {
+            Some(expected) if data.len() != expected => Err(Error::message(format!(
+                "{} holds {expected} bytes but {} were given",
+                what(),
+                data.len()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn host_copy(
         &mut self,
         data: &[u8],
         mip_level: u32,
-        offset: UVec2,
-        extent: UVec2,
+        offset: D::Extent,
+        extent: D::Extent,
     ) -> Result<()> {
-        let range = self.whole_view().subresource_range();
-        let layout = self.layout.get_mut();
-        let old_layout = vk::ImageLayout::from_raw(*layout as i32);
-        if old_layout != vk::ImageLayout::GENERAL {
-            *layout = vk::ImageLayout::GENERAL.as_raw() as u32;
-            let transition = vk::HostImageLayoutTransitionInfoEXT::default()
-                .image(self.image)
-                .old_layout(old_layout)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .subresource_range(range);
-            unsafe { Functions::host_image_copy().transition_image_layout(&[transition])? };
+        let image = self.raw.image;
+        let aspect = self.raw.format.aspects();
+        let (_, _, layouts) = self.views.whole();
+        // Every mip not in `GENERAL` yet moves there, as if a command accessed the whole view.
+        let to_general = ImageUse {
+            access: ImageAccess {
+                stage: vk::PipelineStageFlags2::HOST,
+                access: vk::AccessFlags2::HOST_WRITE,
+                image,
+                layout: vk::ImageLayout::GENERAL,
+                aspect,
+                mip_range: (0..self.raw.mip_levels).into(),
+            },
+            layouts,
+        };
+        let mut transitions: smallvec::SmallVec<[vk::HostImageLayoutTransitionInfoEXT; 1]> =
+            smallvec::SmallVec::new();
+        to_general.take_layouts(|mips, old_layout| {
+            transitions.push(
+                vk::HostImageLayoutTransitionInfoEXT::default()
+                    .image(image)
+                    .old_layout(old_layout)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: aspect,
+                        base_mip_level: mips.start,
+                        level_count: mips.end - mips.start,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }),
+            )
+        });
+        if !transitions.is_empty() {
+            unsafe { Functions::host_image_copy().transition_image_layout(&transitions)? };
         }
         let regions = [vk::MemoryToImageCopyEXT::default()
             .host_pointer(data.as_ptr().cast())
-            .image_offset(vk::Offset3D {
-                x: offset.x as i32,
-                y: offset.y as i32,
-                z: 0,
-            })
-            .image_extent(vk::Extent3D {
-                width: extent.x,
-                height: extent.y,
-                depth: 1,
-            })
+            .image_offset(D::unsigned_offset_3d(offset))
+            .image_extent(D::extent_3d(extent))
             .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: self.format.aspects(),
+                aspect_mask: aspect,
                 mip_level,
                 base_array_layer: 0,
                 layer_count: 1,
@@ -337,7 +587,7 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
             .memory_image_height(0)
             .memory_row_length(0)];
         let info = vk::CopyMemoryToImageInfoEXT::default()
-            .dst_image(self.image)
+            .dst_image(image)
             .dst_image_layout(vk::ImageLayout::GENERAL)
             .regions(&regions);
         unsafe { Functions::host_image_copy().copy_memory_to_image(&info)? };
@@ -345,85 +595,47 @@ impl<F: Format, U: IsHostCopy> Image<F, U> {
     }
 }
 
-impl<F: Format, U: IsSampled> Image<F, U> {
-    /// Binds the image at `index` of the sampled set, right away:
-    /// `Image::new(w, h)?.bind_sampled(index)`.
-    #[validation_trace]
-    pub fn bind_sampled(mut self, index: u32) -> Self {
-        self.handle.descriptor_index_set0 = index;
-        bindless::bind([self.whole_view()], [BindlessHandle::sampled(index)]);
-        self
-    }
-}
-
-impl<F: Format, U: IsStorage> Image<F, U> {
-    /// Binds the image at `index` of the storage set, right away. An image with both usages
-    /// can be bound in both sets: `.bind_sampled(a).bind_storage(b)`.
-    #[validation_trace]
-    pub fn bind_storage(mut self, index: u32) -> Self {
-        self.handle.descriptor_index_set1 = index;
-        bindless::bind([self.whole_view()], [BindlessHandle::storage(index)]);
-        self
-    }
-}
-
-/// Extent of mip `level` of an image whose level 0 is `extent`: halved per level, at least 1.
-pub fn mip_extent(extent: UVec2, level: u32) -> UVec2 {
-    UVec2::new(
-        extent.x.checked_shr(level).unwrap_or(0).max(1),
-        extent.y.checked_shr(level).unwrap_or(0).max(1),
-    )
-}
-
-/// Bytes of tightly packed texel data for an image of `extent`: texels of `texel_size` bytes,
-/// or whole blocks of `(side length, bytes)` when there is no fixed texel size
+/// Bytes of tightly packed texel data for a box of `extent`: texels of `texel_size` bytes,
+/// or whole blocks of `(side length, bytes)` (one texel deep) when there is no fixed texel size
 /// (`texel_size == 0`). `None` when the format has neither, so the length can't be checked.
 fn expected_data_len(
-    extent: UVec2,
+    extent: vk::Extent3D,
     texel_size: usize,
     block: Option<(u32, usize)>,
 ) -> Option<usize> {
+    let depth = extent.depth as usize;
     if texel_size != 0 {
-        return Some(extent.x as usize * extent.y as usize * texel_size);
+        return Some(extent.width as usize * extent.height as usize * depth * texel_size);
     }
     let (side, bytes) = block?;
-    Some(extent.x.div_ceil(side) as usize * extent.y.div_ceil(side) as usize * bytes)
-}
-
-/// Whether the `extent` rectangle at `offset` is non-empty and lies inside `mip_extent`.
-fn region_fits(mip_extent: UVec2, offset: UVec2, extent: UVec2) -> bool {
-    extent.cmpgt(UVec2::ZERO).all()
-        && offset.cmple(mip_extent).all()
-        && extent.cmple(mip_extent - offset.min(mip_extent)).all()
+    Some(
+        extent.width.div_ceil(side) as usize
+            * extent.height.div_ceil(side) as usize
+            * depth
+            * bytes,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn regions_must_lie_inside_the_mip() {
-        let mip = UVec2::new(8, 4);
-        assert!(region_fits(mip, UVec2::ZERO, mip));
-        assert!(region_fits(mip, UVec2::new(6, 3), UVec2::new(2, 1)));
-        assert!(!region_fits(mip, UVec2::new(6, 3), UVec2::new(3, 1)));
-        assert!(!region_fits(mip, UVec2::new(9, 0), UVec2::ONE));
-        assert!(!region_fits(mip, UVec2::ZERO, UVec2::new(0, 4)));
-        // Offsets near `u32::MAX` must not overflow.
-        assert!(!region_fits(
-            mip,
-            UVec2::splat(u32::MAX),
-            UVec2::splat(u32::MAX)
-        ));
+    fn extent(width: u32, height: u32, depth: u32) -> vk::Extent3D {
+        vk::Extent3D {
+            width,
+            height,
+            depth,
+        }
     }
 
     #[test]
     fn expected_data_len_is_texels_times_texel_size() {
-        assert_eq!(expected_data_len(UVec2::new(8, 4), 4, None), Some(128));
-        assert_eq!(expected_data_len(UVec2::new(3, 5), 1, None), Some(15));
-        assert_eq!(expected_data_len(UVec2::new(1, 1), 16, None), Some(16));
+        assert_eq!(expected_data_len(extent(8, 4, 1), 4, None), Some(128));
+        assert_eq!(expected_data_len(extent(3, 5, 1), 1, None), Some(15));
+        assert_eq!(expected_data_len(extent(1, 1, 1), 16, None), Some(16));
+        assert_eq!(expected_data_len(extent(2, 2, 3), 2, None), Some(24));
         // Block-compressed and runtime-defined formats can't be checked.
-        assert_eq!(expected_data_len(UVec2::new(8, 4), 0, None), None);
+        assert_eq!(expected_data_len(extent(8, 4, 1), 0, None), None);
     }
 
     #[test]
@@ -432,27 +644,11 @@ mod tests {
         assert_eq!(bc7, Some((4, 16)));
         assert_eq!(bc_block(vk::Format::BC4_UNORM_BLOCK), Some((4, 8)));
         assert_eq!(bc_block(vk::Format::R8G8B8A8_UNORM), None);
-        assert_eq!(expected_data_len(UVec2::new(8, 4), 0, bc7), Some(32));
+        assert_eq!(expected_data_len(extent(8, 4, 1), 0, bc7), Some(32));
         // Mips smaller than a block, or not a multiple of it, still take whole blocks.
-        assert_eq!(expected_data_len(UVec2::new(1, 1), 0, bc7), Some(16));
-        assert_eq!(expected_data_len(UVec2::new(6, 2), 0, bc7), Some(32));
-    }
-
-    #[test]
-    fn mip_extent_halves_per_level() {
-        let extent = UVec2::new(256, 64);
-        assert_eq!(mip_extent(extent, 0), UVec2::new(256, 64));
-        assert_eq!(mip_extent(extent, 1), UVec2::new(128, 32));
-        assert_eq!(mip_extent(extent, 6), UVec2::new(4, 1));
-    }
-
-    #[test]
-    fn mip_extent_rounds_down_and_never_reaches_zero() {
-        assert_eq!(mip_extent(UVec2::new(5, 3), 1), UVec2::new(2, 1));
-        assert_eq!(mip_extent(UVec2::new(5, 3), 2), UVec2::new(1, 1));
-        assert_eq!(mip_extent(UVec2::new(5, 3), 31), UVec2::new(1, 1));
-        // Shifting by the full bit width must not overflow.
-        assert_eq!(mip_extent(UVec2::new(5, 3), 32), UVec2::new(1, 1));
-        assert_eq!(mip_extent(UVec2::new(5, 3), 200), UVec2::new(1, 1));
+        assert_eq!(expected_data_len(extent(1, 1, 1), 0, bc7), Some(16));
+        assert_eq!(expected_data_len(extent(6, 2, 1), 0, bc7), Some(32));
+        // A 3D image's blocks are one texel deep.
+        assert_eq!(expected_data_len(extent(4, 4, 3), 0, bc7), Some(48));
     }
 }
