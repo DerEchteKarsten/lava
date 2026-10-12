@@ -1,8 +1,5 @@
 //! Borrowed image views and 2D slices, with per-image layout tracking for barriers
-use std::{
-    range::Range,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::{range::Range, sync::atomic::AtomicU32};
 
 use ash::vk::{self, Offset3D};
 use bytemuck::Zeroable;
@@ -11,7 +8,7 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindless::BindlessHandle,
-    command_buffer::ImageAccess,
+    command_buffer::{ImageAccess, ImageUse},
     error::Result,
     image::{Image, format::Format, usage::ImageUsage},
     state::Ctx,
@@ -89,35 +86,23 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U> {
         }
     }
 
-    /// The access of a command that wants the image in `layout`. It takes the image's tracked
-    /// layout as its `old_layout` and sets the tracked layout to `layout` right away, when the
-    /// access is built, not when the command is recorded. That way lava doesn't have to track
-    /// every image's layout per command buffer, but the accesses have to be recorded in the
-    /// order they were built:
-    /// - build bindings (`push_bindings`, `color_attachment`, `depth_attachment`) right before
-    ///   recording them, and don't build one for an image another unrecorded one also uses;
-    /// - don't drop a built binding unrecorded: the image keeps the layout it never got;
-    /// - don't record command buffers that use the same image on several threads at once, or
-    ///   submit them in another order than they were recorded.
-    ///
-    /// Getting this wrong gives a layout transition from the wrong `old_layout`, which the
-    /// validation layer reports.
+    /// The access of a command that wants the image in `layout`. It borrows the image's
+    /// tracked layout, which moves to `layout` only when the command is recorded.
     pub(crate) fn access(
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
         layout: vk::ImageLayout,
-    ) -> ImageAccess {
-        let old_layout = vk::ImageLayout::from_raw(
-            self.layout.swap(layout.as_raw() as u32, Ordering::Relaxed) as i32,
-        );
-        ImageAccess {
-            stage,
-            access,
-            image: self.image,
-            layout,
-            aspect: self.format.aspects(),
-            old_layout,
+    ) -> ImageUse<'a> {
+        ImageUse {
+            access: ImageAccess {
+                stage,
+                access,
+                image: self.image,
+                layout,
+                aspect: self.format.aspects(),
+            },
+            tracked_layout: self.layout,
         }
     }
 }
@@ -206,6 +191,7 @@ mod tests {
         usage::{DepthAttachment, Sampled, StaticUsage, Storage},
     };
     use ash::vk::Handle;
+    use std::sync::atomic::Ordering;
 
     /// A view over a fake image: layout tracking and region math need no device.
     fn view<F: StaticFormat, U: StaticUsage>(
@@ -267,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn access_reports_the_previous_layout_and_stores_the_new_one() {
+    fn taking_an_access_layout_reports_the_previous_one_and_stores_the_new_one() {
         let layout = undefined();
         let view = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
 
@@ -276,27 +262,26 @@ mod tests {
             vk::AccessFlags2::TRANSFER_WRITE,
             vk::ImageLayout::GENERAL,
         );
-        assert_eq!(first.old_layout, vk::ImageLayout::UNDEFINED);
-        assert_eq!(first.layout, vk::ImageLayout::GENERAL);
-        assert_eq!(first.image, vk::Image::from_raw(42));
-        assert_eq!(first.aspect, vk::ImageAspectFlags::COLOR);
-        assert_eq!(first.stage, vk::PipelineStageFlags2::TRANSFER);
-        assert_eq!(first.access, vk::AccessFlags2::TRANSFER_WRITE);
-
-        // Same layout again: no transition pending.
-        let second = view.access(
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_STORAGE_READ,
-            vk::ImageLayout::GENERAL,
-        );
-        assert_eq!(second.old_layout, vk::ImageLayout::GENERAL);
-
+        assert_eq!(first.access.layout, vk::ImageLayout::GENERAL);
+        assert_eq!(first.access.image, vk::Image::from_raw(42));
+        assert_eq!(first.access.aspect, vk::ImageAspectFlags::COLOR);
+        assert_eq!(first.access.stage, vk::PipelineStageFlags2::TRANSFER);
+        assert_eq!(first.access.access, vk::AccessFlags2::TRANSFER_WRITE);
         let present = view.access(
             vk::PipelineStageFlags2::empty(),
             vk::AccessFlags2::empty(),
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
-        assert_eq!(present.old_layout, vk::ImageLayout::GENERAL);
+        // Building accesses leaves the layout alone.
+        assert_eq!(
+            layout.load(Ordering::Relaxed),
+            vk::ImageLayout::UNDEFINED.as_raw() as u32
+        );
+
+        assert_eq!(first.take_layout(), vk::ImageLayout::UNDEFINED);
+        // Same layout again: no transition.
+        assert_eq!(first.take_layout(), vk::ImageLayout::GENERAL);
+        assert_eq!(present.take_layout(), vk::ImageLayout::GENERAL);
         assert_eq!(
             layout.load(Ordering::Relaxed),
             vk::ImageLayout::PRESENT_SRC_KHR.as_raw() as u32
@@ -315,18 +300,22 @@ mod tests {
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_WRITE,
             vk::ImageLayout::GENERAL,
-        );
+        )
+        .take_layout();
         let from_copy = b.access(
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_READ,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         );
-        assert_eq!(from_copy.old_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(from_copy.take_layout(), vk::ImageLayout::GENERAL);
         let from_cast = c.access(
             vk::PipelineStageFlags2::TRANSFER,
             vk::AccessFlags2::TRANSFER_READ,
             vk::ImageLayout::GENERAL,
         );
-        assert_eq!(from_cast.old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        assert_eq!(
+            from_cast.take_layout(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        );
     }
 }

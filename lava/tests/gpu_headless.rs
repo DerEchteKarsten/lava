@@ -1062,7 +1062,7 @@ fn specialization_constants_pick_the_pipeline() {
 
 // ---- raster passes ---------------------------------------------------------------------------
 
-fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<kind::RasterVertex> {
+fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<'_, kind::RasterVertex> {
     TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
 }
 

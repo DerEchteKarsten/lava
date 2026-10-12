@@ -268,7 +268,6 @@ unsafe impl bytemuck::Zeroable for {name} {{}}
 }
 
 struct NewFn {
-    lifetime: bool,
     generics: Vec<String>,
     params: Vec<String>,
     gpu_inits: Vec<String>,
@@ -285,7 +284,6 @@ fn build_new_fn<'a>(
     stage: &str,
 ) -> NewFn {
     let mut out = NewFn {
-        lifetime: false,
         generics: Vec::new(),
         params: Vec::new(),
         gpu_inits: Vec::new(),
@@ -298,7 +296,6 @@ fn build_new_fn<'a>(
         let suffix = camel_case(name);
         match field_kind(t) {
             FieldKind::Image { usage } => {
-                out.lifetime = true;
                 let format_bound = match image_texel(t) {
                     Some((texel, components)) => {
                         let texels = format!("[{texel}; {components}]");
@@ -327,7 +324,6 @@ fn build_new_fn<'a>(
                 ));
             }
             FieldKind::Buffer => {
-                out.lifetime = true;
                 let ptr = t.field_by_index(0).unwrap().type_layout().unwrap();
                 let inner = rust_type(ptr.element_type_layout().unwrap(), structs);
                 let ty = format!("BufferSlice<'a, {inner}, U{suffix}>");
@@ -583,7 +579,7 @@ fn generate_pass(
         structs,
         stage,
     );
-    let output = format!("BindingOutput<kind::{kind_marker}>");
+    let output = format!("BindingOutput<'a, kind::{kind_marker}>");
     let incomplete = format!("Incomplete{pass_name}");
 
     let binding_output = format!(
@@ -608,7 +604,7 @@ fn generate_pass(
         (output.clone(), binding_output)
     } else {
         (
-            incomplete.clone(),
+            format!("{incomplete}<'a>"),
             format!("{incomplete}({binding_output})"),
         )
     };
@@ -625,7 +621,7 @@ impl {pass_name} {{
     }}
 }}
 "#,
-        generics = fn_generics(&push),
+        generics = fn_generics(&push, true),
         params = push.params.join(", "),
         checks = push.checks.join("\n        "),
     ));
@@ -663,9 +659,9 @@ unsafe impl bytemuck::Pod for {consts_name} {{}}
 unsafe impl bytemuck::Zeroable for {consts_name} {{}}
 
 #[must_use = "`{pass_name}` has specialization constants: call `.constant_bindings(..)`"]
-pub struct {incomplete}({output});
+pub struct {incomplete}<'a>({output});
 
-impl {incomplete} {{
+impl<'a> {incomplete}<'a> {{
     pub fn constant_bindings{generics}(self, {params}) -> {output} {{
         {checks}
         self.0.with_constants(
@@ -683,7 +679,7 @@ impl {incomplete} {{
 }}
 "#,
             fields = fields.join("\n"),
-            generics = fn_generics(&new),
+            generics = fn_generics(&new, false),
             params = new.params.join(", "),
             checks = new.checks.join("\n        "),
             gpu_inits = gpu_inits.join(", "),
@@ -703,9 +699,11 @@ impl {incomplete} {{
 }
 
 /// `<'a, F…, U…>` of a generated function, empty without parameters that borrow.
-fn fn_generics(new: &NewFn) -> String {
+/// The generics of a generated function; `lifetime` adds the `'a` its views, slices and
+/// result share.
+fn fn_generics(new: &NewFn, lifetime: bool) -> String {
     let mut generics: Vec<String> = Vec::new();
-    if new.lifetime {
+    if lifetime {
         generics.push("'a".to_string());
     }
     generics.extend(new.generics.iter().cloned());
