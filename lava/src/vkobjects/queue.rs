@@ -1,4 +1,5 @@
 //! Queue submission and sync: queue leases, semaphores, fences, frame slots, presenting
+use ash::vk::TaggedStructure;
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -68,7 +69,7 @@ impl SemaphoreType for Timeline {
             semaphore_type: vk::SemaphoreType::TIMELINE,
             ..Default::default()
         };
-        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
+        let create_info = vk::SemaphoreCreateInfo::default().push(&mut timeline);
         let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
         Ok(Semaphore {
             handle,

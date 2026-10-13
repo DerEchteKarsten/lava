@@ -1,4 +1,5 @@
 //! Pass queries: pipeline statistics and hardware performance counters (`VK_KHR_performance_query`) per pass and rendering of a frame slot, the device's counters, and the profiling lock
+use ash::vk::TaggedStructure;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
@@ -285,7 +286,7 @@ impl PassQueries {
                         &vk::QueryPoolCreateInfo::default()
                             .query_type(vk::QueryType::PERFORMANCE_QUERY_KHR)
                             .query_count(QUERIES)
-                            .push_next(&mut info),
+                            .push(&mut info),
                         None,
                     )
                 };

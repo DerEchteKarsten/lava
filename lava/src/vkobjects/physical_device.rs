@@ -1,4 +1,5 @@
 //! Physical device selection and queue family capability discovery
+use ash::vk::TaggedStructure;
 use std::ffi::CStr;
 
 use crate::error::{Error, Result};
@@ -55,6 +56,8 @@ pub struct PhysicalDevice {
     pub supported_extensions: Vec<String>,
     pub supported_features: Features,
     pub bindless_supported: bool,
+    /// `VK_KHR_device_address_commands`, which every command buffer needs.
+    pub device_address_commands: bool,
     pub ray_tracing_pipeline_properties:
         Option<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>>,
     pub acceleration_structure_properties:
@@ -104,6 +107,7 @@ impl PhysicalDevice {
         let mut clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
         let mut performance = vk::PhysicalDevicePerformanceQueryFeaturesKHR::default();
         let mut host_image_copy = vk::PhysicalDeviceHostImageCopyFeaturesEXT::default();
+        let mut address_commands = vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR::default();
         let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
         let mut rt_pipeline_properties =
             vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
@@ -111,21 +115,22 @@ impl PhysicalDevice {
         let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut features12)
-            .push_next(&mut ray_tracing_feature)
-            .push_next(&mut acceleration_struct_feature)
-            .push_next(&mut mesh_shading)
-            .push_next(&mut clock)
-            .push_next(&mut performance)
-            .push_next(&mut host_image_copy);
+            .push(&mut features12)
+            .push(&mut ray_tracing_feature)
+            .push(&mut acceleration_struct_feature)
+            .push(&mut mesh_shading)
+            .push(&mut clock)
+            .push(&mut performance)
+            .push(&mut host_image_copy)
+            .push(&mut address_commands);
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
         let pipeline_statistics = features2.features.pipeline_statistics_query == vk::TRUE;
 
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
-            .push_next(&mut rt_pipeline_properties)
-            .push_next(&mut acc_properties)
-            .push_next(&mut mesh_shader_properties)
-            .push_next(&mut vk12_properties);
+            .push(&mut rt_pipeline_properties)
+            .push(&mut acc_properties)
+            .push(&mut mesh_shader_properties)
+            .push(&mut vk12_properties);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
         // Detach them from the chain on this stack.
         mesh_shader_properties.p_next = std::ptr::null_mut();
@@ -139,6 +144,8 @@ impl PhysicalDevice {
                 .iter()
                 .any(|e| e.as_bytes() == name.to_bytes())
         };
+        let device_address_commands = has_extension(ash::khr::device_address_commands::NAME)
+            && address_commands.device_address_commands == vk::TRUE;
         let features = Features {
             rebar,
             host_image_copy: rebar
@@ -187,6 +194,7 @@ impl PhysicalDevice {
             bindless_supported: features12.runtime_descriptor_array == vk::TRUE
                 && features12.descriptor_binding_partially_bound == vk::TRUE
                 && features12.descriptor_binding_variable_descriptor_count == vk::TRUE,
+            device_address_commands,
             supported_features: features,
         })
     }
@@ -254,8 +262,13 @@ impl PhysicalDevice {
                 device.properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
                     || device.properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
             })
+            .filter(|device| device.device_address_commands)
             .find_map(|device| Some((device, device.pick_queue_families()?)))
-            .ok_or_else(|| Error::message("Could not find a suitable device"))?;
+            .ok_or_else(|| {
+                Error::message(
+                    "Could not find a suitable device: a GPU with VK_KHR_device_address_commands",
+                )
+            })?;
         let mut required = device.supported_features.clone();
         required.present = features.present;
         let unsuported_ext = device.unsupports_extensions(&required.extensions());
@@ -338,6 +351,7 @@ mod tests {
             supported_extensions: Vec::new(),
             supported_features: Features::default(),
             bindless_supported: true,
+            device_address_commands: true,
             ray_tracing_pipeline_properties: None,
             acceleration_structure_properties: None,
         }

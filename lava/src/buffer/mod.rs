@@ -1,4 +1,5 @@
-//! Typed, usage-tagged GPU buffers backed by host-mapped gpu-allocator memory, their type erasure and drop hook
+//! Typed, usage-tagged GPU buffers backed by gpu-allocator memory, their host access (`host`, `host_mut`, `host_ptr`), type erasure and drop hook
+use ash::vk::TaggedStructure;
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -55,27 +56,14 @@ pub fn on_drop(hook: fn(&DynamicBuffer)) -> Result<()> {
 
 impl<T: Copy + Pod, U: BufferUsage> Index<usize> for Buffer<T, U> {
     type Output = T;
-    fn index(&self, index: usize) -> &Self::Output {
-        unsafe { &*self.range(..).element_ptr(index) }
+    fn index(&self, index: usize) -> &T {
+        &self.host()[index]
     }
 }
 
 impl<T: Copy + Pod, U: BufferUsage> IndexMut<usize> for Buffer<T, U> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe { &mut *self.range(..).element_ptr(index) }
-    }
-}
-
-impl<'a, T: Copy + Pod, U: BufferUsage> Index<usize> for BufferSlice<'a, T, U> {
-    type Output = T;
-    fn index(&self, index: usize) -> &Self::Output {
-        unsafe { &*self.element_ptr(index) }
-    }
-}
-
-impl<'a, T: Copy + Pod, U: BufferUsage> IndexMut<usize> for BufferSlice<'a, T, U> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe { &mut *self.element_ptr(index) }
+    fn index_mut(&mut self, index: usize) -> &mut T {
+        &mut self.host_mut()[index]
     }
 }
 
@@ -132,7 +120,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
         let mut dedicated = vk::MemoryDedicatedRequirements::default();
         let mut requirements = {
-            let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+            let mut requirements = vk::MemoryRequirements2::default().push(&mut dedicated);
             unsafe {
                 Ctx::device().get_buffer_memory_requirements2(
                     &vk::BufferMemoryRequirementsInfo2::default().buffer(buffer),
@@ -204,6 +192,48 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
     /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
     pub fn usage_check(&self, required: vk::BufferUsageFlags) {
         self.usage.check(required);
+    }
+
+    /// Whether the memory is host-visible: every buffer with `cpu_writable`, and every buffer
+    /// on a device with `rebar`.
+    pub fn is_mapped(&self) -> bool {
+        self.allocation.mapped_ptr().is_some()
+    }
+
+    fn mapped(&self) -> *mut T {
+        let ptr = self
+            .allocation
+            .mapped_ptr()
+            .expect("buffer is not host-mapped")
+            .as_ptr()
+            .cast::<T>();
+        debug_assert!(ptr.is_aligned());
+        ptr
+    }
+
+    /// The mapping as a slice. Panics unless the buffer is mapped.
+    ///
+    /// What the GPU wrote is there once its submission's fence passed: every submission ends
+    /// with a barrier that makes its writes host-visible.
+    pub fn host(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.mapped(), self.len()) }
+    }
+
+    /// The mapping as a mutable slice. Panics unless the buffer is mapped.
+    ///
+    /// The GPU may still read the buffer for a frame in flight: write only that frame slot's
+    /// part of a ring, or a buffer no pending frame uses.
+    pub fn host_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.mapped(), self.len()) }
+    }
+
+    /// The mapping as a pointer, for buffers whose elements are owned one at a time through a
+    /// shared reference (slots handed out by an allocator). Panics unless the buffer is mapped.
+    ///
+    /// Dereferencing it is `unsafe`: the caller must own the element it accesses, and nothing
+    /// may call `host`/`host_mut` on the buffer while such elements are live.
+    pub fn host_ptr(&self) -> *mut T {
+        self.mapped()
     }
 
     pub fn cast<B: Copy + Pod>(self) -> Buffer<B, U> {

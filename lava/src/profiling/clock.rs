@@ -39,7 +39,10 @@ static LAST_READ: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 fn counter(index: usize) -> &'static AtomicU64 {
     let counters = COUNTERS.get().expect("shader clocks are initialised");
-    unsafe { &*(counters.range(..).element_ptr(index) as *const AtomicU64) }
+    assert!(index < counters.len());
+    // SAFETY: the buffer is only ever reached through this function, as atomics; nothing
+    // borrows its mapping.
+    unsafe { &*(counters.host_ptr().add(index) as *const AtomicU64) }
 }
 
 /// Creates the counters and binds them, if the device has subgroup clocks.
@@ -48,8 +51,8 @@ pub(crate) fn init() -> Result<()> {
         return Ok(());
     }
     let len = PASS_MAP.len() * MAX_REGIONS * STRIPES * STRIPE_WORDS;
-    let counters = Buffer::<u64>::new(len, true)?;
-    counters.range(..).copy_from(&vec![0; counters.len()]);
+    let mut counters = Buffer::<u64>::new(len, true)?;
+    counters.host_mut().fill(0);
     let info = [vk::DescriptorBufferInfo::default()
         .buffer(counters.handle)
         .range(vk::WHOLE_SIZE)];

@@ -1,4 +1,5 @@
 //! GPU profiling: the timestamps, pass queries (pipeline statistics and hardware counters) and shader clocks, three independent systems, plus GPU memory
+use ash::vk::TaggedStructure;
 use ash::vk;
 
 use crate::{
@@ -48,7 +49,7 @@ pub fn memory_report() -> MemoryReport {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut properties = vk::PhysicalDeviceMemoryProperties2::default();
     if has_budget {
-        properties = properties.push_next(&mut budget);
+        properties = properties.push(&mut budget);
     }
     unsafe {
         Functions::instance()
@@ -71,7 +72,7 @@ pub fn memory_report() -> MemoryReport {
         .collect();
     MemoryReport {
         allocated: report.total_allocated_bytes,
-        reserved: report.total_reserved_bytes,
+        reserved: report.total_capacity_bytes,
         blocks: report.blocks.len(),
         heaps,
     }

@@ -1,4 +1,5 @@
 //! Global Vulkan context: instance, device, queues, features, and validation logging
+use ash::vk::TaggedStructure;
 use std::{
     cell::Cell,
     ffi::{c_char, c_void},
@@ -103,7 +104,9 @@ impl Ctx {
             .collect();
 
         let mut instance_extensions = match display {
-            Some(display) => ash_window::enumerate_required_extensions(*display)?.to_vec(),
+            Some(display) => ash_window::enumerate_required_extensions(*display)
+                .map_err(|err| Error::message(&format!("no surface extensions for this display: {err}")))?
+                .to_vec(),
             None => Vec::new(),
         };
 
@@ -132,7 +135,7 @@ impl Ctx {
 
             instance_info = instance_info
                 .enabled_layer_names(&layers_names_raw)
-                .push_next(&mut validation_features);
+                .push(&mut validation_features);
         }
         instance_info = instance_info
             .application_info(&app_info)
@@ -141,7 +144,7 @@ impl Ctx {
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
         let mut instance_debug_utils = None;
         if features.debug_utils {
-            instance_debug_utils = Some(debug_utils::Instance::new(&entry, &instance));
+            instance_debug_utils = Some(debug_utils::Instance::load(&entry, &instance));
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
                     vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -163,7 +166,7 @@ impl Ctx {
             };
         }
 
-        let surface_fn = display.map(|_| ash::khr::surface::Instance::new(&entry, &instance));
+        let surface_fn = display.map(|_| ash::khr::surface::Instance::load(&entry, &instance));
 
         let physical_devices = PhysicalDevice::enumerate_physical_devices(&instance)?;
         let (physical_device, graphics_queue_family, transfer_queue_familie) =
@@ -182,19 +185,20 @@ impl Ctx {
         let device = create_device(queues, &physical_device, &features, &instance)?;
         let mut debug_utils = None;
         if features.device_debug_utils {
-            debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
+            debug_utils = Some(ash::ext::debug_utils::Device::load(&instance, &device));
         }
 
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
             physical_device: physical_device.handel,
-            debug_settings: AllocatorDebugSettings {
-                log_allocations: true,
-                log_frees: true,
-                log_leaks_on_shutdown: false,
-                log_memory_information: true,
-                ..Default::default()
+            debug_settings: {
+                let mut settings = AllocatorDebugSettings::default();
+                settings.log_allocations = true;
+                settings.log_frees = true;
+                settings.log_leaks_on_shutdown = false;
+                settings.log_memory_information = true;
+                settings
             },
             buffer_device_address: true,
             allocation_sizes: AllocationSizes::new(256, if features.rebar { 256 } else { 16 }),
@@ -203,32 +207,35 @@ impl Ctx {
         FUNCTIONS
             .set(Functions {
                 mesh: if features.mesh {
-                    Some(ash::ext::mesh_shader::Device::new(&instance, &device))
+                    Some(ash::ext::mesh_shader::Device::load(&instance, &device))
                 } else {
                     None
                 },
                 performance_query: features.performance_query.then(|| {
                     (
-                        ash::khr::performance_query::Instance::new(&entry, &instance),
-                        ash::khr::performance_query::Device::new(&instance, &device),
+                        ash::khr::performance_query::Instance::load(&entry, &instance),
+                        ash::khr::performance_query::Device::load(&instance, &device),
                     )
                 }),
                 raytracing_pipeline: if features.raytracing {
-                    Some(ash::khr::ray_tracing_pipeline::Device::new(
+                    Some(ash::khr::ray_tracing_pipeline::Device::load(
                         &instance, &device,
                     ))
                 } else {
                     None
                 },
                 acceleration_structure: if features.raytracing {
-                    Some(ash::khr::acceleration_structure::Device::new(
+                    Some(ash::khr::acceleration_structure::Device::load(
                         &instance, &device,
                     ))
                 } else {
                     None
                 },
-                host_image_copy: ash::ext::host_image_copy::Device::new(&instance, &device),
-                swapchain: ash::khr::swapchain::Device::new(&instance, &device),
+                host_image_copy: ash::ext::host_image_copy::Device::load(&instance, &device),
+                device_address_commands: ash::khr::device_address_commands::Device::load(
+                    &instance, &device,
+                ),
+                swapchain: ash::khr::swapchain::Device::load(&instance, &device),
                 instance,
                 entry,
                 surface: surface_fn,
@@ -359,8 +366,10 @@ pub struct Features {
     pub performance_query: bool,
 }
 impl Features {
+    /// The device extensions to enable. `VK_KHR_device_address_commands` is always required:
+    /// every command takes a `BufferSlice` as an address range.
     pub fn extensions(&self) -> Vec<&CStr> {
-        let mut extensions = vec![];
+        let mut extensions = vec![ash::khr::device_address_commands::NAME];
         if self.host_image_copy {
             extensions.push(ash::ext::host_image_copy::NAME);
         }
@@ -404,7 +413,9 @@ impl Features {
         host_image_copy: &'a mut vk::PhysicalDeviceHostImageCopyFeaturesEXT,
         clock: &'a mut vk::PhysicalDeviceShaderClockFeaturesKHR,
         performance: &'a mut vk::PhysicalDevicePerformanceQueryFeaturesKHR,
+        address_commands: &'a mut vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR,
     ) -> vk::PhysicalDeviceFeatures2<'a> {
+        *address_commands = address_commands.device_address_commands(true);
         *vk11 = vk11.shader_draw_parameters(true);
         *vk12 = vk12
             .runtime_descriptor_array(true)
@@ -448,35 +459,36 @@ impl Features {
 
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(phfeatures)
-            .push_next(vk11)
-            .push_next(vk12)
-            .push_next(vk13);
+            .push(vk11)
+            .push(vk12)
+            .push(vk13)
+            .push(address_commands);
         if self.host_image_copy {
             *host_image_copy =
                 vk::PhysicalDeviceHostImageCopyFeaturesEXT::default().host_image_copy(true);
-            features = features.push_next(host_image_copy);
+            features = features.push(host_image_copy);
         }
         if self.mesh {
             *mesh = mesh
                 .task_shader(true)
                 .mesh_shader(true)
                 .mesh_shader_queries(self.mesh_queries);
-            features = features.push_next(mesh);
+            features = features.push(mesh);
         }
         if self.shader_clock {
             *clock = clock.shader_subgroup_clock(true);
-            features = features.push_next(clock);
+            features = features.push(clock);
         }
         if self.performance_query {
             *performance = performance.performance_counter_query_pools(true);
-            features = features.push_next(performance);
+            features = features.push(performance);
         }
         if self.raytracing {
             *ray = ray.ray_tracing_pipeline(true);
             *acc = acc
                 .acceleration_structure(true)
                 .descriptor_binding_acceleration_structure_update_after_bind(true);
-            features = features.push_next(ray).push_next(acc);
+            features = features.push(ray).push(acc);
         }
         features
     }
@@ -485,6 +497,7 @@ impl Features {
 pub struct Functions {
     instance: ash::Instance,
     host_image_copy: ash::ext::host_image_copy::Device,
+    device_address_commands: ash::khr::device_address_commands::Device,
     entry: ash::Entry,
     swapchain: ash::khr::swapchain::Device,
     surface: Option<ash::khr::surface::Instance>,
@@ -513,6 +526,9 @@ impl Functions {
     }
     pub(crate) fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
         &get().host_image_copy
+    }
+    pub(crate) fn device_address_commands() -> &'static ash::khr::device_address_commands::Device {
+        &get().device_address_commands
     }
     pub(crate) fn instance() -> &'static ash::Instance {
         &get().instance
@@ -627,7 +643,7 @@ pub(super) fn create_device(
 
     let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut host_image_copy, mut clock) =
         Default::default();
-    let mut performance = Default::default();
+    let (mut performance, mut address_commands) = Default::default();
     let mut features = features.features(
         &mut vk11,
         &mut vk12,
@@ -638,11 +654,14 @@ pub(super) fn create_device(
         &mut host_image_copy,
         &mut clock,
         &mut performance,
+        &mut address_commands,
     );
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
-        .enabled_extension_names(device_extensions_as_ptr.as_slice())
-        .push_next(&mut features);
+        .enabled_extension_names(device_extensions_as_ptr.as_slice());
+    // `features` carries its own chain, which `push` refuses; every struct in it is a live
+    // local of this function.
+    let device_create_info = unsafe { device_create_info.extend(&mut features) };
 
     let device =
         unsafe { instance.create_device(physical_device.handel, &device_create_info, None)? };
@@ -667,12 +686,16 @@ mod tests {
 
     #[test]
     fn headless_devices_need_no_extension() {
-        assert!(names(&Features::default()).is_empty());
+        assert_eq!(
+            names(&Features::default()),
+            ["VK_KHR_device_address_commands"]
+        );
     }
 
     #[test]
     fn each_feature_adds_its_device_extensions() {
-        let only = |f: Features| names(&f);
+        // Without the extension every device needs.
+        let only = |f: Features| names(&f).split_off(1);
         assert_eq!(
             only(Features {
                 present: true,
@@ -755,7 +778,7 @@ mod tests {
     ) {
         let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut hic) =
             Default::default();
-        let (mut clock, mut performance) = Default::default();
+        let (mut clock, mut performance, mut address_commands) = Default::default();
         features.features(
             &mut vk11,
             &mut vk12,
@@ -766,6 +789,7 @@ mod tests {
             &mut hic,
             &mut clock,
             &mut performance,
+            &mut address_commands,
         );
         // Detach the copies from the pNext chain that borrowed them.
         vk12.p_next = std::ptr::null_mut();

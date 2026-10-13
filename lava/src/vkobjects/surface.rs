@@ -21,13 +21,8 @@ impl Surface {
     pub fn new(display: &RawDisplayHandle, window: &RawWindowHandle) -> Result<Self> {
         let surface_fn = surface_fn()?;
         let handle = unsafe {
-            ash_window::create_surface(
-                Functions::entry(),
-                Functions::instance(),
-                *display,
-                *window,
-                None,
-            )?
+            ash_window::SurfaceFactory::new(Functions::entry(), Functions::instance(), *display)?
+                .create_surface(*window, None)?
         };
         // From here on `Drop` destroys the handle on every error path.
         let mut surface = Self {

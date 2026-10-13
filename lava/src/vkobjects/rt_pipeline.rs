@@ -194,7 +194,7 @@ impl ShaderBindingTable {
             desc.hit_shader_count,
         ];
 
-        let buffer = Buffer::raw(
+        let mut buffer = Buffer::raw(
             usage::ShaderBindingTable,
             true,
             buffer_size as _,
@@ -223,7 +223,7 @@ impl ShaderBindingTable {
             }
         }
 
-        buffer.range(..).copy_from(stb_data.as_slice());
+        buffer.host_mut()[..stb_data.len()].copy_from_slice(&stb_data);
 
         let raygen_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(buffer.address)

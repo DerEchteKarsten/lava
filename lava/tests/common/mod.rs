@@ -130,8 +130,8 @@ impl Gpu {
 
 /// A host-readable buffer holding `data`.
 pub fn buffer_with<T: Pod, U: StaticUsage>(data: &[T]) -> Buffer<T, U> {
-    let buffer = Buffer::new(data.len(), true).unwrap();
-    buffer.range(..).copy_from(data);
+    let mut buffer = Buffer::new(data.len(), true).unwrap();
+    buffer.host_mut().copy_from_slice(data);
     buffer
 }
 

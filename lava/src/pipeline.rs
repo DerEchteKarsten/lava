@@ -1,5 +1,6 @@
 //! Pass pipelines: the pass table's entries, the cache of every pass's pipelines per specialization and raster state, and their creation; with `hot-reload`, a second cache whose reloads replace pipelines that command buffers keep alive
 #[cfg(feature = "hot-reload")]
+use ash::vk::TaggedStructure;
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -724,7 +725,7 @@ fn create_raster_pipeline(
         .depth_stencil_state(&depth_stencil_state)
         .base_pipeline_handle(vk::Pipeline::null())
         .base_pipeline_index(-1)
-        .push_next(&mut rendering);
+        .push(&mut rendering);
 
     let pipeline = unsafe {
         Ctx::device()

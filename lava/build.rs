@@ -345,7 +345,7 @@ fn build_new_fn<'a>(
                     "{name}.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);"
                 ));
                 out.params.push(format!("{name}: {ty}"));
-                out.gpu_inits.push(format!("{name}: {name}.gpu_ptr"));
+                out.gpu_inits.push(format!("{name}: {name}.address"));
                 let access = if type_name(t) == "MutBuf" {
                     "vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE"
                 } else {

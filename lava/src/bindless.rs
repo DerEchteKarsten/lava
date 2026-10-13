@@ -1,4 +1,5 @@
 //! Global bindless descriptor sets: immutable samplers, caller-indexed image descriptors, handles
+use ash::vk::TaggedStructure;
 use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
@@ -225,7 +226,7 @@ impl Bindless {
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL_EXT)
-            .push_next(&mut ext_flags);
+            .push(&mut ext_flags);
         layouts[0] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
         let descriptor_binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
@@ -245,7 +246,7 @@ impl Bindless {
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL_EXT)
-            .push_next(&mut ext_flags);
+            .push(&mut ext_flags);
         layouts[1] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
         let bindings = [vk::DescriptorSetLayoutBinding {
@@ -309,7 +310,7 @@ impl Bindless {
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts)
-            .push_next(&mut alloc_info);
+            .push(&mut alloc_info);
         let sets = unsafe { Ctx::device().allocate_descriptor_sets(&allocate_info) }?
             .try_into()
             .expect("allocated descriptor set count matches the three layouts");

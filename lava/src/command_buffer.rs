@@ -31,7 +31,7 @@ use crate::{
     state::{Ctx, Functions},
     vkobjects::queue::{PendingAccesses, PendingWrite},
 };
-use ash::vk::{self, BufferCopy, IndexType};
+use ash::vk::{self, IndexType};
 use bytemuck::{Pod, Zeroable, bytes_of};
 use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
@@ -372,33 +372,34 @@ struct Draw<'a, const COLOR_ATTACHMENTS: usize> {
     state: RasterState<COLOR_ATTACHMENTS>,
 }
 
+#[derive(Debug)]
 pub(crate) enum DrawCommand {
     Draw {
         vertices: u32,
         instances: u32,
     },
     Indexed {
-        buffer: vk::Buffer,
-        offset: u64,
-        indices: u32,
+        indices: vk::DeviceAddressRangeKHR,
+        flags: vk::AddressCommandFlagsKHR,
+        count: u32,
         instances: u32,
     },
     Indirect {
-        buffer: vk::Buffer,
-        offset: u64,
+        draws: vk::StridedDeviceAddressRangeKHR,
+        flags: vk::AddressCommandFlagsKHR,
         count: u32,
     },
     IndirectCount {
-        buffer: vk::Buffer,
-        offset: u64,
-        count_buffer: vk::Buffer,
-        count_offset: u64,
+        draws: vk::StridedDeviceAddressRangeKHR,
+        flags: vk::AddressCommandFlagsKHR,
+        count: vk::DeviceAddressRangeKHR,
+        count_flags: vk::AddressCommandFlagsKHR,
         max_count: u32,
     },
     Launch([u32; 3]),
     LaunchIndirect {
-        buffer: vk::Buffer,
-        offset: u64,
+        draws: vk::StridedDeviceAddressRangeKHR,
+        flags: vk::AddressCommandFlagsKHR,
         count: u32,
     },
 }
@@ -572,9 +573,9 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             vk::AccessFlags2::INDEX_READ,
         ));
         let command = DrawCommand::Indexed {
-            buffer: index_buffer.handle,
-            offset: index_buffer.offset(),
-            indices: index_buffer.len() as u32,
+            indices: index_buffer.address_range(),
+            flags: index_buffer.address_flags(),
+            count: index_buffer.len() as u32,
             instances,
         };
         self.push(bindings, command, state)
@@ -589,8 +590,8 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         let mut bindings = bindings.erase();
         bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::Indirect {
-            buffer: buffer.handle,
-            offset: buffer.offset(),
+            draws: buffer.strided_range(),
+            flags: buffer.address_flags(),
             count: buffer.len() as u32,
         };
         self.push(bindings, command, state)
@@ -607,10 +608,10 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         bindings.buffers.push(indirect_access(buffer));
         bindings.buffers.push(indirect_access(count_buffer));
         let command = DrawCommand::IndirectCount {
-            buffer: buffer.handle,
-            offset: buffer.offset(),
-            count_buffer: count_buffer.handle,
-            count_offset: count_buffer.offset(),
+            draws: buffer.strided_range(),
+            flags: buffer.address_flags(),
+            count: count_buffer.address_range(),
+            count_flags: count_buffer.address_flags(),
             max_count: buffer.len() as u32,
         };
         self.push(bindings, command, state)
@@ -635,8 +636,8 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         let mut bindings = bindings.erase();
         bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::LaunchIndirect {
-            buffer: buffer.handle,
-            offset: buffer.offset(),
+            draws: buffer.strided_range(),
+            flags: buffer.address_flags(),
             count: buffer.len() as u32,
         };
         self.push(bindings, command, state)
@@ -799,53 +800,59 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
                         instances,
                     } => device.cmd_draw(handle, vertices, instances, 0, 0),
                     DrawCommand::Indexed {
-                        buffer,
-                        offset,
                         indices,
+                        flags,
+                        count,
                         instances,
                     } => {
-                        device.cmd_bind_index_buffer(handle, buffer, offset, IndexType::UINT32);
-                        device.cmd_draw_indexed(handle, indices, instances, 0, 0, 0);
+                        address_commands().cmd_bind_index_buffer3(
+                            handle,
+                            &vk::BindIndexBuffer3InfoKHR::default()
+                                .address_range(indices)
+                                .address_flags(flags)
+                                .index_type(IndexType::UINT32),
+                        );
+                        device.cmd_draw_indexed(handle, count, instances, 0, 0, 0);
                     }
                     DrawCommand::Indirect {
-                        buffer,
-                        offset,
+                        draws,
+                        flags,
                         count,
-                    } => device.cmd_draw_indirect(
+                    } => address_commands().cmd_draw_indirect2(
                         handle,
-                        buffer,
-                        offset,
-                        count,
-                        size_of::<vk::DrawIndirectCommand>() as u32,
+                        &vk::DrawIndirect2InfoKHR::default()
+                            .address_range(draws)
+                            .address_flags(flags)
+                            .draw_count(count),
                     ),
                     DrawCommand::IndirectCount {
-                        buffer,
-                        offset,
-                        count_buffer,
-                        count_offset,
+                        draws,
+                        flags,
+                        count,
+                        count_flags,
                         max_count,
-                    } => device.cmd_draw_indirect_count(
+                    } => address_commands().cmd_draw_indirect_count2(
                         handle,
-                        buffer,
-                        offset,
-                        count_buffer,
-                        count_offset,
-                        max_count,
-                        size_of::<vk::DrawIndirectCommand>() as u32,
+                        &vk::DrawIndirectCount2InfoKHR::default()
+                            .address_range(draws)
+                            .address_flags(flags)
+                            .count_address_range(count)
+                            .count_address_flags(count_flags)
+                            .max_draw_count(max_count),
                     ),
                     DrawCommand::Launch([x, y, z]) => {
                         mesh_functions().cmd_draw_mesh_tasks(handle, x, y, z)
                     }
                     DrawCommand::LaunchIndirect {
-                        buffer,
-                        offset,
+                        draws,
+                        flags,
                         count,
-                    } => mesh_functions().cmd_draw_mesh_tasks_indirect(
+                    } => address_commands().cmd_draw_mesh_tasks_indirect2(
                         handle,
-                        buffer,
-                        offset,
-                        count,
-                        size_of::<vk::DrawMeshTasksIndirectCommandEXT>() as u32,
+                        &vk::DrawIndirect2InfoKHR::default()
+                            .address_range(draws)
+                            .address_flags(flags)
+                            .draw_count(count),
                     ),
                 }
             }
@@ -853,6 +860,10 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         unsafe { device.cmd_end_rendering(handle) };
         self.cmd_buf.end_pass();
     }
+}
+
+fn address_commands() -> &'static ash::khr::device_address_commands::Device {
+    Functions::device_address_commands()
 }
 
 fn mesh_functions() -> &'static ash::ext::mesh_shader::Device {
@@ -928,11 +939,10 @@ impl CommandBuffer {
             }),
         );
         unsafe {
-            Ctx::device().cmd_fill_buffer(
+            address_commands().cmd_fill_memory(
                 self.handle,
-                buffer.handle,
-                buffer.offset(),
-                buffer.size,
+                &buffer.address_range(),
+                buffer.address_flags(),
                 data,
             )
         };
@@ -981,10 +991,10 @@ impl CommandBuffer {
             }),
         );
         unsafe {
-            Ctx::device().cmd_update_buffer(
+            address_commands().cmd_update_memory(
                 self.handle,
-                buffer.handle,
-                buffer.offset(),
+                &buffer.address_range(),
+                buffer.address_flags(),
                 bytemuck::bytes_of(data),
             )
         };
@@ -1035,38 +1045,59 @@ impl CommandBuffer {
     }
     #[validation_trace]
 
+    /// Copies `src` to the start of `dst`, which must be at least as long.
     pub fn copy_buffer<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
         &mut self,
         src: BufferSlice<'a, T, U>,
         dst: BufferSlice<'a, T, U2>,
     ) {
-        self.copy_buffer_regions(src, dst, &[src.region(dst)]);
+        self.copy_buffer_regions(&[(src, dst)]);
     }
     #[validation_trace]
 
+    /// One `copy_buffer` per pair, in one command.
     pub fn copy_buffer_regions<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
         &mut self,
-        src: BufferSlice<'a, T, U>,
-        dst: BufferSlice<'a, T, U2>,
-        regions: &[BufferCopy],
+        regions: &[(BufferSlice<'a, T, U>, BufferSlice<'a, T, U2>)],
     ) {
-        self.flush_pending(
-            iter::empty(),
-            [
-                BufferAccess {
-                    access: vk::AccessFlags2::TRANSFER_READ,
-                    stage: vk::PipelineStageFlags2::TRANSFER,
-                    range: src.get_range(),
-                },
-                BufferAccess {
-                    access: vk::AccessFlags2::TRANSFER_WRITE,
-                    stage: vk::PipelineStageFlags2::TRANSFER,
-                    range: dst.get_range(),
-                },
-            ]
-            .iter(),
-        );
-        unsafe { Ctx::device().cmd_copy_buffer(self.handle, src.handle, dst.handle, regions) };
+        let accesses = regions
+            .iter()
+            .flat_map(|(src, dst)| {
+                assert!(
+                    src.size <= dst.size,
+                    "cannot copy {} bytes into a buffer slice of {} bytes",
+                    src.size,
+                    dst.size
+                );
+                [
+                    src.access(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    ),
+                    dst.range(..src.len()).access(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
+                ]
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        self.flush_pending(iter::empty(), accesses.iter());
+        let copies = regions
+            .iter()
+            .map(|(src, dst)| {
+                vk::DeviceMemoryCopyKHR::default()
+                    .src_range(src.address_range())
+                    .src_flags(src.address_flags())
+                    .dst_range(dst.range(..src.len()).address_range())
+                    .dst_flags(dst.address_flags())
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        unsafe {
+            address_commands().cmd_copy_memory(
+                self.handle,
+                &vk::CopyDeviceMemoryInfoKHR::default().regions(&copies),
+            )
+        };
     }
 
     #[validation_trace]
@@ -1098,21 +1129,19 @@ impl CommandBuffer {
                 range: src.get_range(),
             }),
         );
-        let regions = [vk::BufferImageCopy {
-            image_extent: D::extent_3d(dst.extend),
-            image_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
-            buffer_image_height: 0,
-            buffer_offset: src.offset(),
-            buffer_row_length: 0,
-            image_offset: D::offset_3d(dst.offset),
-        }];
+        let regions = [vk::DeviceMemoryImageCopyKHR::default()
+            .address_range(src.address_range())
+            .address_flags(src.address_flags())
+            .image_subresource(dst.view.subresource_layers(dst.view.mip_range.start))
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_offset(D::offset_3d(dst.offset))
+            .image_extent(D::extent_3d(dst.extend))];
         unsafe {
-            Ctx::device().cmd_copy_buffer_to_image(
+            address_commands().cmd_copy_memory_to_image(
                 self.handle,
-                src.handle,
-                dst.view.image,
-                vk::ImageLayout::GENERAL,
-                &regions,
+                &vk::CopyDeviceMemoryImageInfoKHR::default()
+                    .image(dst.view.image)
+                    .regions(&regions),
             )
         };
     }
@@ -1148,21 +1177,19 @@ impl CommandBuffer {
                 range: dst.get_range(),
             }),
         );
-        let regions = [vk::BufferImageCopy {
-            image_extent: D::extent_3d(src.extend),
-            image_subresource: src.view.subresource_layers(src.view.mip_range.start),
-            buffer_image_height: 0,
-            buffer_offset: dst.offset(),
-            buffer_row_length: 0,
-            image_offset: D::offset_3d(src.offset),
-        }];
+        let regions = [vk::DeviceMemoryImageCopyKHR::default()
+            .address_range(dst.address_range())
+            .address_flags(dst.address_flags())
+            .image_subresource(src.view.subresource_layers(src.view.mip_range.start))
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_offset(D::offset_3d(src.offset))
+            .image_extent(D::extent_3d(src.extend))];
         unsafe {
-            Ctx::device().cmd_copy_image_to_buffer(
+            address_commands().cmd_copy_image_to_memory(
                 self.handle,
-                src.view.image,
-                vk::ImageLayout::GENERAL,
-                dst.handle,
-                &regions,
+                &vk::CopyDeviceMemoryImageInfoKHR::default()
+                    .image(src.view.image)
+                    .regions(&regions),
             )
         };
     }
@@ -1209,7 +1236,12 @@ impl CommandBuffer {
         unsafe {
             Ctx::device().cmd_bind_pipeline(self.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
             if let Some(slice) = indirect_buffer {
-                Ctx::device().cmd_dispatch_indirect(self.handle, slice.handle, slice.offset());
+                address_commands().cmd_dispatch_indirect2(
+                    self.handle,
+                    &vk::DispatchIndirect2InfoKHR::default()
+                        .address_range(slice.address_range())
+                        .address_flags(slice.address_flags()),
+                );
             } else {
                 Ctx::device().cmd_dispatch(self.handle, dispatch[0], dispatch[1], dispatch[2]);
             }
@@ -2408,14 +2440,10 @@ mod tests {
         len: u64,
     ) -> BufferSlice<'static, T, U> {
         BufferSlice {
-            handle: vk::Buffer::null(),
+            address: gpu_ptr,
             size: len * size_of::<T>() as u64,
-            cpu_ptr: 0,
-            gpu_ptr,
-            base_address: gpu_ptr,
             usage: U::default(),
             _marker: PhantomData,
-            _lifetime: PhantomData,
         }
     }
 
@@ -2762,22 +2790,32 @@ mod tests {
                 RasterState::default(),
             );
         let [indexed, launch] = &builder.draws;
-        assert!(matches!(
-            indexed.command,
-            DrawCommand::Indexed {
-                indices: 6,
-                instances: 2,
-                ..
-            }
-        ));
+        let DrawCommand::Indexed {
+            indices,
+            flags,
+            count: 6,
+            instances: 2,
+        } = indexed.command
+        else {
+            panic!("not the indexed draw: {:?}", indexed.command);
+        };
+        assert_eq!((indices.address, indices.size), (0x1000, 24));
+        assert_eq!(
+            flags,
+            vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
+                | vk::AddressCommandFlagsKHR::FULLY_BOUND
+        );
         let index = &indexed.bindings.buffers[0];
         assert_eq!((index.stage, index.access), (S::INDEX_INPUT, A::INDEX_READ));
         assert_eq!(index.range, (0x1000u64..0x1018).into());
 
-        assert!(matches!(
-            launch.command,
-            DrawCommand::LaunchIndirect { count: 1, .. }
-        ));
+        let DrawCommand::LaunchIndirect {
+            draws, count: 1, ..
+        } = launch.command
+        else {
+            panic!("not the indirect launch: {:?}", launch.command);
+        };
+        assert_eq!((draws.address, draws.size, draws.stride), (0x2000, 12, 12));
         let indirect = &launch.bindings.buffers[0];
         assert_eq!(
             (indirect.stage, indirect.access),

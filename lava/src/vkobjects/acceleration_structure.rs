@@ -38,7 +38,7 @@ impl AccelerationStructure {
             functions()?.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
                 &build_geo_info,
-                max_primitive_counts,
+                Some(max_primitive_counts),
                 &mut size_info,
             )
         };
@@ -98,7 +98,7 @@ impl AccelerationStructure {
                 device_address: scratch_buffer.address,
             });
         unsafe {
-            functions.cmd_build_acceleration_structures(*cmd, &[build_geo_info], &[as_ranges])
+            functions.cmd_build_acceleration_structures(*cmd, &[build_geo_info], &[Some(as_ranges)])
         };
 
         Ok(AccelerationStructure {
