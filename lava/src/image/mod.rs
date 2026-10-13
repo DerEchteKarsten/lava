@@ -387,9 +387,14 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         }
     }
 
-    /// The same image with another format and usage, unchecked: the image still has the
-    /// format and usage it was created with.
+    /// The same image typed as `format` and `usage`, which must be the format it was created
+    /// with and no more than its usage (an image of several usages as one of them, a static
+    /// type as `Dynamic`); a cast that claims more panics.
     pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> Image<NF, NU, D, V> {
+        slice::cast_check(
+            (self.raw.format.vk_format(), self.raw.usage.flags()),
+            (format.vk_format(), usage.flags()),
+        );
         Image {
             views: self.views,
             raw: self.raw.cast(format, usage),

@@ -168,6 +168,7 @@ impl PhysicalDevice {
             shader_clock: clock.shader_subgroup_clock == vk::TRUE,
             performance_query: has_extension(ash::khr::performance_query::NAME)
                 && performance.performance_counter_query_pools == vk::TRUE,
+            calibrated_timestamps: has_extension(ash::khr::calibrated_timestamps::NAME),
         };
 
         Ok(Self {
@@ -288,6 +289,8 @@ impl PhysicalDevice {
             cfg!(feature = "profiling") && device.supported_features.shader_clock;
         features.performance_query =
             cfg!(feature = "profiling") && device.supported_features.performance_query;
+        features.calibrated_timestamps =
+            cfg!(feature = "profiling") && device.supported_features.calibrated_timestamps;
         Ok((device.clone(), graphics, transfer_queue))
     }
 }
@@ -513,6 +516,7 @@ mod tests {
             memory_budget: true,
             shader_clock: true,
             performance_query: true,
+            calibrated_timestamps: true,
         };
 
         // Without validation the device debug utils stay off, and `present` is the caller's.

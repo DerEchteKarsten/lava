@@ -4,6 +4,7 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use crate::error::{Error, Result};
@@ -38,21 +39,60 @@ impl<T: SemaphoreType + ?Sized> Drop for Semaphore<T> {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum SemaphoreInfo {
-    Timeline(vk::Semaphore, u64),
-    Binary(vk::Semaphore),
+/// Where a submission waits for a semaphore: at every command (the default), or only at
+/// one kind of lava command, so that the others run before the wait. A hint the caller sets
+/// with `SemaphoreInfo::at`; the stages before it in the submission then run before the
+/// semaphore is signalled, so it must name the kind of the first command that touches what
+/// the semaphore guards (a transition out of `PRESENT_SRC_KHR` waits at `ALL_COMMANDS`,
+/// which chains with any of them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage {
+    #[default]
+    All,
+    /// `compute` dispatches, direct and indirect.
+    Compute,
+    /// `raytrace` launches, direct and indirect.
+    RayTracing,
+    /// `raster` renderings: their draws, attachments, indirect arguments and index buffers.
+    Raster,
+    /// Copies, blits and clears.
+    Transfer,
+}
+
+impl Stage {
+    pub(crate) fn flags(self) -> vk::PipelineStageFlags2 {
+        use vk::PipelineStageFlags2 as F;
+        match self {
+            Stage::All => F::ALL_COMMANDS,
+            Stage::Compute => F::COMPUTE_SHADER | F::DRAW_INDIRECT,
+            Stage::RayTracing => F::RAY_TRACING_SHADER_KHR | F::DRAW_INDIRECT,
+            Stage::Raster => F::ALL_GRAPHICS,
+            Stage::Transfer => F::ALL_TRANSFER,
+        }
+    }
+}
+
+/// A semaphore to wait on or signal in a submission (`Semaphore::info`). A wait holds back
+/// every command unless `at` names the kind of command it should hold back instead.
+/// Signals always happen after everything.
+#[derive(Clone, Copy, Debug)]
+pub struct SemaphoreInfo {
+    handle: vk::Semaphore,
+    /// `None` for a binary semaphore.
+    value: Option<u64>,
+    stage: Stage,
 }
 impl SemaphoreInfo {
-    pub(crate) fn to_vk<'a>(
-        &'a self,
-        stage: vk::PipelineStageFlags2,
-    ) -> vk::SemaphoreSubmitInfo<'a> {
-        let sub = vk::SemaphoreSubmitInfo::default().stage_mask(stage);
-        match self {
-            SemaphoreInfo::Binary(handle) => sub.semaphore(*handle),
-            SemaphoreInfo::Timeline(handle, value) => sub.semaphore(*handle).value(*value),
-        }
+    /// Waited on only at `stage` (see `Stage`); the default is `Stage::All`.
+    pub fn at(self, stage: Stage) -> Self {
+        Self { stage, ..self }
+    }
+
+    pub(crate) fn to_vk(&self, stage: vk::PipelineStageFlags2) -> vk::SemaphoreSubmitInfo<'_> {
+        vk::SemaphoreSubmitInfo::default()
+            .stage_mask(stage)
+            .semaphore(self.handle)
+            .value(self.value.unwrap_or(0))
     }
 }
 
@@ -111,14 +151,22 @@ impl Semaphore<Timeline> {
     }
     #[validation_trace]
     pub fn info(&self, value: u64) -> SemaphoreInfo {
-        SemaphoreInfo::Timeline(self.handle, value)
+        SemaphoreInfo {
+            handle: self.handle,
+            value: Some(value),
+            stage: Stage::All,
+        }
     }
 }
 
 impl Semaphore<Binary> {
     #[validation_trace]
     pub fn info(&self) -> SemaphoreInfo {
-        SemaphoreInfo::Binary(self.handle)
+        SemaphoreInfo {
+            handle: self.handle,
+            value: None,
+            stage: Stage::All,
+        }
     }
 }
 
@@ -444,6 +492,12 @@ impl Frame<'_> {
         self.slot.timestamps.as_ref()?.results()
     }
 
+    /// When the root scope of `last_timestamps` started, on the host's clock: from
+    /// `VK_KHR_calibrated_timestamps` (`Features::calibrated_timestamps`), `None` without it.
+    pub fn last_timestamps_start(&self) -> Option<Instant> {
+        self.slot.timestamps.as_ref()?.root_start()
+    }
+
     /// The pass queries of the frame this slot submitted before, if it was counted.
     pub fn last_counters(&self) -> Option<&PassCounters> {
         self.slot.counters.as_ref()?.results()
@@ -561,7 +615,7 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
             vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
         let wait_infos: SmallVec<[_; 1]> = wait_on
             .iter()
-            .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
+            .map(|sem| sem.to_vk(sem.stage.flags()))
             .collect();
         // Untracked work (queries, `flush_all`, host barriers) has to finish too.
         let signal_infos: SmallVec<[_; 1]> = signal
@@ -597,7 +651,7 @@ impl Queue<Gfx> {
     ) -> Result<bool> {
         let sc = [swapchain.handle];
         let ii = [image_index];
-        let waits: Vec<_> = wait_on.iter().map(|sem| sem.handle).collect();
+        let waits: SmallVec<[_; 2]> = wait_on.iter().map(|sem| sem.handle).collect();
         let _span = tracing::info_span!("present").entered();
         let present_info = vk::PresentInfoKHR::default()
             .swapchains(&sc)
@@ -650,7 +704,11 @@ mod tests {
 
     #[test]
     fn binary_semaphore_info_has_no_value() {
-        let info = SemaphoreInfo::Binary(vk::Semaphore::from_raw(7));
+        let info = SemaphoreInfo {
+            handle: vk::Semaphore::from_raw(7),
+            value: None,
+            stage: Stage::All,
+        };
         let submit = info.to_vk(vk::PipelineStageFlags2::COMPUTE_SHADER);
         assert_eq!(submit.semaphore, vk::Semaphore::from_raw(7));
         assert_eq!(submit.value, 0);
@@ -659,7 +717,11 @@ mod tests {
 
     #[test]
     fn timeline_semaphore_info_carries_its_value() {
-        let info = SemaphoreInfo::Timeline(vk::Semaphore::from_raw(9), 12);
+        let info = SemaphoreInfo {
+            handle: vk::Semaphore::from_raw(9),
+            value: Some(12),
+            stage: Stage::All,
+        };
         let submit = info.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS);
         assert_eq!(submit.semaphore, vk::Semaphore::from_raw(9));
         assert_eq!(submit.value, 12);

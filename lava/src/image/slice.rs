@@ -85,12 +85,17 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         self.usage.check(required);
     }
 
-    /// The same view with another format and usage, unchecked (see `Image::cast`).
+    /// The same view typed as `format` and `usage`, which must be the view's format and no
+    /// more than its usage (see `Image::cast`).
     pub fn cast<NF: Format, NU: ImageUsage>(
         self,
         format: NF,
         usage: NU,
     ) -> ImageView<'a, NF, NU, D> {
+        cast_check(
+            (self.format.vk_format(), self.usage.flags()),
+            (format.vk_format(), usage.flags()),
+        );
         ImageView {
             image: self.image,
             view: self.view,
@@ -145,7 +150,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageSlice<'a, F, U, D> {
         self
     }
 
-    /// The same slice with another format and usage, unchecked (see `Image::cast`).
+    /// The same slice typed as `format` and `usage` (see `ImageView::cast`).
     pub fn cast<NF: Format, NU: ImageUsage>(
         self,
         format: NF,
@@ -157,6 +162,22 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageSlice<'a, F, U, D> {
             extend: self.extend,
         }
     }
+}
+
+/// Panics unless `to` is the same format as `from` and no more than its usage: a cast can only
+/// narrow what the type says about an image, never claim a usage it was created without.
+pub(crate) fn cast_check(
+    from: (vk::Format, vk::ImageUsageFlags),
+    to: (vk::Format, vk::ImageUsageFlags),
+) {
+    assert!(
+        from.0 == to.0 && from.1.contains(to.1),
+        "can't cast an image of format {:?} and usage {:?} to format {:?} and usage {:?}",
+        from.0,
+        from.1,
+        to.0,
+        to.1
+    );
 }
 
 impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
@@ -171,7 +192,7 @@ mod tests {
     use super::*;
     use crate::image::{
         format::{D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
-        usage::{DepthAttachment, Sampled, StaticUsage, Storage},
+        usage::{DepthAttachment, Sampled, SampledStorage, StaticUsage, Storage},
     };
     use ash::vk::Handle;
     use glam::{IVec2, UVec2};
@@ -293,7 +314,7 @@ mod tests {
     #[test]
     fn copies_and_casts_share_the_layout_state() {
         let layout = undefined();
-        let a = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
+        let a = view::<R8G8B8A8Unorm, SampledStorage>(&layout, 0..1);
         let b = a;
         let c = a.cast(R8G8B8A8Unorm, Storage);
         let taken = |access: ImageUse| {
@@ -315,5 +336,16 @@ mod tests {
             taken(from_cast),
             Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         );
+    }
+
+    /// A cast may drop usages but never add one or change the format.
+    #[test]
+    fn casts_only_narrow() {
+        let layout = undefined();
+        let a = view::<R8G8B8A8Unorm, SampledStorage>(&layout, 0..1);
+        a.cast(R8G8B8A8Unorm, Sampled);
+        a.cast(R8G8B8A8Unorm, SampledStorage);
+        assert!(std::panic::catch_unwind(|| a.cast(R8G8B8A8Unorm, DepthAttachment)).is_err());
+        assert!(std::panic::catch_unwind(|| a.cast(D32SfloatS8Uint, Sampled)).is_err());
     }
 }

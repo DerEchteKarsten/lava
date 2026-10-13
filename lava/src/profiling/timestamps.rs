@@ -1,9 +1,12 @@
 //! GPU timestamps: the timestamp pool of a frame slot, which times its root scope, every `begin_scope` group and every pass
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use ash::vk;
 
-use crate::{error::Result, state::Ctx};
+use crate::{
+    error::Result,
+    state::{Ctx, Functions},
+};
 
 const TIMESTAMPS: u32 = 256;
 
@@ -34,6 +37,8 @@ pub struct TimestampQueries {
     next: u32,
     ticks: Vec<u64>,
     results: Vec<GpuScope>,
+    /// When the root scope of `results` started, on the host's clock (see `root_start`).
+    root_start: Option<Instant>,
 }
 
 impl TimestampQueries {
@@ -57,6 +62,7 @@ impl TimestampQueries {
             next: 0,
             ticks: Vec::new(),
             results: Vec::new(),
+            root_start: None,
         })
     }
 
@@ -123,6 +129,17 @@ impl TimestampQueries {
         let period = Ctx::device_properties().limits.timestamp_period as f64;
         let (ticks, valid_bits) = (&self.ticks, self.valid_bits);
         let base = ticks[self.scopes[0].timestamp as usize] & valid_bits;
+        self.root_start = calibrate().map(|(now_ticks, now)| {
+            // The root started before the calibration: a positive distance in the masked
+            // ticks, unless the clock wrapped in between, which reads as the other way round.
+            let behind = now_ticks.wrapping_sub(base) & valid_bits;
+            if behind <= valid_bits >> 1 {
+                now - Duration::from_nanos((behind as f64 * period) as u64)
+            } else {
+                let ahead = base.wrapping_sub(now_ticks) & valid_bits;
+                now + Duration::from_nanos((ahead as f64 * period) as u64)
+            }
+        });
         let ns = |tick: u64| ((tick & valid_bits).saturating_sub(base) as f64 * period) as u64;
         self.results
             .extend(self.scopes.iter().map(|scope| GpuScope {
@@ -137,6 +154,25 @@ impl TimestampQueries {
     pub(crate) fn results(&self) -> Option<&[GpuScope]> {
         (!self.results.is_empty()).then_some(&self.results)
     }
+
+    /// When the root scope of `results` started, on the host's clock; `None` without
+    /// `VK_KHR_calibrated_timestamps` or results.
+    pub(crate) fn root_start(&self) -> Option<Instant> {
+        self.results().and(self.root_start)
+    }
+}
+
+/// The device's clock (its raw timestamp) and the host's at the same moment, from
+/// `VK_KHR_calibrated_timestamps`: the host time is the middle of the call.
+fn calibrate() -> Option<(u64, Instant)> {
+    let functions = Functions::calibrated_timestamps()?;
+    let info = [vk::CalibratedTimestampInfoKHR::default().time_domain(vk::TimeDomainKHR::DEVICE)];
+    let before = Instant::now();
+    let (timestamps, _max_deviation) = unsafe { functions.get_calibrated_timestamps(&info) }
+        .inspect_err(|err| tracing::warn!("failed to calibrate the GPU timestamps: {err}"))
+        .ok()?;
+    let after = Instant::now();
+    Some((timestamps[0], before + (after - before) / 2))
 }
 
 impl Drop for TimestampQueries {

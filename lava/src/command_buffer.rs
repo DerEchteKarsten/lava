@@ -781,9 +781,11 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             device.cmd_set_scissor(handle, 0, &self.scissors);
         }
         for draw in &self.draws {
-            // The validation layer warns about direct draws of nothing.
+            // The validation layer warns about direct draws of nothing, and an empty index
+            // range can't be bound without `nullDescriptor`.
             if let DrawCommand::Draw { instances: 0, .. }
-            | DrawCommand::Indexed { instances: 0, .. } = draw.command
+            | DrawCommand::Indexed { instances: 0, .. }
+            | DrawCommand::Indexed { count: 0, .. } = draw.command
             {
                 continue;
             }

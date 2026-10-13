@@ -231,6 +231,9 @@ impl Ctx {
                 } else {
                     None
                 },
+                calibrated_timestamps: features.calibrated_timestamps.then(|| {
+                    ash::khr::calibrated_timestamps::Device::load(&instance, &device)
+                }),
                 host_image_copy: ash::ext::host_image_copy::Device::load(&instance, &device),
                 device_address_commands: ash::khr::device_address_commands::Device::load(
                     &instance, &device,
@@ -364,6 +367,9 @@ pub struct Features {
     /// `profiling::counters`; only enabled with the `profiling` feature. Also enables host query
     /// reset, since a counter pool may not be reset in a command buffer that uses it.
     pub performance_query: bool,
+    /// `VK_KHR_calibrated_timestamps`, which puts a frame's GPU scopes on the host's clock
+    /// (`Frame::last_timestamps_start`); only enabled with the `profiling` feature.
+    pub calibrated_timestamps: bool,
 }
 impl Features {
     /// The device extensions to enable. `VK_KHR_device_address_commands` is always required:
@@ -393,6 +399,9 @@ impl Features {
         }
         if self.performance_query {
             extensions.push(ash::khr::performance_query::NAME);
+        }
+        if self.calibrated_timestamps {
+            extensions.push(ash::khr::calibrated_timestamps::NAME);
         }
         if self.raytracing {
             extensions.push(ash::khr::ray_tracing_pipeline::NAME);
@@ -510,6 +519,7 @@ pub struct Functions {
     )>,
     raytracing_pipeline: Option<ash::khr::ray_tracing_pipeline::Device>,
     acceleration_structure: Option<ash::khr::acceleration_structure::Device>,
+    calibrated_timestamps: Option<ash::khr::calibrated_timestamps::Device>,
 }
 
 impl Debug for Functions {
@@ -553,6 +563,10 @@ impl Functions {
     }
     pub(crate) fn mesh() -> Option<&'static ash::ext::mesh_shader::Device> {
         get().mesh.as_ref()
+    }
+    pub(crate) fn calibrated_timestamps()
+    -> Option<&'static ash::khr::calibrated_timestamps::Device> {
+        get().calibrated_timestamps.as_ref()
     }
     pub(crate) fn raytracing_pipeline() -> Option<&'static ash::khr::ray_tracing_pipeline::Device> {
         get().raytracing_pipeline.as_ref()
