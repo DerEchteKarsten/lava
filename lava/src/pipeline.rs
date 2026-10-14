@@ -1,4 +1,4 @@
-//! Pass pipelines: the pass table's entries, the cache of every pass's pipelines per specialization and raster state, and their creation; with `hot-reload`, reloads that replace a pass's pipelines and retire the old ones
+//! Pass pipelines: the pass table's entries (ray tracing passes with their shader groups), the cache of every pass's pipelines per specialization and raster state, and their creation (none for passes the device lacks the features of); with `hot-reload`, reloads that replace a pass's pipelines and retire the old ones
 use ash::vk::TaggedStructure;
 use std::{
     collections::HashMap,
@@ -20,9 +20,7 @@ use crate::{
     command_buffer::Blend,
     error::Result,
     state::{Ctx, Functions},
-    vkobjects::rt_pipeline::{
-        RayTracingShaderCreateInfo, RayTracingShaderGroup, RaytracingPipeline,
-    },
+    vkobjects::rt_pipeline::RaytracingPipeline,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,13 +28,14 @@ pub enum PassKind {
     Compute {
         entry: &'static str,
     },
-    /// One raygen group, a miss group if there is a miss shader, and a triangle hit group
-    /// if there is a closest-hit or any-hit shader.
+    /// The shader groups in binding table order (`[Group(n)]` in `ray_tracing.slang`).
     RayTracing {
         raygen: &'static str,
-        miss: Option<&'static str>,
-        closest_hit: Option<&'static str>,
-        any_hit: Option<&'static str>,
+        miss: &'static [&'static str],
+        hit: &'static [HitGroup],
+        callable: &'static [&'static str],
+        /// `maxPipelineRayRecursionDepth` (`[MaxRecursion(n)]`).
+        max_recursion: u32,
     },
     RasterVertex {
         vertex: &'static str,
@@ -47,6 +46,14 @@ pub enum PassKind {
         mesh: &'static str,
         fragment: &'static str,
     },
+}
+
+/// The entry points of a hit group: triangles without an intersection shader, else procedural.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HitGroup {
+    pub closest_hit: Option<&'static str>,
+    pub any_hit: Option<&'static str>,
+    pub intersection: Option<&'static str>,
 }
 
 pub struct PassEntry {
@@ -73,9 +80,30 @@ pub struct PassEntry {
     /// entry points the bindings were generated from; a hot reload refuses a pass whose
     /// hash changed, since the Rust side can't follow.
     pub layout: u64,
+    /// Its SPIR-V uses ray queries.
+    pub ray_query: bool,
 }
 
 impl PassEntry {
+    /// What the pass needs that the device lacks, if anything.
+    fn missing_feature(&self) -> Option<&'static str> {
+        let features = Ctx::features();
+        if self.ray_query && !features.ray_query {
+            Some("ray queries (`Features::ray_query`)")
+        } else if matches!(self.kind, PassKind::RayTracing { .. }) && !features.ray_tracing_pipeline
+        {
+            Some("ray tracing pipelines (`Features::ray_tracing_pipeline`)")
+        } else {
+            None
+        }
+    }
+
+    /// Panics if the device can't run the pass.
+    fn assert_supported(&self) {
+        if let Some(feature) = self.missing_feature() {
+            panic!("pass `{}` needs {feature}, which this device lacks", self.name);
+        }
+    }
     #[cfg(not(feature = "hot-reload"))]
     fn spirv(&self) -> &'static [u8] {
         self.spirv
@@ -126,7 +154,8 @@ const NO_CONSTANTS: Constants = [0; MAX_SPECIALIZATION_CONSTANTS_SIZE];
 
 /// Every pass's pipelines: compute and ray tracing passes without specialization constants
 /// have one, made at start; the others one per specialization (and raster state), made at
-/// first use. With `hot-reload`, [`Self::reload_pass`] replaces a pass's module and pipelines,
+/// first use. A pass the device can't run (`PassEntry::missing_feature`) has no module and no
+/// pipeline, and panics when it is recorded. With `hot-reload`, [`Self::reload_pass`] replaces a pass's module and pipelines,
 /// and the replaced pipelines are destroyed once no frame can use them (`epoch`).
 pub(crate) struct PipelineManager {
     shader_modules: RwLock<Box<[vk::ShaderModule]>>,
@@ -143,21 +172,29 @@ impl PipelineManager {
     fn new() -> Self {
         let modules: Box<[_]> = PASS_MAP
             .iter()
-            .map(|pass| must(pass, create_module(&pass.spirv())))
+            .map(|pass| match pass.missing_feature() {
+                Some(_) => vk::ShaderModule::null(),
+                None => must(pass, create_module(&pass.spirv())),
+            })
             .collect();
         Self {
             compute_pipelines: RwLock::new(create_unspecialized(false, |pass_index, pass| {
-                must(
-                    pass,
-                    create_compute_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
-                )
+                match pass.missing_feature() {
+                    Some(_) => vk::Pipeline::null(),
+                    None => must(
+                        pass,
+                        create_compute_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
+                    ),
+                }
             })),
             specialized_compute_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raytracing_pipelines: RwLock::new(create_unspecialized(true, |pass_index, pass| {
-                Some(must(
-                    pass,
-                    create_raytracing_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
-                ))
+                pass.missing_feature().is_none().then(|| {
+                    must(
+                        pass,
+                        create_raytracing_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
+                    )
+                })
             })),
             specialized_raytracing_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raster_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
@@ -168,6 +205,7 @@ impl PipelineManager {
     /// The compute pipeline of `pass_index` with `constants`.
     pub(crate) fn compute(&self, pass_index: usize, constants: &Constants) -> vk::Pipeline {
         let pass = &PASS_MAP[pass_index];
+        pass.assert_supported();
         if pass.constants.is_empty() {
             return self.compute_pipelines.read().unwrap()[pass.index];
         }
@@ -187,6 +225,7 @@ impl PipelineManager {
         record: impl FnOnce(&RaytracingPipeline) -> R,
     ) -> R {
         let pass = &PASS_MAP[pass_index];
+        pass.assert_supported();
         if pass.constants.is_empty() {
             return record(
                 self.raytracing_pipelines.read().unwrap()[pass.index]
@@ -213,6 +252,7 @@ impl PipelineManager {
     /// The pipeline of raster pass `pass_index` for `hash`.
     pub(crate) fn raster(&self, hash: &RasterHash, pass_index: usize) -> vk::Pipeline {
         let pass = &PASS_MAP[pass_index];
+        pass.assert_supported();
         cached(&self.raster_pipelines, pass, hash, || {
             let module = self.shader_modules.read().unwrap()[pass_index];
             must(pass, create_raster_pipeline(module, hash, pass_index))
@@ -222,10 +262,13 @@ impl PipelineManager {
     /// Replaces the pass's module and every pipeline made from it. A replaced pipeline is
     /// destroyed once no frame can use it (`epoch`). If the driver rejects the module or one
     /// of the pipelines, nothing is replaced: every new pipeline is made before any is swapped
-    /// in, and no lock is held while one fails.
+    /// in, and no lock is held while one fails. A pass the device can't run is skipped.
     #[cfg(feature = "hot-reload")]
     pub(crate) fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Result<()> {
         let pass = &PASS_MAP[pass_index];
+        if pass.missing_feature().is_some() {
+            return Ok(());
+        }
         let module = create_module(spirv)?;
         let destroy_module = |module| unsafe { Ctx::device().destroy_shader_module(module, None) };
         let unspecialized = pass.constants.is_empty();
@@ -425,8 +468,9 @@ fn create_raytracing_pipeline(
     let PassKind::RayTracing {
         raygen,
         miss,
-        closest_hit,
-        any_hit,
+        hit,
+        callable,
+        max_recursion,
     } = pass.kind
     else {
         unreachable!("{} is a ray tracing pass", pass.name)
@@ -434,32 +478,49 @@ fn create_raytracing_pipeline(
     let info = vk::SpecializationInfo::default()
         .map_entries(pass.constants)
         .data(&constants[..pass.constants_size]);
-    let stage = |entry, flags| make_shader_stage(entry, flags, module, &info);
-    let raygen = [stage(raygen, vk::ShaderStageFlags::RAYGEN_KHR)];
-    let miss = miss.map(|miss| [stage(miss, vk::ShaderStageFlags::MISS_KHR)]);
-    // A hit group's stages: closest hit first, then any hit (see `RaytracingPipeline::new`).
-    let hit: SmallVec<[_; 2]> = closest_hit
-        .map(|entry| stage(entry, vk::ShaderStageFlags::CLOSEST_HIT_KHR))
-        .into_iter()
-        .chain(any_hit.map(|entry| stage(entry, vk::ShaderStageFlags::ANY_HIT_KHR)))
-        .collect();
-    let mut groups = vec![RayTracingShaderCreateInfo {
-        stages: &raygen,
-        group: RayTracingShaderGroup::RayGen,
-    }];
-    if let Some(miss) = &miss {
-        groups.push(RayTracingShaderCreateInfo {
-            stages: miss,
-            group: RayTracingShaderGroup::Miss,
-        });
+    let mut stages: SmallVec<[vk::PipelineShaderStageCreateInfo; 8]> = SmallVec::new();
+    let mut groups: SmallVec<[vk::RayTracingShaderGroupCreateInfoKHR; 8]> = SmallVec::new();
+    // Adds the stage and returns its index, or `SHADER_UNUSED_KHR` without one.
+    let mut stage = |entry: Option<&'static str>, flags| match entry {
+        Some(entry) => {
+            stages.push(make_shader_stage(entry, flags, module, &info));
+            stages.len() as u32 - 1
+        }
+        None => vk::SHADER_UNUSED_KHR,
+    };
+    let group = |ty| {
+        vk::RayTracingShaderGroupCreateInfoKHR::default()
+            .ty(ty)
+            .general_shader(vk::SHADER_UNUSED_KHR)
+            .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+            .any_hit_shader(vk::SHADER_UNUSED_KHR)
+            .intersection_shader(vk::SHADER_UNUSED_KHR)
+    };
+    let general = vk::RayTracingShaderGroupTypeKHR::GENERAL;
+    groups.push(group(general).general_shader(stage(Some(raygen), vk::ShaderStageFlags::RAYGEN_KHR)));
+    for &entry in miss {
+        groups.push(group(general).general_shader(stage(Some(entry), vk::ShaderStageFlags::MISS_KHR)));
     }
-    if !hit.is_empty() {
-        groups.push(RayTracingShaderCreateInfo {
-            stages: &hit,
-            group: RayTracingShaderGroup::Hit,
-        });
+    for g in hit {
+        let ty = if g.intersection.is_some() {
+            vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP
+        } else {
+            vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP
+        };
+        groups.push(
+            group(ty)
+                .closest_hit_shader(stage(g.closest_hit, vk::ShaderStageFlags::CLOSEST_HIT_KHR))
+                .any_hit_shader(stage(g.any_hit, vk::ShaderStageFlags::ANY_HIT_KHR))
+                .intersection_shader(stage(g.intersection, vk::ShaderStageFlags::INTERSECTION_KHR)),
+        );
     }
-    RaytracingPipeline::new(Bindless::layout(), &groups)
+    for &entry in callable {
+        groups.push(
+            group(general).general_shader(stage(Some(entry), vk::ShaderStageFlags::CALLABLE_KHR)),
+        );
+    }
+    let counts = [1, miss.len(), hit.len(), callable.len()].map(|n| n as u32);
+    RaytracingPipeline::new(Bindless::layout(), &stages, &groups, counts, max_recursion)
 }
 
 fn make_shader_stage<'a>(
@@ -706,8 +767,9 @@ mod tests {
                 PassKind::RayTracing {
                     raygen,
                     miss,
-                    closest_hit,
-                    any_hit,
+                    hit,
+                    callable,
+                    max_recursion,
                 } => {
                     if specialized {
                         &mut specialized_raytracing
@@ -715,9 +777,16 @@ mod tests {
                         &mut raytracing
                     }
                     .push(pass.index);
-                    [Some(raygen), miss, closest_hit, any_hit]
+                    assert!((1..=31).contains(&max_recursion));
+                    let hit = hit
+                        .iter()
+                        .flat_map(|g| [g.closest_hit, g.any_hit, g.intersection])
+                        .flatten();
+                    [raygen]
                         .into_iter()
-                        .flatten()
+                        .chain(miss.iter().copied())
+                        .chain(hit)
+                        .chain(callable.iter().copied())
                         .collect()
                 }
             };

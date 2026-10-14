@@ -101,12 +101,13 @@ impl SemaphoreInfo<'_> {
     }
 }
 
-pub trait SemaphoreType {
+pub trait SemaphoreType: crate::sealed::Sealed {
     fn create() -> Result<Semaphore<Self>>;
 }
 
 #[derive(Debug)]
 pub struct Timeline;
+impl crate::sealed::Sealed for Timeline {}
 impl SemaphoreType for Timeline {
     fn create() -> Result<Semaphore<Self>> {
         let mut timeline = vk::SemaphoreTypeCreateInfo {
@@ -125,6 +126,7 @@ impl SemaphoreType for Timeline {
 
 #[derive(Debug)]
 pub struct Binary;
+impl crate::sealed::Sealed for Binary {}
 impl SemaphoreType for Binary {
     fn create() -> Result<Semaphore<Self>> {
         let create_info = vk::SemaphoreCreateInfo::default();
@@ -212,7 +214,7 @@ impl Fence {
 }
 
 /// A queue family lava submits to. Present always goes through [`Gfx`].
-pub trait QueueFamilie: Debug {
+pub trait QueueFamilie: crate::sealed::Sealed + Debug {
     fn queues() -> &'static FamilyQueues;
 }
 
@@ -221,12 +223,14 @@ pub struct Transfer;
 #[derive(Debug)]
 pub struct Gfx;
 
+impl crate::sealed::Sealed for Transfer {}
 impl QueueFamilie for Transfer {
     fn queues() -> &'static FamilyQueues {
         let ctx = Ctx::get();
         ctx.transfer_queues.as_ref().unwrap_or(&ctx.gfx_queues)
     }
 }
+impl crate::sealed::Sealed for Gfx {}
 impl QueueFamilie for Gfx {
     fn queues() -> &'static FamilyQueues {
         &Ctx::get().gfx_queues

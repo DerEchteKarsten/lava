@@ -1,16 +1,21 @@
-//! Typed buffer slices: the address ranges commands take (no buffer handle or offset), sub-ranges, byte views and casts
+//! Typed buffer slices: the address ranges commands take (no buffer handle or offset), sub-ranges, byte views and casts, and the buffer transfer commands (fill, update, copy)
 use ash::vk;
 use bytemuck::Pod;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::range::Range;
 
+use lava_macros::validation_trace;
+use smallvec::SmallVec;
+use std::iter;
+
 use crate::{
     buffer::{
         Buffer,
         usage::{BufferUsage, Storage},
     },
-    command_buffer::BufferAccess,
+    command_buffer::{BufferAccess, CommandBuffer},
+    state::Functions,
 };
 
 /// A range of a buffer as the GPU sees it: an address, a size and the usage. `Copy`, since a
@@ -93,6 +98,9 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     pub fn len(&self) -> usize {
         self.size as usize / size_of::<T>()
     }
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -146,6 +154,112 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     }
 }
 
+// ---- transfer commands -------------------------------------------------------------------
+
+impl CommandBuffer {
+    #[validation_trace]
+    pub fn fill_buffer<'a, T: Copy + Pod, U: BufferUsage>(
+        &mut self,
+        buffer: BufferSlice<'a, T, U>,
+        data: u32,
+    ) {
+        self.flush_pending(
+            std::iter::empty(),
+            std::iter::once(&BufferAccess {
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: buffer.get_range(),
+            }),
+        );
+        unsafe {
+            Functions::device_address_commands().cmd_fill_memory(
+                self.handle,
+                &buffer.address_range(),
+                buffer.address_flags(),
+                data,
+            )
+        };
+    }
+
+    #[validation_trace]
+    pub fn update_buffer<'a, T: Copy + Pod, U: BufferUsage>(
+        &mut self,
+        buffer: BufferSlice<'a, T, U>,
+        data: &T,
+    ) {
+        self.flush_pending(
+            iter::empty(),
+            iter::once(&BufferAccess {
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                range: buffer.get_range(),
+            }),
+        );
+        unsafe {
+            Functions::device_address_commands().cmd_update_memory(
+                self.handle,
+                &buffer.address_range(),
+                buffer.address_flags(),
+                bytemuck::bytes_of(data),
+            )
+        };
+    }
+    /// Copies `src` to the start of `dst`, which must be at least as long.
+    #[validation_trace]
+    pub fn copy_buffer<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
+        &mut self,
+        src: BufferSlice<'a, T, U>,
+        dst: BufferSlice<'a, T, U2>,
+    ) {
+        self.copy_buffer_regions(&[(src, dst)]);
+    }
+    /// One `copy_buffer` per pair, in one command.
+    #[validation_trace]
+    pub fn copy_buffer_regions<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
+        &mut self,
+        regions: &[(BufferSlice<'a, T, U>, BufferSlice<'a, T, U2>)],
+    ) {
+        let accesses = regions
+            .iter()
+            .flat_map(|(src, dst)| {
+                assert!(
+                    src.size <= dst.size,
+                    "cannot copy {} bytes into a buffer slice of {} bytes",
+                    src.size,
+                    dst.size
+                );
+                [
+                    src.access(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    ),
+                    dst.range(..src.len()).access(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
+                ]
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        self.flush_pending(iter::empty(), accesses.iter());
+        let copies = regions
+            .iter()
+            .map(|(src, dst)| {
+                vk::DeviceMemoryCopyKHR::default()
+                    .src_range(src.address_range())
+                    .src_flags(src.address_flags())
+                    .dst_range(dst.range(..src.len()).address_range())
+                    .dst_flags(dst.address_flags())
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        unsafe {
+            Functions::device_address_commands().cmd_copy_memory(
+                self.handle,
+                &vk::CopyDeviceMemoryInfoKHR::default().regions(&copies),
+            )
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +300,10 @@ mod tests {
 
         let excluded_start =
             slice.range((std::ops::Bound::Excluded(1), std::ops::Bound::Unbounded));
-        assert_eq!((excluded_start.address(), excluded_start.len()), (BASE + 8, 6));
+        assert_eq!(
+            (excluded_start.address(), excluded_start.len()),
+            (BASE + 8, 6)
+        );
 
         let empty = slice.range(4..4);
         assert_eq!((empty.address(), empty.len()), (BASE + 16, 0));
@@ -203,7 +320,10 @@ mod tests {
     fn byte_range_addresses_bytes_and_casts_reinterpret() {
         let slice = slice(8);
         let bytes = slice.byte_range(4..20);
-        assert_eq!((bytes.address(), bytes.len(), bytes.size()), (BASE + 4, 16, 16));
+        assert_eq!(
+            (bytes.address(), bytes.len(), bytes.size()),
+            (BASE + 4, 16, 16)
+        );
 
         let words = bytes.cast::<u32>();
         assert_eq!((words.address(), words.len()), (BASE + 4, 4));

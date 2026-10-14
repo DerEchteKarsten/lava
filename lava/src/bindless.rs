@@ -361,7 +361,7 @@ impl Bindless {
                 &[],
             )
         };
-        if Ctx::features().raytracing {
+        if Ctx::features().ray_tracing_pipeline {
             unsafe {
                 Ctx::device().cmd_bind_descriptor_sets(
                     *cmd,

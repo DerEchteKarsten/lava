@@ -37,13 +37,21 @@ mod hot_reload;
 pub mod image;
 pub mod pipeline;
 pub mod profiling;
-// Without hot reload only build.rs compiles passes, and the lib needs just its constants.
-#[cfg_attr(not(feature = "hot-reload"), allow(dead_code))]
+// Shared with build.rs, which uses most of it: the lib needs its constants, and with hot
+// reload the session, linking and layout hash.
+#[allow(dead_code)]
 mod slang_compile;
 pub mod scratchpad;
 pub mod state;
 pub mod vkobjects;
 use raw_window_handle::RawDisplayHandle;
+
+/// The supertrait of the traits only lava implements (formats, usages, dimensions, views,
+/// semaphore and queue kinds, acceleration structure levels, index formats): public in a
+/// private module, so other crates can name and bound by those traits but not implement them.
+mod sealed {
+    pub trait Sealed {}
+}
 
 /// Initialises the global Vulkan context. Pass the display handle to be able to create
 /// [`vkobjects::surface::Surface`]s and swapchains; `None` runs headless.

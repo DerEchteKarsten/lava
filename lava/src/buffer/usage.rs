@@ -3,7 +3,9 @@ use ash::vk;
 
 /// Every buffer also gets `SHADER_DEVICE_ADDRESS`, `TRANSFER_SRC` and `TRANSFER_DST` (`Buffer::raw`):
 /// leaving the transfer usages out of buffers that don't need them made no measurable difference.
-pub trait BufferUsage: 'static + Copy + Send + Sync + std::fmt::Debug {
+/// With `Features::acceleration_structure` it also gets
+/// `ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR`, so any buffer can feed a build.
+pub trait BufferUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     fn flags(&self) -> vk::BufferUsageFlags;
     /// Panics unless the usage has every flag of `required`. The command buffer calls it with
     /// what its trait bounds (`IsStorage`, `IsIndirect`, ...) require. A static usage's type
@@ -34,6 +36,7 @@ pub struct Unknown;
 impl StaticUsage for Unknown {
     const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::empty();
 }
+impl crate::sealed::Sealed for Unknown {}
 impl BufferUsage for Unknown {
     fn flags(&self) -> vk::BufferUsageFlags {
         Self::VK
@@ -47,7 +50,22 @@ pub struct ShaderBindingTable;
 impl StaticUsage for ShaderBindingTable {
     const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR;
 }
+impl crate::sealed::Sealed for ShaderBindingTable {}
 impl BufferUsage for ShaderBindingTable {
+    fn flags(&self) -> vk::BufferUsageFlags {
+        Self::VK
+    }
+    fn check(&self, _: vk::BufferUsageFlags) {}
+}
+
+/// The memory of an acceleration structure, which owns its buffer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccelerationStructureStorage;
+impl StaticUsage for AccelerationStructureStorage {
+    const VK: vk::BufferUsageFlags = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR;
+}
+impl crate::sealed::Sealed for AccelerationStructureStorage {}
+impl BufferUsage for AccelerationStructureStorage {
     fn flags(&self) -> vk::BufferUsageFlags {
         Self::VK
     }
@@ -59,6 +77,7 @@ impl BufferUsage for ShaderBindingTable {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dynamic(pub vk::BufferUsageFlags);
 
+impl crate::sealed::Sealed for Dynamic {}
 impl BufferUsage for Dynamic {
     fn flags(&self) -> vk::BufferUsageFlags {
         self.0
@@ -101,6 +120,7 @@ macro_rules! usages {
                 const VK: vk::BufferUsageFlags =
                     vk::BufferUsageFlags::from_raw(0 $(| usages!(@flag $flag).as_raw())+);
             }
+            impl crate::sealed::Sealed for $name {}
             impl BufferUsage for $name {
                 fn flags(&self) -> vk::BufferUsageFlags {
                     Self::VK

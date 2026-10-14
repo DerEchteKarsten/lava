@@ -161,6 +161,7 @@ mod tests {
             constants_size: 0,
             regions: &[],
             layout: 0,
+            ray_query: false,
         }
     }
 

@@ -217,20 +217,12 @@ impl Ctx {
                         ash::khr::performance_query::Device::load(&instance, &device),
                     )
                 }),
-                raytracing_pipeline: if features.raytracing {
-                    Some(ash::khr::ray_tracing_pipeline::Device::load(
-                        &instance, &device,
-                    ))
-                } else {
-                    None
-                },
-                acceleration_structure: if features.raytracing {
-                    Some(ash::khr::acceleration_structure::Device::load(
-                        &instance, &device,
-                    ))
-                } else {
-                    None
-                },
+                raytracing_pipeline: features.ray_tracing_pipeline.then(|| {
+                    ash::khr::ray_tracing_pipeline::Device::load(&instance, &device)
+                }),
+                acceleration_structure: features.acceleration_structure.then(|| {
+                    ash::khr::acceleration_structure::Device::load(&instance, &device)
+                }),
                 calibrated_timestamps: features.calibrated_timestamps.then(|| {
                     ash::khr::calibrated_timestamps::Device::load(&instance, &device)
                 }),
@@ -353,7 +345,14 @@ pub struct Features {
     pub device_debug_utils: bool,
     pub debug_utils: bool,
     pub mesh: bool,
-    pub raytracing: bool,
+    /// `VK_KHR_acceleration_structure`: `Blas`/`Tlas` and their builds. `ray_query` and
+    /// `ray_tracing_pipeline` need it. Also enables host query reset, which `CompactedSizes`
+    /// uses to poll a query before it ran.
+    pub acceleration_structure: bool,
+    /// `VK_KHR_ray_query`: tracing from compute, mesh and fragment passes.
+    pub ray_query: bool,
+    /// `VK_KHR_ray_tracing_pipeline` with indirect tracing: ray tracing passes.
+    pub ray_tracing_pipeline: bool,
     /// Pipeline statistics queries (invocation counts per pass).
     pub pipeline_statistics: bool,
     /// Task and mesh shader invocations in pipeline statistics.
@@ -403,10 +402,15 @@ impl Features {
         if self.calibrated_timestamps {
             extensions.push(ash::khr::calibrated_timestamps::NAME);
         }
-        if self.raytracing {
-            extensions.push(ash::khr::ray_tracing_pipeline::NAME);
+        if self.acceleration_structure {
             extensions.push(ash::khr::deferred_host_operations::NAME);
             extensions.push(ash::khr::acceleration_structure::NAME);
+        }
+        if self.ray_query {
+            extensions.push(ash::khr::ray_query::NAME);
+        }
+        if self.ray_tracing_pipeline {
+            extensions.push(ash::khr::ray_tracing_pipeline::NAME);
         }
         extensions
     }
@@ -419,6 +423,7 @@ impl Features {
         mesh: &'a mut vk::PhysicalDeviceMeshShaderFeaturesEXT,
         ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
         acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+        query: &'a mut vk::PhysicalDeviceRayQueryFeaturesKHR,
         host_image_copy: &'a mut vk::PhysicalDeviceHostImageCopyFeaturesEXT,
         clock: &'a mut vk::PhysicalDeviceShaderClockFeaturesKHR,
         performance: &'a mut vk::PhysicalDevicePerformanceQueryFeaturesKHR,
@@ -448,7 +453,7 @@ impl Features {
             .storage_buffer8_bit_access(true)
             .shader_buffer_int64_atomics(true)
             .shader_int8(true)
-            .host_query_reset(self.performance_query);
+            .host_query_reset(self.performance_query || self.acceleration_structure);
         *vk13 = vk13
             .dynamic_rendering(true)
             .maintenance4(true)
@@ -492,12 +497,19 @@ impl Features {
             *performance = performance.performance_counter_query_pools(true);
             features = features.push(performance);
         }
-        if self.raytracing {
-            *ray = ray.ray_tracing_pipeline(true);
-            *acc = acc
-                .acceleration_structure(true)
-                .descriptor_binding_acceleration_structure_update_after_bind(true);
-            features = features.push(ray).push(acc);
+        if self.acceleration_structure {
+            *acc = acc.acceleration_structure(true);
+            features = features.push(acc);
+        }
+        if self.ray_query {
+            *query = query.ray_query(true);
+            features = features.push(query);
+        }
+        if self.ray_tracing_pipeline {
+            *ray = ray
+                .ray_tracing_pipeline(true)
+                .ray_tracing_pipeline_trace_rays_indirect(true);
+            features = features.push(ray);
         }
         features
     }
@@ -657,7 +669,7 @@ pub(super) fn create_device(
 
     let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut host_image_copy, mut clock) =
         Default::default();
-    let (mut performance, mut address_commands) = Default::default();
+    let (mut query, mut performance, mut address_commands) = Default::default();
     let mut features = features.features(
         &mut vk11,
         &mut vk12,
@@ -665,6 +677,7 @@ pub(super) fn create_device(
         &mut mesh,
         &mut ray,
         &mut acc,
+        &mut query,
         &mut host_image_copy,
         &mut clock,
         &mut performance,
@@ -761,14 +774,27 @@ mod tests {
         );
         assert_eq!(
             only(Features {
-                raytracing: true,
+                acceleration_structure: true,
                 ..Default::default()
             }),
             [
-                "VK_KHR_ray_tracing_pipeline",
                 "VK_KHR_deferred_host_operations",
                 "VK_KHR_acceleration_structure"
             ]
+        );
+        assert_eq!(
+            only(Features {
+                ray_query: true,
+                ..Default::default()
+            }),
+            ["VK_KHR_ray_query"]
+        );
+        assert_eq!(
+            only(Features {
+                ray_tracing_pipeline: true,
+                ..Default::default()
+            }),
+            ["VK_KHR_ray_tracing_pipeline"]
         );
         // Instance-level validation alone needs no device extension.
         assert!(
@@ -789,10 +815,11 @@ mod tests {
         vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
         vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
         vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
+        vk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
     ) {
         let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut hic) =
             Default::default();
-        let (mut clock, mut performance, mut address_commands) = Default::default();
+        let (mut query, mut clock, mut performance, mut address_commands) = Default::default();
         features.features(
             &mut vk11,
             &mut vk12,
@@ -800,6 +827,7 @@ mod tests {
             &mut mesh,
             &mut ray,
             &mut acc,
+            &mut query,
             &mut hic,
             &mut clock,
             &mut performance,
@@ -811,12 +839,13 @@ mod tests {
         mesh.p_next = std::ptr::null_mut();
         ray.p_next = std::ptr::null_mut();
         acc.p_next = std::ptr::null_mut();
-        (vk12, vk13, mesh, ray, acc)
+        query.p_next = std::ptr::null_mut();
+        (vk12, vk13, mesh, ray, acc, query)
     }
 
     #[test]
     fn core_features_lava_relies_on_are_always_requested() {
-        let (vk12, vk13, mesh, ray, acc) = requested(&Features::default());
+        let (vk12, vk13, mesh, ray, acc, query) = requested(&Features::default());
         // Bindless descriptors, buffer pointers in push constants, sync2 barriers, dynamic rendering.
         assert_eq!(vk12.buffer_device_address, vk::TRUE);
         assert_eq!(vk12.runtime_descriptor_array, vk::TRUE);
@@ -835,25 +864,35 @@ mod tests {
         assert_eq!(mesh.mesh_shader, vk::FALSE);
         assert_eq!(ray.ray_tracing_pipeline, vk::FALSE);
         assert_eq!(acc.acceleration_structure, vk::FALSE);
+        assert_eq!(query.ray_query, vk::FALSE);
     }
 
     #[test]
     fn optional_features_are_requested_only_when_enabled() {
-        let (_, _, mesh, ray, acc) = requested(&Features {
+        let (_, _, mesh, ray, acc, query) = requested(&Features {
             mesh: true,
             ..Default::default()
         });
         assert_eq!((mesh.mesh_shader, mesh.task_shader), (vk::TRUE, vk::TRUE));
         assert_eq!(ray.ray_tracing_pipeline, vk::FALSE);
         assert_eq!(acc.acceleration_structure, vk::FALSE);
+        assert_eq!(query.ray_query, vk::FALSE);
 
-        let (_, _, mesh, ray, acc) = requested(&Features {
-            raytracing: true,
+        let (_, _, mesh, ray, acc, query) = requested(&Features {
+            acceleration_structure: true,
+            ray_query: true,
+            ray_tracing_pipeline: true,
             ..Default::default()
         });
         assert_eq!(mesh.mesh_shader, vk::FALSE);
-        assert_eq!(ray.ray_tracing_pipeline, vk::TRUE);
         assert_eq!(acc.acceleration_structure, vk::TRUE);
+        assert_eq!(
+            acc.descriptor_binding_acceleration_structure_update_after_bind,
+            vk::FALSE
+        );
+        assert_eq!(query.ray_query, vk::TRUE);
+        assert_eq!(ray.ray_tracing_pipeline, vk::TRUE);
+        assert_eq!(ray.ray_tracing_pipeline_trace_rays_indirect, vk::TRUE);
     }
 
     #[test]

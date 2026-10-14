@@ -6,7 +6,7 @@ use std::{
 
 use ash::vk;
 
-pub trait Format: 'static + Copy + Send + Sync + std::fmt::Debug {
+pub trait Format: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     /// The texels of a clear value: an array of the format's component type, `(depth, stencil)`
     /// for depth-stencil formats, a `ClearValue` for `Dynamic`.
     type Texels;
@@ -35,9 +35,9 @@ pub trait StaticFormat: Format + Default {}
 /// Formats whose texels a shader can read as `T` (`[f32; 4]` for a `Tex2D<float4>`).
 pub trait HasTexels<T>: Format {}
 
-pub trait ColorAspect {}
-pub trait DepthAspect {}
-pub trait StencilAspect {}
+pub trait ColorAspect: crate::sealed::Sealed {}
+pub trait DepthAspect: crate::sealed::Sealed {}
+pub trait StencilAspect: crate::sealed::Sealed {}
 
 /// The value an attachment or image is cleared to, padded to 4 components.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -79,6 +79,7 @@ impl Dynamic {
     }
 }
 
+impl crate::sealed::Sealed for Dynamic {}
 impl Format for Dynamic {
     type Texels = ClearValue;
 
@@ -206,6 +207,7 @@ macro_rules! formats {
         $(
             #[derive(Clone, Copy, Debug, Default)]
             pub struct $name;
+            impl crate::sealed::Sealed for $name {}
             impl StaticFormat for $name {}
             impl Format for $name {
                 type Texels = formats!(@texels $kind $($n)?);

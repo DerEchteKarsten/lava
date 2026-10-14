@@ -5,7 +5,7 @@ use ash::vk;
 use glam::{IVec2, IVec3, UVec2, UVec3};
 
 /// The dimension of an image and its views. A 3D image's mips halve in depth too.
-pub trait Dim: Copy + Default + Debug + Send + Sync + 'static {
+pub trait Dim: crate::sealed::Sealed + Copy + Default + Debug + Send + Sync + 'static {
     /// `UVec2` or `UVec3`: sizes, and the unsigned offsets of host copies.
     type Extent: Copy + Debug + PartialEq + Add<Output = Self::Extent> + Send + Sync;
     /// `IVec2` or `IVec3`: the offsets of `ImageSlice`s, which blits may move outside.
@@ -37,6 +37,7 @@ fn halve(size: u32, level: u32) -> u32 {
     size.checked_shr(level).unwrap_or(0).max(1)
 }
 
+impl crate::sealed::Sealed for D2 {}
 impl Dim for D2 {
     type Extent = UVec2;
     type Offset = IVec2;
@@ -70,6 +71,7 @@ impl Dim for D2 {
     }
 }
 
+impl crate::sealed::Sealed for D3 {}
 impl Dim for D3 {
     type Extent = UVec3;
     type Offset = IVec3;

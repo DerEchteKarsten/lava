@@ -1,17 +1,21 @@
-//! Borrowed image views of a mip range and their slices, the only image types commands take, with the layouts they track for barriers
-use std::{range::Range, sync::atomic::AtomicU32};
+//! Borrowed image views of a mip range and their slices, the only image types commands take, with the layouts they track for barriers, and the image transfer commands (clear, blit, copies to and from buffers)
+use std::{iter, range::Range, sync::atomic::AtomicU32};
 
 use ash::vk;
+use bytemuck::Pod;
+use lava_macros::validation_trace;
 
 use crate::{
     bindless::BindlessHandle,
-    command_buffer::{ImageAccess, ImageUse},
+    buffer::{slice::BufferSlice, usage::BufferUsage},
+    command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
     image::{
         Image, Views,
         dim::{D2, Dim},
-        format::Format,
-        usage::ImageUsage,
+        format::{ColorAspect, Format},
+        usage::{ImageUsage, IsTransferDst, IsTransferSrc},
     },
+    state::{Ctx, Functions},
 };
 
 /// A borrowed view of `mip_range` of an image. Commands, bindless binds and generated bindings
@@ -187,6 +191,208 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     }
 }
 
+// ---- transfer commands -------------------------------------------------------------------
+
+/// How a blit samples its source.
+#[repr(i32)]
+pub enum Filter {
+    Nearest = 0,
+    Liniear = 1,
+}
+
+impl CommandBuffer {
+    #[validation_trace]
+    pub fn clear_image<'a, F: Format, U: IsTransferDst, D: Dim>(
+        &'a mut self,
+        image: ImageView<'a, F, U, D>,
+        clear_color: F::Texels,
+    ) where
+        F: ColorAspect,
+    {
+        image.aspect_check(vk::ImageAspectFlags::COLOR);
+        image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        self.flush_pending(
+            std::iter::once(&image.access(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::ImageLayout::GENERAL,
+            )),
+            std::iter::empty(),
+        );
+        unsafe {
+            Ctx::device().cmd_clear_color_image(
+                self.handle,
+                image.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearValue::from(image.format().clear_value(clear_color)).color,
+                &[image.subresource_range()],
+            )
+        };
+    }
+    #[validation_trace]
+    pub fn blit_image<'a, F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst, D: Dim>(
+        &mut self,
+        src: ImageSlice<'a, F, U, D>,
+        dst: ImageSlice<'a, F2, U2, D>,
+        filter: Filter,
+    ) where
+        F: ColorAspect,
+        F2: ColorAspect,
+    {
+        src.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
+        dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        self.flush_pending(
+            [
+                src.view.access(
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                    vk::ImageLayout::GENERAL,
+                ),
+                dst.view.access(
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::ImageLayout::GENERAL,
+                ),
+            ]
+            .iter(),
+            iter::empty(),
+        );
+
+        let regions = [blit_region(&src, &dst)];
+        unsafe {
+            Ctx::device().cmd_blit_image(
+                self.handle,
+                src.view.image,
+                vk::ImageLayout::GENERAL,
+                dst.view.image,
+                vk::ImageLayout::GENERAL,
+                &regions,
+                vk::Filter::from_raw(filter as i32),
+            );
+        }
+    }
+    #[validation_trace]
+    pub fn copy_buffer_to_image<
+        'a,
+        T: Copy + Pod,
+        BU: BufferUsage,
+        F: Format,
+        U: IsTransferDst,
+        D: Dim,
+    >(
+        &mut self,
+        src: BufferSlice<'a, T, BU>,
+        dst: ImageSlice<'a, F, U, D>,
+    ) where
+        F: ColorAspect,
+    {
+        dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        self.flush_pending(
+            iter::once(&dst.view.access(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::ImageLayout::GENERAL,
+            )),
+            iter::once(&BufferAccess {
+                access: vk::AccessFlags2::TRANSFER_READ,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: src.get_range(),
+            }),
+        );
+        let regions = [vk::DeviceMemoryImageCopyKHR::default()
+            .address_range(src.address_range())
+            .address_flags(src.address_flags())
+            .image_subresource(dst.view.subresource_layers(dst.view.mip_range.start))
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_offset(D::offset_3d(dst.offset))
+            .image_extent(D::extent_3d(dst.extend))];
+        unsafe {
+            Functions::device_address_commands().cmd_copy_memory_to_image(
+                self.handle,
+                &vk::CopyDeviceMemoryImageInfoKHR::default()
+                    .image(dst.view.image)
+                    .regions(&regions),
+            )
+        };
+    }
+
+    /// Copies the texels of `src` (its view's first mip level) into `dst`, tightly packed row
+    /// by row (and slice by slice).
+    #[validation_trace]
+    pub fn copy_image_to_buffer<
+        'a,
+        T: Copy + Pod,
+        F: Format,
+        U: IsTransferSrc,
+        BU: BufferUsage,
+        D: Dim,
+    >(
+        &mut self,
+        src: ImageSlice<'a, F, U, D>,
+        dst: BufferSlice<'a, T, BU>,
+    ) where
+        F: ColorAspect,
+    {
+        src.view.aspect_check(vk::ImageAspectFlags::COLOR);
+        src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
+        self.flush_pending(
+            iter::once(&src.view.access(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+                vk::ImageLayout::GENERAL,
+            )),
+            iter::once(&BufferAccess {
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: dst.get_range(),
+            }),
+        );
+        let regions = [vk::DeviceMemoryImageCopyKHR::default()
+            .address_range(dst.address_range())
+            .address_flags(dst.address_flags())
+            .image_subresource(src.view.subresource_layers(src.view.mip_range.start))
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_offset(D::offset_3d(src.offset))
+            .image_extent(D::extent_3d(src.extend))];
+        unsafe {
+            Functions::device_address_commands().cmd_copy_image_to_memory(
+                self.handle,
+                &vk::CopyDeviceMemoryImageInfoKHR::default()
+                    .image(src.view.image)
+                    .regions(&regions),
+            )
+        };
+    }
+}
+
+/// Blit region covering the two slices: from each slice's offset to offset + extent.
+fn blit_region<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
+    src: &ImageSlice<'_, F, U, D>,
+    dst: &ImageSlice<'_, F2, U2, D>,
+) -> vk::ImageBlit {
+    let corners = |offset: D::Offset, extend: D::Extent| {
+        let start = D::offset_3d(offset);
+        let size = D::extent_3d(extend);
+        [
+            start,
+            vk::Offset3D {
+                x: start.x + size.width as i32,
+                y: start.y + size.height as i32,
+                z: start.z + size.depth as i32,
+            },
+        ]
+    };
+    vk::ImageBlit {
+        src_offsets: corners(src.offset, src.extend),
+        dst_offsets: corners(dst.offset, dst.extend),
+        src_subresource: src.view.subresource_layers(src.view.mip_range.start),
+        dst_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +553,28 @@ mod tests {
         a.cast(R8G8B8A8Unorm, SampledStorage);
         assert!(std::panic::catch_unwind(|| a.cast(R8G8B8A8Unorm, DepthAttachment)).is_err());
         assert!(std::panic::catch_unwind(|| a.cast(D32SfloatS8Uint, Sampled)).is_err());
+    }
+
+    #[test]
+    fn blit_region_spans_offset_to_offset_plus_extent() {
+        let (a, b) = (undefined(), undefined());
+        let src = view::<R8G8B8A8Unorm, Sampled>(&a, 0..1)
+            .region(UVec2::new(16, 8))
+            .offset(IVec2::new(4, 2));
+        let dst = view::<R8G8B8A8Unorm, Sampled>(&b, 0..1)
+            .region(UVec2::new(32, 16))
+            .offset(IVec2::new(10, 20));
+        let region = blit_region(&src, &dst);
+
+        let corner = |o: vk::Offset3D| (o.x, o.y, o.z);
+        assert_eq!(corner(region.src_offsets[0]), (4, 2, 0));
+        assert_eq!(corner(region.src_offsets[1]), (20, 10, 1));
+        assert_eq!(corner(region.dst_offsets[0]), (10, 20, 0));
+        assert_eq!(corner(region.dst_offsets[1]), (42, 36, 1));
+        assert_eq!(region.src_subresource.mip_level, 0);
+        assert_eq!(
+            region.src_subresource.aspect_mask,
+            vk::ImageAspectFlags::COLOR
+        );
     }
 }

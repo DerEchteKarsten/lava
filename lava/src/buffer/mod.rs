@@ -102,10 +102,13 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         num_bytes: u64,
         alignment: Option<u32>,
     ) -> Result<Self> {
-        let flags = usage.flags()
+        let mut flags = usage.flags()
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        if Ctx::features().acceleration_structure {
+            flags |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        }
         let create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(flags);
         let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
         let mut dedicated = vk::MemoryDedicatedRequirements::default();

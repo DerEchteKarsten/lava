@@ -1,4 +1,4 @@
-//! Command recording for generated passes: barriers, renderings, dispatches and transfers
+//! Command recording for generated passes: barriers, renderings and dispatches (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with the swapchain)
 use std::{
     fmt::Debug,
     iter,
@@ -23,8 +23,8 @@ use crate::{
     image::{
         dim::Dim,
         format::{ColorAspect, DepthAspect, Format},
-        slice::{ImageSlice, ImageView},
-        usage::{ImageUsage, IsColorAttachment, IsDepthAttachment, IsTransferDst, IsTransferSrc},
+        slice::ImageView,
+        usage::{ImageUsage, IsColorAttachment, IsDepthAttachment},
     },
     pipeline::{Constants, RasterHash, pipelines},
     profiling::{PassQueries, TimestampQueries},
@@ -42,6 +42,33 @@ pub(crate) struct BufferAccess {
     pub(crate) stage: vk::PipelineStageFlags2,
     pub(crate) access: vk::AccessFlags2,
     pub(crate) range: Range<u64>,
+}
+
+/// The range of a read of every acceleration structure: a TLAS build or a trace reaches
+/// BLASes lava can't list (instances may be written on the GPU). It is empty, so it overlaps
+/// no buffer range, covers none and is covered by none; [`BufferAccess::overlaps`] makes it
+/// conflict with acceleration structure writes instead, which only acceleration structure
+/// commands make, all at the build stage.
+pub(crate) const EVERY_ACCELERATION_STRUCTURE: Range<u64> = Range {
+    start: u64::MAX,
+    end: u64::MAX,
+};
+
+impl BufferAccess {
+    /// Whether the two accesses touch the same memory.
+    fn overlaps(&self, other: &BufferAccess) -> bool {
+        let writes_structure = |a: &BufferAccess| {
+            a.access
+                .contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
+        };
+        if self.range == EVERY_ACCELERATION_STRUCTURE {
+            writes_structure(other)
+        } else if other.range == EVERY_ACCELERATION_STRUCTURE {
+            writes_structure(self)
+        } else {
+            !self.range.intersect(other.range).is_empty()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +265,16 @@ impl<'a, K> BindingOutput<'a, K> {
         )
     }
 
+    /// The pass traces `tlas` through an address it reads from a buffer (an `Accel` inside a
+    /// struct): its memory and the BLASes it names.
+    pub fn acceleration_structure_read(
+        mut self,
+        tlas: &crate::vkobjects::acceleration_structure::Tlas,
+    ) -> Self {
+        self.buffers.extend(tlas.trace_accesses(self.stage));
+        self
+    }
+
     /// The pass reads `buffer` through a pointer (`Buf`).
     pub fn buffer_read<V: Copy + Pod, U: crate::buffer::usage::IsStorage>(
         self,
@@ -277,12 +314,6 @@ impl<'a, K> BindingOutput<'a, K> {
         self.buffers.push(buffer.access(self.stage, access));
         self
     }
-}
-
-#[repr(i32)]
-pub enum Filter {
-    Nearest = 0,
-    Liniear = 1,
 }
 
 /// One rendering being built: its `COLOR_ATTACHMENTS` and its `DRAWS` so far, which
@@ -416,6 +447,15 @@ pub struct DispatchIndirectCommand {
     pub x: u32,
     pub y: u32,
     pub z: u32,
+}
+
+/// The rays of an indirect trace (`VkTraceRaysIndirectCommandKHR`).
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct TraceRaysIndirectCommand {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -879,303 +919,6 @@ fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<'_, T, U>) 
 }
 
 impl CommandBuffer {
-    fn trace_rays(
-        &self,
-        pipeline: vk::Pipeline,
-        sbt: &crate::vkobjects::rt_pipeline::ShaderBindingTable,
-        x: u32,
-        y: u32,
-    ) {
-        unsafe {
-            Ctx::device().cmd_bind_pipeline(
-                self.handle,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                pipeline,
-            );
-            let call_region = vk::StridedDeviceAddressRegionKHR::default();
-            Functions::raytracing_pipeline().unwrap().cmd_trace_rays(
-                self.handle,
-                &sbt.raygen_region,
-                &sbt.miss_region,
-                &sbt.hit_region,
-                &call_region,
-                x,
-                y,
-                1,
-            );
-        }
-    }
-
-    #[validation_trace]
-    pub fn fill_buffer<'a, T: Copy + Pod, U: BufferUsage>(
-        &mut self,
-        buffer: BufferSlice<'a, T, U>,
-        data: u32,
-    ) {
-        self.flush_pending(
-            std::iter::empty(),
-            std::iter::once(&BufferAccess {
-                access: vk::AccessFlags2::TRANSFER_WRITE,
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                range: buffer.get_range(),
-            }),
-        );
-        unsafe {
-            address_commands().cmd_fill_memory(
-                self.handle,
-                &buffer.address_range(),
-                buffer.address_flags(),
-                data,
-            )
-        };
-    }
-
-    #[validation_trace]
-    pub fn clear_image<'a, F: Format, U: IsTransferDst, D: Dim>(
-        &'a mut self,
-        image: ImageView<'a, F, U, D>,
-        clear_color: F::Texels,
-    ) where
-        F: ColorAspect,
-    {
-        image.aspect_check(vk::ImageAspectFlags::COLOR);
-        image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        self.flush_pending(
-            std::iter::once(&image.access(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::ImageLayout::GENERAL,
-            )),
-            std::iter::empty(),
-        );
-        unsafe {
-            Ctx::device().cmd_clear_color_image(
-                self.handle,
-                image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearValue::from(image.format().clear_value(clear_color)).color,
-                &[image.subresource_range()],
-            )
-        };
-    }
-    #[validation_trace]
-    pub fn update_buffer<'a, T: Copy + Pod, U: BufferUsage>(
-        &mut self,
-        buffer: BufferSlice<'a, T, U>,
-        data: &T,
-    ) {
-        self.flush_pending(
-            iter::empty(),
-            iter::once(&BufferAccess {
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                access: vk::AccessFlags2::TRANSFER_WRITE,
-                range: buffer.get_range(),
-            }),
-        );
-        unsafe {
-            address_commands().cmd_update_memory(
-                self.handle,
-                &buffer.address_range(),
-                buffer.address_flags(),
-                bytemuck::bytes_of(data),
-            )
-        };
-    }
-    #[validation_trace]
-    pub fn blit_image<'a, F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst, D: Dim>(
-        &mut self,
-        src: ImageSlice<'a, F, U, D>,
-        dst: ImageSlice<'a, F2, U2, D>,
-        filter: Filter,
-    ) where
-        F: ColorAspect,
-        F2: ColorAspect,
-    {
-        src.view.aspect_check(vk::ImageAspectFlags::COLOR);
-        dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
-        src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
-        dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        self.flush_pending(
-            [
-                src.view.access(
-                    vk::PipelineStageFlags2::TRANSFER,
-                    vk::AccessFlags2::TRANSFER_READ,
-                    vk::ImageLayout::GENERAL,
-                ),
-                dst.view.access(
-                    vk::PipelineStageFlags2::TRANSFER,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                    vk::ImageLayout::GENERAL,
-                ),
-            ]
-            .iter(),
-            iter::empty(),
-        );
-
-        let regions = [blit_region(&src, &dst)];
-        unsafe {
-            Ctx::device().cmd_blit_image(
-                self.handle,
-                src.view.image,
-                vk::ImageLayout::GENERAL,
-                dst.view.image,
-                vk::ImageLayout::GENERAL,
-                &regions,
-                vk::Filter::from_raw(filter as i32),
-            );
-        }
-    }
-    #[validation_trace]
-
-    /// Copies `src` to the start of `dst`, which must be at least as long.
-    pub fn copy_buffer<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
-        &mut self,
-        src: BufferSlice<'a, T, U>,
-        dst: BufferSlice<'a, T, U2>,
-    ) {
-        self.copy_buffer_regions(&[(src, dst)]);
-    }
-    #[validation_trace]
-
-    /// One `copy_buffer` per pair, in one command.
-    pub fn copy_buffer_regions<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
-        &mut self,
-        regions: &[(BufferSlice<'a, T, U>, BufferSlice<'a, T, U2>)],
-    ) {
-        let accesses = regions
-            .iter()
-            .flat_map(|(src, dst)| {
-                assert!(
-                    src.size <= dst.size,
-                    "cannot copy {} bytes into a buffer slice of {} bytes",
-                    src.size,
-                    dst.size
-                );
-                [
-                    src.access(
-                        vk::PipelineStageFlags2::TRANSFER,
-                        vk::AccessFlags2::TRANSFER_READ,
-                    ),
-                    dst.range(..src.len()).access(
-                        vk::PipelineStageFlags2::TRANSFER,
-                        vk::AccessFlags2::TRANSFER_WRITE,
-                    ),
-                ]
-            })
-            .collect::<SmallVec<[_; 4]>>();
-        self.flush_pending(iter::empty(), accesses.iter());
-        let copies = regions
-            .iter()
-            .map(|(src, dst)| {
-                vk::DeviceMemoryCopyKHR::default()
-                    .src_range(src.address_range())
-                    .src_flags(src.address_flags())
-                    .dst_range(dst.range(..src.len()).address_range())
-                    .dst_flags(dst.address_flags())
-            })
-            .collect::<SmallVec<[_; 4]>>();
-        unsafe {
-            address_commands().cmd_copy_memory(
-                self.handle,
-                &vk::CopyDeviceMemoryInfoKHR::default().regions(&copies),
-            )
-        };
-    }
-
-    #[validation_trace]
-    pub fn copy_buffer_to_image<
-        'a,
-        T: Copy + Pod,
-        BU: BufferUsage,
-        F: Format,
-        U: IsTransferDst,
-        D: Dim,
-    >(
-        &mut self,
-        src: BufferSlice<'a, T, BU>,
-        dst: ImageSlice<'a, F, U, D>,
-    ) where
-        F: ColorAspect,
-    {
-        dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
-        dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        self.flush_pending(
-            iter::once(&dst.view.access(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::ImageLayout::GENERAL,
-            )),
-            iter::once(&BufferAccess {
-                access: vk::AccessFlags2::TRANSFER_READ,
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                range: src.get_range(),
-            }),
-        );
-        let regions = [vk::DeviceMemoryImageCopyKHR::default()
-            .address_range(src.address_range())
-            .address_flags(src.address_flags())
-            .image_subresource(dst.view.subresource_layers(dst.view.mip_range.start))
-            .image_layout(vk::ImageLayout::GENERAL)
-            .image_offset(D::offset_3d(dst.offset))
-            .image_extent(D::extent_3d(dst.extend))];
-        unsafe {
-            address_commands().cmd_copy_memory_to_image(
-                self.handle,
-                &vk::CopyDeviceMemoryImageInfoKHR::default()
-                    .image(dst.view.image)
-                    .regions(&regions),
-            )
-        };
-    }
-
-    /// Copies the texels of `src` (its view's first mip level) into `dst`, tightly packed row
-    /// by row (and slice by slice).
-    #[validation_trace]
-    pub fn copy_image_to_buffer<
-        'a,
-        T: Copy + Pod,
-        F: Format,
-        U: IsTransferSrc,
-        BU: BufferUsage,
-        D: Dim,
-    >(
-        &mut self,
-        src: ImageSlice<'a, F, U, D>,
-        dst: BufferSlice<'a, T, BU>,
-    ) where
-        F: ColorAspect,
-    {
-        src.view.aspect_check(vk::ImageAspectFlags::COLOR);
-        src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
-        self.flush_pending(
-            iter::once(&src.view.access(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_READ,
-                vk::ImageLayout::GENERAL,
-            )),
-            iter::once(&BufferAccess {
-                access: vk::AccessFlags2::TRANSFER_WRITE,
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                range: dst.get_range(),
-            }),
-        );
-        let regions = [vk::DeviceMemoryImageCopyKHR::default()
-            .address_range(dst.address_range())
-            .address_flags(dst.address_flags())
-            .image_subresource(src.view.subresource_layers(src.view.mip_range.start))
-            .image_layout(vk::ImageLayout::GENERAL)
-            .image_offset(D::offset_3d(src.offset))
-            .image_extent(D::extent_3d(src.extend))];
-        unsafe {
-            address_commands().cmd_copy_image_to_memory(
-                self.handle,
-                &vk::CopyDeviceMemoryImageInfoKHR::default()
-                    .image(src.view.image)
-                    .regions(&regions),
-            )
-        };
-    }
-
     /// Starts a rendering of the area `extent`, with viewport and scissor covering it.
     pub fn raster(&mut self, extent: UVec2) -> RasterBuilder<'_, 0, 0> {
         RasterBuilder {
@@ -1245,31 +988,68 @@ impl CommandBuffer {
         self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None);
     }
 
-    pub fn raytrace(&mut self, bindings: BindingOutput<'_, kind::RayTracing>, x: u32, y: u32) {
+    fn raytrace_private<IND: IsIndirect>(
+        &mut self,
+        mut bindings: BindingOutput<'_, kind::RayTracing>,
+        rays: [u32; 3],
+        indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand, IND>>,
+    ) {
         let pass = &PASS_MAP[bindings.pass];
+        let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
+        bindings
+            .buffers
+            .extend(indirect_buffer.map(indirect_access));
         self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
         self.push_constants(&bindings.push_constants);
 
         self.begin_pass(pass.name);
-        pipelines().ray_tracing(bindings.pass, &bindings.constants, |pipeline| {
-            self.trace_rays(pipeline.pipeline, &pipeline.sbt, x, y)
+        let functions = Functions::raytracing_pipeline()
+            .expect("a pass that can be recorded has its pipeline functions");
+        pipelines().ray_tracing(bindings.pass, &bindings.constants, |pipeline| unsafe {
+            Ctx::device().cmd_bind_pipeline(
+                self.handle,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                pipeline.pipeline,
+            );
+            let [raygen, miss, hit, callable] = &pipeline.sbt.regions;
+            match indirect_buffer {
+                Some(slice) => functions.cmd_trace_rays_indirect(
+                    self.handle,
+                    raygen,
+                    miss,
+                    hit,
+                    callable,
+                    slice.address(),
+                ),
+                None => functions.cmd_trace_rays(
+                    self.handle,
+                    raygen,
+                    miss,
+                    hit,
+                    callable,
+                    rays[0],
+                    rays[1],
+                    rays[2],
+                ),
+            }
         });
         self.end_pass();
     }
 
+    /// Traces `rays` (width, height, depth) raygen invocations of a ray tracing pass.
     #[validation_trace]
-    pub fn present<'a, F: Format, U: ImageUsage>(
-        &'a mut self,
-        swapchain_image: ImageView<'a, F, U>,
+    pub fn raytrace(&mut self, bindings: BindingOutput<'_, kind::RayTracing>, rays: [u32; 3]) {
+        self.raytrace_private::<buffer::usage::Indirect>(bindings, rays, None);
+    }
+
+    /// Like [`Self::raytrace`], with the ray counts read from `buffer` on the GPU.
+    #[validation_trace]
+    pub fn raytrace_indirect<IND: IsIndirect>(
+        &mut self,
+        bindings: BindingOutput<'_, kind::RayTracing>,
+        buffer: BufferSlice<'_, TraceRaysIndirectCommand, IND>,
     ) {
-        self.flush_pending(
-            iter::once(&swapchain_image.access(
-                vk::PipelineStageFlags2::empty(),
-                vk::AccessFlags2::empty(),
-                vk::ImageLayout::PRESENT_SRC_KHR,
-            )),
-            iter::empty(),
-        );
+        self.raytrace_private(bindings, [0, 0, 0], Some(buffer));
     }
 
     fn push_constants(&mut self, constants: &[u8; MAX_PUSH_CONSTANTS_SIZE]) {
@@ -1411,7 +1191,7 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
             for pending in pending
                 .buffer_reads
                 .iter()
-                .filter(|r| !r.range.intersect(buffer_access.range).is_empty())
+                .filter(|r| r.overlaps(buffer_access))
             {
                 src_stage |= pending.stage;
                 src_access |= pending.access;
@@ -1420,7 +1200,7 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
             }
         }
         for w in pending.buffer_writes.iter().filter(|w| {
-            !w.write.range.intersect(buffer_access.range).is_empty()
+            w.write.overlaps(buffer_access)
                 && !w.visible_to(buffer_access.stage, buffer_access.access)
         }) {
             if is_read || is_write {
@@ -1646,7 +1426,14 @@ impl PendingAccesses {
             if writes {
                 self.buffer_writes.retain(|a| !covers(&a.write));
                 self.buffer_writes.push(PendingWrite::new(access.clone()));
-                self.buffer_reads.retain(|a| !covers(a));
+                // An acceleration structure write waited for every read of every structure,
+                // and every later one runs at the same build stage, after that barrier.
+                let structure_write = access
+                    .access
+                    .contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR);
+                self.buffer_reads.retain(|a| {
+                    !covers(a) && !(structure_write && a.range == EVERY_ACCELERATION_STRUCTURE)
+                });
             }
             if reads {
                 let mut read = access.clone();
@@ -1685,31 +1472,6 @@ impl PendingAccesses {
                 self.image_reads.push(read);
             }
         }
-    }
-}
-
-/// Blit region covering the two slices: from each slice's offset to offset + extent.
-fn blit_region<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
-    src: &ImageSlice<'_, F, U, D>,
-    dst: &ImageSlice<'_, F2, U2, D>,
-) -> vk::ImageBlit {
-    let corners = |offset: D::Offset, extend: D::Extent| {
-        let start = D::offset_3d(offset);
-        let size = D::extent_3d(extend);
-        [
-            start,
-            vk::Offset3D {
-                x: start.x + size.width as i32,
-                y: start.y + size.height as i32,
-                z: start.z + size.depth as i32,
-            },
-        ]
-    };
-    vk::ImageBlit {
-        src_offsets: corners(src.offset, src.extend),
-        dst_offsets: corners(dst.offset, dst.extend),
-        src_subresource: src.view.subresource_layers(src.view.mip_range.start),
-        dst_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
     }
 }
 
@@ -1945,6 +1707,132 @@ mod tests {
             A::SHADER_STORAGE_READ
         );
         assert_eq!(barriers.memory.unwrap().dst_stage_mask, S::COMPUTE_SHADER);
+    }
+
+    // ---- acceleration structures ---------------------------------------------------------
+
+    const BUILD: S = S::ACCELERATION_STRUCTURE_BUILD_KHR;
+
+    fn structure_write(range: std::ops::Range<u64>) -> BufferAccess {
+        buffer(BUILD, A::ACCELERATION_STRUCTURE_WRITE_KHR, range)
+    }
+
+    /// What a trace (or TLAS build) adds for the BLASes it reaches.
+    fn every_structure_read() -> BufferAccess {
+        BufferAccess {
+            stage: S::COMPUTE_SHADER,
+            access: A::ACCELERATION_STRUCTURE_READ_KHR,
+            range: EVERY_ACCELERATION_STRUCTURE,
+        }
+    }
+
+    #[test]
+    fn a_trace_waits_for_the_build_of_any_structure() {
+        let barriers = buffer_barrier(
+            &pending(&[structure_write(0..256)], &[]),
+            &every_structure_read(),
+        )
+        .unwrap()
+        .memory
+        .unwrap();
+        assert_eq!(
+            (barriers.src_stage_mask, barriers.src_access_mask),
+            (BUILD, A::ACCELERATION_STRUCTURE_WRITE_KHR)
+        );
+        assert_eq!(
+            (barriers.dst_stage_mask, barriers.dst_access_mask),
+            (S::COMPUTE_SHADER, A::ACCELERATION_STRUCTURE_READ_KHR)
+        );
+    }
+
+    #[test]
+    fn a_trace_after_a_rebuild_between_two_traces_waits_for_it() {
+        let tlas = 4096..8192;
+        let trace = || {
+            [
+                buffer(
+                    S::COMPUTE_SHADER,
+                    A::ACCELERATION_STRUCTURE_READ_KHR,
+                    tlas.clone(),
+                ),
+                every_structure_read(),
+            ]
+        };
+        let build = |scratch: std::ops::Range<u64>| {
+            [
+                structure_write(tlas.clone()),
+                buffer(
+                    BUILD,
+                    A::ACCELERATION_STRUCTURE_READ_KHR | A::ACCELERATION_STRUCTURE_WRITE_KHR,
+                    scratch,
+                ),
+                buffer(BUILD, A::SHADER_READ, 0..64),
+                BufferAccess {
+                    stage: BUILD,
+                    access: A::ACCELERATION_STRUCTURE_READ_KHR,
+                    range: EVERY_ACCELERATION_STRUCTURE,
+                },
+            ]
+        };
+        let mut pending = PendingAccesses::default();
+        flush(&mut pending, &[], &build(100_000..101_000));
+        assert!(flush(&mut pending, &[], &trace()).is_some());
+        assert!(flush(&mut pending, &[], &build(200_000..201_000)).is_some());
+        let barrier = flush(&mut pending, &[], &trace())
+            .and_then(|b| b.memory)
+            .expect("the second trace waits for the rebuild");
+        assert!(barrier.src_stage_mask.contains(BUILD));
+        assert!(
+            barrier
+                .src_access_mask
+                .contains(A::ACCELERATION_STRUCTURE_WRITE_KHR)
+        );
+    }
+
+    #[test]
+    fn a_trace_ignores_unrelated_storage_writes() {
+        let pending = pending(&[write(0..u64::MAX - 1)], &[]);
+        assert!(buffer_barrier(&pending, &every_structure_read()).is_none());
+    }
+
+    #[test]
+    fn a_structure_write_waits_for_pending_traces() {
+        let barriers = buffer_barrier(
+            &pending(&[every_structure_read()], &[]),
+            &structure_write(0..256),
+        )
+        .unwrap()
+        .memory
+        .unwrap();
+        assert_eq!(barriers.src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(barriers.dst_stage_mask, BUILD);
+        // Other writes don't.
+        assert!(buffer_barrier(&pending(&[every_structure_read()], &[]), &write(0..256)).is_none());
+    }
+
+    #[test]
+    fn a_structure_write_retires_the_read_of_every_structure() {
+        let mut pending = pending(&[every_structure_read(), read(0..64)], &[]);
+        pending.record(iter::empty(), iter::once(&structure_write(1024..2048)));
+        assert!(
+            pending
+                .buffer_reads
+                .iter()
+                .all(|r| r.range != EVERY_ACCELERATION_STRUCTURE)
+        );
+        // The unrelated read stays, and a later write to it still waits.
+        assert!(buffer_barrier(&pending, &write(0..8)).is_some());
+    }
+
+    #[test]
+    fn the_read_of_every_structure_absorbs_no_other_read() {
+        let pending = pending(&[read(0..64), every_structure_read()], &[]);
+        assert_eq!(pending.buffer_reads.len(), 2);
+        let barriers = buffer_barrier(&pending, &buffer(S::TRANSFER, A::TRANSFER_WRITE, 0..8))
+            .unwrap()
+            .memory
+            .unwrap();
+        assert_eq!(barriers.src_stage_mask, S::VERTEX_SHADER);
     }
 
     #[test]
@@ -2415,29 +2303,6 @@ mod tests {
     }
 
     // ---- blits ---------------------------------------------------------------------------
-
-    #[test]
-    fn blit_region_spans_offset_to_offset_plus_extent() {
-        let (a, b) = (layout(L::GENERAL), layout(L::GENERAL));
-        let src = view::<R8G8B8A8Unorm, Sampled>(&a)
-            .region(UVec2::new(16, 8))
-            .offset(IVec2::new(4, 2));
-        let dst = view::<R8G8B8A8Unorm, Sampled>(&b)
-            .region(UVec2::new(32, 16))
-            .offset(IVec2::new(10, 20));
-        let region = blit_region(&src, &dst);
-
-        let corner = |o: vk::Offset3D| (o.x, o.y, o.z);
-        assert_eq!(corner(region.src_offsets[0]), (4, 2, 0));
-        assert_eq!(corner(region.src_offsets[1]), (20, 10, 1));
-        assert_eq!(corner(region.dst_offsets[0]), (10, 20, 0));
-        assert_eq!(corner(region.dst_offsets[1]), (42, 36, 1));
-        assert_eq!(region.src_subresource.mip_level, 0);
-        assert_eq!(
-            region.src_subresource.aspect_mask,
-            vk::ImageAspectFlags::COLOR
-        );
-    }
 
     // ---- raster builder ------------------------------------------------------------------
 

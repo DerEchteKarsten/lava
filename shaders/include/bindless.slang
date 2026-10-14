@@ -151,6 +151,16 @@ public typealias MutTex2D<E : ITexelElement = float4>   = Img<E, __Shape2D, 3>;
 public struct Buf<T>    { public T *val; }
 public struct MutBuf<T> { public T *val; }
 
+/// A top-level acceleration structure by its device address: lava's `&Tlas` in push constants,
+/// a `u64` inside structs (register it with `BindingOutput::acceleration_structure_read`). Never
+/// an `SCONST`: addresses change from run to run.
+public struct Accel {
+    public uint64_t address;
+    [ForceInline] public RaytracingAccelerationStructure get() {
+        return RaytracingAccelerationStructure(address);
+    }
+}
+
 /// Marks the `uint64_t` behind an `SCONST`; lava's `build.rs` reads the type from it.
 [__AttributeUsage(_AttributeTargets.Var)]
 public struct SConstAttribute { string type; };

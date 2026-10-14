@@ -21,11 +21,12 @@ use lava::{
     },
     epoch,
     command_buffer::{
-        BindingOutput, Blend, CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand, Filter,
+        BindingOutput, Blend, CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand,
         RasterState, Scissor, Viewport, kind,
     },
     image::{
         D3, Image, MipChain,
+        slice::Filter,
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
         usage::{
             ColorAttachmentSampledTransferSrcTransferDst,

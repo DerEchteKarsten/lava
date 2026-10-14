@@ -102,6 +102,7 @@ impl PhysicalDevice {
         let mut ray_tracing_feature = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
         let mut acceleration_struct_feature =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut ray_query_feature = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let mut clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
@@ -118,6 +119,7 @@ impl PhysicalDevice {
             .push(&mut features12)
             .push(&mut ray_tracing_feature)
             .push(&mut acceleration_struct_feature)
+            .push(&mut ray_query_feature)
             .push(&mut mesh_shading)
             .push(&mut clock)
             .push(&mut performance)
@@ -135,6 +137,8 @@ impl PhysicalDevice {
         // Detach them from the chain on this stack.
         mesh_shader_properties.p_next = std::ptr::null_mut();
         vk12_properties.p_next = std::ptr::null_mut();
+        rt_pipeline_properties.p_next = std::ptr::null_mut();
+        acc_properties.p_next = std::ptr::null_mut();
 
         let mem_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -144,6 +148,10 @@ impl PhysicalDevice {
                 .iter()
                 .any(|e| e.as_bytes() == name.to_bytes())
         };
+        let acceleration_structure = has_extension(ash::khr::acceleration_structure::NAME)
+            && has_extension(ash::khr::deferred_host_operations::NAME)
+            && acceleration_struct_feature.acceleration_structure == vk::TRUE
+            && features12.host_query_reset == vk::TRUE;
         let device_address_commands = has_extension(ash::khr::device_address_commands::NAME)
             && address_commands.device_address_commands == vk::TRUE;
         let features = Features {
@@ -160,8 +168,14 @@ impl PhysicalDevice {
                     .to_owned(),
             ),
             mesh: mesh_shading.mesh_shader == vk::TRUE,
-            raytracing: ray_tracing_feature.ray_tracing_pipeline == vk::TRUE
-                && acceleration_struct_feature.acceleration_structure == vk::TRUE,
+            acceleration_structure,
+            ray_query: acceleration_structure
+                && has_extension(ash::khr::ray_query::NAME)
+                && ray_query_feature.ray_query == vk::TRUE,
+            ray_tracing_pipeline: acceleration_structure
+                && has_extension(ash::khr::ray_tracing_pipeline::NAME)
+                && ray_tracing_feature.ray_tracing_pipeline == vk::TRUE
+                && ray_tracing_feature.ray_tracing_pipeline_trace_rays_indirect == vk::TRUE,
             pipeline_statistics,
             mesh_queries: mesh_shading.mesh_shader_queries == vk::TRUE,
             memory_budget: has_extension(ash::ext::memory_budget::NAME),
@@ -181,16 +195,12 @@ impl PhysicalDevice {
             queue_families,
             supported_extensions,
 
-            acceleration_structure_properties: if features.raytracing {
-                Some(acc_properties)
-            } else {
-                None
-            },
-            ray_tracing_pipeline_properties: if features.raytracing {
-                Some(rt_pipeline_properties)
-            } else {
-                None
-            },
+            acceleration_structure_properties: features
+                .acceleration_structure
+                .then_some(acc_properties),
+            ray_tracing_pipeline_properties: features
+                .ray_tracing_pipeline
+                .then_some(rt_pipeline_properties),
 
             bindless_supported: features12.runtime_descriptor_array == vk::TRUE
                 && features12.descriptor_binding_partially_bound == vk::TRUE
@@ -279,7 +289,9 @@ impl PhysicalDevice {
         features.device_debug_utils =
             device.supported_features.device_debug_utils && features.debug_utils;
         features.mesh = device.supported_features.mesh;
-        features.raytracing = device.supported_features.raytracing;
+        features.acceleration_structure = device.supported_features.acceleration_structure;
+        features.ray_query = device.supported_features.ray_query;
+        features.ray_tracing_pipeline = device.supported_features.ray_tracing_pipeline;
         features.rebar = device.supported_features.rebar;
         features.host_image_copy = device.supported_features.host_image_copy;
         features.pipeline_statistics = device.supported_features.pipeline_statistics;
@@ -510,7 +522,9 @@ mod tests {
             device_debug_utils: true,
             debug_utils: true,
             mesh: true,
-            raytracing: false,
+            acceleration_structure: true,
+            ray_query: true,
+            ray_tracing_pipeline: false,
             pipeline_statistics: true,
             mesh_queries: false,
             memory_budget: true,
@@ -524,7 +538,8 @@ mod tests {
         PhysicalDevice::select_suitable_physical_device(&[dev.clone()], &mut features).unwrap();
         assert!(features.mesh && features.rebar && features.host_image_copy);
         assert!(features.pipeline_statistics && features.memory_budget);
-        assert!(!features.raytracing && !features.mesh_queries);
+        assert!(features.acceleration_structure && features.ray_query);
+        assert!(!features.ray_tracing_pipeline && !features.mesh_queries);
         assert!(!features.device_debug_utils);
         assert!(!features.present);
 

@@ -1,5 +1,5 @@
-//! Swapchain creation, image acquisition, and resize-driven recreation
-use std::{ffi::CStr, sync::atomic::AtomicU32};
+//! Swapchain creation, image acquisition, resize-driven recreation, and the command that readies an image for presenting
+use std::{ffi::CStr, iter, sync::atomic::AtomicU32};
 
 use crate::{
     bindless::BindlessHandle,
@@ -11,11 +11,14 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    bindless, epoch,
+    bindless,
+    command_buffer::CommandBuffer,
+    epoch,
     image::{
-        D2, format,
+        D2,
+        format::{self, Format},
         slice::ImageView,
-        usage::{ColorAttachmentStorageTransferDst, StaticUsage},
+        usage::{ColorAttachmentStorageTransferDst, ImageUsage, StaticUsage},
     },
     state::{Ctx, Functions},
     vkobjects::{
@@ -298,6 +301,25 @@ pub(crate) fn select_extent(
         capabilities.current_extent
     } else {
         min
+    }
+}
+
+impl CommandBuffer {
+    /// Moves `swapchain_image` into `PRESENT_SRC_KHR`, the layout a present needs, once the
+    /// frame's earlier accesses of it are done.
+    #[validation_trace]
+    pub fn present<'a, F: Format, U: ImageUsage>(
+        &'a mut self,
+        swapchain_image: ImageView<'a, F, U>,
+    ) {
+        self.flush_pending(
+            iter::once(&swapchain_image.access(
+                vk::PipelineStageFlags2::empty(),
+                vk::AccessFlags2::empty(),
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            )),
+            iter::empty(),
+        );
     }
 }
 

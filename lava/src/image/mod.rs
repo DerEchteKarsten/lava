@@ -161,7 +161,7 @@ impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
 }
 
 /// What an image keeps per view: [`Single`] or [`PerMip`]. Only lava implements it.
-pub trait Views: std::fmt::Debug + Send + Sync + 'static + Sized {
+pub trait Views: crate::sealed::Sealed + std::fmt::Debug + Send + Sync + 'static + Sized {
     #[doc(hidden)]
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self>;
     /// The view over every mip, its handle and the layouts it covers.
@@ -200,6 +200,7 @@ fn undefined() -> AtomicU32 {
     AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32)
 }
 
+impl crate::sealed::Sealed for Single {}
 impl Views for Single {
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
         Ok(Single {
@@ -216,6 +217,7 @@ impl Views for Single {
     }
 }
 
+impl crate::sealed::Sealed for PerMip {}
 impl Views for PerMip {
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
         // Built up front, so `Drop` destroys whatever was created before an error.

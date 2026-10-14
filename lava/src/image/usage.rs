@@ -1,7 +1,7 @@
 //! Image usages: one marker type per combination of usages Vulkan allows, mapping to Vulkan flags and the bindless sets they can be bound in, and `Dynamic`, whose usage is only known at runtime
 use ash::vk;
 
-pub trait ImageUsage: 'static + Copy + Send + Sync + std::fmt::Debug {
+pub trait ImageUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     fn flags(&self) -> vk::ImageUsageFlags;
     /// Panics unless the usage has every flag of `required`. The command buffer calls it with
     /// what its trait bounds (`IsSampled`, `IsTransferDst`, ...) require. A static usage's type
@@ -57,6 +57,7 @@ macro_rules! usages {
                 const VK: vk::ImageUsageFlags =
                     vk::ImageUsageFlags::from_raw(0 $(| usages!(@flag $flag).as_raw())+);
             }
+            impl crate::sealed::Sealed for $name {}
             impl ImageUsage for $name {
                 fn flags(&self) -> vk::ImageUsageFlags {
                     Self::VK
@@ -177,6 +178,7 @@ usages! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dynamic(pub vk::ImageUsageFlags);
 
+impl crate::sealed::Sealed for Dynamic {}
 impl ImageUsage for Dynamic {
     fn flags(&self) -> vk::ImageUsageFlags {
         self.0

@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 use shader_slang::{
-    self as slang, ParameterCategory as Cat, ScalarType, Stage, TypeKind,
+    self as slang, ParameterCategory as Cat, ScalarType, TypeKind,
     reflection::{TypeLayout, VariableLayout, compute_string_hash},
 };
 
@@ -14,6 +14,8 @@ struct StructDef {
     checks: String,
     signature: Vec<(String, usize)>,
     size: usize,
+    /// It mirrors a lava type (`MIRRORED_TYPES`), which isn't generated, only checked.
+    mirror: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -43,6 +45,8 @@ enum FieldKind {
     Plain,
     Buffer,
     Image { usage: u64 },
+    /// A TLAS by its address.
+    Accel,
 }
 
 type Structs = BTreeMap<String, StructDef>;
@@ -54,6 +58,12 @@ const IMAGE_TYPES: [&str; 1] = ["Img"];
 const BUFFER_TYPES: [&str; 2] = ["Buf", "MutBuf"];
 /// Image types as struct fields: all are a `BindlessHandle` on the Rust side.
 const HANDLE_TYPES: [&str; 2] = ["Img", "DynImg"];
+const ACCEL_TYPES: [&str; 1] = ["Accel"];
+/// Slang structs that mirror a lava type: (Slang name, Rust path).
+const MIRRORED_TYPES: [(&str, &str); 1] = [(
+    "AccelerationStructureInstance",
+    "crate::vkobjects::acceleration_structure::Instance",
+)];
 
 fn field_name(f: &VariableLayout) -> &str {
     f.variable().and_then(|v| v.name()).expect("unnamed field")
@@ -126,6 +136,16 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
             let name = type_name(t).to_string();
             let signature = layout_signature(t);
             let size = t.size(Cat::Uniform);
+            if let Some(&(_, rust)) = MIRRORED_TYPES.iter().find(|(slang, _)| *slang == name) {
+                structs.entry(name).or_insert_with(|| StructDef {
+                    body: String::new(),
+                    checks: layout_checks(rust, t),
+                    signature,
+                    size,
+                    mirror: true,
+                });
+                return rust.to_string();
+            }
 
             if let Some(existing) = structs.get(&name) {
                 if existing.signature != signature || existing.size != size {
@@ -145,6 +165,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
                     checks: String::new(),
                     signature,
                     size,
+                    mirror: false,
                 },
             );
             let mut body = String::new();
@@ -173,6 +194,8 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
 fn gpu_type(t: &TypeLayout, structs: &mut Structs) -> String {
     if is_struct_named(t, &HANDLE_TYPES) {
         "BindlessHandle".into()
+    } else if is_struct_named(t, &ACCEL_TYPES) {
+        "u64".into()
     } else if is_struct_named(t, &BUFFER_TYPES) {
         rust_type(t.field_by_index(0).unwrap().type_layout().unwrap(), structs);
         "u64".into()
@@ -241,6 +264,8 @@ fn field_kind(t: &TypeLayout) -> FieldKind {
         }
     } else if is_struct_named(t, &BUFFER_TYPES) {
         FieldKind::Buffer
+    } else if is_struct_named(t, &ACCEL_TYPES) {
+        FieldKind::Accel
     } else {
         FieldKind::Plain
     }
@@ -354,6 +379,16 @@ fn build_new_fn<'a>(
                 out.buffer_accesses
                     .push(format!("{name}.access({stage}, {access})"));
             }
+            FieldKind::Accel => {
+                out.params.push(format!(
+                    "{name}: &'a crate::vkobjects::acceleration_structure::Tlas"
+                ));
+                out.gpu_inits.push(format!("{name}: {name}.address()"));
+                for i in 0..2 {
+                    out.buffer_accesses
+                        .push(format!("{name}.trace_accesses({stage})[{i}].clone()"));
+                }
+            }
             FieldKind::Plain => {
                 let ty = rust_type(t, structs);
                 out.params.push(format!("{name}: {ty}"));
@@ -427,7 +462,9 @@ fn sconsts<'a>(
                     field_kind(layout),
                     FieldKind::Buffer | FieldKind::Image { .. }
                 ),
-                "{file}: SCONST `{name}` has type `{ty}`, which isn't a buffer or image"
+                "{file}: SCONST `{name}` has type `{ty}`, which isn't a buffer or image handle \
+                 (acceleration structure addresses change from run to run, so they never go \
+                 into specialization constants)"
             );
             SConst {
                 name: name.trim_end_matches("_sconst").to_string(),
@@ -480,7 +517,8 @@ fn generate_pass(
     pc: &TypeLayout,
     consts: &[SConst],
     regions: &[String],
-    entries: &[(&'static str, String)],
+    entries: &[slang_compile::Entry],
+    ray_query: bool,
     structs: &mut Structs,
     pass_map: &mut Vec<String>,
     pipelines: &mut Pipelines,
@@ -492,25 +530,19 @@ fn generate_pass(
     let consts_name = format!("C{pass_name}Constants");
     let index = pass_map.len();
 
-    let entry = |stage: &str| {
-        entries
-            .iter()
-            .find(|(s, _)| *s == stage)
-            .map(|(_, n)| n.as_str())
-    };
-    let mut stages: Vec<&str> = entries.iter().map(|(s, _)| *s).collect();
+    let entry = |stage: &str| entries.iter().find(|e| e.stage == stage).map(|e| e.name);
+    let mut stages: Vec<&str> = entries.iter().map(|e| e.stage).collect();
     stages.sort_unstable();
 
     let kind = match stages.as_slice() {
         ["fragment", "vertex"] => PassKind::RasterVertex,
         ["fragment", "mesh"] | ["amplification", "fragment", "mesh"] => PassKind::RasterMesh,
         ["compute"] => PassKind::Compute,
-        // Raygen, with any of miss, closest hit and any hit.
         stages
             if stages.contains(&"raygen")
                 && stages
                     .iter()
-                    .all(|s| ["raygen", "miss", "closest_hit", "any_hit"].contains(s)) =>
+                    .all(|s| slang_compile::RAY_TRACING_STAGES.contains(s)) =>
         {
             PassKind::RayTracing
         }
@@ -539,16 +571,35 @@ fn generate_pass(
             format!("Compute {{ entry: \"{compute}\\0\" }}")
         }
         PassKind::RayTracing => {
-            let optional = |stage: &str| match entry(stage) {
-                Some(name) => format!("Some(\"{name}\\0\")"),
+            let groups = slang_compile::ray_tracing_groups(entries)
+                .unwrap_or_else(|e| panic!("{source}: {e}"));
+            let name = |name: &str| format!("\"{name}\\0\"");
+            let optional = |entry: &Option<String>| match entry {
+                Some(entry) => format!("Some({})", name(entry)),
                 None => "None".to_string(),
             };
+            let names = |entries: &[String]| {
+                entries.iter().map(|e| name(e)).collect::<Vec<_>>().join(", ")
+            };
+            let hit: Vec<String> = groups
+                .hit
+                .iter()
+                .map(|g| {
+                    format!(
+                        "HitGroup {{ closest_hit: {}, any_hit: {}, intersection: {} }}",
+                        optional(&g.closest_hit),
+                        optional(&g.any_hit),
+                        optional(&g.intersection)
+                    )
+                })
+                .collect();
             format!(
-                "RayTracing {{ raygen: \"{}\\0\", miss: {}, closest_hit: {}, any_hit: {} }}",
-                entry("raygen").unwrap(),
-                optional("miss"),
-                optional("closest_hit"),
-                optional("any_hit"),
+                "RayTracing {{ raygen: {}, miss: &[{}], hit: &[{}], callable: &[{}], max_recursion: {} }}",
+                name(&groups.raygen),
+                names(&groups.miss),
+                hit.join(", "),
+                names(&groups.callable),
+                groups.max_recursion,
             )
         }
     };
@@ -585,6 +636,7 @@ fn generate_pass(
         constants_size: {constants_size},
         regions: &{regions:?},
         layout: {layout_hash:#x},
+        ray_query: {ray_query},
     }},"#
     ));
 
@@ -849,10 +901,18 @@ use ash::vk;
             .map(capitalize_first)
             .collect();
 
-        let entries: Vec<(&'static str, String)> = layout
+        let entries: Vec<slang_compile::Entry> = layout
             .entry_points()
-            .map(|ep| (stage_name(ep.stage()), ep.name().unwrap().to_string()))
+            .map(|ep| slang_compile::Entry {
+                stage: slang_compile::stage_name(ep.stage()),
+                name: ep.name().unwrap(),
+                group: slang_compile::entry_attribute(ep, "Group"),
+                max_recursion: slang_compile::entry_attribute(ep, "MaxRecursion"),
+            })
             .collect();
+        let pass_spirv = program
+            .target_code(0)
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
 
         let pc = layout
             .parameters()
@@ -871,6 +931,7 @@ use ash::vk;
             &consts,
             &regions,
             &entries,
+            slang_compile::uses_ray_query(pass_spirv.as_slice()),
             &mut structs,
             &mut pass_map,
             &mut pipelines,
@@ -882,10 +943,6 @@ use ash::vk;
         max_buffers = max_buffers.max(pass.buffers);
         constants_sizes.push(pass.constants_size);
         bindings.push_str(&pass.code);
-
-        let pass_spirv = program
-            .target_code(0)
-            .unwrap_or_else(|e| panic!("{file}: {e}"));
         fs::write(out, pass_spirv.as_slice()).unwrap();
     }
 
@@ -938,6 +995,10 @@ const _: () = assert!(MAX_SPECIALIZATION_CONSTANTS_SIZE < 128, "Keep SConstants 
     bindings.push_str("];\n");
 
     for (name, def) in &structs {
+        if def.mirror {
+            bindings.push_str(&def.checks);
+            continue;
+        }
         bindings.push_str(&format!(
             "\n#[derive(Pod, Copy, Clone, Zeroable, Debug, Default)]\n#[repr(C)]\npub struct {name} {{\n{}}}\n{}",
             def.body, def.checks
@@ -953,20 +1014,5 @@ const _: () = assert!(MAX_SPECIALIZATION_CONSTANTS_SIZE < 128, "Keep SConstants 
     // `hot-reload` a shader edit then rebuilds nothing (without it the SPIR-V is built in).
     if fs::read(&bindings_path).ok().as_deref() != Some(bindings.as_bytes()) {
         fs::write(bindings_path, bindings).unwrap();
-    }
-}
-
-fn stage_name(stage: Stage) -> &'static str {
-    match stage {
-        Stage::Vertex => "vertex",
-        Stage::Fragment => "fragment",
-        Stage::Mesh => "mesh",
-        Stage::Amplification => "amplification",
-        Stage::Compute => "compute",
-        Stage::RayGeneration => "raygen",
-        Stage::AnyHit => "any_hit",
-        Stage::ClosestHit => "closest_hit",
-        Stage::Miss => "miss",
-        other => panic!("unsupported stage {other:?}"),
     }
 }
