@@ -1,5 +1,5 @@
 //! Swapchain creation, image acquisition, and resize-driven recreation
-use std::{ffi::CStr, sync::atomic::AtomicU32};
+use std::{ffi::CStr, mem::ManuallyDrop};
 
 use crate::{
     bindless::BindlessHandle,
@@ -17,6 +17,7 @@ use crate::{
         slice::ImageView,
         usage::{ColorAttachmentStorageTransferDst, StaticUsage},
     },
+    keepalive::KeepAlive,
     state::{Ctx, Functions},
     vkobjects::{
         queue::{Binary, Fence, Semaphore},
@@ -29,9 +30,10 @@ struct SwapchainImage {
     image: vk::Image,
     view: vk::ImageView,
     handle: BindlessHandle,
-    layout: AtomicU32,
 }
 
+/// Dropping it destroys it once no frame in flight that drew to or presented one of its
+/// images counts it any more (`keepalive`).
 #[derive(Debug)]
 pub struct Swapchain {
     pub size: UVec2,
@@ -43,13 +45,33 @@ pub struct Swapchain {
     pub present_mode: usize,
     pub(crate) handle: vk::SwapchainKHR,
     images: SmallVec<[SwapchainImage; 5]>,
+    /// A word per image: the swapchain's count (the first) and each image's tracked layout.
+    owner: ManuallyDrop<KeepAlive>,
+    /// The surface may only go once the swapchain is destroyed.
+    surface: Option<KeepAlive>,
+}
+
+/// What destroying a swapchain takes, parked while a frame in flight still counts it.
+struct RawSwapchain {
+    handle: vk::SwapchainKHR,
+    views: SmallVec<[vk::ImageView; 5]>,
+    /// Dropped after the swapchain is destroyed.
+    _surface: Option<KeepAlive>,
+}
+
+impl Drop for RawSwapchain {
+    fn drop(&mut self) {
+        unsafe {
+            for view in &self.views {
+                Ctx::device().destroy_image_view(*view, None);
+            }
+            Functions::swapchain().destroy_swapchain(self.handle, None);
+        }
+    }
 }
 
 impl Swapchain {
-    pub fn image(
-        &self,
-        index: u32,
-    ) -> ImageView<'_, format::Dynamic, ColorAttachmentStorageTransferDst> {
+    pub fn image(&self, index: u32) -> ImageView<format::Dynamic, ColorAttachmentStorageTransferDst> {
         let image = &self.images[index as usize];
         ImageView {
             image: image.image,
@@ -57,11 +79,17 @@ impl Swapchain {
             mip_range: (0..1).into(),
             extent: self.size,
             handle: image.handle,
-            layouts: std::slice::from_ref(&image.layout),
+            keep: KeepAlive::clone(&self.owner),
+            layouts: (index..index + 1).into(),
             format: self.format,
             usage: ColorAttachmentStorageTransferDst,
             dim: D2,
         }
+    }
+
+    /// A count of the swapchain, which keeps it alive.
+    pub(crate) fn keep_alive(&self) -> KeepAlive {
+        KeepAlive::clone(&self.owner)
     }
 
     pub fn num_images(&self) -> usize {
@@ -134,6 +162,7 @@ impl Swapchain {
         let handle = unsafe { Functions::swapchain().create_swapchain(&create_info, None)? };
         let images = unsafe { Functions::swapchain().get_swapchain_images(handle)? };
 
+        assert!(images.len() as u32 <= crate::keepalive::MAX_LAYOUTS);
         let images = images
             .into_iter()
             .enumerate()
@@ -170,7 +199,6 @@ impl Swapchain {
                     handle: BindlessHandle::none(),
                     image,
                     view,
-                    layout: AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32),
                 })
             })
             .collect::<Result<SmallVec<[SwapchainImage; 5]>>>()?;
@@ -178,6 +206,9 @@ impl Swapchain {
         Ok(Self {
             handle,
             format: format::Dynamic(format.format),
+            // One tracked layout per image, 2 bits of the swapchain's slot each.
+            owner: ManuallyDrop::new(KeepAlive::new()),
+            surface: Some(surface.keep_alive()),
             images,
             size: UVec2::new(extent.width, extent.height),
             present_modes,
@@ -211,10 +242,10 @@ impl Swapchain {
         Ok(image_index)
     }
 
-    /// Replaces the swapchain with one of `size` and returns the old one, whose images frames
-    /// in flight may still use: retire it with the next frame (`Frame::retire`), which drops
-    /// it once that frame, and so every earlier one, has finished. The new images are unbound
-    /// (see `new`); bind them again. On an error (see `new`) the old swapchain stays.
+    /// Replaces the swapchain with one of `size` and returns the old one, which can be dropped
+    /// right away: frames in flight that use its images keep it alive (`keepalive`). The new
+    /// images are unbound (see `new`); bind them again. On an error (see `new`) the old
+    /// swapchain stays.
     #[validation_trace]
     pub fn recreate(&mut self, surface: &mut Surface, size: UVec2) -> Result<Swapchain> {
         let _span = tracing::info_span!("Swapchain Recreation").entered();
@@ -223,16 +254,14 @@ impl Swapchain {
     }
 }
 
-/// Destroys the swapchain, which no pending frame may use anymore: retire a replaced one
-/// (`recreate`), and wait for the device (`lava::wait_idle`) before dropping the last.
 impl Drop for Swapchain {
     fn drop(&mut self) {
-        unsafe {
-            for image in &self.images {
-                Ctx::device().destroy_image_view(image.view, None);
-            }
-            Functions::swapchain().destroy_swapchain(self.handle, None);
-        }
+        let owner = unsafe { ManuallyDrop::take(&mut self.owner) };
+        owner.release(RawSwapchain {
+            handle: self.handle,
+            views: self.images.iter().map(|image| image.view).collect(),
+            _surface: self.surface.take(),
+        });
     }
 }
 

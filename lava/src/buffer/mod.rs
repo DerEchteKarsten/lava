@@ -5,10 +5,9 @@ use std::{
     marker::PhantomData,
     mem::{self, ManuallyDrop},
     ops::{Index, IndexMut},
-    sync::OnceLock,
 };
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use ash::vk::{self};
 use bytemuck::Pod;
 use gpu_allocator::{
@@ -22,6 +21,7 @@ use crate::{
         slice::BufferSlice,
         usage::{BufferUsage, StaticUsage, Storage},
     },
+    keepalive::KeepAlive,
     state::Ctx,
 };
 
@@ -31,6 +31,9 @@ pub mod usage;
 /// A buffer of `T`s (`u8` when untyped). Its usage is a type (`usage::Storage`), which the
 /// command buffer's bounds check at compile time, or a `usage::Dynamic` value, which it checks
 /// at runtime (`usage_check`).
+///
+/// Dropping it destroys it once nothing keeps it alive any more: its slices, and the frames in
+/// flight that used it, each count (`keepalive`).
 #[derive(Debug)]
 pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
     pub handle: vk::Buffer,
@@ -38,21 +41,27 @@ pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
     pub allocation: Allocation,
     num_bytes: u64,
     usage: U,
+    owner: ManuallyDrop<KeepAlive>,
     _type_marker: PhantomData<T>,
+}
+
+/// What destroying a buffer takes, parked while something still counts it.
+struct RawBuffer {
+    handle: vk::Buffer,
+    allocation: Allocation,
+}
+
+impl Drop for RawBuffer {
+    fn drop(&mut self) {
+        unsafe { Ctx::device().destroy_buffer(self.handle, None) };
+        if let Err(err) = Ctx::allocator().free(mem::take(&mut self.allocation)) {
+            tracing::error!(%err, "failed to free buffer allocation");
+        }
+    }
 }
 
 /// A buffer of bytes whose usage is a runtime value (`Buffer::erase`).
 pub type DynamicBuffer = Buffer<u8, usage::Dynamic>;
-
-static ON_DROP: OnceLock<fn(&DynamicBuffer)> = OnceLock::new();
-
-/// Sets the function every dropped buffer calls with itself, erased, right before it is
-/// destroyed. It can be set once.
-pub fn on_drop(hook: fn(&DynamicBuffer)) -> Result<()> {
-    ON_DROP
-        .set(hook)
-        .map_err(|_| Error::message("the buffer drop hook is already set"))
-}
 
 impl<T: Copy + Pod, U: BufferUsage> Index<usize> for Buffer<T, U> {
     type Output = T;
@@ -69,23 +78,17 @@ impl<T: Copy + Pod, U: BufferUsage> IndexMut<usize> for Buffer<T, U> {
 
 impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     fn drop(&mut self) {
-        if let Some(hook) = ON_DROP.get() {
-            // Lent to the hook and never dropped: the memory comes back to be freed below.
-            let mut buffer = ManuallyDrop::new(self.take(usage::Dynamic(self.usage.flags())));
-            hook(&buffer);
-            self.allocation = mem::take(&mut buffer.allocation);
-        }
-        unsafe { Ctx::device().destroy_buffer(self.handle, None) };
-        let alloc = mem::take(&mut self.allocation);
-        if let Err(err) = Ctx::allocator().free(alloc) {
-            tracing::error!(%err, "failed to free buffer allocation");
-        }
+        let owner = unsafe { ManuallyDrop::take(&mut self.owner) };
+        owner.release(RawBuffer {
+            handle: self.handle,
+            allocation: mem::take(&mut self.allocation),
+        });
     }
 }
 
-impl<'a, T: Copy + Pod, U: BufferUsage> Into<BufferSlice<'a, T, U>> for &'a Buffer<T, U> {
-    fn into(self) -> BufferSlice<'a, T, U> {
-        self.range(..)
+impl<T: Copy + Pod, U: BufferUsage> From<&Buffer<T, U>> for BufferSlice<T, U> {
+    fn from(buffer: &Buffer<T, U>) -> Self {
+        buffer.range(..)
     }
 }
 
@@ -172,9 +175,16 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             usage,
             address,
             num_bytes,
-            allocation: allocation,
+            allocation,
             handle: buffer,
+            owner: ManuallyDrop::new(KeepAlive::new()),
         })
+    }
+
+    /// A count of the buffer that keeps it alive, for a frame that reaches it in a way its
+    /// commands don't name (`Frame::uses`): through an address stored in another buffer.
+    pub fn keep_alive(&self) -> KeepAlive {
+        KeepAlive::clone(&self.owner)
     }
 
     pub fn size(&self) -> u64 {
@@ -248,8 +258,8 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         ManuallyDrop::new(self).take(usage)
     }
 
-    /// Moves the buffer into one of another element type and usage, leaving `self` without
-    /// memory; `self` must not destroy its handle unless it gets the memory back.
+    /// Moves the buffer into one of another element type and usage; `self` must not be
+    /// dropped after.
     fn take<B: Copy + Pod, NU: BufferUsage>(&mut self, usage: NU) -> Buffer<B, NU> {
         Buffer {
             handle: self.handle,
@@ -257,6 +267,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             allocation: mem::take(&mut self.allocation),
             num_bytes: self.num_bytes,
             usage,
+            owner: ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut self.owner) }),
             _type_marker: PhantomData,
         }
     }

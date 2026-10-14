@@ -131,8 +131,8 @@ fn run(event_loop: &ActiveEventLoop) {
     step("acquire_clear_present");
 
     let new_size = SIZE / 2;
-    // The old swapchain is handed back for the application to retire with a frame; here the
-    // slot of its last frame was waited for already.
+    // The old swapchain is handed back and can be dropped: the frames and presents that used
+    // it keep it alive until they are done.
     let old = swapchain.recreate(&mut surface, new_size).unwrap();
     assert_eq!(old.size, SIZE);
     assert_eq!(swapchain.size, new_size);

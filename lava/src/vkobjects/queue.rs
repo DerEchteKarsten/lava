@@ -3,6 +3,7 @@ use ash::vk::TaggedStructure;
 use std::{
     fmt::Debug,
     marker::PhantomData,
+    mem::ManuallyDrop,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -16,15 +17,36 @@ use smallvec::SmallVec;
 use crate::pipeline::GenericPipeline;
 use crate::{
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
+    keepalive::KeepAlive,
     profiling::{Counter, GpuScope, PassCounters, PassQueries, TimestampQueries},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
 
+/// Dropping it destroys it once no frame in flight that waited on or signalled it counts it
+/// any more (`keepalive`).
 #[derive(Debug)]
 pub struct Semaphore<T: SemaphoreType + ?Sized> {
     pub(crate) handle: vk::Semaphore,
+    owner: ManuallyDrop<KeepAlive>,
     marker: PhantomData<T>,
+}
+
+struct RawSemaphore(vk::Semaphore);
+impl Drop for RawSemaphore {
+    fn drop(&mut self) {
+        unsafe { Ctx::device().destroy_semaphore(self.0, None) };
+    }
+}
+
+impl<T: SemaphoreType + ?Sized> Semaphore<T> {
+    fn from_handle(handle: vk::Semaphore) -> Self {
+        Semaphore {
+            handle,
+            owner: ManuallyDrop::new(KeepAlive::new()),
+            marker: PhantomData,
+        }
+    }
 }
 
 impl<T: SemaphoreType> Default for Semaphore<T> {
@@ -35,7 +57,8 @@ impl<T: SemaphoreType> Default for Semaphore<T> {
 
 impl<T: SemaphoreType + ?Sized> Drop for Semaphore<T> {
     fn drop(&mut self) {
-        unsafe { Ctx::device().destroy_semaphore(self.handle, None) };
+        let owner = unsafe { ManuallyDrop::take(&mut self.owner) };
+        owner.release(RawSemaphore(self.handle));
     }
 }
 
@@ -74,13 +97,15 @@ impl Stage {
 
 /// A semaphore to wait on or signal in a submission (`Semaphore::info`). A wait holds back
 /// every command unless `at` names the kind of command it should hold back instead.
-/// Signals always happen after everything.
-#[derive(Clone, Copy, Debug)]
+/// Signals always happen after everything. The frame counts the semaphore until the GPU
+/// finished it.
+#[derive(Clone, Debug)]
 pub struct SemaphoreInfo {
     handle: vk::Semaphore,
     /// `None` for a binary semaphore.
     value: Option<u64>,
     stage: Stage,
+    keep: KeepAlive,
 }
 impl SemaphoreInfo {
     /// Waited on only at `stage` (see `Stage`); the default is `Stage::All`.
@@ -111,10 +136,7 @@ impl SemaphoreType for Timeline {
         };
         let create_info = vk::SemaphoreCreateInfo::default().push(&mut timeline);
         let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
-        Ok(Semaphore {
-            handle,
-            marker: PhantomData,
-        })
+        Ok(Semaphore::from_handle(handle))
     }
 }
 
@@ -124,10 +146,7 @@ impl SemaphoreType for Binary {
     fn create() -> Result<Semaphore<Self>> {
         let create_info = vk::SemaphoreCreateInfo::default();
         let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
-        Ok(Semaphore {
-            handle,
-            marker: PhantomData,
-        })
+        Ok(Semaphore::from_handle(handle))
     }
 }
 
@@ -155,6 +174,7 @@ impl Semaphore<Timeline> {
             handle: self.handle,
             value: Some(value),
             stage: Stage::All,
+            keep: KeepAlive::clone(&self.owner),
         }
     }
 }
@@ -166,6 +186,7 @@ impl Semaphore<Binary> {
             handle: self.handle,
             value: None,
             stage: Stage::All,
+            keep: KeepAlive::clone(&self.owner),
         }
     }
 }
@@ -234,6 +255,10 @@ pub struct FamilyQueues {
     handles: Box<[Mutex<vk::Queue>]>,
     /// The leases of each queue.
     leases: Mutex<Box<[u32]>>,
+    /// Per queue: the swapchains and semaphores of the presents queued since its last
+    /// submission. A frame's fence doesn't cover a present queued after it, so the next
+    /// submission to the queue keeps them alive (`keepalive`) instead.
+    presented: Box<[Mutex<Vec<KeepAlive>>]>,
 }
 
 impl FamilyQueues {
@@ -244,11 +269,19 @@ impl FamilyQueues {
                 .map(|i| Mutex::new(unsafe { device.get_device_queue(family, i) }))
                 .collect(),
             leases: Mutex::new(vec![0; count as usize].into()),
+            presented: (0..count).map(|_| Mutex::new(Vec::new())).collect(),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Releases what the presents of every queue kept: only once the device is idle.
+    pub(crate) fn release_presented(&self) {
+        for presented in &self.presented {
+            presented.lock().unwrap().clear();
+        }
     }
 }
 
@@ -289,6 +322,8 @@ impl<Q: QueueFamilie> Queue<Q> {
             return Ok(());
         }
         self.with(|queue| unsafe { Ctx::device().queue_wait_idle(queue) })?;
+        // Their presents are done too.
+        self.family.presented[self.index].lock().unwrap().clear();
         let mut leases = self.family.leases.lock().unwrap();
         leases[self.index] -= 1;
         self.index = lease(&mut leases);
@@ -388,7 +423,9 @@ impl Drop for CommandBufferMemory {
 /// A command buffer with its pool and fence. Submit its frames through one [`Queue`] lease,
 /// so they reach the GPU in order and the barriers between them hold.
 pub struct FrameSlot {
-    retired: Vec<Box<dyn Send + Sync>>,
+    /// The counts of everything the last submission used (`keepalive`), dropped once its
+    /// fence signalled; and what `Frame::uses` added for the next.
+    in_flight: Vec<KeepAlive>,
     /// The pipelines the last frame recorded, which a shader reload may have replaced since.
     #[cfg(feature = "hot-reload")]
     pipelines: Vec<Arc<GenericPipeline>>,
@@ -409,7 +446,7 @@ impl FrameSlot {
         let pool = CommandPool::new(queue.family.family)?;
         let buffer = pool.create_command_buffer()?;
         Ok(Self {
-            retired: Vec::new(),
+            in_flight: Vec::new(),
             #[cfg(feature = "hot-reload")]
             pipelines: Vec::new(),
             buffer,
@@ -451,9 +488,9 @@ impl FrameSlot {
             self.fence.reset()?;
             self.pool.reset()?;
             self.submitted = false;
-            self.retired.clear();
         }
         // Also after a frame that failed before it was submitted.
+        self.in_flight.clear();
         #[cfg(feature = "hot-reload")]
         self.pipelines.clear();
         // The pools are idle now. A new counter selection needs new ones.
@@ -483,8 +520,12 @@ pub struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    pub fn retire<T: Send + Sync + 'static>(&mut self, value: T) {
-        self.slot.retired.push(Box::new(value));
+    /// Keeps what the frame reaches without its commands naming it alive until the GPU
+    /// finished the frame, e.g. a buffer reached through an address stored in another buffer
+    /// (`Buffer::keep_alive`). Whatever the commands take (views, slices, bindings) is kept
+    /// already.
+    pub fn uses(&mut self, keep: impl IntoIterator<Item = KeepAlive>) {
+        self.slot.in_flight.extend(keep);
     }
 
     /// The GPU scopes of the frame this slot submitted before, if it was timed.
@@ -580,10 +621,13 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     executor: F,
 ) -> Result<PendingAccesses> {
     let buffer = &slot.buffer;
+    let mut pending = pending;
+    pending.prune();
     unsafe {
         let mut cmd_buffer = CommandBuffer {
             handle: buffer.handle,
             pending_accesses: pending,
+            used: std::mem::take(&mut slot.in_flight),
             timestamps: slot.timestamps.take(),
             counters: slot.counters.take(),
             #[cfg(feature = "hot-reload")]
@@ -609,6 +653,11 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         {
             slot.pipelines = std::mem::take(&mut cmd_buffer.pipelines);
         }
+        slot.in_flight = std::mem::take(&mut cmd_buffer.used);
+        let semaphores = wait_on.iter().chain(signal).map(|sem| sem.keep.clone());
+        slot.in_flight.extend(semaphores);
+        let presented = &queue.family.presented[queue.index];
+        slot.in_flight.append(&mut presented.lock().unwrap());
         cmd_buffer.end()?;
 
         let cmd_buffer_submit_info =
@@ -659,6 +708,10 @@ impl Queue<Gfx> {
             .wait_semaphores(waits.as_slice());
         let presented = self
             .with(|queue| unsafe { Functions::swapchain().queue_present(queue, &present_info) });
+        let keep = wait_on.iter().map(|sem| KeepAlive::clone(&sem.owner));
+        let mut kept = self.family.presented[self.index].lock().unwrap();
+        kept.extend(keep.chain([swapchain.keep_alive()]));
+        drop(kept);
         match presented {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
             Ok(false) => Ok(false),
@@ -708,6 +761,7 @@ mod tests {
             handle: vk::Semaphore::from_raw(7),
             value: None,
             stage: Stage::All,
+            keep: KeepAlive::new(),
         };
         let submit = info.to_vk(vk::PipelineStageFlags2::COMPUTE_SHADER);
         assert_eq!(submit.semaphore, vk::Semaphore::from_raw(7));
@@ -721,6 +775,7 @@ mod tests {
             handle: vk::Semaphore::from_raw(9),
             value: Some(12),
             stage: Stage::All,
+            keep: KeepAlive::new(),
         };
         let submit = info.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS);
         assert_eq!(submit.semaphore, vk::Semaphore::from_raw(9));

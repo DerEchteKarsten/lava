@@ -3,7 +3,7 @@ use ash::vk::TaggedStructure;
 use std::{
     mem::{self, ManuallyDrop},
     range::Range,
-    sync::{OnceLock, atomic::AtomicU32},
+    sync::OnceLock,
 };
 
 use crate::error::{Error, Result};
@@ -13,12 +13,13 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindless::{self, BindlessHandle},
-    command_buffer::{ImageAccess, ImageUse},
+    command_buffer::ImageUse,
     image::{
         format::{Format, StaticFormat, bc_block},
         slice::ImageView,
         usage::{ImageUsage, IsHostCopy, IsSampled, IsStorage, StaticUsage},
     },
+    keepalive::{KeepAlive, MAX_LAYOUTS},
     state::{Ctx, Functions},
 };
 
@@ -155,11 +156,15 @@ impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
 
 /// What an image keeps per view: [`Single`] or [`PerMip`]. Only lava implements it.
 pub trait Views: std::fmt::Debug + Send + Sync + 'static + Sized {
+    /// Whether every mip has its own tracked layout (2 bits of the image's slot in
+    /// `keepalive`), or one layout covers them all.
+    #[doc(hidden)]
+    const PER_MIP: bool;
     #[doc(hidden)]
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self>;
-    /// The view over every mip, its handle and the layouts it covers.
+    /// The view over every mip and its handle.
     #[doc(hidden)]
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]);
+    fn whole(&self) -> (vk::ImageView, BindlessHandle);
     #[doc(hidden)]
     fn whole_handle(&mut self) -> &mut BindlessHandle;
 }
@@ -170,7 +175,6 @@ pub trait Views: std::fmt::Debug + Send + Sync + 'static + Sized {
 pub struct Single {
     view: vk::ImageView,
     handle: BindlessHandle,
-    layout: AtomicU32,
 }
 
 /// The view over every mip plus one view per mip, each with its handle, and a layout per mip:
@@ -180,7 +184,6 @@ pub struct PerMip {
     view: vk::ImageView,
     handle: BindlessHandle,
     mips: Box<[MipView]>,
-    layouts: Box<[AtomicU32]>,
 }
 
 #[derive(Debug)]
@@ -189,20 +192,16 @@ struct MipView {
     handle: BindlessHandle,
 }
 
-fn undefined() -> AtomicU32 {
-    AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32)
-}
-
 impl Views for Single {
+    const PER_MIP: bool = false;
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
         Ok(Single {
             view: raw.create_view((0..raw.mip_levels).into())?,
             handle: BindlessHandle::none(),
-            layout: undefined(),
         })
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
-        (self.view, self.handle, std::slice::from_ref(&self.layout))
+    fn whole(&self) -> (vk::ImageView, BindlessHandle) {
+        (self.view, self.handle)
     }
     fn whole_handle(&mut self) -> &mut BindlessHandle {
         &mut self.handle
@@ -210,13 +209,13 @@ impl Views for Single {
 }
 
 impl Views for PerMip {
+    const PER_MIP: bool = true;
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
         // Built up front, so `Drop` destroys whatever was created before an error.
         let mut views = PerMip {
             view: vk::ImageView::null(),
             handle: BindlessHandle::none(),
             mips: Box::new([]),
-            layouts: (0..raw.mip_levels).map(|_| undefined()).collect(),
         };
         views.view = raw.create_view((0..raw.mip_levels).into())?;
         let mut mips = Vec::with_capacity(raw.mip_levels as usize);
@@ -235,8 +234,8 @@ impl Views for PerMip {
         views.mips = mips.into();
         Ok(views)
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
-        (self.view, self.handle, &self.layouts)
+    fn whole(&self) -> (vk::ImageView, BindlessHandle) {
+        (self.view, self.handle)
     }
     fn whole_handle(&mut self) -> &mut BindlessHandle {
         &mut self.handle
@@ -245,9 +244,11 @@ impl Views for PerMip {
 
 static ON_DROP: OnceLock<fn(BindlessHandle)> = OnceLock::new();
 
-/// Sets the function a dropped image calls with each handle it has that isn't null (its whole
-/// view's, then each mip's), right before the view is destroyed, so whoever picked the indices
-/// can hand them out again. It can be set once.
+/// Sets the function a destroyed image calls with each handle it has that isn't null (its
+/// whole view's, then each mip's), right before the view is destroyed, so whoever picked the
+/// indices can hand them out again. That is when its owner drops it, or, if a view or a frame
+/// in flight still keeps it alive (`keepalive`), when the last of them is gone. It can be set
+/// once.
 pub fn on_drop(hook: fn(BindlessHandle)) -> Result<()> {
     ON_DROP
         .set(hook)
@@ -283,11 +284,29 @@ impl Drop for PerMip {
 /// time, or `format::Dynamic`/`usage::Dynamic` values, which it checks at runtime
 /// (`aspect_check`, `texel_check`, `usage_check`). A [`Single`] image (the default) has one view
 /// over all its mips, a [`MipChain`] also one per mip.
+///
+/// Dropping it destroys it once nothing keeps it alive any more: its views, and the frames in
+/// flight that used it, each count (`keepalive`).
 #[derive(Debug)]
 pub struct Image<F: Format, U: ImageUsage, D: Dim = D2, V: Views = Single> {
-    // Dropped in this order: the views and their handles first, then the image.
-    views: V,
-    raw: RawImage<F, U, D>,
+    // Destroyed in this order: the views and their handles first, then the image.
+    views: ManuallyDrop<V>,
+    raw: ManuallyDrop<RawImage<F, U, D>>,
+    /// The image's count and tracked layouts (one, or one per mip with `V::PER_MIP`).
+    owner: ManuallyDrop<KeepAlive>,
+}
+
+impl<F: Format, U: ImageUsage, D: Dim, V: Views> Drop for Image<F, U, D, V> {
+    fn drop(&mut self) {
+        let (views, raw, owner) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.views),
+                ManuallyDrop::take(&mut self.raw),
+                ManuallyDrop::take(&mut self.owner),
+            )
+        };
+        owner.release((views, raw));
+    }
 }
 
 /// An image whose mips the GPU accesses one at a time ([`Image::mip_view`]).
@@ -313,10 +332,14 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included.
     #[validation_trace]
     pub fn with_params(format: F, usage: U, extent: D::Extent, mip_levels: u32) -> Result<Self> {
+        // One tracked layout per mip, 2 bits of the image's slot each.
+        assert!(!V::PER_MIP || mip_levels <= MAX_LAYOUTS, "a mip chain has at most {MAX_LAYOUTS} mips");
         let raw = RawImage::new(format, usage, extent, mip_levels)?;
+        let views = V::create(&raw)?;
         Ok(Image {
-            views: V::create(&raw)?,
-            raw,
+            views: ManuallyDrop::new(views),
+            raw: ManuallyDrop::new(raw),
+            owner: ManuallyDrop::new(KeepAlive::new()),
         })
     }
 
@@ -362,28 +385,43 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     }
 
     /// The view over every mip.
-    pub fn whole_view(&self) -> ImageView<'_, F, U, D> {
-        let (view, handle, layouts) = self.views.whole();
-        self.view(view, (0..self.raw.mip_levels).into(), handle, layouts)
+    pub fn whole_view(&self) -> ImageView<F, U, D> {
+        let (view, handle) = self.views.whole();
+        let layouts = if V::PER_MIP { self.raw.mip_levels } else { 1 };
+        self.view(view, (0..self.raw.mip_levels).into(), handle, (0..layouts).into())
     }
 
-    fn view<'a>(
-        &'a self,
+    /// `layouts`: the layouts of the image's slot the view tracks.
+    fn view(
+        &self,
         view: vk::ImageView,
         mip_range: Range<u32>,
         handle: BindlessHandle,
-        layouts: &'a [AtomicU32],
-    ) -> ImageView<'a, F, U, D> {
+        layouts: Range<u32>,
+    ) -> ImageView<F, U, D> {
         ImageView {
             image: self.raw.image,
             view,
             mip_range,
             extent: self.mip_extent(mip_range.start),
             handle,
+            keep: KeepAlive::clone(&self.owner),
             layouts,
             format: self.raw.format,
             usage: self.raw.usage,
             dim: D::default(),
+        }
+    }
+
+    /// The parts, without dropping (destroying) the image.
+    fn into_parts(self) -> (V, RawImage<F, U, D>, KeepAlive) {
+        let mut this = ManuallyDrop::new(self);
+        unsafe {
+            (
+                ManuallyDrop::take(&mut this.views),
+                ManuallyDrop::take(&mut this.raw),
+                ManuallyDrop::take(&mut this.owner),
+            )
         }
     }
 
@@ -395,9 +433,11 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             (self.raw.format.vk_format(), self.raw.usage.flags()),
             (format.vk_format(), usage.flags()),
         );
+        let (views, raw, owner) = self.into_parts();
         Image {
-            views: self.views,
-            raw: self.raw.cast(format, usage),
+            views: ManuallyDrop::new(views),
+            raw: ManuallyDrop::new(raw.cast(format, usage)),
+            owner: ManuallyDrop::new(owner),
         }
     }
 
@@ -435,10 +475,10 @@ impl<F: Format, U: IsStorage, D: Dim, V: Views> Image<F, U, D, V> {
 impl<F: Format, U: ImageUsage, D: Dim> MipChain<F, U, D> {
     /// The view of mip `level` alone, sized `mip_extent(level)`: for a storage write, an
     /// attachment or a copy of one mip. The whole view samples across mips.
-    pub fn mip_view(&self, level: u32) -> ImageView<'_, F, U, D> {
+    pub fn mip_view(&self, level: u32) -> ImageView<F, U, D> {
         let mip = &self.views.mips[level as usize];
-        let layouts = std::slice::from_ref(&self.views.layouts[level as usize]);
-        self.view(mip.view, (level..level + 1).into(), mip.handle, layouts)
+        let range = (level..level + 1).into();
+        self.view(mip.view, range, mip.handle, range)
     }
 
     /// Binds mip `i`'s view at `first + i` of the sampled (`sampled`) or the storage set.
@@ -562,19 +602,12 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
     ) -> Result<()> {
         let image = self.raw.image;
         let aspect = self.raw.format.aspects();
-        let (_, _, layouts) = self.views.whole();
         // Every mip not in `GENERAL` yet moves there, as if a command accessed the whole view.
-        let to_general = ImageUse {
-            access: ImageAccess {
-                stage: vk::PipelineStageFlags2::HOST,
-                access: vk::AccessFlags2::HOST_WRITE,
-                image,
-                layout: vk::ImageLayout::GENERAL,
-                aspect,
-                mip_range: (0..self.raw.mip_levels).into(),
-            },
-            layouts,
-        };
+        let to_general: ImageUse = self.whole_view().into_access(
+            vk::PipelineStageFlags2::HOST,
+            vk::AccessFlags2::HOST_WRITE,
+            vk::ImageLayout::GENERAL,
+        );
         let mut transitions: smallvec::SmallVec<[vk::HostImageLayoutTransitionInfoEXT; 1]> =
             smallvec::SmallVec::new();
         to_general.take_layouts(|mips, old_layout| {

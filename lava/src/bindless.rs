@@ -81,8 +81,8 @@ pub fn max_storage_images() -> u32 {
 /// only be rewritten while no pending command buffer uses it. Panics if an image lacks the
 /// usage of a set it is written to, or an index is outside its set.
 #[validation_trace]
-pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
-    images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
+pub fn bind<F: Format, U: ImageUsage, D: Dim>(
+    images: impl IntoIterator<Item = ImageView<F, U, D>>,
     handles: impl IntoIterator<Item = BindlessHandle>,
 ) {
     let bindless = Bindless::get();

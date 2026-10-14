@@ -261,38 +261,33 @@ fn a_reselected_lease_keeps_its_frame_slots_usable() {
     assert_eq!(buffer.host(), [1, 1, 2, 2]);
 }
 
+/// A frame slot keeps everything its last frame used alive until it is begun again: images
+/// and buffers dropped right after their frame was submitted, and a buffer only reached
+/// through an address (`Frame::uses`). Destroying any of them while the GPU still runs the
+/// frame is a validation error, which fails the test.
 #[test]
-fn frame_slot_can_be_reused_and_keeps_retired_values_until_the_frame_is_done() {
-    struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
-    impl Drop for SetOnDrop {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
+fn frame_slot_can_be_reused_and_keeps_what_its_frame_used_until_the_frame_is_done() {
     let gpu = gpu();
     let buffer = zeroed_buffer::<u32, Storage>(4);
-    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut slot = FrameSlot::new(&gpu.queue).unwrap();
     let mut pending = PendingAccesses::default();
 
     for value in 1..=3 {
         let mut frame = slot.begin().unwrap();
-        if value == 1 {
-            frame.retire(SetOnDrop(dropped.clone()));
-        } else {
-            // Beginning the next frame waited for the first one and released what it retired.
-            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
-        }
+        let scratch = zeroed_buffer::<u32, Storage>(1024);
+        let image =
+            Image::<R8G8B8A8Unorm, StorageTransferSrcTransferDst>::new(UVec2::new(64, 64)).unwrap();
+        let reached = zeroed_buffer::<u32, Storage>(16);
+        frame.uses([reached.keep_alive()]);
         // Pending accesses are carried from frame to frame like the engine does.
         pending = frame
             .execute(&gpu.queue, pending, &[], &[], |cmd| {
-                cmd.fill_buffer(buffer.range(..), value)
+                cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.0, 1.0]);
+                cmd.fill_buffer(scratch.range(..), value);
+                cmd.copy_buffer(scratch.range(..4), buffer.range(..));
             })
             .unwrap();
-        if value == 1 {
-            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
-        }
+        drop((scratch, image, reached));
     }
     drop(slot);
     assert_eq!(buffer.host(), [3; 4]);
@@ -535,7 +530,7 @@ fn copy_buffer_regions_copies_each_region() {
         (src.range(0..2), dst.range(6..)),
         (src.range(7..8), dst.range(0..1)),
     ];
-    gpu.submit(|cmd| cmd.copy_buffer_regions(&regions));
+    gpu.submit(|cmd| cmd.copy_buffer_regions(regions));
     assert_eq!(dst.host(), [8, 0, 0, 0, 0, 0, 1, 2]);
 }
 
@@ -686,24 +681,6 @@ fn dropped_images_hand_every_handle_to_the_hook() {
         _ => BindlessHandle::storage(i),
     });
     assert!(DROPPED.lock().unwrap().ends_with(&handles));
-}
-
-#[test]
-fn dropped_buffers_go_to_the_hook_erased() {
-    static DROPPED: std::sync::Mutex<Vec<(u64, lava::BufferUsageFlags)>> =
-        std::sync::Mutex::new(Vec::new());
-    let _gpu = gpu();
-    lava::buffer::on_drop(|buffer| {
-        let dropped = (buffer.size(), buffer.usage().0);
-        DROPPED.lock().unwrap().push(dropped)
-    })
-    .unwrap();
-    let buffer = zeroed_buffer::<u32, Storage>(4);
-    let erased = buffer.erase();
-    assert_eq!((erased.len(), erased.size()), (16, 16));
-    drop(erased);
-    let dropped = (16, lava::BufferUsageFlags::STORAGE_BUFFER);
-    assert!(DROPPED.lock().unwrap().contains(&dropped));
 }
 
 #[test]
@@ -1089,7 +1066,7 @@ fn specialization_constants_pick_the_pipeline() {
 
 // ---- raster passes ---------------------------------------------------------------------------
 
-fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<'_, kind::RasterVertex> {
+fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<kind::RasterVertex> {
     TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
 }
 

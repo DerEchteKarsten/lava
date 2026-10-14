@@ -1,5 +1,4 @@
 //! Pass pipelines: the pass table's entries, the cache of every pass's pipelines per specialization and raster state, and their creation; with `hot-reload`, a second cache whose reloads replace pipelines that command buffers keep alive
-#[cfg(feature = "hot-reload")]
 use ash::vk::TaggedStructure;
 use std::sync::Arc;
 use std::{

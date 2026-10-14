@@ -3,7 +3,7 @@ use ash::vk;
 
 /// Every buffer also gets `SHADER_DEVICE_ADDRESS`, `TRANSFER_SRC` and `TRANSFER_DST` (`Buffer::raw`):
 /// leaving the transfer usages out of buffers that don't need them made no measurable difference.
-pub trait BufferUsage: 'static + Copy + std::fmt::Debug {
+pub trait BufferUsage: 'static + Copy + Send + Sync + std::fmt::Debug {
     fn flags(&self) -> vk::BufferUsageFlags;
     /// Panics unless the usage has every flag of `required`. The command buffer calls it with
     /// what its trait bounds (`IsStorage`, `IsIndirect`, ...) require. A static usage's type

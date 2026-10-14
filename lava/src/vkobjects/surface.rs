@@ -2,17 +2,32 @@
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
+use std::mem::ManuallyDrop;
+
 use crate::{
     error::{Error, Result},
+    keepalive::KeepAlive,
     state::{Ctx, Functions},
 };
 
+/// Dropping it destroys it once the swapchains made for it are destroyed: each counts it
+/// (`keepalive`).
 #[derive(Debug)]
 pub struct Surface {
     pub handle: vk::SurfaceKHR,
     pub formats: Vec<vk::SurfaceFormatKHR>,
     pub present_modes: Vec<vk::PresentModeKHR>,
     pub capabilities: vk::SurfaceCapabilitiesKHR,
+    owner: ManuallyDrop<KeepAlive>,
+}
+
+struct RawSurface(vk::SurfaceKHR);
+impl Drop for RawSurface {
+    fn drop(&mut self) {
+        if let Some(surface_fn) = Functions::surface() {
+            unsafe { surface_fn.destroy_surface(self.0, None) };
+        }
+    }
 }
 
 impl Surface {
@@ -30,6 +45,7 @@ impl Surface {
             formats: Vec::new(),
             present_modes: Vec::new(),
             capabilities: vk::SurfaceCapabilitiesKHR::default(),
+            owner: ManuallyDrop::new(KeepAlive::new()),
         };
 
         let physical_device = Ctx::physical_device().handel;
@@ -81,10 +97,16 @@ fn surface_fn() -> Result<&'static ash::khr::surface::Instance> {
     })
 }
 
+impl Surface {
+    /// A count of the surface, which keeps it alive.
+    pub(crate) fn keep_alive(&self) -> KeepAlive {
+        KeepAlive::clone(&self.owner)
+    }
+}
+
 impl Drop for Surface {
     fn drop(&mut self) {
-        if let Some(surface_fn) = Functions::surface() {
-            unsafe { surface_fn.destroy_surface(self.handle, None) };
-        }
+        let owner = unsafe { ManuallyDrop::take(&mut self.owner) };
+        owner.release(RawSurface(self.handle));
     }
 }

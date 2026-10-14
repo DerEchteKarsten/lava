@@ -6,7 +6,7 @@ use std::{
 
 use ash::vk;
 
-pub trait Format: 'static + Copy + std::fmt::Debug {
+pub trait Format: 'static + Copy + Send + Sync + std::fmt::Debug {
     /// The texels of a clear value: an array of the format's component type, `(depth, stencil)`
     /// for depth-stencil formats, a `ClearValue` for `Dynamic`.
     type Texels;
