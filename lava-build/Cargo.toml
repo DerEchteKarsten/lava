@@ -1,0 +1,7 @@
+[package]
+name = "lava-build"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }

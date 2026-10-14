@@ -1,0 +1,30 @@
+[package]
+name = "lava-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+lava = { path = "../lava", default-features = false }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+winit = "0.30"
+raw-window-handle = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+png = { workspace = true }
+
+[build-dependencies]
+lava-build = { path = "../lava-build" }
+
+[features]
+default = ["profiling", "hot-reload"]
+# lava's features, so `--no-default-features` tests lava without them.
+profiling = ["lava/profiling"]
+hot-reload = ["lava/hot-reload"]
+
+[[test]]
+name = "gpu_window"
+harness = false

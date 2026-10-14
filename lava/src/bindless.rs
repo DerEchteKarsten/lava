@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use lava_macros::validation_trace;
 
 use crate::{
-    bindings::MAX_PUSH_CONSTANTS_SIZE,
+    pipeline::MAX_PUSH_CONSTANTS_SIZE,
     image::{Dim, format::Format, slice::ImageView, usage::ImageUsage},
     state::Ctx,
 };

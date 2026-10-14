@@ -19,14 +19,6 @@ pub use ash::vk::Result as VkResult;
 /// What `format::Dynamic`, `image::usage::Dynamic` and `buffer::usage::Dynamic` hold.
 pub use ash::vk::{BufferUsageFlags, Format as VkFormat, ImageUsageFlags};
 
-#[cfg(not(feature = "test-passes"))]
-pub mod bindings;
-/// With `test-passes`, the bindings also cover the passes in `lava/tests/shaders` and are
-/// generated into OUT_DIR instead of `src/bindings.rs`.
-#[cfg(feature = "test-passes")]
-pub mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
 pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;
@@ -37,10 +29,6 @@ mod hot_reload;
 pub mod image;
 pub mod pipeline;
 pub mod profiling;
-// Shared with build.rs, which uses most of it: the lib needs its constants, and with hot
-// reload the session, linking and layout hash.
-#[allow(dead_code)]
-mod slang_compile;
 pub mod scratchpad;
 pub mod state;
 pub mod vkobjects;
@@ -53,14 +41,34 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// Initialises the global Vulkan context. Pass the display handle to be able to create
+/// The bindings lava-build generated in the application's build script: every pass's
+/// `Pass::push_bindings`, the types its shaders share, and the `PASS_MAP` that goes to
+/// [`init`]. Expands where it is called, so `OUT_DIR` is the calling crate's.
+#[macro_export]
+macro_rules! include_passes {
+    () => {
+        include!(concat!(env!("OUT_DIR"), "/lava/bindings.rs"));
+    };
+}
+
+/// Initialises the global Vulkan context with the application's passes (the `PASS_MAP` of
+/// [`include_passes!`]). Pass the display handle to be able to create
 /// [`vkobjects::surface::Surface`]s and swapchains; `None` runs headless.
 pub fn init(
     display: Option<&RawDisplayHandle>,
     enable_validation: bool,
     enable_gpu_assited_validation: bool,
+    passes: &'static pipeline::PassMap,
 ) -> Result<()> {
+    assert_eq!(
+        passes.profiling,
+        cfg!(feature = "profiling"),
+        "the passes were compiled for lava {} its `profiling` feature: run lava-build from the \
+         build script of a crate that depends on lava directly",
+        if passes.profiling { "with" } else { "without" }
+    );
     Ctx::init(display, enable_validation, enable_gpu_assited_validation)?;
+    pipeline::set_pass_map(passes);
     Bindless::init()?;
     profiling::init()?;
     pipeline::init();

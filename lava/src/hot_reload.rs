@@ -6,25 +6,28 @@ use std::{
     time::Duration,
 };
 
-use notify::EventHandler;
-use shader_slang as slang;
-
-use crate::{
-    bindings::PASS_MAP,
-    pipeline::{PassEntry, PipelineManager},
-    slang_compile::{self, SHADER_DIR},
+use lava_build::{
+    Optimization,
+    compile::{self, slang},
 };
+use notify::EventHandler;
 
-/// Watches the shader directory and compiles changed passes on a thread of its own.
+use crate::pipeline::{PassEntry, PipelineManager, pass_map};
+
+/// Watches the pass map's directories and lava-build's `slang/`, and compiles changed passes
+/// on a thread of its own.
 pub(crate) fn watch(manager: &'static PipelineManager) {
     use notify::Watcher;
 
     static WATCHER: OnceLock<Option<notify::RecommendedWatcher>> = OnceLock::new();
     let _ = WATCHER.get_or_init(|| {
         let watch = || -> std::result::Result<notify::RecommendedWatcher, String> {
-            // The source directory of the build machine: a moved binary has no shaders to
+            // The source directories of the build machine: a moved binary has no shaders to
             // watch, and keeps the pipelines it started with.
-            let dirs = ["passes", "include"].map(|dir| Path::new(SHADER_DIR).join(dir));
+            let dirs: Vec<&Path> = (pass_map().watch_dirs.iter().copied())
+                .chain([lava_build::SLANG_DIR])
+                .map(Path::new)
+                .collect();
             if let Some(missing) = dirs.iter().find(|dir| !dir.is_dir()) {
                 return Err(format!("{} is not a directory", missing.display()));
             }
@@ -88,8 +91,8 @@ fn compile_changed_passes(manager: &'static PipelineManager, changed: mpsc::Rece
         std::thread::sleep(Duration::from_millis(50));
         let paths: Vec<PathBuf> = iter::once(first).chain(changed.try_iter()).collect();
 
-        for pass_index in passes_to_reload(&paths, &PASS_MAP) {
-            let pass = &PASS_MAP[pass_index];
+        for pass_index in passes_to_reload(&paths, pass_map().passes) {
+            let pass = &pass_map().passes[pass_index];
 
             let reloaded = compile_pass(&global, pass_index).and_then(|spirv| {
                 tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
@@ -108,7 +111,7 @@ fn compile_changed_passes(manager: &'static PipelineManager, changed: mpsc::Rece
 /// the passes whose own source changed, or every pass as soon as a non-pass file (an include)
 /// is among them.
 fn passes_to_reload(changed: &[PathBuf], passes: &[PassEntry]) -> Vec<usize> {
-    let is_source_of = |path: &PathBuf, pass: &PassEntry| path.ends_with(pass.source);
+    let is_source_of = |path: &PathBuf, pass: &PassEntry| path == Path::new(pass.source);
     let all = changed
         .iter()
         .any(|path| !passes.iter().any(|pass| is_source_of(path, pass)));
@@ -126,16 +129,19 @@ fn compile_pass(
     global: &slang::GlobalSession,
     pass_index: usize,
 ) -> std::result::Result<slang::Blob, String> {
-    let pass = &PASS_MAP[pass_index];
-    let options = slang_compile::Options {
-        test_passes: cfg!(feature = "test-passes"),
-        profiling: cfg!(feature = "profiling"),
+    let map = pass_map();
+    let pass = &map.passes[pass_index];
+    let options = compile::Options {
+        search_paths: map.search_paths,
+        defines: map.defines,
+        optimization: Optimization::from_level(map.optimization),
+        profiling: map.profiling,
         pass_index,
     };
-    let session = slang_compile::session(global, &options);
-    let program = slang_compile::link(&session, pass.source).map_err(|e| e.to_string())?;
+    let session = compile::session(global, &options);
+    let program = compile::link(&session, pass.source).map_err(|e| e.to_string())?;
     let layout = program.layout(0).map_err(|e| e.to_string())?;
-    if slang_compile::layout_hash(layout) != pass.layout {
+    if compile::layout_hash(layout) != pass.layout {
         return Err(
             "its push constants, specialization constants or entry points changed, \
                     which the generated bindings can't follow: run `cargo build`"
@@ -153,7 +159,7 @@ mod tests {
     fn pass(source: &'static str) -> PassEntry {
         PassEntry {
             name: "",
-            path: "",
+            spirv: &[],
             source,
             kind: PassKind::Compute { entry: "main\0" },
             index: 0,
@@ -168,9 +174,9 @@ mod tests {
     #[test]
     fn changed_pass_sources_reload_only_those_passes() {
         let passes = [
-            pass("passes/a.slang"),
-            pass("passes/b.slang"),
-            pass("passes/c.slang"),
+            pass("/repo/shaders/passes/a.slang"),
+            pass("/repo/shaders/passes/b.slang"),
+            pass("/repo/shaders/passes/c.slang"),
         ];
         let changed = [
             PathBuf::from("/repo/shaders/passes/c.slang"),
@@ -182,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_changed_include_reloads_every_pass() {
-        let passes = [pass("passes/a.slang"), pass("passes/b.slang")];
+        let passes = [pass("/repo/shaders/passes/a.slang"), pass("/repo/shaders/passes/b.slang")];
         let changed = [
             PathBuf::from("/repo/shaders/passes/a.slang"),
             PathBuf::from("/repo/shaders/include/math.slang"),
@@ -193,7 +199,7 @@ mod tests {
     #[test]
     fn pass_sources_match_on_whole_path_components() {
         // `xa.slang` is not pass `a.slang`; it counts as an unknown file, i.e. an include.
-        let passes = [pass("passes/a.slang"), pass("passes/b.slang")];
+        let passes = [pass("/repo/shaders/passes/a.slang"), pass("/repo/shaders/passes/b.slang")];
         let changed = [PathBuf::from("/repo/shaders/passes/xa.slang")];
         assert_eq!(passes_to_reload(&changed, &passes), [0, 1]);
     }

@@ -1,4 +1,4 @@
-//! Golden-image comparison: rendered RGBA8 pixels against PNGs in `lava/tests/golden`
+//! Golden-image comparison: rendered RGBA8 pixels against PNGs in `lava-tests/tests/golden`
 //!
 //! Run with `LAVA_BLESS=1` to (re)write the expected images, then review them by eye.
 use std::{fs::File, io::BufWriter, path::PathBuf};

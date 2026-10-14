@@ -114,8 +114,9 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     }
 
     /// The access of a command that wants the view's mips in `layout`. It borrows their
-    /// tracked layouts, which move to `layout` only when the command is recorded.
-    pub(crate) fn access(
+    /// tracked layouts, which move to `layout` only when the command is recorded. A pass's
+    /// access, for [`crate::command_buffer::BindingOutput::new`].
+    pub fn access(
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,

@@ -1,6 +1,6 @@
 //! GPU ray tracing tests: acceleration structure builds, refits and compaction, ray queries and ray tracing pipelines on a small scene
 //!
-//! The scene (`tests/shaders/include/ray_scene.slang`): a non-opaque wall at z = 0 seen along
+//! The scene (`shaders/include/ray_scene.slang`): a non-opaque wall at z = 0 seen along
 //! +Z, a triangle and a sphere (an AABB) in front of it, and a second triangle that the rays'
 //! mask skips. Each test skips when the device lacks what it needs.
 mod common;
@@ -8,7 +8,6 @@ mod common;
 use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{Affine3A, Quat, UVec2, Vec3};
 use lava::{
-    bindings::{TestRayQuery, TestRayTracing, TestWriteInstances},
     buffer::{
         Buffer,
         usage::{Indirect, Storage},
@@ -21,6 +20,7 @@ use lava::{
         Triangles, scratch_alignment,
     },
 };
+use lava_tests::bindings::{TestRayQuery, TestRayTracing, TestWriteInstances};
 
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);

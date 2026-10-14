@@ -3,6 +3,9 @@ name = "lava"
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
+# Hands the `profiling` feature to lava-build in the application's build script
+# (`DEP_LAVA_PROFILING`).
+links = "lava"
 
 [dependencies]
 glam = {workspace = true}
@@ -15,27 +18,15 @@ raw-window-handle = {workspace = true}
 lava-macros = { version = "0.1.0", path = "../lava-macros" }
 smallvec.workspace = true
 notify = {workspace = true, optional = true}
-shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
-
-[build-dependencies]
-shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
+lava-build = { path = "../lava-build", optional = true }
 
 [dev-dependencies]
-# Enables the test passes for lava's own tests only.
-lava = { path = ".", default-features = false, features = ["test-passes"] }
-winit = "0.30"
 tracing-subscriber = { workspace = true }
-png = {workspace = true}
 
 [features]
 default = ["profiling", "hot-reload"]
 # GPU timestamps, pipeline statistics and shader clocks (`PROFILING` in `profile.slang`).
 profiling = []
-# Also compile the passes in `tests/shaders` (bindings then go to OUT_DIR).
-test-passes = []
-# Recompiles changed shaders at runtime (a debugging aid, `src/hot_reload.rs`).
-hot-reload = ["dep:notify"]
-
-[[test]]
-name = "gpu_window"
-harness = false
+# Recompiles changed shaders at runtime (a debugging aid, `src/hot_reload.rs`); the only way
+# lava reaches Slang.
+hot-reload = ["dep:notify", "dep:lava-build"]

@@ -10,48 +10,42 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 
 ## 1. Publishing blockers
 
-1. **Codegen is hard-wired to this workspace.** `slang_compile.rs:6` compiles
-   `CARGO_MANIFEST_DIR/../shaders/passes`, and `build.rs:1008-1017` writes `src/bindings.rs`
-   into the source tree, which `cargo publish` verification rejects. A crates.io user gets a
-   panic, and a git user gets the engine's `BvhCull`, `Material` and `UIVertex` with no way to
-   add passes.
-2. **The runtime is sized from the generated code.** The `PipelineManager` arrays
-   (`pipeline.rs:14-18,160-169`), `MAX_PUSH_CONSTANTS_SIZE`/`MAX_PASS_*` (`command_buffer.rs:157-166`)
-   and the clock buffer (`profiling/clock.rs:53,86`, `PROFILE_PASS` = `PASS_MAP` index) all
-   come from the generated file, and the generated code calls `pub(crate)` items. So there is
-   only ever one pass set, and an app and a library on lava can't both bring passes.
-   - **Direction:** a `lava-build` crate that the user's `build.rs` calls
-     (`Passes::new("shaders/passes").include(..).define(..).compile()`), writing into the user's
-     `OUT_DIR` for `include!`.
-     - Each pass gets a `static ENTRY: PassEntry` with its own lazily created pipeline cache,
-       and `BindingOutput` holds `&'static PassEntry`.
-     - Caps become fixed instead of generated.
-     - `PROFILE_PASS` becomes a runtime-assigned specialization constant, which also allows one
-       Slang session for all passes.
-     - Generated code calls a `#[doc(hidden)] pub mod __private`.
-     - lava ships `bindless.slang`, `profile.slang` and `ray_tracing.slang` and adds their
-       directory to every session's search path.
-     - lava's own tests become an ordinary consumer, so `test-passes` goes away.
+1. ~~**Codegen is hard-wired to this workspace.**~~ **Done (2026-10-15):** the `lava-build`
+   crate, called from the application's `build.rs`
+   (`Shaders::new().passes(..).include(..).define(..).optimization(..).compile()`), compiles
+   the application's passes and writes the SPIR-V and the bindings into its `OUT_DIR`, which
+   it includes with `lava::include_passes!()`.
+2. ~~**The runtime is sized from the generated code.**~~ **Done (2026-10-15)**, differently from
+   the direction sketched here: the generated `PASS_MAP` (a `PassMap`: entries plus the compile
+   options hot reload needs) goes to `lava::init`, and lava sizes its pipeline arrays from it,
+   so there is still one pass set per application (an app and a library on lava can't both
+   bring passes yet). The caps are fixed in `pipeline.rs`, `PROFILE_PASS` stays the map index,
+   and the generated code uses public API (`BindingOutput::new`/`with_constants`,
+   `BufferSlice::access`, `ImageView::access`, `Tlas::trace_accesses`), documented for other
+   binding generators, instead of a `__private` module. lava-build ships `bindless.slang`,
+   `profile.slang` and `ray_tracing.slang` in its `slang/`, searched by every session, and
+   lava's GPU tests moved to the `lava-tests` crate, an ordinary consumer, so `test-passes` is
+   gone.
 3. **Git dependencies.** `shader-slang` comes from git (`lava/Cargo.toml:18,21`), and
    ash/ash-window/gpu-allocator are `[patch]`ed in the workspace. Patches don't reach
    dependents, so a published lava would resolve ash 0.38, which lacks
    `VK_KHR_device_address_commands`. Either wait for releases or hand-write that extension's
    loader against released ash.
-4. **Slang is needed by every user.** `build.rs:818` always links `slang-compiler`, and
-   `shader-slang` is a non-optional runtime dependency. `.cargo/config.toml` supplies
-   `SLANG_DIR` and an absolute `/home/karsten/...` rpath, and neither ships. Slang belongs only
-   in `lava-build` and behind `hot-reload`.
-5. **The default `hot-reload` feature makes binaries non-relocatable.** With it,
-   `PassEntry.path` is an absolute `target/.../out/passes/*.spv` path (`bindings.rs:670`), read
-   at init with a panic on failure (`pipeline.rs:112-115`). Always `include_bytes!` the SPIR-V,
-   use the file only as the reload source, and make the default features empty.
+4. **Slang is needed by every user.** *Partly done (2026-10-15):* only lava-build depends on
+   `shader-slang` and links `slang-compiler`, and lava reaches it only through `hot-reload`.
+   Still open: `.cargo/config.toml` supplies `SLANG_DIR` and an absolute `/home/karsten/...`
+   rpath, and neither ships.
+5. ~~**The default `hot-reload` feature makes binaries non-relocatable.**~~ **Done
+   (2026-10-15):** `PassEntry.spirv` is always `include_bytes!`'d and hot reload compiles from
+   the absolute `PassEntry.source`, so a moved binary runs with the pipelines it was built
+   with. The default features are still `profiling` and `hot-reload`.
 6. **Nightly.** `generic_const_exprs` (incomplete and prone to compiler crashes) leaks to every
    user (`core/src/lib.rs:4`, `tests/gpu_headless.rs:7`), and it exists only for `RasterBuilder`
    (see 4.1). `range_into_bounds`/`range_bounds_is_empty` serve one line
    (`command_buffer.rs:69`), and `const_trait_impl` looks unused.
 7. **Packaging.**
    - No `description`, `license`, `repository` or `rust-version`.
-   - `pub mod scratchpad` and the `test-passes` feature are public.
+   - `pub mod scratchpad` is public.
    - Check whether the name `lava` is free on crates.io.
 8. **Engine conventions are library behaviour.**
    - Fixed raster state: front face `CLOCKWISE` (the bake's winding), depth compare `GREATER`

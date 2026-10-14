@@ -18,6 +18,7 @@ use lava::{
         swapchain::Swapchain,
     },
 };
+use lava_tests::bindings::PASS_MAP;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::{
     application::ApplicationHandler,
@@ -91,11 +92,12 @@ fn run(event_loop: &ActiveEventLoop) {
         Some(&window.display_handle().unwrap().as_raw()),
         true,
         false,
+        &PASS_MAP,
     )
     .expect("lava init with a display failed");
     assert!(Ctx::features().present);
     assert!(
-        lava::init(None, false, false).is_err(),
+        lava::init(None, false, false, &PASS_MAP).is_err(),
         "second init must fail"
     );
     lava::bindless::on_drop(|handle| DROPPED.lock().unwrap().push(handle)).unwrap();

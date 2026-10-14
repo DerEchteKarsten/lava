@@ -1,7 +1,7 @@
 //! Headless GPU tests: buffers, images, sync, command recording, and golden images per pass type
 //!
 //! These run on the real GPU with the validation layer on; every test fails if the layer
-//! reports an error. The passes come from `lava/tests/shaders`, not from the engine.
+//! reports an error. The passes come from `lava-tests/shaders`, not from the engine.
 // Needed to call `RasterBuilder`'s attachment and draw methods, which return it one larger.
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
@@ -10,10 +10,6 @@ mod common;
 use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{IVec2, UVec2, UVec3, Vec2, Vec4};
 use lava::{
-    bindings::{
-        TestComputeBuffer, TestComputeImage, TestComputeVolume, TestConstants, TestMesh,
-        TestRaster, TestRasterTextured, TestTexturedVertex, TestVertex,
-    },
     bindless::{BindlessHandle, NULL_HANDLE, max_sampled_images, max_storage_images},
     buffer::{
         Buffer,
@@ -39,6 +35,10 @@ use lava::{
     profiling::{clock, counters},
     state::Ctx,
     vkobjects::queue::{Binary, FrameSlot, Gfx, Queue, Semaphore, Timeline},
+};
+use lava_tests::bindings::{
+    PASS_MAP, TestComputeBuffer, TestComputeImage, TestComputeVolume, TestConstants, TestMesh,
+    TestRaster, TestRasterTextured, TestTexturedVertex, TestVertex,
 };
 
 // ---- helpers ---------------------------------------------------------------------------------
@@ -129,7 +129,7 @@ fn texel(pixels: &[u8], width: u32, x: u32, y: u32) -> &[u8] {
 #[test]
 fn init_twice_is_an_error() {
     let _gpu = gpu();
-    assert!(lava::init(None, false, false).is_err());
+    assert!(lava::init(None, false, false, &PASS_MAP).is_err());
 }
 
 #[test]
@@ -1914,4 +1914,137 @@ fn indirect_mesh_launch_matches_the_direct_one() {
             .record("indirect")
     });
     assert_eq!(indirect, direct);
+}
+
+// ---- generated bindings ----------------------------------------------------------------------
+
+mod generated {
+    use super::*;
+    use bytemuck::Pod;
+    use lava::{
+        AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S, pipeline::PassKind,
+    };
+    use lava_tests::bindings::{
+        CTestComputeBufferBindings, CTestComputeImageBindings, CTestRasterBindings,
+    };
+
+    fn push_constants<G: Pod, K>(bindings: &BindingOutput<'_, K>) -> G {
+        bytemuck::pod_read_unaligned(&bindings.push_constants()[..size_of::<G>()])
+    }
+
+    #[test]
+    fn test_passes_are_registered_with_their_kind() {
+        let _gpu = gpu();
+        let buffer = zeroed_buffer::<u32, Storage>(1);
+        let vertices = zeroed_buffer::<TestVertex, Storage>(1);
+        let compute =
+            TestComputeBuffer::push_bindings(buffer.range(..), buffer.range(..), 1, 1).pass();
+        assert!(matches!(
+            PASS_MAP.passes[compute].kind,
+            PassKind::Compute {
+                entry: "test_compute_buffer\0"
+            }
+        ));
+        let raster = TestRaster::push_bindings(vertices.range(..), Vec2::ZERO).pass();
+        assert!(matches!(
+            PASS_MAP.passes[raster].kind,
+            PassKind::RasterVertex {
+                vertex: "test_raster_vertex\0",
+                fragment: "test_raster_fragment\0"
+            }
+        ));
+        assert!(PASS_MAP.passes[raster].source.ends_with("/shaders/test_raster.slang"));
+    }
+
+    #[test]
+    fn push_constants_are_the_struct_zero_padded() {
+        let _gpu = gpu();
+        let (src, dst) = (zeroed_buffer::<u32, Storage>(16), zeroed_buffer::<u32, Storage>(16));
+        let bindings = TestComputeBuffer::push_bindings(src.range(..), dst.range(..), 16, 3);
+        let size = size_of::<CTestComputeBufferBindings>();
+        assert!(bindings.push_constants()[size..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn buffer_fields_become_device_addresses_and_accesses() {
+        let _gpu = gpu();
+        let (src, dst) = (zeroed_buffer::<u32, Storage>(16), zeroed_buffer::<u32, Storage>(16));
+        let bindings = TestComputeBuffer::push_bindings(src.range(..), dst.range(..), 16, 3);
+        let constants: CTestComputeBufferBindings = push_constants(&bindings);
+        assert_eq!(constants.src, src.range(..).address());
+        assert_eq!(constants.dst, dst.range(..).address());
+        assert_eq!((constants.count, constants.multiplier), (16, 3));
+
+        let [src_access, dst_access] = bindings.buffers() else {
+            panic!("two buffers");
+        };
+        // `Buf` is read-only, `MutBuf` is read-write.
+        assert_eq!(src_access.access, A::SHADER_STORAGE_READ);
+        assert_eq!(dst_access.access, A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
+        assert_eq!(src_access.stage, S::COMPUTE_SHADER);
+        assert_eq!(src_access.range, src.range(..).get_range());
+        assert_eq!(dst_access.range, dst.range(..).get_range());
+    }
+
+    #[test]
+    fn raster_passes_access_their_buffers_in_both_shader_stages() {
+        let _gpu = gpu();
+        let vertices = zeroed_buffer::<TestVertex, Storage>(3);
+        let bindings = TestRaster::push_bindings(vertices.range(..), Vec2::new(0.5, 0.0));
+        let constants: CTestRasterBindings = push_constants(&bindings);
+        assert_eq!(constants.vertices, vertices.range(..).address());
+        assert_eq!(bindings.buffers()[0].stage, S::VERTEX_SHADER | S::FRAGMENT_SHADER);
+        assert_eq!(bindings.buffers()[0].access, A::SHADER_STORAGE_READ);
+    }
+
+    #[test]
+    fn registered_accesses_are_appended_with_the_pass_stages() {
+        let _gpu = gpu();
+        let vertices = zeroed_buffer::<TestVertex, Storage>(3);
+        let (read, write) = (zeroed_buffer::<u32, Storage>(4), zeroed_buffer::<u32, Storage>(4));
+        let extra = Image::<R8G8B8A8Unorm, StorageImage>::new(UVec2::new(8, 8)).unwrap();
+        let bindings = TestRaster::push_bindings(vertices.range(..), Vec2::new(0.5, 0.0))
+            .storage_read(extra.whole_view())
+            .buffer_read(read.range(..))
+            .buffer_write(write.range(..));
+
+        let stages = S::VERTEX_SHADER | S::FRAGMENT_SHADER;
+        let [image] = bindings.images() else {
+            panic!("one image");
+        };
+        assert_eq!(image.access.access, A::SHADER_STORAGE_READ);
+        assert_eq!(image.access.stage, stages);
+        assert_eq!(image.access.layout, L::GENERAL);
+
+        // The pass's own buffer stays first, registered ones follow in call order.
+        let [vertex_access, read_access, write_access] = bindings.buffers() else {
+            panic!("three buffers");
+        };
+        assert_eq!(vertex_access.range, vertices.range(..).get_range());
+        assert_eq!(read_access.range, read.range(..).get_range());
+        assert_eq!(read_access.access, A::SHADER_STORAGE_READ);
+        assert_eq!(write_access.range, write.range(..).get_range());
+        assert_eq!(write_access.access, A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
+        assert_eq!((read_access.stage, write_access.stage), (stages, stages));
+    }
+
+    #[test]
+    fn image_fields_become_bindless_handles_and_general_layout_accesses() {
+        let _gpu = gpu();
+        let image = Image::<R8G8B8A8Unorm, StorageImage>::new(UVec2::new(8, 8)).unwrap();
+        let mut target = image.whole_view();
+        target.handle.descriptor_index_set1 = 5;
+        let bindings =
+            TestComputeImage::push_bindings(target, Vec4::ONE, UVec2::ZERO, UVec2::new(8, 8))
+                .constant_bindings();
+        let constants: CTestComputeImageBindings = push_constants(&bindings);
+        assert_eq!(constants.target.descriptor_index_set1, 5);
+        let [image] = bindings.images() else {
+            panic!("one image");
+        };
+        let access = &image.access;
+        assert_eq!(access.access, A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
+        assert_eq!(access.stage, S::COMPUTE_SHADER);
+        assert_eq!(access.layout, L::GENERAL);
+    }
 }

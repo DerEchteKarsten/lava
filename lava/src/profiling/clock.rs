@@ -6,10 +6,7 @@ use std::sync::{
 
 use ash::vk;
 
-use crate::{
-    bindings::PASS_MAP, bindless::Bindless, buffer::Buffer, error::Result, slang_compile,
-    state::Ctx,
-};
+use crate::{bindless::Bindless, buffer::Buffer, error::Result, pipeline::pass_map, state::Ctx};
 
 /// Clock ticks a pass's region spent since the last read. Ticks are the device's own unit,
 /// about core clock cycles.
@@ -23,9 +20,12 @@ pub struct RegionTime {
     pub subgroups: u64,
 }
 
+/// The specialization constant ids of a pass's clock region hashes (`CLOCK_REGION_0..` in
+/// `profile.slang`), which generated `constant_bindings` set without parameters. lava-build
+/// keeps a copy.
+pub const CLOCK_REGION_IDS: std::ops::Range<u32> = 901..909;
 /// Mirrors `profile.slang`.
-const MAX_REGIONS: usize = slang_compile::CLOCK_REGION_IDS.end as usize
-    - slang_compile::CLOCK_REGION_IDS.start as usize;
+const MAX_REGIONS: usize = CLOCK_REGION_IDS.end as usize - CLOCK_REGION_IDS.start as usize;
 const STRIPES: usize = 64;
 const STRIPE_WORDS: usize = 8;
 /// A counter holds the ticks in its low bits and the subgroups above them.
@@ -50,7 +50,7 @@ pub(crate) fn init() -> Result<()> {
     if !Ctx::features().shader_clock {
         return Ok(());
     }
-    let len = PASS_MAP.len() * MAX_REGIONS * STRIPES * STRIPE_WORDS;
+    let len = pass_map().passes.len() * MAX_REGIONS * STRIPES * STRIPE_WORDS;
     let mut counters = Buffer::<u64>::new(len, true)?;
     counters.host_mut().fill(0);
     let info = [vk::DescriptorBufferInfo::default()
@@ -83,8 +83,9 @@ pub fn read(mut f: impl FnMut(RegionTime)) {
         return;
     }
     let mut last = LAST_READ.lock().unwrap();
-    last.resize(PASS_MAP.len() * MAX_REGIONS, 0);
-    for (pass, entry) in PASS_MAP.iter().enumerate() {
+    let passes = pass_map().passes;
+    last.resize(passes.len() * MAX_REGIONS, 0);
+    for (pass, entry) in passes.iter().enumerate() {
         for (region, name) in entry.regions.iter().enumerate() {
             let slot = pass * MAX_REGIONS + region;
             let mut now = 0u64;

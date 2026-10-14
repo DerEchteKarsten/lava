@@ -9,10 +9,6 @@ use std::{
 };
 
 use crate::{
-    bindings::{
-        MAX_PASS_BUFFERS, MAX_PASS_IMAGES, MAX_PUSH_CONSTANTS_SIZE,
-        MAX_SPECIALIZATION_CONSTANTS_SIZE, PASS_MAP,
-    },
     bindless::Bindless,
     buffer::{
         self,
@@ -26,7 +22,10 @@ use crate::{
         slice::ImageView,
         usage::{ImageUsage, IsColorAttachment, IsDepthAttachment},
     },
-    pipeline::{Constants, RasterHash, pipelines},
+    pipeline::{
+        Constants, MAX_PASS_BUFFERS, MAX_PASS_IMAGES, MAX_PUSH_CONSTANTS_SIZE, RasterHash,
+        pass_map, pipelines,
+    },
     profiling::{PassQueries, TimestampQueries},
     state::{Ctx, Functions},
     vkobjects::queue::{PendingAccesses, PendingWrite},
@@ -37,11 +36,13 @@ use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
 use smallvec::{SmallVec, smallvec};
 
+/// A pass's access of a buffer range, made by `BufferSlice::access` (a binding generator's
+/// part of [`BindingOutput::new`]).
 #[derive(Debug, Clone)]
-pub(crate) struct BufferAccess {
-    pub(crate) stage: vk::PipelineStageFlags2,
-    pub(crate) access: vk::AccessFlags2,
-    pub(crate) range: Range<u64>,
+pub struct BufferAccess {
+    pub stage: vk::PipelineStageFlags2,
+    pub access: vk::AccessFlags2,
+    pub range: Range<u64>,
 }
 
 /// The range of a read of every acceleration structure: a TLAS build or a trace reaches
@@ -72,20 +73,21 @@ impl BufferAccess {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ImageAccess {
-    pub(crate) stage: vk::PipelineStageFlags2,
-    pub(crate) access: vk::AccessFlags2,
-    pub(crate) image: vk::Image,
-    pub(crate) layout: vk::ImageLayout,
-    pub(crate) aspect: vk::ImageAspectFlags,
-    pub(crate) mip_range: Range<u32>,
+pub struct ImageAccess {
+    pub stage: vk::PipelineStageFlags2,
+    pub access: vk::AccessFlags2,
+    pub image: vk::Image,
+    pub layout: vk::ImageLayout,
+    pub aspect: vk::ImageAspectFlags,
+    pub mip_range: Range<u32>,
 }
 
 /// An image access of a command that isn't recorded yet, with the tracked layouts of its mips,
-/// which only move when the command is recorded (see [`compute_barriers`]).
+/// which only move when the command is recorded (see [`compute_barriers`]). Made by
+/// `ImageView::access` (a binding generator's part of [`BindingOutput::new`]).
 #[derive(Debug, Clone)]
-pub(crate) struct ImageUse<'a> {
-    pub(crate) access: ImageAccess,
+pub struct ImageUse<'a> {
+    pub access: ImageAccess,
     /// One layout for all of `access.mip_range`, or one per mip.
     pub(crate) layouts: &'a [AtomicU32],
 }
@@ -154,14 +156,17 @@ pub mod kind {
 /// A pass's push constants, specialization constants and the resources it accesses, made by
 /// the generated `Pass::push_bindings` (and `constant_bindings` for a pass with
 /// specialization constants). It borrows its images' tracked layouts until it is recorded.
+///
+/// [`Self::new`] and [`Self::with_constants`] are the API a binding generator other than
+/// lava-build's (e.g. one for GLSL) makes them with.
 pub struct BindingOutput<'a, K> {
-    /// Index into `PASS_MAP`.
+    /// Index into the pass map `lava::init` was given.
     pub(crate) pass: usize,
     /// The pass's push-constant struct, zero-padded; always pushed whole.
     pub(crate) push_constants: [u8; MAX_PUSH_CONSTANTS_SIZE],
-    /// The pass's specialization constants (laid out by `PassEntry.constants`), zero-padded;
-    /// part of the key of its pipeline.
-    pub(crate) constants: [u8; MAX_SPECIALIZATION_CONSTANTS_SIZE],
+    /// The pass's specialization constants (laid out by `PassEntry.constants`); part of the
+    /// key of its pipeline.
+    pub(crate) constants: Constants,
     pub(crate) images: SmallVec<[ImageUse<'a>; MAX_PASS_IMAGES]>,
     pub(crate) buffers: SmallVec<[BufferAccess; MAX_PASS_BUFFERS]>,
     /// Shader stages of the pass; accesses registered later use the same stages.
@@ -170,7 +175,10 @@ pub struct BindingOutput<'a, K> {
 }
 
 impl<'a, K> BindingOutput<'a, K> {
-    pub(crate) fn new<G: Pod, const I: usize, const B: usize>(
+    /// The bindings of pass `pass` (its index in the pass map) with the push constants
+    /// `bindings`, run in `stage`, accessing `images` and `buffers`. `K` must be the pass's
+    /// kind.
+    pub fn new<G: Pod, const I: usize, const B: usize>(
         pass: usize,
         bindings: &G,
         stage: vk::PipelineStageFlags2,
@@ -183,7 +191,7 @@ impl<'a, K> BindingOutput<'a, K> {
         Self {
             pass,
             push_constants,
-            constants: [0; MAX_SPECIALIZATION_CONSTANTS_SIZE],
+            constants: Constants::NONE,
             images: images.into_iter().collect(),
             buffers: buffers.into_iter().collect(),
             stage,
@@ -191,17 +199,41 @@ impl<'a, K> BindingOutput<'a, K> {
         }
     }
 
-    /// Sets the specialization constants and adds the accesses of the resources they name.
-    pub(crate) fn with_constants<G: Pod, const I: usize, const B: usize>(
+    /// Sets the specialization constants, laid out as the pass's `PassEntry.constants` says,
+    /// and adds the accesses of the resources they name.
+    pub fn with_constants<G: Pod, const I: usize, const B: usize>(
         mut self,
         constants: &G,
         images: [ImageUse<'a>; I],
         buffers: [BufferAccess; B],
     ) -> Self {
-        self.constants[..size_of::<G>()].copy_from_slice(bytes_of(constants));
+        self.constants = Constants::new(bytes_of(constants));
         self.images.extend(images);
         self.buffers.extend(buffers);
         self
+    }
+
+    /// The pass's index in the pass map.
+    pub fn pass(&self) -> usize {
+        self.pass
+    }
+
+    /// The push constants, zero-padded to [`MAX_PUSH_CONSTANTS_SIZE`].
+    pub fn push_constants(&self) -> &[u8; MAX_PUSH_CONSTANTS_SIZE] {
+        &self.push_constants
+    }
+
+    /// The specialization constants, empty for a pass without them.
+    pub fn constants(&self) -> &[u8] {
+        self.constants.bytes()
+    }
+
+    pub fn images(&self) -> &[ImageUse<'a>] {
+        &self.images
+    }
+
+    pub fn buffers(&self) -> &[BufferAccess] {
+        &self.buffers
     }
 
     /// Also shortens the borrow, so a longer-lived binding can join a rendering. A `SmallVec`
@@ -947,7 +979,7 @@ impl CommandBuffer {
         dispatch: [u32; 3],
         indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand, IND>>,
     ) {
-        let pass = &PASS_MAP[bindings.pass];
+        let pass = &pass_map().passes[bindings.pass];
         let _span = tracing::info_span!("compute", pass = pass.name).entered();
         bindings
             .buffers
@@ -994,7 +1026,7 @@ impl CommandBuffer {
         rays: [u32; 3],
         indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand, IND>>,
     ) {
-        let pass = &PASS_MAP[bindings.pass];
+        let pass = &pass_map().passes[bindings.pass];
         let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
         bindings
             .buffers
@@ -1528,7 +1560,7 @@ mod tests {
     use super::*;
     use crate::image::{
         format::{self, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
-        usage::{self, ColorAttachment, DepthAttachment, Sampled, StaticUsage},
+        usage::{self, ColorAttachment, DepthAttachment, StaticUsage},
     };
     use ash::vk::Handle;
     use std::sync::atomic::AtomicU32;
@@ -2363,8 +2395,6 @@ mod tests {
         assert_eq!(state.blends, [Blend::Replace; 2]);
     }
 
-    const NO_CONSTANTS: Constants = [0; MAX_SPECIALIZATION_CONSTANTS_SIZE];
-
     #[test]
     fn raster_state_setters_end_up_in_the_pipeline_key() {
         let mut cmd = offline_cmd();
@@ -2373,13 +2403,13 @@ mod tests {
             .backface_culling(false)
             .wire_frame(true)
             .depth_write(false);
-        let key = builder.pipeline_key(&state, &NO_CONSTANTS);
+        let key = builder.pipeline_key(&state, &Constants::NONE);
         assert!(!key.backface_culling);
         assert!(key.wire_frame);
         assert!(!key.depth_write);
         assert_ne!(
             key,
-            builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS),
+            builder.pipeline_key(&RasterState::default(), &Constants::NONE),
             "different state must not share a pipeline"
         );
     }
@@ -2398,7 +2428,7 @@ mod tests {
             Blend::Attenuate,
             Blend::Skip,
         ]
-        .map(|blend| builder.pipeline_key(&RasterState::default().blends([blend]), &NO_CONSTANTS));
+        .map(|blend| builder.pipeline_key(&RasterState::default().blends([blend]), &Constants::NONE));
         for (i, key) in keys.iter().enumerate() {
             assert!(!keys[i + 1..].contains(key), "{key:?}");
         }
@@ -2412,10 +2442,10 @@ mod tests {
             .raster(EXTENT)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&a), None)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&b), None);
-        let key = builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS);
+        let key = builder.pipeline_key(&RasterState::default(), &Constants::NONE);
         assert_eq!(key.blends.as_slice(), [Blend::Replace; 2]);
         let explicit = RasterState::default().blends([Blend::Replace; 2]);
-        assert_eq!(key, builder.pipeline_key(&explicit, &NO_CONSTANTS));
+        assert_eq!(key, builder.pipeline_key(&explicit, &Constants::NONE));
     }
 
     #[test]
@@ -2521,8 +2551,8 @@ mod tests {
         );
         // Depth writes are pipeline state, so read-only draws get their own pipeline.
         assert_ne!(
-            builder.pipeline_key(&read_only, &NO_CONSTANTS),
-            builder.pipeline_key(&RasterState::default(), &NO_CONSTANTS)
+            builder.pipeline_key(&read_only, &Constants::NONE),
+            builder.pipeline_key(&RasterState::default(), &Constants::NONE)
         );
     }
 
@@ -2734,160 +2764,5 @@ mod tests {
         let dispatch = DispatchIndirectCommand { x: 5, y: 6, z: 7 };
         let raw: vk::DispatchIndirectCommand = unsafe { std::mem::transmute(dispatch) };
         assert_eq!((raw.x, raw.y, raw.z), (5, 6, 7));
-    }
-
-    #[cfg(feature = "test-passes")]
-    mod generated {
-        use super::*;
-        use crate::bindings::{
-            CTestComputeBufferBindings, CTestComputeImageBindings, CTestRasterBindings,
-            TestComputeBuffer, TestComputeImage, TestRaster, TestVertex,
-        };
-        use crate::buffer::usage::Storage as StorageBuffer;
-        use crate::image::usage::Storage as StorageImage;
-        use crate::pipeline::PassKind;
-
-        fn storage<T: Pod>(gpu_ptr: u64, len: u64) -> BufferSlice<'static, T, StorageBuffer> {
-            slice(gpu_ptr, len)
-        }
-
-        fn push_constants<G: Pod, K>(bindings: &BindingOutput<'_, K>) -> G {
-            bytemuck::pod_read_unaligned(&bindings.push_constants[..size_of::<G>()])
-        }
-
-        #[test]
-        fn test_passes_are_registered_with_their_kind() {
-            let compute =
-                TestComputeBuffer::push_bindings(storage::<u32>(0, 1), storage::<u32>(0, 1), 1, 1)
-                    .pass;
-            assert!(matches!(
-                PASS_MAP[compute].kind,
-                PassKind::Compute {
-                    entry: "test_compute_buffer\0"
-                }
-            ));
-            let raster =
-                TestRaster::push_bindings(storage::<TestVertex>(0, 1), glam::Vec2::ZERO).pass;
-            assert!(matches!(
-                PASS_MAP[raster].kind,
-                PassKind::RasterVertex {
-                    vertex: "test_raster_vertex\0",
-                    fragment: "test_raster_fragment\0"
-                }
-            ));
-            assert_eq!(PASS_MAP[raster].source, "shaders/test_raster.slang");
-        }
-
-        #[test]
-        fn push_constants_are_the_struct_zero_padded() {
-            let bindings = TestComputeBuffer::push_bindings(
-                storage::<u32>(0x1000, 16),
-                storage::<u32>(0x2000, 16),
-                16,
-                3,
-            );
-            let size = size_of::<CTestComputeBufferBindings>();
-            assert!(bindings.push_constants[size..].iter().all(|&b| b == 0));
-        }
-
-        #[test]
-        fn buffer_fields_become_device_addresses_and_accesses() {
-            let bindings = TestComputeBuffer::push_bindings(
-                storage::<u32>(0x1000, 16),
-                storage::<u32>(0x2000, 16),
-                16,
-                3,
-            );
-            let constants: CTestComputeBufferBindings = push_constants(&bindings);
-            assert_eq!(constants.src, 0x1000);
-            assert_eq!(constants.dst, 0x2000);
-            assert_eq!((constants.count, constants.multiplier), (16, 3));
-
-            let [src, dst] = bindings.buffers.as_slice() else {
-                panic!("two buffers");
-            };
-            // `Buf` is read-only, `MutBuf` is read-write.
-            assert_eq!(src.access, A::SHADER_STORAGE_READ);
-            assert_eq!(dst.access, A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
-            assert_eq!(src.stage, S::COMPUTE_SHADER);
-            assert_eq!(src.range, (0x1000u64..0x1040).into());
-            assert_eq!(dst.range, (0x2000u64..0x2040).into());
-        }
-
-        #[test]
-        fn raster_passes_access_their_buffers_in_both_shader_stages() {
-            let bindings = TestRaster::push_bindings(
-                storage::<TestVertex>(0x4000, 3),
-                glam::Vec2::new(0.5, 0.0),
-            );
-            let constants: CTestRasterBindings = push_constants(&bindings);
-            assert_eq!(constants.vertices, 0x4000);
-            assert_eq!(
-                bindings.buffers[0].stage,
-                S::VERTEX_SHADER | S::FRAGMENT_SHADER
-            );
-            assert_eq!(bindings.buffers[0].access, A::SHADER_STORAGE_READ);
-        }
-
-        #[test]
-        fn registered_accesses_are_appended_with_the_pass_stages() {
-            let state = layout(L::UNDEFINED);
-            let extra = view::<R8G8B8A8Unorm, StorageImage>(&state);
-            let bindings = TestRaster::push_bindings(
-                storage::<TestVertex>(0x4000, 3),
-                glam::Vec2::new(0.5, 0.0),
-            )
-            .storage_read(extra)
-            .buffer_read(storage::<u32>(0x5000, 4))
-            .buffer_write(storage::<u32>(0x6000, 4));
-
-            let stages = S::VERTEX_SHADER | S::FRAGMENT_SHADER;
-            let [image] = bindings.images.as_slice() else {
-                panic!("one image");
-            };
-            assert_eq!(image.access.access, A::SHADER_STORAGE_READ);
-            assert_eq!(image.access.stage, stages);
-            assert_eq!(image.access.layout, L::GENERAL);
-
-            // The pass's own buffer stays first, registered ones follow in call order.
-            let [vertices, read, write] = bindings.buffers.as_slice() else {
-                panic!("three buffers");
-            };
-            assert_eq!(vertices.range.start, 0x4000);
-            assert_eq!(read.range, (0x5000u64..0x5010).into());
-            assert_eq!(read.access, A::SHADER_STORAGE_READ);
-            assert_eq!(write.range.start, 0x6000);
-            assert_eq!(
-                write.access,
-                A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE
-            );
-            assert_eq!((read.stage, write.stage), (stages, stages));
-        }
-
-        #[test]
-        fn image_fields_become_bindless_handles_and_general_layout_accesses() {
-            let state = layout(L::UNDEFINED);
-            let mut target = view::<R8G8B8A8Unorm, StorageImage>(&state);
-            target.handle.descriptor_index_set1 = 5;
-            let bindings = TestComputeImage::push_bindings(
-                target,
-                glam::Vec4::ONE,
-                UVec2::ZERO,
-                UVec2::new(8, 8),
-            )
-            .constant_bindings();
-            let constants: CTestComputeImageBindings = push_constants(&bindings);
-            assert_eq!(constants.target.descriptor_index_set1, 5);
-            let [image] = bindings.images.as_slice() else {
-                panic!("one image");
-            };
-            let access = &image.access;
-            assert_eq!(
-                access.access,
-                A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE
-            );
-            assert_eq!(access.stage, S::COMPUTE_SHADER);
-            assert_eq!(access.layout, L::GENERAL);
-        }
     }
 }

@@ -297,7 +297,7 @@ impl Tlas {
     }
 
     /// The accesses of a pass that traces it: its memory and the BLASes it names.
-    pub(crate) fn trace_accesses(&self, stage: vk::PipelineStageFlags2) -> [BufferAccess; 2] {
+    pub fn trace_accesses(&self, stage: vk::PipelineStageFlags2) -> [BufferAccess; 2] {
         [self.access(stage, TRACE_READ), every_structure_read(stage)]
     }
 }
@@ -547,12 +547,12 @@ impl Describe for BlasGeometry<'_> {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Instance {
-    pub(crate) transform: TransformMatrix,
+    pub transform: TransformMatrix,
     /// The custom index in bits 0..24, the mask in 24..32.
-    pub(crate) custom_index_and_mask: u32,
+    pub custom_index_and_mask: u32,
     /// The hit group offset in bits 0..24, the flags in 24..32.
-    pub(crate) sbt_offset_and_flags: u32,
-    pub(crate) blas: u64,
+    pub sbt_offset_and_flags: u32,
+    pub blas: u64,
 }
 
 const LOW_24: u32 = (1 << 24) - 1;

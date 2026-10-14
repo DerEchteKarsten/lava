@@ -59,7 +59,7 @@ pub fn take_validation_errors() -> Vec<String> {
 
 static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
     capture_validation_errors();
-    lava::init(None, true, false).expect(
+    lava::init(None, true, false, &lava_tests::bindings::PASS_MAP).expect(
         "headless lava init failed; the GPU tests need a Vulkan 1.4 GPU and the Khronos validation layer",
     );
     Mutex::new(Gpu {

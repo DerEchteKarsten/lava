@@ -1,47 +1,56 @@
-//! Slang session and pass linking shared by build.rs and shader hot reload, plus the reflection both read: entry point stages and attributes, ray tracing groups, layout hashes
+//! Slang session and pass linking shared by the build script and lava's shader hot reload, plus the reflection both read: entry point stages and attributes, ray tracing groups, layout hashes
 use std::{collections::BTreeMap, ffi::CString};
 
-use shader_slang as slang;
+/// The Slang bindings, for the sessions and programs these functions take and return.
+pub use shader_slang as slang;
 
-pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../shaders");
-/// Lava's own test passes, in `lava/tests/shaders`.
-pub const TEST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+use crate::{Optimization, SLANG_DIR};
+
 /// The specialization constant ids of a pass's shader clock region hashes (`CLOCK_REGION_0..`
-/// in `profile.slang`). `build.rs` bakes their values into the pass's `constant_bindings`
-/// instead of making them parameters.
+/// in `profile.slang`), which codegen bakes into the pass's `constant_bindings` instead of
+/// making them parameters. A copy of lava's `profiling::clock::CLOCK_REGION_IDS`.
 pub const CLOCK_REGION_IDS: std::ops::Range<u32> = 901..909;
 
-/// How a pass compiles: the cargo features that matter, and which pass it is.
-pub struct Options {
-    /// Also search `lava/tests`, whose `shaders/` holds the test passes.
-    pub test_passes: bool,
-    /// Defines `PROFILING`.
+/// How a pass compiles: what the build script was given, and which pass it is.
+pub struct Options<'a> {
+    /// Absolute include directories; lava-build's own `slang/` is always searched too.
+    pub search_paths: &'a [&'a str],
+    pub defines: &'a [(&'a str, &'a str)],
+    pub optimization: Optimization,
+    /// Defines `PROFILING`: lava was built with its `profiling` feature.
     pub profiling: bool,
     /// The pass's index in `PASS_MAP`, defined as `PROFILE_PASS` for the shader clocks of
     /// `profile.slang`.
     pub pass_index: usize,
 }
 
-/// A session that compiles a pass to SPIR-V 1.6. Pass sources are named relative to the
-/// shader directory (`passes/x.slang`) or, with `test_passes`, to `lava/tests`.
+/// A session that compiles a pass, named by its absolute path, to SPIR-V 1.6.
 pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Session {
-    let mut paths = vec![
-        CString::new(SHADER_DIR).unwrap(),
-        CString::new(format!("{SHADER_DIR}/include")).unwrap(),
-    ];
-    if options.test_passes {
-        paths.push(CString::new(TEST_DIR).unwrap());
-    }
+    let paths: Vec<CString> = options
+        .search_paths
+        .iter()
+        .copied()
+        .chain([SLANG_DIR])
+        .map(|path| CString::new(path).unwrap())
+        .collect();
     let search_paths: Vec<_> = paths.iter().map(|path| path.as_ptr()).collect();
     let targets = [slang::TargetDesc::default()
         .format(slang::CompileTarget::Spirv)
         .profile(global.find_profile("spirv_1_6"))];
+    let optimization = match options.optimization {
+        Optimization::None => slang::OptimizationLevel::None,
+        Optimization::Default => slang::OptimizationLevel::Default,
+        Optimization::Maximal => slang::OptimizationLevel::Maximal,
+    };
     let mut compiler = slang::CompilerOptions::default()
-        .optimization(slang::OptimizationLevel::Maximal)
+        .optimization(optimization)
         .vulkan_use_entry_point_name(true)
         .matrix_layout_column(true);
     if options.profiling {
         compiler = compiler.macro_define("PROFILING", "1");
+    }
+    for (name, value) in options.defines {
+        compiler = compiler.macro_define(name, value);
     }
     compiler = compiler.macro_define("PROFILE_PASS", &options.pass_index.to_string());
     global
@@ -280,7 +289,7 @@ pub fn uses_ray_query(spirv: &[u8]) -> bool {
     false
 }
 
-/// The pass in `source` with all its entry points, linked.
+/// The pass at the absolute path `source` with all its entry points, linked.
 pub fn link(session: &slang::Session, source: &str) -> slang::Result<slang::ComponentType> {
     let module = session.load_module(source)?;
     let mut components: Vec<slang::ComponentType> = vec![module.clone().into()];

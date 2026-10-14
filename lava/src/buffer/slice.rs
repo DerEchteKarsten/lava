@@ -25,7 +25,8 @@ use crate::{
 /// (`VK_KHR_device_address_commands`).
 #[derive(Copy, Clone, Debug)]
 pub struct BufferSlice<'a, T: Copy + Pod, U: BufferUsage = Storage> {
-    pub(crate) address: u64,
+    /// What generated push constants hold.
+    pub address: u64,
     pub(crate) size: u64,
     pub(crate) usage: U,
     pub(crate) _marker: PhantomData<&'a [T]>,
@@ -74,7 +75,8 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
 }
 
 impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
-    pub(crate) fn access(
+    /// A pass's access of the slice, for [`crate::command_buffer::BindingOutput::new`].
+    pub fn access(
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
