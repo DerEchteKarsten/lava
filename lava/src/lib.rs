@@ -30,11 +30,11 @@ pub mod bindings {
 pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;
+pub mod epoch;
 pub mod error;
 #[cfg(feature = "hot-reload")]
 mod hot_reload;
 pub mod image;
-pub mod keepalive;
 pub mod pipeline;
 pub mod profiling;
 // Without hot reload only build.rs compiles passes, and the lib needs just its constants.
@@ -60,16 +60,12 @@ pub fn init(
 }
 
 /// Waits until the device finished everything submitted so far, e.g. before exiting. A stall;
-/// a resource dropped while frames in flight use it lives until they are done anyway
-/// (`keepalive`).
+/// a dropped resource is destroyed once the frames that may use it are done anyway (`epoch`).
+/// Destroys what every submitted frame and present kept alive, so call it outside of
+/// `Frame::execute`.
 pub fn wait_idle() -> Result<()> {
     unsafe { Ctx::device().device_wait_idle()? };
-    // The presents are over too, which nothing else tells once nothing is submitted after them.
-    let ctx = Ctx::get();
-    ctx.gfx_queues.release_presented();
-    if let Some(transfer) = &ctx.transfer_queues {
-        transfer.release_presented();
-    }
+    epoch::device_idle();
     Ok(())
 }
 

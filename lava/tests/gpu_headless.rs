@@ -19,6 +19,7 @@ use lava::{
         Buffer,
         usage::{Index, Indirect, Storage},
     },
+    epoch,
     command_buffer::{
         BindingOutput, Blend, CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand, Filter,
         RasterState, Scissor, Viewport, kind,
@@ -36,7 +37,7 @@ use lava::{
     },
     profiling::{clock, counters},
     state::Ctx,
-    vkobjects::queue::{Binary, FrameSlot, Gfx, PendingAccesses, Queue, Semaphore, Timeline},
+    vkobjects::queue::{Binary, FrameSlot, Gfx, Queue, Semaphore, Timeline},
 };
 
 // ---- helpers ---------------------------------------------------------------------------------
@@ -220,9 +221,9 @@ fn more_threads_than_queues_submit_in_parallel() {
                 let queue = Queue::<Gfx>::new();
                 let mut slot = FrameSlot::new(&queue).unwrap();
                 barrier.wait();
-                slot.begin()
+                slot.begin(epoch::reserve())
                     .unwrap()
-                    .execute(&queue, PendingAccesses::default(), &[], &[], |cmd| {
+                    .execute(&queue, &[], &[], |cmd| {
                         cmd.fill_buffer(buffer.range(..), value)
                     })
                     .unwrap();
@@ -241,19 +242,16 @@ fn a_reselected_lease_keeps_its_frame_slots_usable() {
     let others: Vec<Queue<Gfx>> = (0..Ctx::num_gfx_queues()).map(|_| Queue::new()).collect();
     let mut queue = Queue::<Gfx>::new();
     let mut slot = FrameSlot::new(&queue).unwrap();
-    let pending = slot
-        .begin()
+    slot.begin(epoch::reserve())
         .unwrap()
-        .execute(&queue, PendingAccesses::default(), &[], &[], |cmd| {
-            cmd.fill_buffer(buffer.range(..), 1)
-        })
+        .execute(&queue, &[], &[], |cmd| cmd.fill_buffer(buffer.range(..), 1))
         .unwrap();
     drop(others);
     queue.reselect().unwrap();
     assert!(queue.is_optimal());
-    slot.begin()
+    slot.begin(epoch::reserve())
         .unwrap()
-        .execute(&queue, pending, &[], &[], |cmd| {
+        .execute(&queue, &[], &[], |cmd| {
             cmd.fill_buffer(buffer.range(2..), 2)
         })
         .unwrap();
@@ -261,33 +259,32 @@ fn a_reselected_lease_keeps_its_frame_slots_usable() {
     assert_eq!(buffer.host(), [1, 1, 2, 2]);
 }
 
-/// A frame slot keeps everything its last frame used alive until it is begun again: images
-/// and buffers dropped right after their frame was submitted, and a buffer only reached
-/// through an address (`Frame::uses`). Destroying any of them while the GPU still runs the
-/// frame is a validation error, which fails the test.
+/// What a frame used lives until the GPU finished the frame, also when it is dropped while
+/// the frame records or right after it was submitted. Destroying it earlier is a validation
+/// error, which fails the test.
 #[test]
-fn frame_slot_can_be_reused_and_keeps_what_its_frame_used_until_the_frame_is_done() {
+fn frame_slot_can_be_reused_and_what_its_frame_used_lives_until_the_frame_is_done() {
     let gpu = gpu();
     let buffer = zeroed_buffer::<u32, Storage>(4);
     let mut slot = FrameSlot::new(&gpu.queue).unwrap();
-    let mut pending = PendingAccesses::default();
 
     for value in 1..=3 {
-        let mut frame = slot.begin().unwrap();
         let scratch = zeroed_buffer::<u32, Storage>(1024);
         let image =
             Image::<R8G8B8A8Unorm, StorageTransferSrcTransferDst>::new(UVec2::new(64, 64)).unwrap();
-        let reached = zeroed_buffer::<u32, Storage>(16);
-        frame.uses([reached.keep_alive()]);
-        // Pending accesses are carried from frame to frame like the engine does.
-        pending = frame
-            .execute(&gpu.queue, pending, &[], &[], |cmd| {
+        let recording = zeroed_buffer::<u32, Storage>(4);
+        let buffer = &buffer;
+        slot.begin(epoch::reserve())
+            .unwrap()
+            .execute(&gpu.queue, &[], &[], move |cmd| {
+                cmd.fill_buffer(recording.range(..), value);
+                drop(recording);
                 cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.0, 1.0]);
                 cmd.fill_buffer(scratch.range(..), value);
                 cmd.copy_buffer(scratch.range(..4), buffer.range(..));
+                drop((scratch, image));
             })
             .unwrap();
-        drop((scratch, image, reached));
     }
     drop(slot);
     assert_eq!(buffer.host(), [3; 4]);
@@ -324,13 +321,13 @@ fn submit_profiled<'a>(
     slot: &'a mut FrameSlot,
     target: &Target,
 ) -> lava::vkobjects::queue::Frame<'a> {
-    slot.begin()
+    slot.begin(epoch::reserve())
         .unwrap()
-        .execute(&gpu.queue, PendingAccesses::default(), &[], &[], |cmd| {
+        .execute(&gpu.queue, &[], &[], |cmd| {
             record_profiled(cmd, target)
         })
         .unwrap();
-    slot.begin().unwrap()
+    slot.begin(epoch::reserve()).unwrap()
 }
 
 #[test]
@@ -341,7 +338,7 @@ fn timestamps_time_scopes_and_passes() {
     let mut slot = FrameSlot::new(&gpu.queue).unwrap();
     slot.set_timestamps(true);
     assert!(
-        slot.begin().unwrap().last_timestamps().is_none(),
+        slot.begin(epoch::reserve()).unwrap().last_timestamps().is_none(),
         "nothing was submitted yet"
     );
     let frame = submit_profiled(&gpu, &mut slot, &target);
@@ -530,7 +527,7 @@ fn copy_buffer_regions_copies_each_region() {
         (src.range(0..2), dst.range(6..)),
         (src.range(7..8), dst.range(0..1)),
     ];
-    gpu.submit(|cmd| cmd.copy_buffer_regions(regions));
+    gpu.submit(|cmd| cmd.copy_buffer_regions(&regions));
     assert_eq!(dst.host(), [8, 0, 0, 0, 0, 0, 1, 2]);
 }
 
@@ -647,15 +644,17 @@ fn bound_constructors_set_the_given_indices() {
 fn dropped_images_hand_every_handle_to_the_hook() {
     static DROPPED: std::sync::Mutex<Vec<BindlessHandle>> = std::sync::Mutex::new(Vec::new());
     let _gpu = gpu();
-    lava::image::on_drop(|handle| DROPPED.lock().unwrap().push(handle)).unwrap();
+    lava::bindless::on_drop(|handle| DROPPED.lock().unwrap().push(handle)).unwrap();
     assert!(
-        lava::image::on_drop(|_| {}).is_err(),
+        lava::bindless::on_drop(|_| {}).is_err(),
         "the hook can be set once"
     );
     let image = Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::new(4, 4))
         .unwrap()
         .bind_sampled(42);
     drop(image);
+    // Destroyed once no frame can reach it: completing the epochs open now.
+    lava::wait_idle().unwrap();
     assert_eq!(
         DROPPED.lock().unwrap().last(),
         Some(&BindlessHandle::sampled(42))
@@ -663,6 +662,7 @@ fn dropped_images_hand_every_handle_to_the_hook() {
 
     // An unbound image has nothing to hand back.
     drop(Image::<D32Sfloat, DepthAttachment>::new(UVec2::new(4, 4)).unwrap());
+    lava::wait_idle().unwrap();
     assert_eq!(
         DROPPED.lock().unwrap().last(),
         Some(&BindlessHandle::sampled(42))
@@ -676,6 +676,7 @@ fn dropped_images_hand_every_handle_to_the_hook() {
         .erase();
     assert_eq!(chain.format().0, lava::VkFormat::R8G8B8A8_UNORM);
     drop(chain);
+    lava::wait_idle().unwrap();
     let handles = [43, 20, 21, 22].map(|i| match i {
         43 => BindlessHandle::sampled(i),
         _ => BindlessHandle::storage(i),
@@ -1066,7 +1067,7 @@ fn specialization_constants_pick_the_pipeline() {
 
 // ---- raster passes ---------------------------------------------------------------------------
 
-fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<kind::RasterVertex> {
+fn bindings(vertices: &Buffer<TestVertex>) -> BindingOutput<'_, kind::RasterVertex> {
     TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
 }
 

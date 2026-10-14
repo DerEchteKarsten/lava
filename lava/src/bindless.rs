@@ -27,6 +27,27 @@ pub struct Bindless {
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 
+static ON_DROP: OnceLock<fn(BindlessHandle)> = OnceLock::new();
+
+/// Sets the function called with every bound handle whose view is destroyed: each handle of an
+/// image (its whole view's, then each mip's) and of a swapchain's images, once no frame can
+/// reach it any more (`epoch`), so whoever picked the indices can hand them out again. It can
+/// be set once.
+pub fn on_drop(hook: fn(BindlessHandle)) -> Result<()> {
+    ON_DROP
+        .set(hook)
+        .map_err(|_| Error::message("the bindless drop hook is already set"))
+}
+
+/// Hands `handle` to the hook unless it is unbound, right before its view is destroyed.
+pub(crate) fn release(handle: BindlessHandle) {
+    if handle != BindlessHandle::none()
+        && let Some(hook) = ON_DROP.get()
+    {
+        hook(handle);
+    }
+}
+
 pub const NULL_HANDLE: u32 = !0;
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -81,8 +102,8 @@ pub fn max_storage_images() -> u32 {
 /// only be rewritten while no pending command buffer uses it. Panics if an image lacks the
 /// usage of a set it is written to, or an index is outside its set.
 #[validation_trace]
-pub fn bind<F: Format, U: ImageUsage, D: Dim>(
-    images: impl IntoIterator<Item = ImageView<F, U, D>>,
+pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
+    images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
     handles: impl IntoIterator<Item = BindlessHandle>,
 ) {
     let bindless = Bindless::get();

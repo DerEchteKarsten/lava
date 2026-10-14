@@ -326,19 +326,19 @@ fn build_new_fn<'a>(
                 out.checks
                     .push(format!("{name}.usage_check(vk::ImageUsageFlags::{flags});"));
                 out.params.push(format!(
-                    "{name}: ImageView<F{suffix}, U{suffix}, {}>",
+                    "{name}: ImageView<'a, F{suffix}, U{suffix}, {}>",
                     image_dim(t)
                 ));
                 out.gpu_inits.push(format!("{name}: {name}.handle"));
                 out.image_accesses.push(format!(
-                    "{name}.into_access({stage}, {access}, vk::ImageLayout::GENERAL)",
+                    "{name}.access({stage}, {access}, vk::ImageLayout::GENERAL)",
                     access = image_access(usage)
                 ));
             }
             FieldKind::Buffer => {
                 let ptr = t.field_by_index(0).unwrap().type_layout().unwrap();
                 let inner = rust_type(ptr.element_type_layout().unwrap(), structs);
-                let ty = format!("BufferSlice<{inner}, U{suffix}>");
+                let ty = format!("BufferSlice<'a, {inner}, U{suffix}>");
                 out.generics
                     .push(format!("U{suffix}: buffer::usage::IsStorage"));
                 out.checks.push(format!(
@@ -352,7 +352,7 @@ fn build_new_fn<'a>(
                     "vk::AccessFlags2::SHADER_STORAGE_READ"
                 };
                 out.buffer_accesses
-                    .push(format!("{name}.into_access({stage}, {access})"));
+                    .push(format!("{name}.access({stage}, {access})"));
             }
             FieldKind::Plain => {
                 let ty = rust_type(t, structs);
@@ -607,7 +607,7 @@ fn generate_pass(
         structs,
         stage,
     );
-    let output = format!("BindingOutput<kind::{kind_marker}>");
+    let output = format!("BindingOutput<'a, kind::{kind_marker}>");
     let incomplete = format!("Incomplete{pass_name}");
 
     let binding_output = format!(
@@ -632,7 +632,7 @@ fn generate_pass(
         (output.clone(), binding_output)
     } else {
         (
-            incomplete.clone(),
+            format!("{incomplete}<'a>"),
             format!("{incomplete}({binding_output})"),
         )
     };
@@ -649,7 +649,7 @@ impl {pass_name} {{
     }}
 }}
 "#,
-        generics = fn_generics(&push),
+        generics = fn_generics(&push, true),
         params = push.params.join(", "),
         checks = push.checks.join("\n        "),
     ));
@@ -687,9 +687,9 @@ unsafe impl bytemuck::Pod for {consts_name} {{}}
 unsafe impl bytemuck::Zeroable for {consts_name} {{}}
 
 #[must_use = "`{pass_name}` has specialization constants: call `.constant_bindings(..)`"]
-pub struct {incomplete}({output});
+pub struct {incomplete}<'a>({output});
 
-impl {incomplete} {{
+impl<'a> {incomplete}<'a> {{
     pub fn constant_bindings{generics}(self, {params}) -> {output} {{
         {checks}
         self.0.with_constants(
@@ -707,7 +707,7 @@ impl {incomplete} {{
 }}
 "#,
             fields = fields.join("\n"),
-            generics = fn_generics(&new),
+            generics = fn_generics(&new, false),
             params = new.params.join(", "),
             checks = new.checks.join("\n        "),
             gpu_inits = gpu_inits.join(", "),
@@ -726,12 +726,19 @@ impl {incomplete} {{
     }
 }
 
-/// `<F…, U…>` of a generated function, empty without image or buffer parameters.
-fn fn_generics(new: &NewFn) -> String {
-    if new.generics.is_empty() {
+/// `<'a, F…, U…>` of a generated function, empty without parameters that borrow.
+/// The generics of a generated function; `lifetime` adds the `'a` its views, slices and
+/// result share.
+fn fn_generics(new: &NewFn, lifetime: bool) -> String {
+    let mut generics: Vec<String> = Vec::new();
+    if lifetime {
+        generics.push("'a".to_string());
+    }
+    generics.extend(new.generics.iter().cloned());
+    if generics.is_empty() {
         String::new()
     } else {
-        format!("<{}>", new.generics.join(", "))
+        format!("<{}>", generics.join(", "))
     }
 }
 

@@ -10,32 +10,28 @@ use crate::{
         Buffer,
         usage::{BufferUsage, Storage},
     },
-    command_buffer::BufferUse,
-    keepalive::KeepAlive,
+    command_buffer::BufferAccess,
 };
 
-/// A range of a buffer as the GPU sees it: an address, a size and the usage. It counts the
-/// buffer (`keepalive`), so the buffer lives at least as long as the slice, and a command that
-/// takes it hands the count to its frame, which keeps the buffer until the GPU finished it. It
-/// gives no host access (that is `Buffer::host`/`host_mut`), so cloning it can't alias
-/// anything. Every command takes it as a `VkDeviceAddressRangeKHR`
+/// A range of a buffer as the GPU sees it: an address, a size and the usage. `Copy`, since a
+/// frame hands the same range to several passes; it borrows the buffer, so the buffer outlives
+/// the recording, but gives no host access (that is `Buffer::host`/`host_mut`), so copying it
+/// can't alias anything. Every command takes it as a `VkDeviceAddressRangeKHR`
 /// (`VK_KHR_device_address_commands`).
-#[derive(Clone, Debug)]
-pub struct BufferSlice<T: Copy + Pod, U: BufferUsage = Storage> {
+#[derive(Copy, Clone, Debug)]
+pub struct BufferSlice<'a, T: Copy + Pod, U: BufferUsage = Storage> {
     pub(crate) address: u64,
     pub(crate) size: u64,
     pub(crate) usage: U,
-    pub(crate) keep: KeepAlive,
-    pub(crate) _marker: PhantomData<fn() -> T>,
+    pub(crate) _marker: PhantomData<&'a [T]>,
 }
 
-fn new_slice<T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
-    keep: KeepAlive,
+fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
     usage: U,
     index: R,
     address: u64,
     size: u64,
-) -> BufferSlice<T, U> {
+) -> BufferSlice<'a, T, U> {
     let element = size_of::<T>() as u64;
     let start_offset = match index.start_bound() {
         std::ops::Bound::Unbounded => 0,
@@ -59,55 +55,40 @@ fn new_slice<T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
         address: address + start_offset,
         size: end_offset - start_offset,
         usage,
-        keep,
         _marker: PhantomData,
     }
 }
 
 impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
-    pub fn range<R: RangeBounds<usize>>(&self, index: R) -> BufferSlice<T, U> {
-        new_slice(self.keep_alive(), self.usage(), index, self.address, self.size())
+    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T, U> {
+        new_slice(self.usage(), index, self.address, self.size())
     }
-    pub fn byte_range<R: RangeBounds<usize>>(&self, index: R) -> BufferSlice<u8, U> {
-        new_slice::<u8, R, U>(self.keep_alive(), self.usage(), index, self.address, self.size())
+    pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, u8, U> {
+        new_slice::<u8, R, U>(self.usage(), index, self.address, self.size())
     }
 }
 
-impl<T: Copy + Pod, U: BufferUsage> BufferSlice<T, U> {
-    /// The access of a command, which takes the slice's count.
-    pub(crate) fn into_access(
-        self,
-        stage: vk::PipelineStageFlags2,
-        access: vk::AccessFlags2,
-    ) -> BufferUse {
-        BufferUse {
-            access: self.access(stage, access),
-            keep: self.keep,
-        }
-    }
-    /// The access of a command that keeps the slice's count elsewhere.
+impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     pub(crate) fn access(
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
-    ) -> crate::command_buffer::BufferAccess {
-        crate::command_buffer::BufferAccess {
+    ) -> BufferAccess {
+        BufferAccess {
             stage,
             access,
             range: self.get_range(),
-            object: self.keep.downgrade(),
         }
     }
     /// The addresses the slice covers.
     pub fn get_range(&self) -> Range<u64> {
         (self.address..(self.address + self.size)).into()
     }
-    /// A sub-range, in elements of the slice.
-    pub fn range<R: RangeBounds<usize>>(&self, index: R) -> BufferSlice<T, U> {
-        new_slice(self.keep.clone(), self.usage, index, self.address, self.size)
+    pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T, U> {
+        new_slice(self.usage, index, self.address, self.size)
     }
-    pub fn byte_range<R: RangeBounds<usize>>(&self, index: R) -> BufferSlice<u8, U> {
-        new_slice::<u8, R, U>(self.keep.clone(), self.usage, index, self.address, self.size)
+    pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, u8, U> {
+        new_slice::<u8, R, U>(self.usage, index, self.address, self.size)
     }
     pub fn len(&self) -> usize {
         self.size as usize / size_of::<T>()
@@ -118,12 +99,11 @@ impl<T: Copy + Pod, U: BufferUsage> BufferSlice<T, U> {
     pub fn address(&self) -> u64 {
         self.address
     }
-    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<B, U> {
+    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B, U> {
         BufferSlice {
             address: self.address,
             size: self.size,
             usage: self.usage,
-            keep: self.keep,
             _marker: PhantomData,
         }
     }
@@ -170,19 +150,13 @@ impl<T: Copy + Pod, U: BufferUsage> BufferSlice<T, U> {
 mod tests {
     use super::*;
     use crate::buffer::usage::{Dynamic, Index, Storage};
-    use crate::keepalive::KeepAlive;
 
     /// GPU address the fake buffers pretend to live at.
     const BASE: u64 = 0x1000;
 
-    /// A count of a fake buffer, which nothing destroys.
-    fn keep() -> KeepAlive {
-        KeepAlive::new()
-    }
-
     /// A slice of `len` u32s, as of a buffer without a device.
-    fn slice(len: u64) -> BufferSlice<u32, Storage> {
-        new_slice(keep(), Storage, .., BASE, len * 4)
+    fn slice(len: u64) -> BufferSlice<'static, u32, Storage> {
+        new_slice(Storage, .., BASE, len * 4)
     }
 
     #[test]
@@ -233,19 +207,16 @@ mod tests {
 
         let words = bytes.cast::<u32>();
         assert_eq!((words.address(), words.len()), (BASE + 4, 4));
-        let pairs = slice.clone().cast::<[u32; 2]>();
+        let pairs = slice.cast::<[u32; 2]>();
         assert_eq!(pairs.len(), 4);
     }
 
     #[test]
     fn access_covers_the_gpu_address_range() {
-        let access = slice(8)
-            .range(2..4)
-            .into_access(
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_STORAGE_READ,
-            )
-            .access;
+        let access = slice(8).range(2..4).access(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_STORAGE_READ,
+        );
         assert_eq!(access.range, (BASE + 8..BASE + 16).into());
         assert_eq!(access.stage, vk::PipelineStageFlags2::COMPUTE_SHADER);
         assert_eq!(access.access, vk::AccessFlags2::SHADER_STORAGE_READ);
@@ -256,7 +227,7 @@ mod tests {
         let slice = slice(8).range(2..6);
         let range = slice.address_range();
         assert_eq!((range.address, range.size), (BASE + 8, 16));
-        let strided = slice.clone().cast::<[u32; 2]>().strided_range();
+        let strided = slice.cast::<[u32; 2]>().strided_range();
         assert_eq!(
             (strided.address, strided.size, strided.stride),
             (BASE + 8, 16, 8)
@@ -267,14 +238,14 @@ mod tests {
                 | vk::AddressCommandFlagsKHR::FULLY_BOUND
         );
 
-        let index: BufferSlice<u32, Index> = new_slice(keep(), Index, .., BASE, 16);
+        let index: BufferSlice<u32, Index> = new_slice(Index, .., BASE, 16);
         assert_eq!(
             index.address_flags(),
             vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
                 | vk::AddressCommandFlagsKHR::FULLY_BOUND
         );
         let dynamic: BufferSlice<u32, Dynamic> =
-            new_slice(keep(), Dynamic(vk::BufferUsageFlags::STORAGE_BUFFER), .., BASE, 16);
+            new_slice(Dynamic(vk::BufferUsageFlags::STORAGE_BUFFER), .., BASE, 16);
         assert!(
             dynamic
                 .address_flags()

@@ -109,10 +109,14 @@ impl AccelerationStructure {
     }
 }
 
+/// Destroyed once no frame can reach it any more (`epoch`).
 impl Drop for AccelerationStructure {
     fn drop(&mut self) {
-        if let Ok(functions) = functions() {
-            unsafe { functions.destroy_acceleration_structure(self.accel, None) };
-        }
+        let accel = self.accel;
+        crate::epoch::retire(move || {
+            if let Ok(functions) = functions() {
+                unsafe { functions.destroy_acceleration_structure(accel, None) };
+            }
+        });
     }
 }

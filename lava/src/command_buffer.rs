@@ -5,6 +5,7 @@ use std::{
     marker::PhantomData,
     ops::{IntoBounds, RangeBounds},
     range::Range,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::{
@@ -19,7 +20,6 @@ use crate::{
         usage::{BufferUsage, IsIndex, IsIndirect},
     },
     error::Result,
-    keepalive::{KeepAlive, Weak},
     image::{
         dim::Dim,
         format::{ColorAspect, DepthAspect, Format},
@@ -42,8 +42,6 @@ pub(crate) struct BufferAccess {
     pub(crate) stage: vk::PipelineStageFlags2,
     pub(crate) access: vk::AccessFlags2,
     pub(crate) range: Range<u64>,
-    /// The buffer, so the access is forgotten once it is destroyed.
-    pub(crate) object: Weak,
 }
 
 #[derive(Debug, Clone)]
@@ -54,48 +52,37 @@ pub(crate) struct ImageAccess {
     pub(crate) layout: vk::ImageLayout,
     pub(crate) aspect: vk::ImageAspectFlags,
     pub(crate) mip_range: Range<u32>,
-    /// The image, so the access is forgotten once it is destroyed.
-    pub(crate) object: Weak,
 }
 
-/// An image access of a command that isn't recorded yet, with the count that keeps the image
-/// alive and through it the tracked layouts of its mips, which only move when the command is
-/// recorded (see [`compute_barriers`]).
+/// An image access of a command that isn't recorded yet, with the tracked layouts of its mips,
+/// which only move when the command is recorded (see [`compute_barriers`]).
 #[derive(Debug, Clone)]
-pub(crate) struct ImageUse {
+pub(crate) struct ImageUse<'a> {
     pub(crate) access: ImageAccess,
-    pub(crate) keep: KeepAlive,
-    /// The layouts of `keep`'s slot it tracks: one for all of `access.mip_range`, or one
-    /// per mip.
-    pub(crate) layouts: Range<u32>,
+    /// One layout for all of `access.mip_range`, or one per mip.
+    pub(crate) layouts: &'a [AtomicU32],
 }
 
-/// A buffer access of a command that isn't recorded yet, with the count that keeps the buffer
-/// alive.
-#[derive(Debug, Clone)]
-pub(crate) struct BufferUse {
-    pub(crate) access: BufferAccess,
-    pub(crate) keep: KeepAlive,
-}
-
-impl ImageUse {
+impl ImageUse<'_> {
     /// Moves the tracked layouts of the access's mips to the one it asks for, and calls
     /// `transition(mips, old_layout)` once per run of neighbouring mips that had the same old
     /// layout and need a transition.
     pub(crate) fn take_layouts(&self, mut transition: impl FnMut(Range<u32>, vk::ImageLayout)) {
         let new = self.access.layout;
+        let swap = |layout: &AtomicU32| {
+            vk::ImageLayout::from_raw(layout.swap(new.as_raw() as u32, Ordering::Relaxed) as i32)
+        };
         let mips = self.access.mip_range;
-        if self.layouts.end - self.layouts.start == 1 {
-            let mut old = new;
-            self.keep.swap_layouts(self.layouts.into(), new, |layout| old = layout);
+        if let [layout] = self.layouts {
+            let old = swap(layout);
             if old != new {
                 transition(mips, old);
             }
             return;
         }
         let mut run: Option<(u32, vk::ImageLayout)> = None;
-        let mut mip = mips.start;
-        self.keep.swap_layouts(self.layouts.into(), new, |old| {
+        for (mip, layout) in (mips.start..).zip(self.layouts) {
+            let old = swap(layout);
             match run {
                 Some((_, run_old)) if run_old == old => {}
                 Some((start, run_old)) => {
@@ -106,8 +93,7 @@ impl ImageUse {
                 }
                 None => run = Some((mip, old)),
             }
-            mip += 1;
-        });
+        }
         if let Some((start, old)) = run
             && old != new
         {
@@ -119,14 +105,8 @@ impl ImageUse {
 pub struct CommandBuffer {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) pending_accesses: PendingAccesses,
-    /// The counts of everything the recorded commands access, handed to the frame slot,
-    /// which keeps them until the GPU finished the submission.
-    pub(crate) used: Vec<KeepAlive>,
     pub(crate) timestamps: Option<TimestampQueries>,
     pub(crate) counters: Option<PassQueries>,
-    /// The pipelines recorded so far, kept alive until the frame slot is begun again.
-    #[cfg(feature = "hot-reload")]
-    pub(crate) pipelines: Vec<std::sync::Arc<crate::pipeline::GenericPipeline>>,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Default)]
@@ -146,9 +126,8 @@ pub mod kind {
 
 /// A pass's push constants, specialization constants and the resources it accesses, made by
 /// the generated `Pass::push_bindings` (and `constant_bindings` for a pass with
-/// specialization constants). It holds the counts of the resources it accesses until it is
-/// recorded, when they go to the frame.
-pub struct BindingOutput<K> {
+/// specialization constants). It borrows its images' tracked layouts until it is recorded.
+pub struct BindingOutput<'a, K> {
     /// Index into `PASS_MAP`.
     pub(crate) pass: usize,
     /// The pass's push-constant struct, zero-padded; always pushed whole.
@@ -156,20 +135,20 @@ pub struct BindingOutput<K> {
     /// The pass's specialization constants (laid out by `PassEntry.constants`), zero-padded;
     /// part of the key of its pipeline.
     pub(crate) constants: [u8; MAX_SPECIALIZATION_CONSTANTS_SIZE],
-    pub(crate) images: SmallVec<[ImageUse; MAX_PASS_IMAGES]>,
-    pub(crate) buffers: SmallVec<[BufferUse; MAX_PASS_BUFFERS]>,
+    pub(crate) images: SmallVec<[ImageUse<'a>; MAX_PASS_IMAGES]>,
+    pub(crate) buffers: SmallVec<[BufferAccess; MAX_PASS_BUFFERS]>,
     /// Shader stages of the pass; accesses registered later use the same stages.
     pub(crate) stage: vk::PipelineStageFlags2,
     kind: PhantomData<K>,
 }
 
-impl<K> BindingOutput<K> {
+impl<'a, K> BindingOutput<'a, K> {
     pub(crate) fn new<G: Pod, const I: usize, const B: usize>(
         pass: usize,
         bindings: &G,
         stage: vk::PipelineStageFlags2,
-        images: [ImageUse; I],
-        buffers: [BufferUse; B],
+        images: [ImageUse<'a>; I],
+        buffers: [BufferAccess; B],
     ) -> Self {
         assert!(size_of::<G>() <= MAX_PUSH_CONSTANTS_SIZE);
         let mut push_constants = [0; MAX_PUSH_CONSTANTS_SIZE];
@@ -189,8 +168,8 @@ impl<K> BindingOutput<K> {
     pub(crate) fn with_constants<G: Pod, const I: usize, const B: usize>(
         mut self,
         constants: &G,
-        images: [ImageUse; I],
-        buffers: [BufferUse; B],
+        images: [ImageUse<'a>; I],
+        buffers: [BufferAccess; B],
     ) -> Self {
         self.constants[..size_of::<G>()].copy_from_slice(bytes_of(constants));
         self.images.extend(images);
@@ -198,34 +177,40 @@ impl<K> BindingOutput<K> {
         self
     }
 
-    /// Forgets the kind, so draws of both kinds fit one rendering.
-    fn erase(self) -> BindingOutput<()> {
+    /// Also shortens the borrow, so a longer-lived binding can join a rendering. A `SmallVec`
+    /// can't coerce to a shorter lifetime by itself: it is invariant in its items.
+    fn erase<'s>(self) -> BindingOutput<'s, ()>
+    where
+        'a: 's,
+    {
         BindingOutput {
             pass: self.pass,
             push_constants: self.push_constants,
             constants: self.constants,
-            images: self.images,
+            // SAFETY: only the lifetime changes, which doesn't affect the layout, and it gets
+            // shorter ('a: 's) on a value owned here, so nothing can store a shorter-lived
+            // borrow where the longer one is expected.
+            images: unsafe {
+                std::mem::transmute::<
+                    SmallVec<[ImageUse<'a>; MAX_PASS_IMAGES]>,
+                    SmallVec<[ImageUse<'s>; MAX_PASS_IMAGES]>,
+                >(self.images)
+            },
             buffers: self.buffers,
             stage: self.stage,
             kind: PhantomData,
         }
-    }
-
-    /// The counts of everything it accesses.
-    fn into_keep(self) -> impl Iterator<Item = KeepAlive> {
-        let images = self.images.into_iter().map(|image| image.keep);
-        images.chain(self.buffers.into_iter().map(|buffer| buffer.keep))
     }
 }
 
 /// Registering resources the pass reaches without naming them in its push constants, e.g.
 /// through a bindless handle or pointer stored in a buffer. Each call adds the access to the
 /// barriers recorded before the pass.
-impl<K> BindingOutput<K> {
+impl<'a, K> BindingOutput<'a, K> {
     /// The pass samples `image` (`Tex2D`, or a `DynImg` with a sampled index).
     pub fn sampled_read<F: Format, U: crate::image::usage::IsSampled, D: Dim>(
         self,
-        image: ImageView<F, U, D>,
+        image: ImageView<'a, F, U, D>,
     ) -> Self {
         image.usage_check(vk::ImageUsageFlags::SAMPLED);
         self.with_image(image, vk::AccessFlags2::SHADER_SAMPLED_READ)
@@ -235,7 +220,7 @@ impl<K> BindingOutput<K> {
     /// sampled index).
     pub fn storage_read<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
         self,
-        image: ImageView<F, U, D>,
+        image: ImageView<'a, F, U, D>,
     ) -> Self {
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         self.with_image(image, vk::AccessFlags2::SHADER_STORAGE_READ)
@@ -244,7 +229,7 @@ impl<K> BindingOutput<K> {
     /// The pass loads from and stores to `image` (`MutImage2D`).
     pub fn storage_write<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
         self,
-        image: ImageView<F, U, D>,
+        image: ImageView<'a, F, U, D>,
     ) -> Self {
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         self.with_image(
@@ -256,7 +241,7 @@ impl<K> BindingOutput<K> {
     /// The pass reads `buffer` through a pointer (`Buf`).
     pub fn buffer_read<V: Copy + Pod, U: crate::buffer::usage::IsStorage>(
         self,
-        buffer: BufferSlice<V, U>,
+        buffer: BufferSlice<'_, V, U>,
     ) -> Self {
         buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
         self.with_buffer(buffer, vk::AccessFlags2::SHADER_STORAGE_READ)
@@ -265,7 +250,7 @@ impl<K> BindingOutput<K> {
     /// The pass reads and writes `buffer` through a pointer (`MutBuf`).
     pub fn buffer_write<V: Copy + Pod, U: crate::buffer::usage::IsStorage>(
         self,
-        buffer: BufferSlice<V, U>,
+        buffer: BufferSlice<'_, V, U>,
     ) -> Self {
         buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
         self.with_buffer(
@@ -276,20 +261,20 @@ impl<K> BindingOutput<K> {
 
     fn with_image<F: Format, U: ImageUsage, D: Dim>(
         mut self,
-        image: ImageView<F, U, D>,
+        image: ImageView<'a, F, U, D>,
         access: vk::AccessFlags2,
     ) -> Self {
         self.images
-            .push(image.into_access(self.stage, access, vk::ImageLayout::GENERAL));
+            .push(image.access(self.stage, access, vk::ImageLayout::GENERAL));
         self
     }
 
     fn with_buffer<V: Copy + Pod, U: BufferUsage>(
         mut self,
-        buffer: BufferSlice<V, U>,
+        buffer: BufferSlice<'_, V, U>,
         access: vk::AccessFlags2,
     ) -> Self {
-        self.buffers.push(buffer.into_access(self.stage, access));
+        self.buffers.push(buffer.access(self.stage, access));
         self
     }
 }
@@ -309,14 +294,14 @@ pub struct RasterBuilder<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     scissors: SmallVec<[vk::Rect2D; 1]>,
     color_formats: [vk::Format; COLOR_ATTACHMENTS],
     color_attachments: [(vk::ImageView, Option<vk::ClearValue>); COLOR_ATTACHMENTS],
-    color_accesses: [ImageUse; COLOR_ATTACHMENTS],
+    color_accesses: [ImageUse<'a>; COLOR_ATTACHMENTS],
     depth_format: vk::Format,
     stencil_format: vk::Format,
     depth_attachment: vk::ImageView,
     /// Only a read; [`Self::depth_access`] adds the write.
-    depth_access: Option<ImageUse>,
+    depth_access: Option<ImageUse<'a>>,
     clear_depth: Option<vk::ClearValue>,
-    draws: [Draw<COLOR_ATTACHMENTS>; DRAWS],
+    draws: [Draw<'a, COLOR_ATTACHMENTS>; DRAWS],
 }
 
 /// How a color attachment combines a fragment's output `src` with the stored value `dst`.
@@ -378,8 +363,8 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
     }
 }
 
-struct Draw<const COLOR_ATTACHMENTS: usize> {
-    bindings: BindingOutput<()>,
+struct Draw<'a, const COLOR_ATTACHMENTS: usize> {
+    bindings: BindingOutput<'a, ()>,
     command: DrawCommand,
     state: RasterState<COLOR_ATTACHMENTS>,
 }
@@ -468,7 +453,7 @@ impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS>
     /// Color attachments come before the draws, since every draw has a blend for each.
     pub fn color_attachment<F: Format, U>(
         self,
-        image: ImageView<F, U>,
+        image: ImageView<'a, F, U>,
         clear: Option<F::Texels>,
     ) -> RasterBuilder<'a, 0, { COLOR_ATTACHMENTS + 1 }>
     where
@@ -477,8 +462,7 @@ impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS>
     {
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::COLOR_ATTACHMENT);
-        let (format, view) = (image.format(), image.view);
-        let access = image.into_access(
+        let access = image.access(
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
                 | if clear.is_none() {
@@ -496,10 +480,13 @@ impl<'a, const COLOR_ATTACHMENTS: usize> RasterBuilder<'a, 0, COLOR_ATTACHMENTS>
             extent: self.extent,
             viewport: self.viewport,
             scissors: self.scissors,
-            color_formats: append(self.color_formats, format.vk_format()),
+            color_formats: append(self.color_formats, image.format().vk_format()),
             color_attachments: append(
                 self.color_attachments,
-                (view, clear.map(|e| format.clear_value(e).into())),
+                (
+                    image.view,
+                    clear.map(|e| image.format().clear_value(e).into()),
+                ),
             ),
             color_accesses: append(self.color_accesses, access),
             depth_format: self.depth_format,
@@ -518,7 +505,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     /// Depth-tests the draws against `image` (nearer = greater). `clear` resets the depth first.
     pub fn depth_attachment<F: Format, U>(
         mut self,
-        image: ImageView<F, U>,
+        image: ImageView<'a, F, U>,
         clear: Option<F::Texels>,
     ) -> Self
     where
@@ -534,7 +521,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         }
         self.depth_attachment = image.view;
         self.clear_depth = clear.map(|e| format.clear_value(e).into());
-        self.depth_access = Some(image.into_access(
+        self.depth_access = Some(image.access(
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
@@ -555,9 +542,9 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         self
     }
 
-    pub fn draw(
+    pub fn draw<'b: 'a>(
         self,
-        bindings: BindingOutput<kind::RasterVertex>,
+        bindings: BindingOutput<'b, kind::RasterVertex>,
         vertices: u32,
         instances: u32,
         state: RasterState<COLOR_ATTACHMENTS>,
@@ -569,51 +556,54 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         self.push(bindings.erase(), command, state)
     }
 
-    pub fn draw_indexed<IDX: IsIndex>(
+    pub fn draw_indexed<'b: 'a, IDX: IsIndex>(
         self,
-        bindings: BindingOutput<kind::RasterVertex>,
-        index_buffer: BufferSlice<u32, IDX>,
+        bindings: BindingOutput<'b, kind::RasterVertex>,
+        index_buffer: BufferSlice<'a, u32, IDX>,
         instances: u32,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         index_buffer.usage_check(vk::BufferUsageFlags::INDEX_BUFFER);
+        let mut bindings = bindings.erase();
+        bindings.buffers.push(index_buffer.access(
+            vk::PipelineStageFlags2::INDEX_INPUT,
+            vk::AccessFlags2::INDEX_READ,
+        ));
         let command = DrawCommand::Indexed {
             indices: index_buffer.address_range(),
             flags: index_buffer.address_flags(),
             count: index_buffer.len() as u32,
             instances,
         };
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(index_buffer.into_access(
-            vk::PipelineStageFlags2::INDEX_INPUT,
-            vk::AccessFlags2::INDEX_READ,
-        ));
         self.push(bindings, command, state)
     }
 
-    pub fn draw_indirect<IND: IsIndirect>(
+    pub fn draw_indirect<'b: 'a, IND: IsIndirect>(
         self,
-        bindings: BindingOutput<kind::RasterVertex>,
-        buffer: BufferSlice<DrawIndirectCommand, IND>,
+        bindings: BindingOutput<'b, kind::RasterVertex>,
+        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
+        let mut bindings = bindings.erase();
+        bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::Indirect {
             draws: buffer.strided_range(),
             flags: buffer.address_flags(),
             count: buffer.len() as u32,
         };
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(indirect_access(buffer));
         self.push(bindings, command, state)
     }
 
-    pub fn draw_indirect_count<IND: IsIndirect, CNT: IsIndirect>(
+    pub fn draw_indirect_count<'b: 'a, IND: IsIndirect, CNT: IsIndirect>(
         self,
-        bindings: BindingOutput<kind::RasterVertex>,
-        buffer: BufferSlice<DrawIndirectCommand, IND>,
-        count_buffer: BufferSlice<u32, CNT>,
+        bindings: BindingOutput<'b, kind::RasterVertex>,
+        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
+        count_buffer: BufferSlice<'a, u32, CNT>,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
+        let mut bindings = bindings.erase();
+        bindings.buffers.push(indirect_access(buffer));
+        bindings.buffers.push(indirect_access(count_buffer));
         let command = DrawCommand::IndirectCount {
             draws: buffer.strided_range(),
             flags: buffer.address_flags(),
@@ -621,15 +611,12 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             count_flags: count_buffer.address_flags(),
             max_count: buffer.len() as u32,
         };
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(indirect_access(buffer));
-        bindings.buffers.push(indirect_access(count_buffer));
         self.push(bindings, command, state)
     }
 
-    pub fn launch(
+    pub fn launch<'b: 'a>(
         self,
-        bindings: BindingOutput<kind::RasterMesh>,
+        bindings: BindingOutput<'b, kind::RasterMesh>,
         groups: [u32; 3],
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
@@ -637,25 +624,25 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     }
 
     /// Launches the task (or, without a task shader, mesh) workgroup counts in `buffer`.
-    pub fn launch_indirect<IND: IsIndirect>(
+    pub fn launch_indirect<'b: 'a, IND: IsIndirect>(
         self,
-        bindings: BindingOutput<kind::RasterMesh>,
-        buffer: BufferSlice<DispatchIndirectCommand, IND>,
+        bindings: BindingOutput<'b, kind::RasterMesh>,
+        buffer: BufferSlice<'a, DispatchIndirectCommand, IND>,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
+        let mut bindings = bindings.erase();
+        bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::LaunchIndirect {
             draws: buffer.strided_range(),
             flags: buffer.address_flags(),
             count: buffer.len() as u32,
         };
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(indirect_access(buffer));
         self.push(bindings, command, state)
     }
 
     fn push(
         self,
-        bindings: BindingOutput<()>,
+        bindings: BindingOutput<'a, ()>,
         command: DrawCommand,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
@@ -682,7 +669,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     }
 
     /// The depth attachment's access: also a write when it is cleared or a draw writes depth.
-    fn depth_access(&self) -> Option<ImageUse> {
+    fn depth_access(&self) -> Option<ImageUse<'a>> {
         let mut depth = self.depth_access.clone()?;
         if self.clear_depth.is_some() || self.draws.iter().any(|d| d.state.depth_write) {
             depth.access.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
@@ -724,7 +711,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
                 .chain(&depth_access),
             self.draws
                 .iter()
-                .flat_map(|draw| draw.bindings.buffers.iter().map(|b| &b.access)),
+                .flat_map(|draw| draw.bindings.buffers.iter()),
         );
 
         let color_attachments = self.color_attachments.map(|(view, clear)| {
@@ -800,9 +787,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
                 continue;
             }
             let key = self.pipeline_key(&draw.state, &draw.bindings.constants);
-            let pipeline = self
-                .cmd_buf
-                .keep(pipelines().raster(&key, draw.bindings.pass));
+            let pipeline = pipelines().raster(&key, draw.bindings.pass);
             self.cmd_buf.push_constants(&draw.bindings.push_constants);
             unsafe {
                 device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -871,11 +856,6 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         }
         unsafe { device.cmd_end_rendering(handle) };
         self.cmd_buf.end_pass();
-        let attachments = self.color_accesses.into_iter().chain(depth_access);
-        let draws = self.draws.into_iter().flat_map(|draw| draw.bindings.into_keep());
-        self.cmd_buf
-            .used
-            .extend(attachments.map(|access| access.keep).chain(draws));
     }
 }
 
@@ -890,30 +870,15 @@ fn mesh_functions() -> &'static ash::ext::mesh_shader::Device {
 }
 
 /// The access of an indirect command read from `buffer`, which has to be `IsIndirect`.
-fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<T, U>) -> BufferUse {
+fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<'_, T, U>) -> BufferAccess {
     buffer.usage_check(vk::BufferUsageFlags::INDIRECT_BUFFER);
-    buffer.into_access(
+    buffer.access(
         vk::PipelineStageFlags2::DRAW_INDIRECT,
         vk::AccessFlags2::INDIRECT_COMMAND_READ,
     )
 }
 
 impl CommandBuffer {
-    /// A pipeline this command buffer records.
-    #[cfg(not(feature = "hot-reload"))]
-    fn keep(&mut self, pipeline: vk::Pipeline) -> vk::Pipeline {
-        pipeline
-    }
-
-    /// A pipeline this command buffer records, kept alive until its frame slot is begun
-    /// again, after the GPU finished it.
-    #[cfg(feature = "hot-reload")]
-    fn keep(&mut self, pipeline: std::sync::Arc<crate::pipeline::GenericPipeline>) -> vk::Pipeline {
-        let handle = pipeline.pipeline;
-        self.pipelines.push(pipeline);
-        handle
-    }
-
     fn trace_rays(
         &self,
         pipeline: vk::Pipeline,
@@ -942,17 +907,18 @@ impl CommandBuffer {
     }
 
     #[validation_trace]
-    pub fn fill_buffer<T: Copy + Pod, U: BufferUsage>(
+    pub fn fill_buffer<'a, T: Copy + Pod, U: BufferUsage>(
         &mut self,
-        buffer: BufferSlice<T, U>,
+        buffer: BufferSlice<'a, T, U>,
         data: u32,
     ) {
         self.flush_pending(
             std::iter::empty(),
-            iter::once(&buffer.access(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            )),
+            std::iter::once(&BufferAccess {
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: buffer.get_range(),
+            }),
         );
         unsafe {
             address_commands().cmd_fill_memory(
@@ -962,50 +928,49 @@ impl CommandBuffer {
                 data,
             )
         };
-        self.used.push(buffer.keep);
     }
 
     #[validation_trace]
-    pub fn clear_image<F: Format, U: IsTransferDst, D: Dim>(
-        &mut self,
-        image: ImageView<F, U, D>,
+    pub fn clear_image<'a, F: Format, U: IsTransferDst, D: Dim>(
+        &'a mut self,
+        image: ImageView<'a, F, U, D>,
         clear_color: F::Texels,
     ) where
         F: ColorAspect,
     {
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        let (handle, range) = (image.image, image.subresource_range());
-        let clear = vk::ClearValue::from(image.format().clear_value(clear_color));
-        let access = image.into_access(
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::ImageLayout::GENERAL,
+        self.flush_pending(
+            std::iter::once(&image.access(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::ImageLayout::GENERAL,
+            )),
+            std::iter::empty(),
         );
-        self.flush_pending(std::iter::once(&access), std::iter::empty());
         unsafe {
             Ctx::device().cmd_clear_color_image(
                 self.handle,
-                handle,
+                image.image,
                 vk::ImageLayout::GENERAL,
-                &clear.color,
-                &[range],
+                &vk::ClearValue::from(image.format().clear_value(clear_color)).color,
+                &[image.subresource_range()],
             )
         };
-        self.used.push(access.keep);
     }
     #[validation_trace]
-    pub fn update_buffer<T: Copy + Pod, U: BufferUsage>(
+    pub fn update_buffer<'a, T: Copy + Pod, U: BufferUsage>(
         &mut self,
-        buffer: BufferSlice<T, U>,
+        buffer: BufferSlice<'a, T, U>,
         data: &T,
     ) {
         self.flush_pending(
             iter::empty(),
-            iter::once(&buffer.access(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            )),
+            iter::once(&BufferAccess {
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                range: buffer.get_range(),
+            }),
         );
         unsafe {
             address_commands().cmd_update_memory(
@@ -1015,13 +980,12 @@ impl CommandBuffer {
                 bytemuck::bytes_of(data),
             )
         };
-        self.used.push(buffer.keep);
     }
     #[validation_trace]
-    pub fn blit_image<F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst, D: Dim>(
+    pub fn blit_image<'a, F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst, D: Dim>(
         &mut self,
-        src: ImageSlice<F, U, D>,
-        dst: ImageSlice<F2, U2, D>,
+        src: ImageSlice<'a, F, U, D>,
+        dst: ImageSlice<'a, F2, U2, D>,
         filter: Filter,
     ) where
         F: ColorAspect,
@@ -1031,52 +995,53 @@ impl CommandBuffer {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        self.flush_pending(
+            [
+                src.view.access(
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                    vk::ImageLayout::GENERAL,
+                ),
+                dst.view.access(
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::ImageLayout::GENERAL,
+                ),
+            ]
+            .iter(),
+            iter::empty(),
+        );
+
         let regions = [blit_region(&src, &dst)];
-        let images = (src.view.image, dst.view.image);
-        let accesses = [
-            src.view.into_access(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_READ,
-                vk::ImageLayout::GENERAL,
-            ),
-            dst.view.into_access(
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::ImageLayout::GENERAL,
-            ),
-        ];
-        self.flush_pending(accesses.iter(), iter::empty());
         unsafe {
             Ctx::device().cmd_blit_image(
                 self.handle,
-                images.0,
+                src.view.image,
                 vk::ImageLayout::GENERAL,
-                images.1,
+                dst.view.image,
                 vk::ImageLayout::GENERAL,
                 &regions,
                 vk::Filter::from_raw(filter as i32),
             );
         }
-        self.used.extend(accesses.map(|access| access.keep));
     }
     #[validation_trace]
 
     /// Copies `src` to the start of `dst`, which must be at least as long.
-    pub fn copy_buffer<T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
+    pub fn copy_buffer<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
         &mut self,
-        src: BufferSlice<T, U>,
-        dst: BufferSlice<T, U2>,
+        src: BufferSlice<'a, T, U>,
+        dst: BufferSlice<'a, T, U2>,
     ) {
-        self.copy_buffer_regions([(src, dst)]);
+        self.copy_buffer_regions(&[(src, dst)]);
     }
     #[validation_trace]
 
     /// One `copy_buffer` per pair, in one command.
-    pub fn copy_buffer_regions<T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
+    pub fn copy_buffer_regions<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
         &mut self,
-        regions: impl IntoIterator<Item = (BufferSlice<T, U>, BufferSlice<T, U2>)>,
+        regions: &[(BufferSlice<'a, T, U>, BufferSlice<'a, T, U2>)],
     ) {
-        let regions: SmallVec<[_; 2]> = regions.into_iter().collect();
         let accesses = regions
             .iter()
             .flat_map(|(src, dst)| {
@@ -1091,13 +1056,10 @@ impl CommandBuffer {
                         vk::PipelineStageFlags2::TRANSFER,
                         vk::AccessFlags2::TRANSFER_READ,
                     ),
-                    BufferAccess {
-                        range: (dst.address..dst.address + src.size).into(),
-                        ..dst.access(
-                            vk::PipelineStageFlags2::TRANSFER,
-                            vk::AccessFlags2::TRANSFER_WRITE,
-                        )
-                    },
+                    dst.range(..src.len()).access(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
                 ]
             })
             .collect::<SmallVec<[_; 4]>>();
@@ -1108,10 +1070,7 @@ impl CommandBuffer {
                 vk::DeviceMemoryCopyKHR::default()
                     .src_range(src.address_range())
                     .src_flags(src.address_flags())
-                    .dst_range(vk::DeviceAddressRangeKHR {
-                        address: dst.address,
-                        size: src.size,
-                    })
+                    .dst_range(dst.range(..src.len()).address_range())
                     .dst_flags(dst.address_flags())
             })
             .collect::<SmallVec<[_; 4]>>();
@@ -1121,12 +1080,11 @@ impl CommandBuffer {
                 &vk::CopyDeviceMemoryInfoKHR::default().regions(&copies),
             )
         };
-        let keep = regions.into_iter().flat_map(|(src, dst)| [src.keep, dst.keep]);
-        self.used.extend(keep);
     }
 
     #[validation_trace]
     pub fn copy_buffer_to_image<
+        'a,
         T: Copy + Pod,
         BU: BufferUsage,
         F: Format,
@@ -1134,31 +1092,29 @@ impl CommandBuffer {
         D: Dim,
     >(
         &mut self,
-        src: BufferSlice<T, BU>,
-        dst: ImageSlice<F, U, D>,
+        src: BufferSlice<'a, T, BU>,
+        dst: ImageSlice<'a, F, U, D>,
     ) where
         F: ColorAspect,
     {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        let image = dst.view.image;
-        let layers = dst.view.subresource_layers(dst.view.mip_range.start);
-        let access = dst.view.into_access(
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::ImageLayout::GENERAL,
-        );
         self.flush_pending(
-            iter::once(&access),
-            iter::once(&src.access(
+            iter::once(&dst.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_READ,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::ImageLayout::GENERAL,
             )),
+            iter::once(&BufferAccess {
+                access: vk::AccessFlags2::TRANSFER_READ,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: src.get_range(),
+            }),
         );
         let regions = [vk::DeviceMemoryImageCopyKHR::default()
             .address_range(src.address_range())
             .address_flags(src.address_flags())
-            .image_subresource(layers)
+            .image_subresource(dst.view.subresource_layers(dst.view.mip_range.start))
             .image_layout(vk::ImageLayout::GENERAL)
             .image_offset(D::offset_3d(dst.offset))
             .image_extent(D::extent_3d(dst.extend))];
@@ -1166,17 +1122,17 @@ impl CommandBuffer {
             address_commands().cmd_copy_memory_to_image(
                 self.handle,
                 &vk::CopyDeviceMemoryImageInfoKHR::default()
-                    .image(image)
+                    .image(dst.view.image)
                     .regions(&regions),
             )
         };
-        self.used.extend([src.keep, access.keep]);
     }
 
     /// Copies the texels of `src` (its view's first mip level) into `dst`, tightly packed row
     /// by row (and slice by slice).
     #[validation_trace]
     pub fn copy_image_to_buffer<
+        'a,
         T: Copy + Pod,
         F: Format,
         U: IsTransferSrc,
@@ -1184,31 +1140,29 @@ impl CommandBuffer {
         D: Dim,
     >(
         &mut self,
-        src: ImageSlice<F, U, D>,
-        dst: BufferSlice<T, BU>,
+        src: ImageSlice<'a, F, U, D>,
+        dst: BufferSlice<'a, T, BU>,
     ) where
         F: ColorAspect,
     {
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
-        let image = src.view.image;
-        let layers = src.view.subresource_layers(src.view.mip_range.start);
-        let access = src.view.into_access(
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_READ,
-            vk::ImageLayout::GENERAL,
-        );
         self.flush_pending(
-            iter::once(&access),
-            iter::once(&dst.access(
+            iter::once(&src.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::AccessFlags2::TRANSFER_READ,
+                vk::ImageLayout::GENERAL,
             )),
+            iter::once(&BufferAccess {
+                access: vk::AccessFlags2::TRANSFER_WRITE,
+                stage: vk::PipelineStageFlags2::TRANSFER,
+                range: dst.get_range(),
+            }),
         );
         let regions = [vk::DeviceMemoryImageCopyKHR::default()
             .address_range(dst.address_range())
             .address_flags(dst.address_flags())
-            .image_subresource(layers)
+            .image_subresource(src.view.subresource_layers(src.view.mip_range.start))
             .image_layout(vk::ImageLayout::GENERAL)
             .image_offset(D::offset_3d(src.offset))
             .image_extent(D::extent_3d(src.extend))];
@@ -1216,11 +1170,10 @@ impl CommandBuffer {
             address_commands().cmd_copy_image_to_memory(
                 self.handle,
                 &vk::CopyDeviceMemoryImageInfoKHR::default()
-                    .image(image)
+                    .image(src.view.image)
                     .regions(&regions),
             )
         };
-        self.used.extend([access.keep, dst.keep]);
     }
 
     /// Starts a rendering of the area `extent`, with viewport and scissor covering it.
@@ -1247,90 +1200,76 @@ impl CommandBuffer {
 
     fn compute_private<IND: IsIndirect>(
         &mut self,
-        mut bindings: BindingOutput<kind::Compute>,
+        mut bindings: BindingOutput<'_, kind::Compute>,
         dispatch: [u32; 3],
-        indirect_buffer: Option<BufferSlice<DispatchIndirectCommand, IND>>,
+        indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand, IND>>,
     ) {
         let pass = &PASS_MAP[bindings.pass];
         let _span = tracing::info_span!("compute", pass = pass.name).entered();
-        let indirect = indirect_buffer
-            .as_ref()
-            .map(|slice| (slice.address_range(), slice.address_flags()));
         bindings
             .buffers
             .extend(indirect_buffer.map(indirect_access));
-        self.flush_pending(
-            bindings.images.iter(),
-            bindings.buffers.iter().map(|b| &b.access),
-        );
+        self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
         self.push_constants(&bindings.push_constants);
 
-        let pipeline = self.keep(pipelines().compute(bindings.pass, &bindings.constants));
+        let pipeline = pipelines().compute(bindings.pass, &bindings.constants);
 
         self.begin_pass(pass.name);
         unsafe {
             Ctx::device().cmd_bind_pipeline(self.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
-            if let Some((range, flags)) = indirect {
+            if let Some(slice) = indirect_buffer {
                 address_commands().cmd_dispatch_indirect2(
                     self.handle,
                     &vk::DispatchIndirect2InfoKHR::default()
-                        .address_range(range)
-                        .address_flags(flags),
+                        .address_range(slice.address_range())
+                        .address_flags(slice.address_flags()),
                 );
             } else {
                 Ctx::device().cmd_dispatch(self.handle, dispatch[0], dispatch[1], dispatch[2]);
             }
         }
         self.end_pass();
-        self.used.extend(bindings.into_keep());
     }
 
     #[validation_trace]
     pub fn compute_indirect<IND: IsIndirect>(
         &mut self,
-        bindings: BindingOutput<kind::Compute>,
-        buffer: BufferSlice<DispatchIndirectCommand, IND>,
+        bindings: BindingOutput<'_, kind::Compute>,
+        buffer: BufferSlice<'_, DispatchIndirectCommand, IND>,
     ) {
         self.compute_private(bindings, [0, 0, 0], Some(buffer));
     }
 
     #[validation_trace]
-    pub fn compute(&mut self, bindings: BindingOutput<kind::Compute>, dispatch: [u32; 3]) {
+    pub fn compute(&mut self, bindings: BindingOutput<'_, kind::Compute>, dispatch: [u32; 3]) {
         self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None);
     }
 
-    pub fn raytrace(&mut self, bindings: BindingOutput<kind::RayTracing>, x: u32, y: u32) {
+    pub fn raytrace(&mut self, bindings: BindingOutput<'_, kind::RayTracing>, x: u32, y: u32) {
         let pass = &PASS_MAP[bindings.pass];
-        self.flush_pending(
-            bindings.images.iter(),
-            bindings.buffers.iter().map(|b| &b.access),
-        );
+        self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
         self.push_constants(&bindings.push_constants);
 
         self.begin_pass(pass.name);
-        #[cfg(not(feature = "hot-reload"))]
         pipelines().ray_tracing(bindings.pass, &bindings.constants, |pipeline| {
             self.trace_rays(pipeline.pipeline, &pipeline.sbt, x, y)
         });
-        #[cfg(feature = "hot-reload")]
-        {
-            let pipeline = pipelines().ray_tracing(bindings.pass, &bindings.constants);
-            self.trace_rays(pipeline.pipeline, pipeline.sbt.as_ref().unwrap(), x, y);
-            self.keep(pipeline);
-        }
         self.end_pass();
-        self.used.extend(bindings.into_keep());
     }
 
     #[validation_trace]
-    pub fn present<F: Format, U: ImageUsage>(&mut self, swapchain_image: ImageView<F, U>) {
-        let access = swapchain_image.into_access(
-            vk::PipelineStageFlags2::empty(),
-            vk::AccessFlags2::empty(),
-            vk::ImageLayout::PRESENT_SRC_KHR,
+    pub fn present<'a, F: Format, U: ImageUsage>(
+        &'a mut self,
+        swapchain_image: ImageView<'a, F, U>,
+    ) {
+        self.flush_pending(
+            iter::once(&swapchain_image.access(
+                vk::PipelineStageFlags2::empty(),
+                vk::AccessFlags2::empty(),
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            )),
+            iter::empty(),
         );
-        self.flush_pending(iter::once(&access), iter::empty());
-        self.used.push(access.keep);
     }
 
     fn push_constants(&mut self, constants: &[u8; MAX_PUSH_CONSTANTS_SIZE]) {
@@ -1345,9 +1284,9 @@ impl CommandBuffer {
         };
     }
 
-    pub(crate) fn flush_pending<'b>(
+    pub(crate) fn flush_pending<'a: 'b, 'b>(
         &mut self,
-        image_acceses: impl Iterator<Item = &'b ImageUse> + Clone,
+        image_acceses: impl Iterator<Item = &'b ImageUse<'a>> + Clone,
         buffer_acceses: impl Iterator<Item = &'b BufferAccess> + Clone,
     ) {
         let barriers = compute_barriers(
@@ -1454,9 +1393,9 @@ pub(crate) struct Barriers {
 /// It moves each image's tracked layout to the requested one, in the order of the accesses, so
 /// call it once per command, when the command is recorded. Command buffers that use the same
 /// image must still be recorded one after the other and submitted in that order.
-pub(crate) fn compute_barriers<'b>(
+pub(crate) fn compute_barriers<'a: 'b, 'b>(
     pending: &PendingAccesses,
-    image_acceses: impl Iterator<Item = &'b ImageUse> + Clone,
+    image_acceses: impl Iterator<Item = &'b ImageUse<'a>> + Clone,
     buffer_acceses: impl Iterator<Item = &'b BufferAccess>,
 ) -> Option<Barriers> {
     let mut src_stage = vk::PipelineStageFlags2::NONE;
@@ -1663,15 +1602,26 @@ impl PendingAccesses {
         }
     }
 
-    /// Forgets the accesses of objects that were destroyed since they were recorded: nothing
-    /// accesses them any more, and an object that gets their handle or addresses next starts
-    /// with nothing pending. Without it, every image and buffer ever accessed would stay
-    /// pending and be compared with every later access.
-    pub(crate) fn prune(&mut self) {
-        self.buffer_reads.retain(|read| read.object.is_alive());
-        self.image_reads.retain(|read| read.object.is_alive());
-        self.buffer_writes.retain(|write| write.write.object.is_alive());
-        self.image_writes.retain(|write| write.write.object.is_alive());
+    /// Forgets the accesses of an image that is being destroyed.
+    pub(crate) fn forget_image(&mut self, image: vk::Image) {
+        self.image_reads.retain(|read| read.image != image);
+        self.image_writes.retain(|write| write.write.image != image);
+    }
+
+    /// Forgets the accesses within the addresses of a buffer that is being destroyed.
+    pub(crate) fn forget_buffer(&mut self, range: std::ops::Range<u64>) {
+        let outside = |access: &BufferAccess| !range.contains(&access.range.start);
+        self.buffer_reads.retain(|read| outside(read));
+        self.buffer_writes.retain(|write| outside(&write.write));
+    }
+
+    /// Adds the accesses of another queue's submissions, which this queue's have to wait for
+    /// too. An access both have is only waited for twice.
+    pub(crate) fn append(&mut self, other: PendingAccesses) {
+        self.buffer_reads.extend(other.buffer_reads);
+        self.image_reads.extend(other.image_reads);
+        self.buffer_writes.extend(other.buffer_writes);
+        self.image_writes.extend(other.image_writes);
     }
 
     /// Remembers the accesses of a command that was just recorded, so later commands can be
@@ -1740,8 +1690,8 @@ impl PendingAccesses {
 
 /// Blit region covering the two slices: from each slice's offset to offset + extent.
 fn blit_region<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
-    src: &ImageSlice<F, U, D>,
-    dst: &ImageSlice<F2, U2, D>,
+    src: &ImageSlice<'_, F, U, D>,
+    dst: &ImageSlice<'_, F2, U2, D>,
 ) -> vk::ImageBlit {
     let corners = |offset: D::Offset, extend: D::Extent| {
         let start = D::offset_3d(offset);
@@ -1819,20 +1769,16 @@ mod tests {
         usage::{self, ColorAttachment, DepthAttachment, Sampled, StaticUsage},
     };
     use ash::vk::Handle;
-    use crate::keepalive::KeepAlive;
+    use std::sync::atomic::AtomicU32;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
     // ---- helpers -------------------------------------------------------------------------
-
-    /// A buffer that lives as long as the tests.
-    static BUFFER: std::sync::LazyLock<KeepAlive> = std::sync::LazyLock::new(KeepAlive::new);
 
     fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess {
         BufferAccess {
             stage,
             access,
             range: range.into(),
-            object: BUFFER.downgrade(),
         }
     }
 
@@ -1845,8 +1791,7 @@ mod tests {
     }
 
     /// An access of image `id`, whose tracked layout is `old_layout` until it is recorded.
-    fn image(id: u64, stage: S, access: A, old_layout: L, layout: L) -> ImageUse {
-        let keep = self::layout(old_layout);
+    fn image(id: u64, stage: S, access: A, old_layout: L, layout: L) -> ImageUse<'static> {
         ImageUse {
             access: ImageAccess {
                 stage,
@@ -1855,14 +1800,12 @@ mod tests {
                 layout,
                 aspect: vk::ImageAspectFlags::COLOR,
                 mip_range: (0..1).into(),
-                object: keep.downgrade(),
             },
-            keep,
-            layouts: (0..1).into(),
+            layouts: std::slice::from_ref(Box::leak(Box::new(self::layout(old_layout)))),
         }
     }
 
-    fn image_read(id: u64) -> ImageUse {
+    fn image_read(id: u64) -> ImageUse<'static> {
         image(
             id,
             S::FRAGMENT_SHADER,
@@ -1872,7 +1815,7 @@ mod tests {
         )
     }
 
-    fn image_write(id: u64) -> ImageUse {
+    fn image_write(id: u64) -> ImageUse<'static> {
         image(
             id,
             S::COMPUTE_SHADER,
@@ -1901,42 +1844,35 @@ mod tests {
         CommandBuffer {
             handle: vk::CommandBuffer::null(),
             pending_accesses: PendingAccesses::default(),
-            used: Vec::new(),
             timestamps: None,
             counters: None,
-            #[cfg(feature = "hot-reload")]
-            pipelines: Vec::new(),
         }
     }
 
-    fn view<F: StaticFormat, U: StaticUsage>(layout: &KeepAlive) -> ImageView<F, U> {
+    fn view<F: StaticFormat, U: StaticUsage>(layout: &AtomicU32) -> ImageView<'_, F, U> {
         dynamic_view(layout, F::default(), U::default())
     }
 
     fn dynamic_view<F: Format, U: ImageUsage>(
-        layout: &KeepAlive,
+        layout: &AtomicU32,
         format: F,
         usage: U,
-    ) -> ImageView<F, U> {
+    ) -> ImageView<'_, F, U> {
         ImageView {
             image: vk::Image::from_raw(1),
             view: vk::ImageView::from_raw(2),
             mip_range: (0..1).into(),
             extent: EXTENT,
             handle: crate::bindless::BindlessHandle::none(),
-            keep: layout.clone(),
-            layouts: (0..1).into(),
+            layouts: std::slice::from_ref(layout),
             format,
             usage,
             dim: crate::image::D2,
         }
     }
 
-    /// A fake image's slot, whose tracked layout is `layout`.
-    fn layout(layout: L) -> KeepAlive {
-        let keep = KeepAlive::new();
-        crate::keepalive::tests::layout(&keep, 0, Some(layout));
-        keep
+    fn layout(layout: L) -> AtomicU32 {
+        AtomicU32::new(layout.as_raw() as u32)
     }
 
     // ---- access classification -----------------------------------------------------------
@@ -2116,6 +2052,24 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_drops_only_the_accesses_of_the_destroyed_object() {
+        let mut p = pending(
+            &[read(0..10), write(10..20), read(100..110), write(120..130)],
+            &[image_read(1), image_write(2), image_read(3), image_write(3)],
+        );
+        p.forget_buffer(100..200);
+        p.forget_image(vk::Image::from_raw(3));
+        assert_eq!(p.buffer_reads.len(), 1);
+        assert_eq!(p.buffer_reads[0].range, (0u64..10).into());
+        assert_eq!(p.buffer_writes.len(), 1);
+        assert_eq!(p.buffer_writes[0].write.range, (10u64..20).into());
+        assert_eq!(p.image_reads.len(), 1);
+        assert_eq!(p.image_reads[0].image, vk::Image::from_raw(1));
+        assert_eq!(p.image_writes.len(), 1);
+        assert_eq!(p.image_writes[0].write.image, vk::Image::from_raw(2));
+    }
+
+    #[test]
     fn image_accesses_replace_older_ones_of_the_same_image_only() {
         let other_stage = image(1, S::TRANSFER, A::TRANSFER_WRITE, L::GENERAL, L::GENERAL);
         let pending = pending(&[], &[image_write(1), image_write(2), other_stage]);
@@ -2167,31 +2121,6 @@ mod tests {
         assert_eq!(p.buffer_reads[0].range, (20u64..30).into());
     }
 
-    #[test]
-    fn pruning_forgets_only_the_accesses_of_destroyed_objects() {
-        let dropped = KeepAlive::new();
-        let dead = |mut access: BufferAccess| {
-            access.object = dropped.downgrade();
-            access
-        };
-        let images = [image_read(1), image_write(2), image_read(3), image_write(4)];
-        let mut p = pending(
-            &[read(0..10), write(10..20), dead(read(20..30)), dead(write(30..40))],
-            &images,
-        );
-        let [_, _, read_3, write_4] = images;
-        drop((dropped, read_3, write_4));
-        p.prune();
-        assert_eq!(p.buffer_reads.len(), 1);
-        assert_eq!(p.buffer_reads[0].range, (0u64..10).into());
-        assert_eq!(p.buffer_writes.len(), 1);
-        assert_eq!(p.buffer_writes[0].write.range, (10u64..20).into());
-        assert_eq!(p.image_reads.len(), 1);
-        assert_eq!(p.image_reads[0].image, vk::Image::from_raw(1));
-        assert_eq!(p.image_writes.len(), 1);
-        assert_eq!(p.image_writes[0].write.image, vk::Image::from_raw(2));
-    }
-
     // ---- image hazards and layout transitions --------------------------------------------
 
     #[test]
@@ -2239,17 +2168,14 @@ mod tests {
     /// neighbours in the same layout, and the mips already in the wanted layout none.
     #[test]
     fn transitions_cover_runs_of_mips_in_the_same_layout() {
-        let layouts = KeepAlive::new();
-        let start = [
+        let layouts = [
             L::UNDEFINED,
             L::UNDEFINED,
             L::GENERAL,
             vk::ImageLayout::ATTACHMENT_OPTIMAL,
             L::UNDEFINED,
-        ];
-        for (mip, layout) in (0..).zip(start) {
-            crate::keepalive::tests::layout(&layouts, mip, Some(layout));
-        }
+        ]
+        .map(layout);
         let access = |mips: std::ops::Range<u32>, wanted: L| {
             let mut access = image(
                 7,
@@ -2259,8 +2185,7 @@ mod tests {
                 wanted,
             );
             access.access.mip_range = mips.clone().into();
-            access.keep = layouts.clone();
-            access.layouts = mips.into();
+            access.layouts = &layouts[mips.start as usize..mips.end as usize];
             access
         };
         let transitions = |access: &ImageUse| {
@@ -2301,7 +2226,7 @@ mod tests {
             S::TRANSFER,
             A::TRANSFER_READ,
             L::GENERAL,
-            L::ATTACHMENT_OPTIMAL,
+            L::TRANSFER_SRC_OPTIMAL,
         );
         let barriers = image_barrier(&pending, &access).unwrap();
         let transition = &barriers.images[0];
@@ -2337,7 +2262,7 @@ mod tests {
             S::TRANSFER,
             A::TRANSFER_READ,
             L::GENERAL,
-            L::ATTACHMENT_OPTIMAL,
+            L::TRANSFER_SRC_OPTIMAL,
         );
         let barriers = image_barrier(&pending, &access).unwrap();
         assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
@@ -2406,7 +2331,7 @@ mod tests {
             S::FRAGMENT_SHADER,
             A::SHADER_SAMPLED_READ,
             L::GENERAL,
-            L::ATTACHMENT_OPTIMAL,
+            L::READ_ONLY_OPTIMAL,
         );
         assert!(flush(&mut pending, &[sampled.clone()], &[]).is_some());
         // Recording it moved the tracked layout, so the same access needs no transition again.
@@ -2454,16 +2379,13 @@ mod tests {
     fn layouts_move_when_accesses_are_recorded() {
         let state = layout(L::UNDEFINED);
         let image = view::<R8G8B8A8Unorm, ColorAttachment>(&state);
-        let sampled =
-            image
-                .clone()
-                .into_access(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL);
-        let attachment = image.clone().into_access(
+        let sampled = image.access(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL);
+        let attachment = image.access(
             S::COLOR_ATTACHMENT_OUTPUT,
             A::COLOR_ATTACHMENT_WRITE,
             vk::ImageLayout::ATTACHMENT_OPTIMAL,
         );
-        drop(image.into_access(S::TRANSFER, A::TRANSFER_READ, L::PRESENT_SRC_KHR));
+        drop(image.access(S::TRANSFER, A::TRANSFER_READ, L::TRANSFER_SRC_OPTIMAL));
 
         let nothing = PendingAccesses::default();
         let transition = |access: &ImageUse| {
@@ -2522,19 +2444,18 @@ mod tests {
     const EXTENT: UVec2 = UVec2::new(640, 480);
 
     /// Bindings for draws that are never recorded.
-    fn no_bindings<K>() -> BindingOutput<K> {
+    fn no_bindings<K>() -> BindingOutput<'static, K> {
         BindingOutput::new(0, &0u32, S::VERTEX_SHADER, [], [])
     }
 
     fn slice<T: Pod, U: crate::buffer::usage::StaticUsage>(
         gpu_ptr: u64,
         len: u64,
-    ) -> BufferSlice<T, U> {
+    ) -> BufferSlice<'static, T, U> {
         BufferSlice {
             address: gpu_ptr,
             size: len * size_of::<T>() as u64,
             usage: U::default(),
-            keep: KeepAlive::new(),
             _marker: PhantomData,
         }
     }
@@ -2686,7 +2607,7 @@ mod tests {
         );
         // A second rendering finds them there.
         assert_eq!(draw(&mut cmd), []);
-        let sampled = view::<R8G8B8A8Unorm, ColorAttachment>(&color).into_access(
+        let sampled = view::<R8G8B8A8Unorm, ColorAttachment>(&color).access(
             S::FRAGMENT_SHADER,
             A::SHADER_SAMPLED_READ,
             L::GENERAL,
@@ -2897,7 +2818,7 @@ mod tests {
             vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
                 | vk::AddressCommandFlagsKHR::FULLY_BOUND
         );
-        let index = &indexed.bindings.buffers[0].access;
+        let index = &indexed.bindings.buffers[0];
         assert_eq!((index.stage, index.access), (S::INDEX_INPUT, A::INDEX_READ));
         assert_eq!(index.range, (0x1000u64..0x1018).into());
 
@@ -2908,7 +2829,7 @@ mod tests {
             panic!("not the indirect launch: {:?}", launch.command);
         };
         assert_eq!((draws.address, draws.size, draws.stride), (0x2000, 12, 12));
-        let indirect = &launch.bindings.buffers[0].access;
+        let indirect = &launch.bindings.buffers[0];
         assert_eq!(
             (indirect.stage, indirect.access),
             (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ)
@@ -2961,11 +2882,11 @@ mod tests {
         use crate::image::usage::Storage as StorageImage;
         use crate::pipeline::PassKind;
 
-        fn storage<T: Pod>(gpu_ptr: u64, len: u64) -> BufferSlice<T, StorageBuffer> {
+        fn storage<T: Pod>(gpu_ptr: u64, len: u64) -> BufferSlice<'static, T, StorageBuffer> {
             slice(gpu_ptr, len)
         }
 
-        fn push_constants<G: Pod, K>(bindings: &BindingOutput<K>) -> G {
+        fn push_constants<G: Pod, K>(bindings: &BindingOutput<'_, K>) -> G {
             bytemuck::pod_read_unaligned(&bindings.push_constants[..size_of::<G>()])
         }
 
@@ -3020,7 +2941,6 @@ mod tests {
             let [src, dst] = bindings.buffers.as_slice() else {
                 panic!("two buffers");
             };
-            let (src, dst) = (&src.access, &dst.access);
             // `Buf` is read-only, `MutBuf` is read-write.
             assert_eq!(src.access, A::SHADER_STORAGE_READ);
             assert_eq!(dst.access, A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
@@ -3038,10 +2958,10 @@ mod tests {
             let constants: CTestRasterBindings = push_constants(&bindings);
             assert_eq!(constants.vertices, 0x4000);
             assert_eq!(
-                bindings.buffers[0].access.stage,
+                bindings.buffers[0].stage,
                 S::VERTEX_SHADER | S::FRAGMENT_SHADER
             );
-            assert_eq!(bindings.buffers[0].access.access, A::SHADER_STORAGE_READ);
+            assert_eq!(bindings.buffers[0].access, A::SHADER_STORAGE_READ);
         }
 
         #[test]
@@ -3068,7 +2988,6 @@ mod tests {
             let [vertices, read, write] = bindings.buffers.as_slice() else {
                 panic!("three buffers");
             };
-            let (vertices, read, write) = (&vertices.access, &read.access, &write.access);
             assert_eq!(vertices.range.start, 0x4000);
             assert_eq!(read.range, (0x5000u64..0x5010).into());
             assert_eq!(read.access, A::SHADER_STORAGE_READ);

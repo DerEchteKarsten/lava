@@ -9,7 +9,8 @@ use bytemuck::Pod;
 use lava::{
     buffer::{Buffer, usage::StaticUsage},
     command_buffer::CommandBuffer,
-    vkobjects::queue::{FrameSlot, Gfx, PendingAccesses, Queue, SemaphoreInfo},
+    epoch,
+    vkobjects::queue::{FrameSlot, Gfx, Queue, SemaphoreInfo},
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
@@ -114,12 +115,10 @@ impl Gpu {
         record: impl FnOnce(&mut CommandBuffer),
     ) {
         let mut slot = FrameSlot::new(&self.queue).unwrap();
-        slot.begin()
+        slot.begin(epoch::reserve())
             .unwrap()
             .execute(
-                &self.queue,
-                PendingAccesses::default(),
-                wait_on,
+                &self.queue, wait_on,
                 signal,
                 record,
             )

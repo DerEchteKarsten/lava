@@ -9,10 +9,11 @@ use std::process::ExitCode;
 
 use lava::{
     bindless::BindlessHandle,
+    epoch,
     image::format::{ClearValue, Format},
     state::Ctx,
     vkobjects::{
-        queue::{Binary, FrameSlot, Gfx, PendingAccesses, Queue, Semaphore},
+        queue::{Binary, FrameSlot, Gfx, Queue, Semaphore},
         surface::Surface,
         swapchain::Swapchain,
     },
@@ -59,12 +60,10 @@ fn present_frame(
     assert!((index as usize) < swapchain.num_images());
 
     let mut slot = FrameSlot::new(queue).unwrap();
-    slot.begin()
+    slot.begin(epoch::reserve())
         .unwrap()
         .execute(
-            queue,
-            PendingAccesses::default(),
-            &[image_available.info()],
+            queue, &[image_available.info()],
             &[render_finished.info()],
             |cmd| {
                 cmd.clear_image(swapchain.image(index), ClearValue::Float(color));
@@ -80,6 +79,9 @@ fn present_frame(
 }
 
 /// Everything that needs a window, in order. Panics on the first failure.
+/// The handles the bindless drop hook was called with.
+static DROPPED: std::sync::Mutex<Vec<BindlessHandle>> = std::sync::Mutex::new(Vec::new());
+
 fn run(event_loop: &ActiveEventLoop) {
     let window = create_window(event_loop, "lava test");
     let step = |name: &str| println!("test {name} ... ok");
@@ -96,6 +98,7 @@ fn run(event_loop: &ActiveEventLoop) {
         lava::init(None, false, false).is_err(),
         "second init must fail"
     );
+    lava::bindless::on_drop(|handle| DROPPED.lock().unwrap().push(handle)).unwrap();
     step("init_with_display");
 
     let mut surface = surface_for(&window).unwrap();
@@ -106,7 +109,7 @@ fn run(event_loop: &ActiveEventLoop) {
 
     let mut swapchain = Swapchain::new(&mut surface, None, Some(SIZE)).unwrap();
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
-    swapchain.bind_storage(0);
+    swapchain.bind_storage(0..);
     assert_eq!(swapchain.size, SIZE);
     assert!(swapchain.num_images() >= surface.capabilities.min_image_count as usize);
     assert!(
@@ -131,25 +134,32 @@ fn run(event_loop: &ActiveEventLoop) {
     step("acquire_clear_present");
 
     let new_size = SIZE / 2;
-    // The old swapchain is handed back and can be dropped: the frames and presents that used
-    // it keep it alive until they are done.
+    // The old swapchain is handed back and can be dropped: it is destroyed once the frames
+    // and presents that may use it are done.
     let old = swapchain.recreate(&mut surface, new_size).unwrap();
     assert_eq!(old.size, SIZE);
     assert_eq!(swapchain.size, new_size);
-    // Binding is left to the application, which may have to reserve slots for more images.
+    // Binding is left to the application: the old swapchain's slots stay in use until it is
+    // destroyed, and the image count may change.
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
-    swapchain.bind_storage(0);
-    for (i, handle) in handles.iter().enumerate().take(swapchain.num_images()) {
-        assert_eq!(swapchain.image(i as u32).handle, *handle);
-    }
+    swapchain.bind_storage(16..);
+    assert_eq!(swapchain.image(0).handle.descriptor_index_set1, 16);
     present_frame(&queue, &swapchain, [0.0, 0.0, 1.0, 1.0], &mut semaphores);
     drop(old);
     step("swapchain_recreate_is_unbound");
 
+    // Destroyed once the frames and presents that may use it are done, which an idle device
+    // is: then its handles go to the hook.
+    lava::wait_idle().unwrap();
+    for handle in &handles {
+        assert!(DROPPED.lock().unwrap().contains(handle));
+    }
+    step("dropped_swapchains_hand_their_handles_to_the_hook");
+
     let second_window = create_window(event_loop, "lava test 2");
     let mut second_surface = surface_for(&second_window).unwrap();
     let mut second_swapchain = Swapchain::new(&mut second_surface, None, Some(SIZE)).unwrap();
-    second_swapchain.bind_storage(8);
+    second_swapchain.bind_storage(8..);
     assert_eq!(second_swapchain.image(0).handle.descriptor_index_set1, 8);
     assert_ne!(second_surface.handle, surface.handle);
     present_frame(
@@ -161,14 +171,14 @@ fn run(event_loop: &ActiveEventLoop) {
     present_frame(&queue, &swapchain, [1.0, 0.0, 1.0, 1.0], &mut semaphores);
     step("second_window_has_its_own_surface_and_swapchain");
 
-    // Swapchains go before their surfaces, surfaces before their windows, and the last use of
-    // a swapchain has to be over before it is dropped.
-    lava::wait_idle().unwrap();
+    // Swapchains go before their surfaces, and surfaces are destroyed before their windows:
+    // waiting for the device destroys everything dropped before.
     drop(second_swapchain);
     drop(second_surface);
     drop(swapchain);
     drop(surface);
     drop(semaphores);
+    lava::wait_idle().unwrap();
     step("teardown");
 
     let errors = common::take_validation_errors();

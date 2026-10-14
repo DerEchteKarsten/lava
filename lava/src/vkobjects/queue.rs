@@ -1,9 +1,9 @@
-//! Queue submission and sync: queue leases, semaphores, fences, frame slots, presenting
+//! Queue submission and sync: queue leases with their pending accesses, semaphores, fences, frame slots with their epochs, presenting
 use ash::vk::TaggedStructure;
 use std::{
     fmt::Debug,
     marker::PhantomData,
-    mem::ManuallyDrop,
+    ops::Range,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -13,40 +13,18 @@ use ash::vk;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
-#[cfg(feature = "hot-reload")]
-use crate::pipeline::GenericPipeline;
 use crate::{
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
-    keepalive::KeepAlive,
+    epoch::{self, Epoch},
     profiling::{Counter, GpuScope, PassCounters, PassQueries, TimestampQueries},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
 
-/// Dropping it destroys it once no frame in flight that waited on or signalled it counts it
-/// any more (`keepalive`).
 #[derive(Debug)]
 pub struct Semaphore<T: SemaphoreType + ?Sized> {
     pub(crate) handle: vk::Semaphore,
-    owner: ManuallyDrop<KeepAlive>,
     marker: PhantomData<T>,
-}
-
-struct RawSemaphore(vk::Semaphore);
-impl Drop for RawSemaphore {
-    fn drop(&mut self) {
-        unsafe { Ctx::device().destroy_semaphore(self.0, None) };
-    }
-}
-
-impl<T: SemaphoreType + ?Sized> Semaphore<T> {
-    fn from_handle(handle: vk::Semaphore) -> Self {
-        Semaphore {
-            handle,
-            owner: ManuallyDrop::new(KeepAlive::new()),
-            marker: PhantomData,
-        }
-    }
 }
 
 impl<T: SemaphoreType> Default for Semaphore<T> {
@@ -55,10 +33,13 @@ impl<T: SemaphoreType> Default for Semaphore<T> {
     }
 }
 
+/// Destroyed once the frames and presents that may wait on or signal it are done (`epoch`).
 impl<T: SemaphoreType + ?Sized> Drop for Semaphore<T> {
     fn drop(&mut self) {
-        let owner = unsafe { ManuallyDrop::take(&mut self.owner) };
-        owner.release(RawSemaphore(self.handle));
+        let handle = self.handle;
+        epoch::retire_after_present(move || unsafe {
+            Ctx::device().destroy_semaphore(handle, None)
+        });
     }
 }
 
@@ -97,17 +78,16 @@ impl Stage {
 
 /// A semaphore to wait on or signal in a submission (`Semaphore::info`). A wait holds back
 /// every command unless `at` names the kind of command it should hold back instead.
-/// Signals always happen after everything. The frame counts the semaphore until the GPU
-/// finished it.
-#[derive(Clone, Debug)]
-pub struct SemaphoreInfo {
+/// Signals always happen after everything. It borrows the semaphore.
+#[derive(Clone, Copy, Debug)]
+pub struct SemaphoreInfo<'a> {
     handle: vk::Semaphore,
     /// `None` for a binary semaphore.
     value: Option<u64>,
     stage: Stage,
-    keep: KeepAlive,
+    _semaphore: PhantomData<&'a ()>,
 }
-impl SemaphoreInfo {
+impl SemaphoreInfo<'_> {
     /// Waited on only at `stage` (see `Stage`); the default is `Stage::All`.
     pub fn at(self, stage: Stage) -> Self {
         Self { stage, ..self }
@@ -136,7 +116,10 @@ impl SemaphoreType for Timeline {
         };
         let create_info = vk::SemaphoreCreateInfo::default().push(&mut timeline);
         let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
-        Ok(Semaphore::from_handle(handle))
+        Ok(Semaphore {
+            handle,
+            marker: PhantomData,
+        })
     }
 }
 
@@ -146,7 +129,10 @@ impl SemaphoreType for Binary {
     fn create() -> Result<Semaphore<Self>> {
         let create_info = vk::SemaphoreCreateInfo::default();
         let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
-        Ok(Semaphore::from_handle(handle))
+        Ok(Semaphore {
+            handle,
+            marker: PhantomData,
+        })
     }
 }
 
@@ -169,24 +155,24 @@ impl Semaphore<Timeline> {
         Ok(())
     }
     #[validation_trace]
-    pub fn info(&self, value: u64) -> SemaphoreInfo {
+    pub fn info(&self, value: u64) -> SemaphoreInfo<'_> {
         SemaphoreInfo {
             handle: self.handle,
             value: Some(value),
             stage: Stage::All,
-            keep: KeepAlive::clone(&self.owner),
+            _semaphore: PhantomData,
         }
     }
 }
 
 impl Semaphore<Binary> {
     #[validation_trace]
-    pub fn info(&self) -> SemaphoreInfo {
+    pub fn info(&self) -> SemaphoreInfo<'_> {
         SemaphoreInfo {
             handle: self.handle,
             value: None,
             stage: Stage::All,
-            keep: KeepAlive::clone(&self.owner),
+            _semaphore: PhantomData,
         }
     }
 }
@@ -255,10 +241,10 @@ pub struct FamilyQueues {
     handles: Box<[Mutex<vk::Queue>]>,
     /// The leases of each queue.
     leases: Mutex<Box<[u32]>>,
-    /// Per queue: the swapchains and semaphores of the presents queued since its last
-    /// submission. A frame's fence doesn't cover a present queued after it, so the next
-    /// submission to the queue keeps them alive (`keepalive`) instead.
-    presented: Box<[Mutex<Vec<KeepAlive>>]>,
+    /// Per queue: the accesses of what was submitted to it that later submissions may have to
+    /// wait for. Locked while a command buffer for the queue is recorded and submitted, so
+    /// leases sharing a queue record one after the other.
+    pending: Box<[Mutex<PendingAccesses>]>,
 }
 
 impl FamilyQueues {
@@ -269,20 +255,34 @@ impl FamilyQueues {
                 .map(|i| Mutex::new(unsafe { device.get_device_queue(family, i) }))
                 .collect(),
             leases: Mutex::new(vec![0; count as usize].into()),
-            presented: (0..count).map(|_| Mutex::new(Vec::new())).collect(),
+            pending: (0..count).map(|_| Mutex::default()).collect(),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.handles.len()
     }
+}
 
-    /// Releases what the presents of every queue kept: only once the device is idle.
-    pub(crate) fn release_presented(&self) {
-        for presented in &self.presented {
-            presented.lock().unwrap().clear();
-        }
+/// Calls `f` with the pending accesses of every queue.
+fn for_each_pending(mut f: impl FnMut(&mut PendingAccesses)) {
+    let ctx = Ctx::get();
+    let families = std::iter::once(&ctx.gfx_queues).chain(&ctx.transfer_queues);
+    for pending in families.flat_map(|family| &family.pending) {
+        f(&mut pending.lock().unwrap());
     }
+}
+
+/// Forgets the pending accesses of an image that is being destroyed, on every queue, so an
+/// image that gets its handle next starts with nothing pending. Without it, every image ever
+/// accessed would stay pending and be compared with every later access.
+pub(crate) fn forget_image(image: vk::Image) {
+    for_each_pending(|pending| pending.forget_image(image));
+}
+
+/// Like [`forget_image`], for the addresses of a buffer that is being destroyed.
+pub(crate) fn forget_buffer(range: Range<u64>) {
+    for_each_pending(|pending| pending.forget_buffer(range.clone()));
 }
 
 /// A lease on one queue of family `Q`: one no other lease holds while there is one, then the
@@ -314,19 +314,28 @@ impl<Q: QueueFamilie> Queue<Q> {
     }
 
     /// Moves the lease to the least used queue of its family. It waits until the old queue is
-    /// idle first, so the submissions through the lease stay in order and its `FrameSlot`s and
-    /// `PendingAccesses` stay valid. Meant for the rare case [`Self::is_optimal`] reports.
+    /// idle first, so the submissions through the lease stay in order and its `FrameSlot`s stay
+    /// valid, and the new queue takes over the old one's pending accesses too. Meant for the
+    /// rare case [`Self::is_optimal`] reports.
     #[validation_trace]
     pub fn reselect(&mut self) -> Result<()> {
         if self.is_optimal() {
             return Ok(());
         }
         self.with(|queue| unsafe { Ctx::device().queue_wait_idle(queue) })?;
-        // Their presents are done too.
-        self.family.presented[self.index].lock().unwrap().clear();
-        let mut leases = self.family.leases.lock().unwrap();
-        leases[self.index] -= 1;
-        self.index = lease(&mut leases);
+        let old = self.index;
+        {
+            let mut leases = self.family.leases.lock().unwrap();
+            leases[old] -= 1;
+            self.index = lease(&mut leases);
+        }
+        if self.index != old {
+            let pending = self.family.pending[old].lock().unwrap().clone();
+            self.family.pending[self.index]
+                .lock()
+                .unwrap()
+                .append(pending);
+        }
         Ok(())
     }
 
@@ -423,12 +432,8 @@ impl Drop for CommandBufferMemory {
 /// A command buffer with its pool and fence. Submit its frames through one [`Queue`] lease,
 /// so they reach the GPU in order and the barriers between them hold.
 pub struct FrameSlot {
-    /// The counts of everything the last submission used (`keepalive`), dropped once its
-    /// fence signalled; and what `Frame::uses` added for the next.
-    in_flight: Vec<KeepAlive>,
-    /// The pipelines the last frame recorded, which a shader reload may have replaced since.
-    #[cfg(feature = "hot-reload")]
-    pipelines: Vec<Arc<GenericPipeline>>,
+    /// The epoch of the frame begun last, completed (dropped) once its fence signalled.
+    epoch: Option<Epoch>,
     buffer: CommandBufferMemory,
     pool: CommandPool,
     fence: Fence,
@@ -446,9 +451,7 @@ impl FrameSlot {
         let pool = CommandPool::new(queue.family.family)?;
         let buffer = pool.create_command_buffer()?;
         Ok(Self {
-            in_flight: Vec::new(),
-            #[cfg(feature = "hot-reload")]
-            pipelines: Vec::new(),
+            epoch: None,
             buffer,
             pool,
             fence: Fence::new()?,
@@ -475,8 +478,11 @@ impl FrameSlot {
         self.counter_selection = selection.filter(|_| cfg!(feature = "profiling"));
     }
 
+    /// Waits for the frame this slot submitted last, completes its epoch, and begins one of
+    /// `epoch`, which the caller reserved (`epoch::reserve`) before reading anything the frame
+    /// reaches. The slot keeps it until the GPU finished the frame.
     #[validation_trace]
-    pub fn begin(&mut self) -> Result<Frame<'_>> {
+    pub fn begin(&mut self, epoch: Epoch) -> Result<Frame<'_>> {
         if self.submitted {
             tracing::info_span!("wait for frame slot").in_scope(|| self.fence.wait())?;
             if let Some(timestamps) = &mut self.timestamps {
@@ -490,9 +496,7 @@ impl FrameSlot {
             self.submitted = false;
         }
         // Also after a frame that failed before it was submitted.
-        self.in_flight.clear();
-        #[cfg(feature = "hot-reload")]
-        self.pipelines.clear();
+        self.epoch = Some(epoch);
         // The pools are idle now. A new counter selection needs new ones.
         if !self.timestamps_on {
             self.timestamps = None;
@@ -520,14 +524,6 @@ pub struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    /// Keeps what the frame reaches without its commands naming it alive until the GPU
-    /// finished the frame, e.g. a buffer reached through an address stored in another buffer
-    /// (`Buffer::keep_alive`). Whatever the commands take (views, slices, bindings) is kept
-    /// already.
-    pub fn uses(&mut self, keep: impl IntoIterator<Item = KeepAlive>) {
-        self.slot.in_flight.extend(keep);
-    }
-
     /// The GPU scopes of the frame this slot submitted before, if it was timed.
     pub fn last_timestamps(&self) -> Option<&[GpuScope]> {
         self.slot.timestamps.as_ref()?.results()
@@ -544,20 +540,29 @@ impl Frame<'_> {
         self.slot.counters.as_ref()?.results()
     }
 
+    /// Records `executor` and submits it to `queue`, after the earlier submissions to it. A
+    /// frame that fails before it is submitted completes its epoch right away.
     #[validation_trace]
     pub fn execute<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         self,
         queue: &Queue<Q>,
-        pending: PendingAccesses,
         wait_on: &[SemaphoreInfo],
         signal: &[SemaphoreInfo],
         executor: F,
-    ) -> Result<PendingAccesses> {
+    ) -> Result<()> {
         let slot = self.slot;
-        let result = execute_command(queue, pending, slot, wait_on, signal, executor);
+        let result = execute_command(queue, slot, wait_on, signal, executor);
         match result {
-            Ok(_) => slot.submitted = true,
-            Err(_) => slot.pool.reset()?,
+            Ok(()) => {
+                slot.submitted = true;
+                if let Some(epoch) = &slot.epoch {
+                    epoch.submitted();
+                }
+            }
+            Err(_) => {
+                slot.epoch = None;
+                slot.pool.reset()?;
+            }
         }
         result
     }
@@ -573,8 +578,8 @@ impl Drop for FrameSlot {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct PendingAccesses {
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PendingAccesses {
     pub(crate) buffer_reads: SmallVec<[BufferAccess; 8]>,
     pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
     pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
@@ -614,27 +619,29 @@ impl<A> PendingWrite<A> {
 #[validation_trace]
 fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     queue: &Queue<Q>,
-    pending: PendingAccesses,
     slot: &mut FrameSlot,
     wait_on: &[SemaphoreInfo],
     signal: &[SemaphoreInfo],
     executor: F,
-) -> Result<PendingAccesses> {
+) -> Result<()> {
     let buffer = &slot.buffer;
-    let mut pending = pending;
-    pending.prune();
+    // Held until the submission, so the queue gets command buffers in the order their
+    // barriers were computed in.
+    let mut pending = queue.family.pending[queue.index].lock().unwrap();
     unsafe {
         let mut cmd_buffer = CommandBuffer {
             handle: buffer.handle,
-            pending_accesses: pending,
-            used: std::mem::take(&mut slot.in_flight),
+            pending_accesses: std::mem::take(&mut *pending),
             timestamps: slot.timestamps.take(),
             counters: slot.counters.take(),
-            #[cfg(feature = "hot-reload")]
-            pipelines: std::mem::take(&mut slot.pipelines),
         };
 
-        cmd_buffer.begin()?;
+        // Put back whatever happens: they describe what earlier submissions do.
+        let recorded = cmd_buffer.begin();
+        if recorded.is_err() {
+            *pending = cmd_buffer.pending_accesses;
+            return recorded;
+        }
         if let Some(timestamps) = &mut cmd_buffer.timestamps {
             timestamps.reset(buffer.handle);
         }
@@ -649,15 +656,7 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         host_barrier(buffer.handle);
         slot.timestamps = cmd_buffer.timestamps.take();
         slot.counters = cmd_buffer.counters.take();
-        #[cfg(feature = "hot-reload")]
-        {
-            slot.pipelines = std::mem::take(&mut cmd_buffer.pipelines);
-        }
-        slot.in_flight = std::mem::take(&mut cmd_buffer.used);
-        let semaphores = wait_on.iter().chain(signal).map(|sem| sem.keep.clone());
-        slot.in_flight.extend(semaphores);
-        let presented = &queue.family.presented[queue.index];
-        slot.in_flight.append(&mut presented.lock().unwrap());
+        *pending = std::mem::take(&mut cmd_buffer.pending_accesses);
         cmd_buffer.end()?;
 
         let cmd_buffer_submit_info =
@@ -684,8 +683,7 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
                 slot.fence.handle,
             )
         })?;
-
-        Ok(cmd_buffer.pending_accesses)
+        Ok(())
     }
 }
 
@@ -708,10 +706,6 @@ impl Queue<Gfx> {
             .wait_semaphores(waits.as_slice());
         let presented = self
             .with(|queue| unsafe { Functions::swapchain().queue_present(queue, &present_info) });
-        let keep = wait_on.iter().map(|sem| KeepAlive::clone(&sem.owner));
-        let mut kept = self.family.presented[self.index].lock().unwrap();
-        kept.extend(keep.chain([swapchain.keep_alive()]));
-        drop(kept);
         match presented {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
             Ok(false) => Ok(false),
@@ -761,7 +755,7 @@ mod tests {
             handle: vk::Semaphore::from_raw(7),
             value: None,
             stage: Stage::All,
-            keep: KeepAlive::new(),
+            _semaphore: PhantomData,
         };
         let submit = info.to_vk(vk::PipelineStageFlags2::COMPUTE_SHADER);
         assert_eq!(submit.semaphore, vk::Semaphore::from_raw(7));
@@ -775,7 +769,7 @@ mod tests {
             handle: vk::Semaphore::from_raw(9),
             value: Some(12),
             stage: Stage::All,
-            keep: KeepAlive::new(),
+            _semaphore: PhantomData,
         };
         let submit = info.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS);
         assert_eq!(submit.semaphore, vk::Semaphore::from_raw(9));

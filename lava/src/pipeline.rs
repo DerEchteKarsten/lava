@@ -1,6 +1,5 @@
-//! Pass pipelines: the pass table's entries, the cache of every pass's pipelines per specialization and raster state, and their creation; with `hot-reload`, a second cache whose reloads replace pipelines that command buffers keep alive
+//! Pass pipelines: the pass table's entries, the cache of every pass's pipelines per specialization and raster state, and their creation; with `hot-reload`, reloads that replace a pass's pipelines and retire the old ones
 use ash::vk::TaggedStructure;
-use std::sync::Arc;
 use std::{
     collections::HashMap,
     ffi::CStr,
@@ -11,8 +10,6 @@ use std::{
 use ash::vk;
 use smallvec::{SmallVec, smallvec};
 
-#[cfg(feature = "hot-reload")]
-use crate::vkobjects::rt_pipeline::ShaderBindingTable;
 use crate::{
     bindings::{
         MAX_SPECIALIZATION_CONSTANTS_SIZE, NUM_COMPUTE_PIPELINES, NUM_RASTER_PIPELINES,
@@ -129,10 +126,10 @@ const NO_CONSTANTS: Constants = [0; MAX_SPECIALIZATION_CONSTANTS_SIZE];
 
 /// Every pass's pipelines: compute and ray tracing passes without specialization constants
 /// have one, made at start; the others one per specialization (and raster state), made at
-/// first use. Its pipelines never change.
-#[cfg(not(feature = "hot-reload"))]
+/// first use. With `hot-reload`, [`Self::reload_pass`] replaces a pass's module and pipelines,
+/// and the replaced pipelines are destroyed once no frame can use them (`epoch`).
 pub(crate) struct PipelineManager {
-    shader_modules: Box<[vk::ShaderModule]>,
+    shader_modules: RwLock<Box<[vk::ShaderModule]>>,
     compute_pipelines: RwLock<[vk::Pipeline; NUM_COMPUTE_PIPELINES]>,
     specialized_compute_pipelines:
         RwLock<[HashMap<Constants, vk::Pipeline>; NUM_SPECIALIZED_COMPUTE_PIPELINES]>,
@@ -142,12 +139,11 @@ pub(crate) struct PipelineManager {
     raster_pipelines: RwLock<[HashMap<RasterHash, vk::Pipeline>; NUM_RASTER_PIPELINES]>,
 }
 
-#[cfg(not(feature = "hot-reload"))]
 impl PipelineManager {
     fn new() -> Self {
         let modules: Box<[_]> = PASS_MAP
             .iter()
-            .map(|pass| must(pass, create_module(pass.spirv())))
+            .map(|pass| must(pass, create_module(&pass.spirv())))
             .collect();
         Self {
             compute_pipelines: RwLock::new(create_unspecialized(false, |pass_index, pass| {
@@ -165,7 +161,7 @@ impl PipelineManager {
             })),
             specialized_raytracing_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
             raster_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
-            shader_modules: modules,
+            shader_modules: RwLock::new(modules),
         }
     }
 
@@ -175,8 +171,9 @@ impl PipelineManager {
         if pass.constants.is_empty() {
             return self.compute_pipelines.read().unwrap()[pass.index];
         }
-        let module = self.shader_modules[pass_index];
         cached(&self.specialized_compute_pipelines, pass, constants, || {
+            // Held until the pipeline exists, so a reload can't destroy the module before.
+            let module = self.shader_modules.read().unwrap()[pass_index];
             must(pass, create_compute_pipeline(module, pass, constants))
         })
     }
@@ -199,12 +196,15 @@ impl PipelineManager {
         }
         let maps = &self.specialized_raytracing_pipelines;
         if !maps.read().unwrap()[pass.index].contains_key(constants) {
-            let module = self.shader_modules[pass_index];
             let map = &mut maps.write().unwrap()[pass.index];
             let cached = map.len();
             map.entry(*constants).or_insert_with(|| {
                 note_new_pipeline(pass, cached);
-                must(pass, create_raytracing_pipeline(module, pass, constants))
+                let modules = self.shader_modules.read().unwrap();
+                must(
+                    pass,
+                    create_raytracing_pipeline(modules[pass_index], pass, constants),
+                )
             });
         }
         record(&maps.read().unwrap()[pass.index][constants])
@@ -212,141 +212,18 @@ impl PipelineManager {
 
     /// The pipeline of raster pass `pass_index` for `hash`.
     pub(crate) fn raster(&self, hash: &RasterHash, pass_index: usize) -> vk::Pipeline {
-        let module = self.shader_modules[pass_index];
         let pass = &PASS_MAP[pass_index];
         cached(&self.raster_pipelines, pass, hash, || {
+            let module = self.shader_modules.read().unwrap()[pass_index];
             must(pass, create_raster_pipeline(module, hash, pass_index))
-        })
-    }
-}
-
-/// A pipeline and, for a ray tracing pass, its shader binding table. With `hot-reload`,
-/// every command buffer keeps the ones it records (`CommandBuffer::keep`) until its frame
-/// slot is begun again, so a pipeline a reload replaced is destroyed once no pending frame
-/// uses it.
-#[cfg(feature = "hot-reload")]
-pub(crate) struct GenericPipeline {
-    pub(crate) pipeline: vk::Pipeline,
-    pub(crate) sbt: Option<ShaderBindingTable>,
-}
-
-#[cfg(feature = "hot-reload")]
-impl Drop for GenericPipeline {
-    fn drop(&mut self) {
-        unsafe { Ctx::device().destroy_pipeline(self.pipeline, None) };
-    }
-}
-
-#[cfg(feature = "hot-reload")]
-fn generic(pipeline: vk::Pipeline) -> Arc<GenericPipeline> {
-    Arc::new(GenericPipeline {
-        pipeline,
-        sbt: None,
-    })
-}
-
-#[cfg(feature = "hot-reload")]
-fn generic_ray_tracing(pipeline: RaytracingPipeline) -> Arc<GenericPipeline> {
-    Arc::new(GenericPipeline {
-        pipeline: pipeline.pipeline,
-        sbt: Some(pipeline.sbt),
-    })
-}
-
-/// Like the manager without `hot-reload`, but a reload replaces a pass's module and
-/// pipelines (`reload_pass`).
-#[cfg(feature = "hot-reload")]
-pub(crate) struct PipelineManager {
-    shader_modules: RwLock<Vec<vk::ShaderModule>>,
-    compute_pipelines: RwLock<[Arc<GenericPipeline>; NUM_COMPUTE_PIPELINES]>,
-    specialized_compute_pipelines:
-        RwLock<[HashMap<Constants, Arc<GenericPipeline>>; NUM_SPECIALIZED_COMPUTE_PIPELINES]>,
-    raytracing_pipelines: RwLock<[Option<Arc<GenericPipeline>>; NUM_RAY_TRACING_PIPELINES]>,
-    specialized_raytracing_pipelines:
-        RwLock<[HashMap<Constants, Arc<GenericPipeline>>; NUM_SPECIALIZED_RAY_TRACING_PIPELINES]>,
-    raster_pipelines: RwLock<[HashMap<RasterHash, Arc<GenericPipeline>>; NUM_RASTER_PIPELINES]>,
-}
-
-#[cfg(feature = "hot-reload")]
-impl PipelineManager {
-    fn new() -> Self {
-        let modules: Vec<_> = PASS_MAP
-            .iter()
-            .map(|pass| must(pass, create_module(&pass.spirv())))
-            .collect();
-        Self {
-            compute_pipelines: RwLock::new(create_unspecialized(false, |pass_index, pass| {
-                generic(must(
-                    pass,
-                    create_compute_pipeline(modules[pass_index], pass, &NO_CONSTANTS),
-                ))
-            })),
-            specialized_compute_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
-            raytracing_pipelines: RwLock::new(create_unspecialized(true, |pass_index, pass| {
-                let pipeline = create_raytracing_pipeline(modules[pass_index], pass, &NO_CONSTANTS);
-                Some(generic_ray_tracing(must(pass, pipeline)))
-            })),
-            specialized_raytracing_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
-            raster_pipelines: RwLock::new(std::array::from_fn(|_| HashMap::new())),
-            shader_modules: RwLock::new(modules),
-        }
-    }
-
-    /// The compute pipeline of `pass_index` with `constants`.
-    pub(crate) fn compute(&self, pass_index: usize, constants: &Constants) -> Arc<GenericPipeline> {
-        let pass = &PASS_MAP[pass_index];
-        if pass.constants.is_empty() {
-            return self.compute_pipelines.read().unwrap()[pass.index].clone();
-        }
-        // Held until the pipeline exists, so a reload can't destroy the module before.
-        let modules = self.shader_modules.read().unwrap();
-        let module = modules[pass_index];
-        cached(&self.specialized_compute_pipelines, pass, constants, || {
-            generic(must(pass, create_compute_pipeline(module, pass, constants)))
-        })
-    }
-
-    /// The ray tracing pipeline of `pass_index` with `constants`.
-    pub(crate) fn ray_tracing(
-        &self,
-        pass_index: usize,
-        constants: &Constants,
-    ) -> Arc<GenericPipeline> {
-        let pass = &PASS_MAP[pass_index];
-        if pass.constants.is_empty() {
-            return self.raytracing_pipelines.read().unwrap()[pass.index]
-                .clone()
-                .unwrap();
-        }
-        let modules = self.shader_modules.read().unwrap();
-        let module = modules[pass_index];
-        cached(
-            &self.specialized_raytracing_pipelines,
-            pass,
-            constants,
-            || {
-                generic_ray_tracing(must(
-                    pass,
-                    create_raytracing_pipeline(module, pass, constants),
-                ))
-            },
-        )
-    }
-
-    /// The pipeline of raster pass `pass_index` for `hash`.
-    pub(crate) fn raster(&self, hash: &RasterHash, pass_index: usize) -> Arc<GenericPipeline> {
-        let modules = self.shader_modules.read().unwrap();
-        let module = modules[pass_index];
-        let pass = &PASS_MAP[pass_index];
-        cached(&self.raster_pipelines, pass, hash, || {
-            generic(must(pass, create_raster_pipeline(module, hash, pass_index)))
         })
     }
 
     /// Replaces the pass's module and every pipeline made from it. A replaced pipeline is
-    /// destroyed once no pending command buffer uses it. If the driver rejects the module or
-    /// one of the pipelines, nothing is replaced: every new pipeline is made before any is
-    /// swapped in, and no lock is held while one fails.
+    /// destroyed once no frame can use it (`epoch`). If the driver rejects the module or one
+    /// of the pipelines, nothing is replaced: every new pipeline is made before any is swapped
+    /// in, and no lock is held while one fails.
+    #[cfg(feature = "hot-reload")]
     pub(crate) fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Result<()> {
         let pass = &PASS_MAP[pass_index];
         let module = create_module(spirv)?;
@@ -357,47 +234,32 @@ impl PipelineManager {
         let result: Result<()> = (|| {
             match pass.kind {
                 PassKind::Compute { .. } if unspecialized => {
-                    let pipeline = generic(create_compute_pipeline(module, pass, &NO_CONSTANTS)?);
-                    self.compute_pipelines.write().unwrap()[pass.index] = pipeline;
+                    let pipeline = create_compute_pipeline(module, pass, &NO_CONSTANTS)?;
+                    let pipelines = &mut self.compute_pipelines.write().unwrap()[pass.index];
+                    retire([std::mem::replace(pipelines, pipeline)]);
                 }
                 PassKind::Compute { .. } => {
-                    let maps = &self.specialized_compute_pipelines;
-                    let keys: Vec<Constants> =
-                        maps.read().unwrap()[pass.index].keys().copied().collect();
-                    let mut new = Vec::with_capacity(keys.len());
-                    for constants in &keys {
-                        new.push(generic(create_compute_pipeline(module, pass, constants)?));
-                    }
-                    let map = &mut maps.write().unwrap()[pass.index];
-                    map.extend(keys.into_iter().zip(new));
+                    retire(rebuild(
+                        &self.specialized_compute_pipelines,
+                        pass,
+                        |constants| create_compute_pipeline(module, pass, constants),
+                    )?);
                 }
                 PassKind::RayTracing { .. } if unspecialized => {
                     let pipeline = create_raytracing_pipeline(module, pass, &NO_CONSTANTS)?;
-                    self.raytracing_pipelines.write().unwrap()[pass.index] =
-                        Some(generic_ray_tracing(pipeline));
+                    let pipelines = &mut self.raytracing_pipelines.write().unwrap()[pass.index];
+                    retire(pipelines.replace(pipeline));
                 }
                 PassKind::RayTracing { .. } => {
                     let maps = &self.specialized_raytracing_pipelines;
-                    let keys: Vec<Constants> =
-                        maps.read().unwrap()[pass.index].keys().copied().collect();
-                    let mut new = Vec::with_capacity(keys.len());
-                    for constants in &keys {
-                        let pipeline = create_raytracing_pipeline(module, pass, constants)?;
-                        new.push(generic_ray_tracing(pipeline));
-                    }
-                    let map = &mut maps.write().unwrap()[pass.index];
-                    map.extend(keys.into_iter().zip(new));
+                    retire(rebuild(maps, pass, |constants| {
+                        create_raytracing_pipeline(module, pass, constants)
+                    })?);
                 }
                 PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. } => {
-                    let maps = &self.raster_pipelines;
-                    let keys: Vec<RasterHash> =
-                        maps.read().unwrap()[pass.index].keys().cloned().collect();
-                    let mut new = Vec::with_capacity(keys.len());
-                    for hash in &keys {
-                        new.push(generic(create_raster_pipeline(module, hash, pass_index)?));
-                    }
-                    let map = &mut maps.write().unwrap()[pass.index];
-                    map.extend(keys.into_iter().zip(new));
+                    retire(rebuild(&self.raster_pipelines, pass, |hash| {
+                        create_raster_pipeline(module, hash, pass_index)
+                    })?);
                 }
             }
             Ok(())
@@ -414,6 +276,49 @@ impl PipelineManager {
         destroy_module(old);
         Ok(())
     }
+}
+
+impl Into<vk::Pipeline> for RaytracingPipeline {
+    fn into(self) -> vk::Pipeline {
+        self.pipeline
+    }
+}
+
+/// Destroys `pipelines` once no frame can use them any more.
+#[cfg(feature = "hot-reload")]
+fn retire<P: Into<vk::Pipeline> + Send + 'static>(pipelines: impl IntoIterator<Item = P>) {
+    let pipelines: Vec<P> = pipelines.into_iter().collect();
+    crate::epoch::retire(move || {
+        pipelines
+            .into_iter()
+            .for_each(|i| unsafe { Ctx::device().destroy_pipeline(i.into(), None) })
+    });
+}
+
+/// Makes the pipeline of every key in the pass's map with `create`, then swaps them all in
+/// and returns the replaced ones. If one fails, the new ones are destroyed and nothing changes.
+#[cfg(feature = "hot-reload")]
+fn rebuild<K: Hash + Eq + Clone, P: Into<vk::Pipeline> + Send + 'static, const N: usize>(
+    maps: &RwLock<[HashMap<K, P>; N]>,
+    pass: &PassEntry,
+    mut create: impl FnMut(&K) -> Result<P>,
+) -> Result<Vec<P>> {
+    let keys: Vec<K> = maps.read().unwrap()[pass.index].keys().cloned().collect();
+    let mut new = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match create(key) {
+            Ok(pipeline) => new.push(pipeline),
+            Err(err) => {
+                retire(new);
+                return Err(err);
+            }
+        }
+    }
+    let map = &mut maps.write().unwrap()[pass.index];
+    let replaced = keys.into_iter().zip(new);
+    Ok(replaced
+        .filter_map(|(key, pipeline)| map.insert(key, pipeline))
+        .collect())
 }
 
 /// A pipeline lava can't do without: created at start or at a pass's first use, so a
