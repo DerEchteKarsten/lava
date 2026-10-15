@@ -2,6 +2,15 @@
 name = "lava"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vulkan for Rust with bindless resources, automatic barriers and typed pass bindings generated from shaders"
+readme = "../README.md"
+keywords = ["vulkan", "graphics", "gpu", "bindless", "rendering"]
+categories = ["graphics", "rendering::graphics-api", "game-development"]
+include = ["src/**", "LICENSE-*"]
 
 [dependencies]
 glam = {workspace = true}

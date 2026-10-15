@@ -2,6 +2,14 @@
 name = "lava-macros"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "lava's internal proc macros (validation call-site tracing)"
+keywords = ["vulkan", "lava"]
+categories = ["development-tools::procedural-macro-helpers"]
+include = ["src/**", "LICENSE-*"]
 
 [lib]
 proc-macro = true

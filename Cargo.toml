@@ -5,6 +5,10 @@ members = ["lava", "lava-build-slang", "lava-macros", "lava-tests"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+authors = ["Christian Keitz"]
+repository = "https://github.com/DerEchteKarsten/lava"
 
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
