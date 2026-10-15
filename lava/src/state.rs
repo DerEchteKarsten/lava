@@ -4,7 +4,7 @@ use std::{
     cell::Cell,
     ffi::{c_char, c_void},
     fmt::Debug,
-    panic::{self, Location},
+    panic::Location,
     sync::{Mutex, MutexGuard, OnceLock},
 };
 

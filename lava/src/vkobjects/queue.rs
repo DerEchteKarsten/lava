@@ -615,9 +615,9 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
 impl Queue<Gfx> {
     /// `Ok(true)` means the swapchain is suboptimal or out of date and should be recreated.
     #[validation_trace]
-    pub fn present(
+    pub fn present<U: crate::image::usage::StaticUsage>(
         &self,
-        swapchain: &Swapchain,
+        swapchain: &Swapchain<U>,
         image_index: u32,
         wait_on: &[&Semaphore<Binary>],
     ) -> Result<bool> {

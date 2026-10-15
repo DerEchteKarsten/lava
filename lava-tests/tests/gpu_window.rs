@@ -10,8 +10,11 @@ use std::process::ExitCode;
 use lava::{
     bindless::BindlessHandle,
     epoch,
-    image::format::{ClearValue, Format},
-    state::Ctx,
+    image::{
+        format::{ClearValue, Format},
+        usage::ColorAttachmentStorageTransferDst,
+    },
+    state::raw_vulkan as vk,
     vkobjects::{
         queue::{Binary, FrameSlot, Gfx, Queue, Semaphore},
         surface::Surface,
@@ -51,7 +54,7 @@ fn surface_for(window: &Window) -> lava::Result<Surface> {
 /// `semaphores`: the presentation engine may still use them after this returns.
 fn present_frame(
     queue: &Queue<Gfx>,
-    swapchain: &Swapchain,
+    swapchain: &Swapchain<ColorAttachmentStorageTransferDst>,
     color: [f32; 4],
     semaphores: &mut Vec<Semaphore<Binary>>,
 ) {
@@ -80,6 +83,12 @@ fn present_frame(
 }
 
 /// Everything that needs a window, in order. Panics on the first failure.
+/// The swapchain format the tests ask for (the images are storage images too).
+const FORMATS: [vk::SurfaceFormatKHR; 1] = [vk::SurfaceFormatKHR {
+    format: vk::Format::B8G8R8A8_UNORM,
+    color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+}];
+
 /// The handles the bindless drop hook was called with.
 static DROPPED: std::sync::Mutex<Vec<BindlessHandle>> = std::sync::Mutex::new(Vec::new());
 
@@ -107,7 +116,7 @@ fn run(event_loop: &ActiveEventLoop) {
     assert!(surface.capabilities.min_image_count >= 1);
     step("surface_reports_formats_modes_and_capabilities");
 
-    let mut swapchain = Swapchain::new(&mut surface, None, Some(SIZE)).unwrap();
+    let mut swapchain = Swapchain::new(&mut surface, None, Some(SIZE), &FORMATS).unwrap();
     assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
     swapchain.bind_storage(0..);
     assert_eq!(swapchain.size, SIZE);
@@ -158,7 +167,7 @@ fn run(event_loop: &ActiveEventLoop) {
 
     let second_window = create_window(event_loop, "lava test 2");
     let mut second_surface = surface_for(&second_window).unwrap();
-    let mut second_swapchain = Swapchain::new(&mut second_surface, None, Some(SIZE)).unwrap();
+    let mut second_swapchain = Swapchain::new(&mut second_surface, None, Some(SIZE), &FORMATS).unwrap();
     second_swapchain.bind_storage(8..);
     assert_eq!(second_swapchain.image(0).handle.descriptor_index_set1, 8);
     assert_ne!(second_surface.handle, surface.handle);

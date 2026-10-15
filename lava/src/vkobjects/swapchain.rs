@@ -1,4 +1,4 @@
-//! Swapchain creation, image acquisition, resize-driven recreation, and the command that readies an image for presenting
+//! Swapchain creation (usage chosen by type, format by preference), image acquisition, resize-driven recreation, and the command that readies an image for presenting
 use std::{ffi::CStr, iter, sync::atomic::AtomicU32};
 
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
         D2,
         format::{self, Format},
         slice::ImageView,
-        usage::{ColorAttachmentStorageTransferDst, ImageUsage, StaticUsage},
+        usage::{ColorAttachmentTransferDst, ImageUsage, IsStorage, StaticUsage},
     },
     state::{Ctx, Functions},
     vkobjects::{
@@ -35,24 +35,27 @@ struct SwapchainImage {
     layout: AtomicU32,
 }
 
+/// The images a surface presents, with usage `U` (any static image usage the surface allows;
+/// color attachment and transfer destination by default).
 #[derive(Debug)]
-pub struct Swapchain {
+pub struct Swapchain<U: StaticUsage = ColorAttachmentTransferDst> {
     pub size: UVec2,
-    /// Picked from what the surface supports; a recreated swapchain may pick another.
+    /// Picked from what the surface supports, by `preferred`; a recreated swapchain may pick
+    /// another.
     pub format: format::Dynamic,
+    /// The formats and colour spaces `new` was asked for, in order of preference.
+    preferred: SmallVec<[vk::SurfaceFormatKHR; 2]>,
     /// The surface's supported modes of `PRESENT_MODES`, FIFO first, with their names.
     pub present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,
     /// Index into `present_modes`; set it and `recreate` to switch. A recreated swapchain keeps it.
     pub present_mode: usize,
     pub(crate) handle: vk::SwapchainKHR,
     images: SmallVec<[SwapchainImage; 5]>,
+    usage: U,
 }
 
-impl Swapchain {
-    pub fn image(
-        &self,
-        index: u32,
-    ) -> ImageView<'_, format::Dynamic, ColorAttachmentStorageTransferDst> {
+impl<U: StaticUsage> Swapchain<U> {
+    pub fn image(&self, index: u32) -> ImageView<'_, format::Dynamic, U> {
         let image = &self.images[index as usize];
         ImageView {
             image: image.image,
@@ -62,7 +65,7 @@ impl Swapchain {
             handle: image.handle,
             layouts: std::slice::from_ref(&image.layout),
             format: self.format,
-            usage: ColorAttachmentStorageTransferDst,
+            usage: self.usage,
             dim: D2,
         }
     }
@@ -74,15 +77,32 @@ impl Swapchain {
     /// The images are unbound; the caller binds them. The image count can change between
     /// swapchains of one surface, e.g. with the present mode (Mailbox often needs one more).
     /// `size` is clamped to what the surface allows right now (its capabilities are
-    /// re-queried); a surface without any extent (`Surface::is_minimised`) is an error.
+    /// re-queried); a surface without any extent (`Surface::is_minimised`) is an error. The
+    /// format is the first of `preferred` the surface has that supports `U`, else the first
+    /// such the surface has; none is an error.
     #[validation_trace]
     pub fn new(
         surface: &mut Surface,
-        old: Option<&Swapchain>,
+        old: Option<&Swapchain<U>>,
         size: Option<UVec2>,
+        preferred: &[vk::SurfaceFormatKHR],
     ) -> Result<Self> {
         surface.refresh_capabilities()?;
-        let format = select_surface_format(&surface.formats);
+        let usage = U::VK;
+        let instance = Functions::instance();
+        let device = Ctx::physical_device().handel;
+        let usable = |format: vk::Format| {
+            let features =
+                unsafe { instance.get_physical_device_format_properties(device, format) };
+            features
+                .optimal_tiling_features
+                .contains(format_features(usage))
+        };
+        let format = select_surface_format(&surface.formats, preferred, usable).ok_or_else(|| {
+            Error::message(format!(
+                "the surface has no format whose images support {usage:?}"
+            ))
+        })?;
 
         let present_modes = supported_present_modes(&surface.present_modes);
         let present_mode_index = old.map_or(0, |old| old.present_mode.min(present_modes.len() - 1));
@@ -93,7 +113,6 @@ impl Swapchain {
                 "the surface has no extent to create a swapchain for (a minimised window)",
             ));
         }
-        let usage = ColorAttachmentStorageTransferDst::VK;
         let supported = surface.capabilities.supported_usage_flags;
         if !supported.contains(usage) {
             return Err(Error::message(format!(
@@ -181,6 +200,8 @@ impl Swapchain {
         Ok(Self {
             handle,
             format: format::Dynamic(format.format),
+            preferred: SmallVec::from_slice(preferred),
+            usage: U::default(),
             images,
             size: UVec2::new(extent.width, extent.height),
             present_modes,
@@ -191,7 +212,10 @@ impl Swapchain {
     /// Binds image `i` at the `i`-th of `storage_indices` of the storage set, right away. The
     /// indices are handed to the bindless drop hook (`bindless::on_drop`) once the swapchain is
     /// destroyed. Panics if there are fewer indices than images.
-    pub fn bind_storage(&mut self, storage_indices: impl IntoIterator<Item = u32>) {
+    pub fn bind_storage(&mut self, storage_indices: impl IntoIterator<Item = u32>)
+    where
+        U: IsStorage,
+    {
         let mut indices = storage_indices.into_iter();
         for image in &mut self.images {
             let index = indices.next().expect("an index per swapchain image");
@@ -223,15 +247,16 @@ impl Swapchain {
     /// (`epoch`). The new images are unbound (see `new`); bind them again. On an error (see
     /// `new`) the old swapchain stays.
     #[validation_trace]
-    pub fn recreate(&mut self, surface: &mut Surface, size: UVec2) -> Result<Swapchain> {
+    pub fn recreate(&mut self, surface: &mut Surface, size: UVec2) -> Result<Swapchain<U>> {
         let _span = tracing::info_span!("Swapchain Recreation").entered();
-        let swapchain = Swapchain::new(surface, Some(self), Some(size))?;
+        let preferred = self.preferred.clone();
+        let swapchain = Swapchain::new(surface, Some(self), Some(size), &preferred)?;
         Ok(std::mem::replace(self, swapchain))
     }
 }
 
 /// Destroyed once the frames and presents that may use it are done (`epoch`).
-impl Drop for Swapchain {
+impl<U: StaticUsage> Drop for Swapchain<U> {
     fn drop(&mut self) {
         let handle = self.handle;
         let images: SmallVec<[_; 5]> = (self.images.iter())
@@ -248,20 +273,37 @@ impl Drop for Swapchain {
     }
 }
 
-/// Prefers BGRA8 unorm with sRGB-nonlinear colour space, otherwise the surface's first format.
-pub(crate) fn select_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
-    let preferred = vk::SurfaceFormatKHR {
-        format: vk::Format::B8G8R8A8_UNORM,
-        color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-    };
+/// The format features images of `usage` need.
+fn format_features(usage: vk::ImageUsageFlags) -> vk::FormatFeatureFlags {
+    use vk::{FormatFeatureFlags as F, ImageUsageFlags as U};
+    [
+        (U::COLOR_ATTACHMENT, F::COLOR_ATTACHMENT),
+        (U::STORAGE, F::STORAGE_IMAGE),
+        (U::SAMPLED, F::SAMPLED_IMAGE),
+        (U::TRANSFER_SRC, F::TRANSFER_SRC),
+        (U::TRANSFER_DST, F::TRANSFER_DST),
+    ]
+    .into_iter()
+    .filter(|(u, _)| usage.contains(*u))
+    .fold(F::empty(), |all, (_, f)| all | f)
+}
+
+/// The first of `preferred` among the surface's `formats` whose format is `usable`, else the
+/// first usable one of `formats`. A surface without formats, or with a single `UNDEFINED`
+/// one, takes any: the first usable of `preferred`.
+pub(crate) fn select_surface_format(
+    formats: &[vk::SurfaceFormatKHR],
+    preferred: &[vk::SurfaceFormatKHR],
+    usable: impl Fn(vk::Format) -> bool,
+) -> Option<vk::SurfaceFormatKHR> {
+    let usable = |f: &&vk::SurfaceFormatKHR| usable(f.format);
     match formats {
-        // No formats or a single UNDEFINED entry: the surface has no preference.
-        [] => preferred,
-        [only] if only.format == vk::Format::UNDEFINED => preferred,
-        _ => *formats
-            .iter()
-            .find(|f| **f == preferred)
-            .unwrap_or(&formats[0]),
+        [] => preferred.iter().find(usable).copied(),
+        [only] if only.format == vk::Format::UNDEFINED => preferred.iter().find(usable).copied(),
+        _ => (preferred.iter().filter(|p| formats.contains(p)))
+            .chain(formats)
+            .find(usable)
+            .copied(),
     }
 }
 
@@ -339,21 +381,27 @@ mod tests {
         color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
     };
 
+    fn any(_: vk::Format) -> bool {
+        true
+    }
+
     #[test]
-    fn bgra_unorm_srgb_is_preferred_wherever_it_is_listed() {
+    fn the_first_preferred_format_wins_wherever_the_surface_lists_it() {
+        let srgb = format(vk::Format::R8G8B8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR);
         let formats = [
-            format(vk::Format::R8G8B8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR),
+            srgb,
             format(
                 vk::Format::A2B10G10R10_UNORM_PACK32,
                 vk::ColorSpaceKHR::HDR10_ST2084_EXT,
             ),
             BGRA,
         ];
-        assert_eq!(select_surface_format(&formats), BGRA);
+        assert_eq!(select_surface_format(&formats, &[BGRA, srgb], any), Some(BGRA));
+        assert_eq!(select_surface_format(&formats, &[srgb, BGRA], any), Some(srgb));
     }
 
     #[test]
-    fn bgra_with_another_colour_space_does_not_count_as_preferred() {
+    fn a_format_in_another_colour_space_is_not_the_preferred_one() {
         let formats = [
             format(vk::Format::R8G8B8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR),
             format(
@@ -361,17 +409,31 @@ mod tests {
                 vk::ColorSpaceKHR::HDR10_ST2084_EXT,
             ),
         ];
-        assert_eq!(select_surface_format(&formats), formats[0]);
+        assert_eq!(select_surface_format(&formats, &[BGRA], any), Some(formats[0]));
+    }
+
+    /// sRGB formats can't be storage images on most devices.
+    #[test]
+    fn formats_that_cant_have_the_usage_are_skipped() {
+        let srgb = format(vk::Format::B8G8R8A8_SRGB, vk::ColorSpaceKHR::SRGB_NONLINEAR);
+        let storable = |f: vk::Format| f != vk::Format::B8G8R8A8_SRGB;
+        assert_eq!(select_surface_format(&[srgb, BGRA], &[srgb], storable), Some(BGRA));
+        assert_eq!(select_surface_format(&[srgb], &[], storable), None);
+        assert_eq!(
+            format_features(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE),
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::STORAGE_IMAGE
+        );
     }
 
     #[test]
-    fn surfaces_without_a_preference_get_bgra() {
-        assert_eq!(select_surface_format(&[]), BGRA);
+    fn surfaces_without_a_preference_take_the_first_usable_preferred_format() {
+        assert_eq!(select_surface_format(&[], &[BGRA], any), Some(BGRA));
         let undefined = [format(
             vk::Format::UNDEFINED,
             vk::ColorSpaceKHR::SRGB_NONLINEAR,
         )];
-        assert_eq!(select_surface_format(&undefined), BGRA);
+        assert_eq!(select_surface_format(&undefined, &[BGRA], any), Some(BGRA));
+        assert_eq!(select_surface_format(&undefined, &[], any), None);
     }
 
     #[test]
