@@ -244,30 +244,6 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
     })
 }
 
-/// Whether a SPIR-V module declares the `RayQueryKHR` capability, which needs
-/// `Features::ray_query`.
-pub fn uses_ray_query(spirv: &[u8]) -> bool {
-    const OP_CAPABILITY: u32 = 17;
-    const RAY_QUERY_KHR: u32 = 4472;
-    let words: Vec<u32> = spirv
-        .chunks_exact(4)
-        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
-        .collect();
-    // After the five header words, each instruction starts with its word count and opcode.
-    let mut i = 5;
-    while i < words.len() {
-        let (count, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
-        if opcode == OP_CAPABILITY && words.get(i + 1) == Some(&RAY_QUERY_KHR) {
-            return true;
-        }
-        if count == 0 {
-            return false;
-        }
-        i += count;
-    }
-    false
-}
-
 /// The pass at the absolute path `source` with all its entry points, linked.
 pub fn link(session: &slang::Session, source: &str) -> slang::Result<slang::ComponentType> {
     let module = session.load_module(source)?;
@@ -353,23 +329,4 @@ mod tests {
         assert!(refused(&[deep]).contains("between 1 and 31"));
     }
 
-    fn module(instructions: &[&[u32]]) -> Vec<u8> {
-        let header = [0x0723_0203, 0x0001_0600, 0, 100, 0];
-        header
-            .iter()
-            .chain(instructions.iter().flat_map(|i| i.iter()))
-            .flat_map(|w| w.to_le_bytes())
-            .collect()
-    }
-
-    #[test]
-    fn ray_query_capabilities_are_found() {
-        let shader = [2 << 16 | 17, 1];
-        let ray_query = [2 << 16 | 17, 4472];
-        // `OpExtension "SPV_KHR_ray_query"`, whose text isn't a capability.
-        let extension = [5 << 16 | 10, 4472, 0, 0, 0];
-        assert!(uses_ray_query(&module(&[&shader, &ray_query])));
-        assert!(!uses_ray_query(&module(&[&extension, &shader])));
-        assert!(!uses_ray_query(&module(&[])));
-    }
 }

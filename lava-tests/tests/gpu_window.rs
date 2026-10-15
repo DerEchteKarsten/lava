@@ -88,16 +88,14 @@ fn run(event_loop: &ActiveEventLoop) {
     let step = |name: &str| println!("test {name} ... ok");
 
     common::capture_validation_errors();
-    lava::init(
-        Some(&window.display_handle().unwrap().as_raw()),
-        true,
-        false,
-        &PASS_MAP,
-    )
-    .expect("lava init with a display failed");
-    assert!(Ctx::features().present);
+    let config = lava::Config {
+        display: Some(window.display_handle().unwrap().as_raw()),
+        validation: true,
+        ..lava::Config::new(&PASS_MAP)
+    };
+    lava::init(&config).expect("lava init with a display failed");
     assert!(
-        lava::init(None, false, false, &PASS_MAP).is_err(),
+        lava::init(&lava::Config::new(&PASS_MAP)).is_err(),
         "second init must fail"
     );
     lava::bindless::on_drop(|handle| DROPPED.lock().unwrap().push(handle)).unwrap();

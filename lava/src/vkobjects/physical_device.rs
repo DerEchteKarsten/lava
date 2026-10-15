@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use ash::vk;
 use lava_macros::validation_trace;
 
-use crate::state::Features;
+use crate::features::{FeatureChain, Features};
 
 impl PartialEq for QueueFamily {
     fn eq(&self, other: &Self) -> bool {
@@ -54,10 +54,10 @@ pub struct PhysicalDevice {
     pub vk12_properties: vk::PhysicalDeviceVulkan12Properties<'static>,
     pub queue_families: Vec<QueueFamily>,
     pub supported_extensions: Vec<String>,
+    /// The optional features it has, which lava enables if it picks it.
     pub supported_features: Features,
-    pub bindless_supported: bool,
-    /// `VK_KHR_device_address_commands`, which every command buffer needs.
-    pub device_address_commands: bool,
+    /// What lava needs that it lacks, by name; empty on a device lava can use.
+    pub lava_missing: Vec<String>,
     pub ray_tracing_pipeline_properties:
         Option<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>>,
     pub acceleration_structure_properties:
@@ -99,35 +99,17 @@ impl PhysicalDevice {
             })
             .collect::<Result<Vec<String>>>()?;
 
-        let mut ray_tracing_feature = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
-        let mut acceleration_struct_feature =
-            vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
-        let mut ray_query_feature = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
-        let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut mesh_shading = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
-        let mut clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
-        let mut performance = vk::PhysicalDevicePerformanceQueryFeaturesKHR::default();
-        let mut host_image_copy = vk::PhysicalDeviceHostImageCopyFeaturesEXT::default();
-        let mut address_commands = vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR::default();
+        let has = |name: &CStr| {
+            supported_extensions
+                .iter()
+                .any(|e| e.as_bytes() == name.to_bytes())
+        };
+        let features = FeatureChain::query(instance, physical_device, &has);
         let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
         let mut rt_pipeline_properties =
             vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
         let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
-
-        let mut features2 = vk::PhysicalDeviceFeatures2::default()
-            .push(&mut features12)
-            .push(&mut ray_tracing_feature)
-            .push(&mut acceleration_struct_feature)
-            .push(&mut ray_query_feature)
-            .push(&mut mesh_shading)
-            .push(&mut clock)
-            .push(&mut performance)
-            .push(&mut host_image_copy)
-            .push(&mut address_commands);
-        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
-        let pipeline_statistics = features2.features.pipeline_statistics_query == vk::TRUE;
-        let precise_occlusion = features2.features.occlusion_query_precise == vk::TRUE;
 
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut rt_pipeline_properties)
@@ -144,47 +126,8 @@ impl PhysicalDevice {
         let mem_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let rebar = has_rebar(&mem_properties);
-        let has_extension = |name: &CStr| {
-            supported_extensions
-                .iter()
-                .any(|e| e.as_bytes() == name.to_bytes())
-        };
-        let acceleration_structure = has_extension(ash::khr::acceleration_structure::NAME)
-            && has_extension(ash::khr::deferred_host_operations::NAME)
-            && acceleration_struct_feature.acceleration_structure == vk::TRUE;
-        let device_address_commands = has_extension(ash::khr::device_address_commands::NAME)
-            && address_commands.device_address_commands == vk::TRUE;
-        let features = Features {
-            rebar,
-            host_image_copy: rebar
-                && has_extension(ash::ext::host_image_copy::NAME)
-                && host_image_copy.host_image_copy == vk::TRUE,
-            present: true,
-            debug_utils: true,
-            device_debug_utils: supported_extensions.contains(
-                &ash::ext::debug_utils::NAME
-                    .to_str()
-                    .expect("extension names are valid UTF-8")
-                    .to_owned(),
-            ),
-            mesh: mesh_shading.mesh_shader == vk::TRUE,
-            acceleration_structure,
-            ray_query: acceleration_structure
-                && has_extension(ash::khr::ray_query::NAME)
-                && ray_query_feature.ray_query == vk::TRUE,
-            ray_tracing_pipeline: acceleration_structure
-                && has_extension(ash::khr::ray_tracing_pipeline::NAME)
-                && ray_tracing_feature.ray_tracing_pipeline == vk::TRUE
-                && ray_tracing_feature.ray_tracing_pipeline_trace_rays_indirect == vk::TRUE,
-            pipeline_statistics,
-            mesh_queries: mesh_shading.mesh_shader_queries == vk::TRUE,
-            memory_budget: has_extension(ash::ext::memory_budget::NAME),
-            shader_clock: clock.shader_subgroup_clock == vk::TRUE,
-            performance_query: has_extension(ash::khr::performance_query::NAME)
-                && performance.performance_counter_query_pools == vk::TRUE,
-            calibrated_timestamps: has_extension(ash::khr::calibrated_timestamps::NAME),
-            precise_occlusion,
-        };
+        let supported_features = features.optional(&has, rebar);
+        let lava_missing = features.lava_missing(&has);
 
         Ok(Self {
             properties,
@@ -196,31 +139,15 @@ impl PhysicalDevice {
             queue_families,
             supported_extensions,
 
-            acceleration_structure_properties: features
+            acceleration_structure_properties: supported_features
                 .acceleration_structure
                 .then_some(acc_properties),
-            ray_tracing_pipeline_properties: features
+            ray_tracing_pipeline_properties: supported_features
                 .ray_tracing_pipeline
                 .then_some(rt_pipeline_properties),
-
-            bindless_supported: features12.runtime_descriptor_array == vk::TRUE
-                && features12.descriptor_binding_partially_bound == vk::TRUE
-                && features12.descriptor_binding_variable_descriptor_count == vk::TRUE,
-            device_address_commands,
-            supported_features: features,
+            supported_features,
+            lava_missing,
         })
-    }
-
-    pub(crate) fn unsupports_extensions(&self, extensions: &[&CStr]) -> Vec<String> {
-        extensions
-            .iter()
-            .map(|e| {
-                e.to_str()
-                    .expect("Vulkan extension names are valid UTF-8")
-                    .to_owned()
-            })
-            .filter(|e| self.supported_extensions.iter().find(|i| *i == e).is_none())
-            .collect::<Vec<String>>()
     }
 
     #[validation_trace]
@@ -261,48 +188,43 @@ impl PhysicalDevice {
         graphics.map(|graphics| (graphics, transfer))
     }
 
-    /// Returns the first GPU with a usable graphics family, plus its graphics and transfer
-    /// families. Presentation goes through the graphics family (checked per surface).
+    /// Returns the first GPU (discrete before integrated) with everything lava needs, the
+    /// `required` features and a usable graphics family, plus its graphics and transfer
+    /// families. Presentation goes through the graphics family (checked per surface). The
+    /// error names what each GPU lacks.
     #[validation_trace]
     pub(crate) fn select_suitable_physical_device(
         devices: &[PhysicalDevice],
-        features: &mut Features,
+        required: &Features,
     ) -> Result<(PhysicalDevice, QueueFamily, Option<QueueFamily>)> {
-        let (device, (graphics, transfer_queue)) = devices
-            .iter()
-            .filter(|device| {
-                device.properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-                    || device.properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
-            })
-            .filter(|device| device.device_address_commands)
-            .find_map(|device| Some((device, device.pick_queue_families()?)))
-            .ok_or_else(|| {
-                Error::message(
-                    "Could not find a suitable device: a GPU with VK_KHR_device_address_commands",
-                )
-            })?;
-        let mut required = device.supported_features.clone();
-        required.present = features.present;
-        let unsuported_ext = device.unsupports_extensions(&required.extensions());
-        if !unsuported_ext.is_empty() {
-            tracing::error!("Unsuported Extensions: {:#?}", unsuported_ext);
+        let mut rejected = Vec::new();
+        for device in devices.iter().filter(|device| {
+            device.properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                || device.properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+        }) {
+            let mut missing = device.lava_missing.clone();
+            missing.extend(
+                required
+                    .missing_from(&device.supported_features)
+                    .into_iter()
+                    .map(|name| format!("Features::{name}")),
+            );
+            let families = device.pick_queue_families();
+            if families.is_none() {
+                missing.push("a queue family with graphics, compute and timestamps".into());
+            }
+            match families {
+                Some((graphics, transfer)) if missing.is_empty() => {
+                    return Ok((device.clone(), graphics, transfer));
+                }
+                _ => rejected.push(format!("{} lacks {}", device.name, missing.join(", "))),
+            }
         }
-        features.device_debug_utils =
-            device.supported_features.device_debug_utils && features.debug_utils;
-        features.mesh = device.supported_features.mesh;
-        features.acceleration_structure = device.supported_features.acceleration_structure;
-        features.ray_query = device.supported_features.ray_query;
-        features.ray_tracing_pipeline = device.supported_features.ray_tracing_pipeline;
-        features.rebar = device.supported_features.rebar;
-        features.host_image_copy = device.supported_features.host_image_copy;
-        features.pipeline_statistics = device.supported_features.pipeline_statistics;
-        features.mesh_queries = device.supported_features.mesh_queries;
-        features.memory_budget = device.supported_features.memory_budget;
-        features.shader_clock = device.supported_features.shader_clock;
-        features.performance_query = device.supported_features.performance_query;
-        features.calibrated_timestamps = device.supported_features.calibrated_timestamps;
-        features.precise_occlusion = device.supported_features.precise_occlusion;
-        Ok((device.clone(), graphics, transfer_queue))
+        Err(Error::message(&if rejected.is_empty() {
+            "no GPU found".to_owned()
+        } else {
+            format!("no suitable GPU: {}", rejected.join("; "))
+        }))
     }
 }
 
@@ -364,8 +286,7 @@ mod tests {
             queue_families,
             supported_extensions: Vec::new(),
             supported_features: Features::default(),
-            bindless_supported: true,
-            device_address_commands: true,
+            lava_missing: Vec::new(),
             ray_tracing_pipeline_properties: None,
             acceleration_structure_properties: None,
         }
@@ -400,19 +321,6 @@ mod tests {
             family(3, Q::GRAPHICS, 1, true),
             family(4, Q::GRAPHICS, 1, true)
         );
-    }
-
-    #[test]
-    fn unsupported_extensions_are_the_requested_ones_the_device_lacks() {
-        let mut dev = device(DISCRETE, vec![gfx_family(0, 1)]);
-        dev.supported_extensions = vec!["VK_KHR_swapchain".into(), "VK_EXT_mesh_shader".into()];
-        let missing = dev.unsupports_extensions(&[
-            ash::khr::swapchain::NAME,
-            ash::khr::ray_tracing_pipeline::NAME,
-            ash::ext::mesh_shader::NAME,
-        ]);
-        assert_eq!(missing, ["VK_KHR_ray_tracing_pipeline"]);
-        assert!(dev.unsupports_extensions(&[]).is_empty());
     }
 
     #[test]
@@ -466,7 +374,7 @@ mod tests {
         second.name = "second".into();
         let (dev, graphics, _) = PhysicalDevice::select_suitable_physical_device(
             &[first, second],
-            &mut Features::default(),
+            &Features::default(),
         )
         .unwrap();
         assert_eq!(dev.name, "first");
@@ -477,11 +385,11 @@ mod tests {
     fn cpu_devices_are_rejected() {
         let result = PhysicalDevice::select_suitable_physical_device(
             &[device(CPU, vec![gfx_family(0, 1)])],
-            &mut Features::default(),
+            &Features::default(),
         );
         assert!(matches!(result, Err(Error::Message(_))));
         assert!(
-            PhysicalDevice::select_suitable_physical_device(&[], &mut Features::default()).is_err()
+            PhysicalDevice::select_suitable_physical_device(&[], &Features::default()).is_err()
         );
     }
 
@@ -502,7 +410,7 @@ mod tests {
 
         let (dev, graphics, transfer) = PhysicalDevice::select_suitable_physical_device(
             &[rejected, chosen],
-            &mut Features::default(),
+            &Features::default(),
         )
         .unwrap();
         assert_eq!(dev.name, "chosen");
@@ -512,45 +420,35 @@ mod tests {
     }
 
     #[test]
-    fn selection_copies_the_devices_optional_features() {
-        let mut dev = device(DISCRETE, vec![gfx_family(0, 1)]);
-        dev.supported_features = Features {
-            rebar: true,
-            host_image_copy: true,
-            present: true,
-            device_debug_utils: true,
-            debug_utils: true,
+    fn selection_skips_gpus_lacking_what_lava_or_the_application_needs() {
+        let mut old = device(DISCRETE, vec![gfx_family(0, 1)]);
+        old.name = "old".into();
+        old.lava_missing = vec!["VK_EXT_extended_dynamic_state3".into()];
+        let mut plain = device(DISCRETE, vec![gfx_family(0, 1)]);
+        plain.name = "plain".into();
+        let mut meshy = device(INTEGRATED, vec![gfx_family(0, 1)]);
+        meshy.name = "meshy".into();
+        meshy.supported_features.mesh = true;
+
+        let mesh = Features {
             mesh: true,
-            acceleration_structure: true,
-            ray_query: true,
-            ray_tracing_pipeline: false,
-            pipeline_statistics: true,
-            mesh_queries: false,
-            memory_budget: true,
-            shader_clock: true,
-            performance_query: true,
-            calibrated_timestamps: true,
-            precise_occlusion: true,
-        };
-
-        // Without validation the device debug utils stay off, and `present` is the caller's.
-        let mut features = Features::default();
-        PhysicalDevice::select_suitable_physical_device(&[dev.clone()], &mut features).unwrap();
-        assert!(features.mesh && features.rebar && features.host_image_copy);
-        assert!(features.pipeline_statistics && features.memory_budget);
-        assert!(features.acceleration_structure && features.ray_query);
-        assert!(!features.ray_tracing_pipeline && !features.mesh_queries);
-        assert!(!features.device_debug_utils);
-        assert!(!features.present);
-
-        let mut features = Features {
-            debug_utils: true,
-            present: true,
             ..Default::default()
         };
-        PhysicalDevice::select_suitable_physical_device(&[dev], &mut features).unwrap();
-        assert!(features.device_debug_utils);
-        assert!(features.present);
+        let devices = [old.clone(), plain.clone(), meshy];
+        let (dev, ..) = PhysicalDevice::select_suitable_physical_device(&devices, &mesh).unwrap();
+        assert_eq!(dev.name, "meshy");
+        let (dev, ..) =
+            PhysicalDevice::select_suitable_physical_device(&devices, &Features::default())
+                .unwrap();
+        assert_eq!(dev.name, "plain");
+
+        let Err(Error::Message(message)) =
+            PhysicalDevice::select_suitable_physical_device(&[old, plain], &mesh)
+        else {
+            panic!("no GPU has mesh shaders");
+        };
+        assert!(message.contains("old lacks VK_EXT_extended_dynamic_state3, Features::mesh"));
+        assert!(message.contains("plain lacks Features::mesh"));
     }
 
     fn memory(

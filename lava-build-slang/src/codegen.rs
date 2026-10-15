@@ -550,7 +550,6 @@ fn generate_pass(
     pc: &TypeLayout,
     consts: &[SConst],
     entries: &[compile::Entry],
-    ray_query: bool,
     structs: &mut Structs,
     pass_map: &mut Vec<String>,
     pipelines: &mut Pipelines,
@@ -665,7 +664,6 @@ fn generate_pass(
         index: {pipeline_index},
         constants: {constants},
         constants_size: {constants_size},
-        ray_query: {ray_query},
     }},"#
     ));
 
@@ -937,7 +935,6 @@ use lava::pipeline::*;
             pc,
             &consts,
             &entries,
-            compile::uses_ray_query(pass_spirv.as_slice()),
             &mut structs,
             &mut pass_map,
             &mut pipelines,

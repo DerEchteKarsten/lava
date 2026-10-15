@@ -172,7 +172,7 @@ const WARMUP: usize = 200;
 const FRAMES: usize = 3000;
 
 fn main() {
-    lava::init(None, false, false, &PASS_MAP).expect("headless lava init failed");
+    lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
     let queue = Queue::<Gfx>::new();
     let resources = Resources::new();
     let mut slots = [

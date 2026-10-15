@@ -6,9 +6,11 @@
 //!
 //! # Shader contract
 //! What every frontend's shaders and generated code must match:
-//! - Descriptor set 0: binding 0 holds the three immutable samplers (nearest and bilinear,
-//!   both clamped to a white border; trilinear repeat), binding 3 the bindless sampled images.
-//!   Set 1, binding 0: the bindless storage images. Passes have no other descriptors.
+//! - Descriptor set 0: binding 0 holds the application's immutable samplers
+//!   ([`Config::samplers`], by index), binding 1 the bindless sampled images. Set 1, binding 0:
+//!   the bindless storage images. Passes have no other descriptors.
+//! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) runs
+//!   only where the device has it.
 //! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes,
 //!   zeroed when a command buffer begins; a pass pushes its own struct from offset 0.
 //!   Specialization constants have no size limit.
@@ -22,6 +24,7 @@ use crate::state::CALLSITE;
 use crate::{bindless::Bindless, state::Ctx};
 
 pub use crate::error::{Error, Result};
+pub use crate::features::Features;
 pub use ash::vk::Pipeline as VkPipeline;
 /// What `Error::Vulkan` holds, e.g. `ERROR_OUT_OF_DATE_KHR` from `Swapchain::aquire_image`.
 pub use ash::vk::Result as VkResult;
@@ -35,6 +38,7 @@ pub mod buffer;
 pub mod command_buffer;
 pub mod epoch;
 pub mod error;
+pub mod features;
 pub mod image;
 pub mod memory;
 pub mod pipeline;
@@ -60,18 +64,48 @@ macro_rules! include_passes {
     };
 }
 
-/// Initialises the global Vulkan context with the application's passes (the `PASS_MAP` of
-/// [`include_passes!`]). Pass the display handle to be able to create
-/// [`vkobjects::surface::Surface`]s and swapchains; `None` runs headless.
-pub fn init(
-    display: Option<&RawDisplayHandle>,
-    enable_validation: bool,
-    enable_gpu_assited_validation: bool,
-    passes: &'static pipeline::PassMap,
-) -> Result<()> {
-    Ctx::init(display, enable_validation, enable_gpu_assited_validation)?;
-    pipeline::set_pass_map(passes);
-    Bindless::init()?;
+/// What [`init`] sets up: the application's passes and samplers, the window system, validation,
+/// and the optional features the application can't run without.
+#[derive(Clone, Copy)]
+pub struct Config<'a> {
+    /// The `PASS_MAP` of [`include_passes!`].
+    pub passes: &'static pipeline::PassMap,
+    /// The display to create [`vkobjects::surface::Surface`]s and swapchains for; `None` runs
+    /// headless.
+    pub display: Option<RawDisplayHandle>,
+    /// The validation layer with synchronization validation and best practices, in debug
+    /// builds.
+    pub validation: bool,
+    /// GPU-assisted validation on top (`validation` only).
+    pub gpu_assisted_validation: bool,
+    /// The immutable samplers shaders pick by index; at least one.
+    pub samplers: &'a [bindless::SamplerDesc],
+    /// Optional features without which `init` fails (lava enables every one the device has).
+    pub required: Features,
+}
+
+impl Config<'static> {
+    /// Headless, without validation, with [`bindless::DEFAULT_SAMPLERS`] and no required
+    /// features.
+    pub fn new(passes: &'static pipeline::PassMap) -> Self {
+        Self {
+            passes,
+            display: None,
+            validation: false,
+            gpu_assisted_validation: false,
+            samplers: &bindless::DEFAULT_SAMPLERS,
+            required: Features::default(),
+        }
+    }
+}
+
+/// Initialises the global Vulkan context: picks a device with everything lava needs and
+/// `config.required`, enables every optional feature it has, and makes the passes' pipelines
+/// (a pass whose SPIR-V needs a missing feature gets none and panics when recorded).
+pub fn init(config: &Config) -> Result<()> {
+    Ctx::init(config)?;
+    pipeline::set_pass_map(config.passes);
+    Bindless::init(config.samplers)?;
     query::init()?;
     pipeline::init();
     Ok(())

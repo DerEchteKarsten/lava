@@ -131,7 +131,7 @@ fn texel(pixels: &[u8], width: u32, x: u32, y: u32) -> &[u8] {
 #[test]
 fn init_twice_is_an_error() {
     let _gpu = gpu();
-    assert!(lava::init(None, false, false, &PASS_MAP).is_err());
+    assert!(lava::init(&lava::Config::new(&PASS_MAP)).is_err());
 }
 
 #[test]
@@ -140,8 +140,6 @@ fn context_exposes_the_graphics_queue_family() {
     assert!(Ctx::num_gfx_queues() >= 1);
     // Presentation shares the graphics family.
     assert_eq!(Ctx::present_queue_index(), Ctx::gfx_queue_index());
-    // Headless: no swapchain was requested.
-    assert!(!Ctx::features().present);
 }
 
 // ---- buffers ---------------------------------------------------------------------------------

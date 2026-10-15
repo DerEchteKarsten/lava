@@ -13,7 +13,8 @@ use smallvec::{SmallVec, smallvec};
 use crate::{
     bindless::Bindless,
     command_buffer::Blend,
-    error::Result,
+    error::{Error, Result},
+    features::Features,
     state::{Ctx, Functions},
     vkobjects::rt_pipeline::RaytracingPipeline,
 };
@@ -104,33 +105,6 @@ pub struct PassEntry {
     /// Where each specialization constant sits in `BindingOutput::constants`.
     pub constants: &'static [vk::SpecializationMapEntry],
     pub constants_size: usize,
-    /// Its SPIR-V uses ray queries.
-    pub ray_query: bool,
-}
-
-impl PassEntry {
-    /// What the pass needs that the device lacks, if anything.
-    fn missing_feature(&self) -> Option<&'static str> {
-        let features = Ctx::features();
-        if self.ray_query && !features.ray_query {
-            Some("ray queries (`Features::ray_query`)")
-        } else if matches!(self.kind, PassKind::RayTracing { .. }) && !features.ray_tracing_pipeline
-        {
-            Some("ray tracing pipelines (`Features::ray_tracing_pipeline`)")
-        } else {
-            None
-        }
-    }
-
-    /// Panics if the device can't run the pass.
-    fn assert_supported(&self) {
-        if let Some(feature) = self.missing_feature() {
-            panic!(
-                "pass `{}` needs {feature}, which this device lacks",
-                self.name
-            );
-        }
-    }
 }
 
 /// The raster state a raster pipeline is made for, besides its specialization constants.
@@ -174,10 +148,12 @@ pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
 
 /// Every pass's pipelines: compute and ray tracing passes without specialization constants
 /// have one, made at start; the others one per specialization (and raster state), made at
-/// first use. A pass the device can't run (`PassEntry::missing_feature`) has no module and no
-/// pipeline, and panics when it is recorded. [`Self::reload_pass`] replaces a pass's module and
+/// first use. A pass whose SPIR-V needs features the device lacks (`missing`) has no module
+/// and no pipeline, and panics when it is recorded. [`Self::reload_pass`] replaces a pass's module and
 /// pipelines, and the replaced pipelines are destroyed once no frame can use them (`epoch`).
 pub(crate) struct PipelineManager {
+    /// The features each pass's SPIR-V declares that the device lacks.
+    missing: Box<[Vec<&'static str>]>,
     shader_modules: RwLock<Box<[vk::ShaderModule]>>,
     compute_pipelines: RwLock<Box<[vk::Pipeline]>>,
     specialized_compute_pipelines: RwLock<Box<[Specialized<(), vk::Pipeline>]>>,
@@ -194,19 +170,22 @@ impl PipelineManager {
         fn maps<K, V>(n: usize) -> RwLock<Box<[HashMap<K, V>]>> {
             RwLock::new((0..n).map(|_| HashMap::new()).collect())
         }
-        let modules: Box<[_]> = passes
+        let missing: Box<[_]> = passes
             .iter()
-            .map(|pass| match pass.missing_feature() {
-                Some(_) => vk::ShaderModule::null(),
-                None => must(pass, create_module(pass.spirv)),
+            .map(|pass| Features::of_spirv(pass.spirv).missing_from(&Ctx::features()))
+            .collect();
+        let modules: Box<[_]> = (passes.iter().zip(&missing))
+            .map(|(pass, missing)| match missing.is_empty() {
+                false => vk::ShaderModule::null(),
+                true => must(pass, create_module(pass.spirv)),
             })
             .collect();
         Self {
             compute_pipelines: RwLock::new(create_unspecialized(
                 false,
-                |pass_index, pass| match pass.missing_feature() {
-                    Some(_) => vk::Pipeline::null(),
-                    None => must(
+                |pass_index, pass| match missing[pass_index].is_empty() {
+                    false => vk::Pipeline::null(),
+                    true => must(
                         pass,
                         create_compute_pipeline(modules[pass_index], pass, &[]),
                     ),
@@ -216,7 +195,7 @@ impl PipelineManager {
                 matches!(p.kind, PassKind::Compute { .. }) && !p.constants.is_empty()
             })),
             raytracing_pipelines: RwLock::new(create_unspecialized(true, |pass_index, pass| {
-                pass.missing_feature().is_none().then(|| {
+                missing[pass_index].is_empty().then(|| {
                     must(
                         pass,
                         create_raytracing_pipeline(modules[pass_index], pass, &[]),
@@ -233,13 +212,26 @@ impl PipelineManager {
                 )
             })),
             shader_modules: RwLock::new(modules),
+            missing,
+        }
+    }
+
+    /// Panics if the device lacks a feature pass `pass_index` needs.
+    fn assert_supported(&self, pass_index: usize) {
+        let missing = &self.missing[pass_index];
+        if !missing.is_empty() {
+            panic!(
+                "pass `{}` needs `Features::{}`, which this device lacks",
+                pass_map().passes[pass_index].name,
+                missing.join("`, `Features::")
+            );
         }
     }
 
     /// The compute pipeline of `pass_index` with `constants`.
     pub(crate) fn compute(&self, pass_index: usize, constants: &[u8]) -> vk::Pipeline {
         let pass = &pass_map().passes[pass_index];
-        pass.assert_supported();
+        self.assert_supported(pass_index);
         if pass.constants.is_empty() {
             return self.compute_pipelines.read().unwrap()[pass.index];
         }
@@ -265,7 +257,7 @@ impl PipelineManager {
         record: impl FnOnce(&RaytracingPipeline) -> R,
     ) -> R {
         let pass = &pass_map().passes[pass_index];
-        pass.assert_supported();
+        self.assert_supported(pass_index);
         if pass.constants.is_empty() {
             return record(
                 self.raytracing_pipelines.read().unwrap()[pass.index]
@@ -305,7 +297,7 @@ impl PipelineManager {
         pass_index: usize,
     ) -> vk::Pipeline {
         let pass = &pass_map().passes[pass_index];
-        pass.assert_supported();
+        self.assert_supported(pass_index);
         cached(&self.raster_pipelines, pass, hash, constants, || {
             let module = self.shader_modules.read().unwrap()[pass_index];
             must(
@@ -321,8 +313,16 @@ impl PipelineManager {
     /// in, and no lock is held while one fails. A pass the device can't run is skipped.
     fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Result<()> {
         let pass = &pass_map().passes[pass_index];
-        if pass.missing_feature().is_some() {
+        if !self.missing[pass_index].is_empty() {
             return Ok(());
+        }
+        let missing = Features::of_spirv(spirv).missing_from(&Ctx::features());
+        if !missing.is_empty() {
+            return Err(Error::message(&format!(
+                "the new `{}` needs `Features::{}`, which this device lacks",
+                pass.name,
+                missing.join("`, `Features::")
+            )));
         }
         let module = create_module(spirv)?;
         let destroy_module = |module| unsafe { Ctx::device().destroy_shader_module(module, None) };

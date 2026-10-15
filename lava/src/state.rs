@@ -21,7 +21,11 @@ use gpu_allocator::{
 use lava_macros::validation_trace;
 use std::ffi::{CStr, CString};
 
-use crate::vkobjects::{physical_device::PhysicalDevice, queue::FamilyQueues};
+use crate::{
+    Config,
+    features::{FeatureChain, Features, LAVA_EXTENSIONS},
+    vkobjects::{physical_device::PhysicalDevice, queue::FamilyQueues},
+};
 
 pub use ash::vk as raw_vulkan;
 
@@ -41,7 +45,6 @@ pub struct Ctx {
     pub(crate) transfer_queues: Option<FamilyQueues>,
 }
 
-use raw_window_handle::RawDisplayHandle;
 static STATE: OnceLock<Ctx> = OnceLock::new();
 impl Ctx {
     #[allow(static_mut_refs)]
@@ -78,17 +81,15 @@ impl Ctx {
             .expect("allocator mutex was poisoned")
     }
 
+    /// The optional features lava enabled: every one the device has.
     pub fn features() -> Features {
-        Ctx::get().features.clone()
+        Ctx::get().features
     }
 
-    /// Creates the instance, device, and allocator. With `display` set, the instance gets the
+    /// Creates the instance, device, and allocator. With a display, the instance gets the
     /// platform surface extensions and the device gets a swapchain; without it lava runs headless.
-    pub(super) fn init(
-        display: Option<&RawDisplayHandle>,
-        enable_validation: bool,
-        enable_gpu_assited_validation: bool,
-    ) -> Result<()> {
+    pub(super) fn init(config: &Config) -> Result<()> {
+        let display = config.display.as_ref();
         let entry = unsafe { Entry::load()? };
         let app_info = vk::ApplicationInfo::default().api_version(make_api_version(0, 1, 4, 0));
         let layer_names = unsafe {
@@ -110,24 +111,19 @@ impl Ctx {
             None => Vec::new(),
         };
 
-        let mut features = Features::default();
-        features.present = display.is_some();
-        #[cfg(debug_assertions)]
-        {
-            features.debug_utils = enable_validation;
-            features.device_debug_utils = enable_validation;
-        }
+        // The validation layer and debug names and labels, in debug builds.
+        let debug = cfg!(debug_assertions) && config.validation;
         let mut validation_features = vk::ValidationFeaturesEXT::default();
         let mut validation_f;
         let mut instance_info = vk::InstanceCreateInfo::default();
-        if features.debug_utils {
+        if debug {
             instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
             validation_f = vec![
                 vk::ValidationFeatureEnableEXT::DEBUG_PRINTF,
                 vk::ValidationFeatureEnableEXT::BEST_PRACTICES,
                 vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION,
             ];
-            if enable_gpu_assited_validation {
+            if config.gpu_assisted_validation {
                 validation_f.push(vk::ValidationFeatureEnableEXT::GPU_ASSISTED);
             }
 
@@ -143,7 +139,7 @@ impl Ctx {
 
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
         let mut instance_debug_utils = None;
-        if features.debug_utils {
+        if debug {
             instance_debug_utils = Some(debug_utils::Instance::load(&entry, &instance));
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
@@ -172,8 +168,14 @@ impl Ctx {
         let (physical_device, graphics_queue_family, transfer_queue_familie) =
             PhysicalDevice::select_suitable_physical_device(
                 physical_devices.as_slice(),
-                &mut features,
+                &config.required,
             )?;
+        let features = physical_device.supported_features;
+        let mut extensions: Vec<&CStr> = LAVA_EXTENSIONS.to_vec();
+        extensions.extend(features.extensions());
+        if display.is_some() {
+            extensions.push(ash::khr::swapchain::NAME);
+        }
 
         let mut queues = vec![(
             graphics_queue_family.index,
@@ -182,9 +184,9 @@ impl Ctx {
         if let Some(tqf) = &transfer_queue_familie {
             queues.push((tqf.index, tqf.num_queues));
         }
-        let device = create_device(queues, &physical_device, &features, &instance)?;
+        let device = create_device(queues, &physical_device, &features, &extensions, &instance)?;
         let mut debug_utils = None;
-        if features.device_debug_utils {
+        if debug {
             debug_utils = Some(ash::ext::debug_utils::Device::load(&instance, &device));
         }
 
@@ -227,6 +229,13 @@ impl Ctx {
                     ash::khr::calibrated_timestamps::Device::load(&instance, &device)
                 }),
                 host_image_copy: ash::ext::host_image_copy::Device::load(&instance, &device),
+                dynamic_state2: ash::ext::extended_dynamic_state2::Device::load(&instance, &device),
+                dynamic_state3: ash::ext::extended_dynamic_state3::Device::load(&instance, &device),
+                color_write: ash::ext::color_write_enable::Device::load(&instance, &device),
+                line_rasterization: ash::khr::line_rasterization::Device::load(&instance, &device),
+                depth_clamp_control: ash::ext::depth_clamp_control::Device::load(
+                    &instance, &device,
+                ),
                 device_address_commands: ash::khr::device_address_commands::Device::load(
                     &instance, &device,
                 ),
@@ -336,190 +345,14 @@ unsafe extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct Features {
-    pub rebar: bool,
-    /// `VK_EXT_host_image_copy` on host-visible device memory (`rebar`): `Image::copy_from`.
-    pub host_image_copy: bool,
-    pub present: bool,
-    pub device_debug_utils: bool,
-    pub debug_utils: bool,
-    pub mesh: bool,
-    /// `VK_KHR_acceleration_structure`: `Blas`/`Tlas` and their builds. `ray_query` and
-    /// `ray_tracing_pipeline` need it.
-    pub acceleration_structure: bool,
-    /// `VK_KHR_ray_query`: tracing from compute, mesh and fragment passes.
-    pub ray_query: bool,
-    /// `VK_KHR_ray_tracing_pipeline` with indirect tracing: ray tracing passes.
-    pub ray_tracing_pipeline: bool,
-    /// Pipeline statistics queries (invocation counts per pass).
-    pub pipeline_statistics: bool,
-    /// Task and mesh shader invocations in pipeline statistics.
-    pub mesh_queries: bool,
-    /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
-    pub memory_budget: bool,
-    /// `VK_KHR_shader_clock` with subgroup clocks (`OpReadClockKHR Subgroup`, which shader
-    /// clock regions read).
-    pub shader_clock: bool,
-    /// `VK_KHR_performance_query` with query pools: `QueryPool::performance`, the hardware
-    /// counters of `query::counters`.
-    pub performance_query: bool,
-    /// `VK_KHR_calibrated_timestamps`, which puts timestamps on the host's clock
-    /// (`QueryPool::instant`).
-    pub calibrated_timestamps: bool,
-    /// Occlusion queries that count samples exactly (`QueryPool::occlusion`).
-    pub precise_occlusion: bool,
-}
-impl Features {
-    /// The device extensions to enable. `VK_KHR_device_address_commands` is always required:
-    /// every command takes a `BufferSlice` as an address range.
-    pub fn extensions(&self) -> Vec<&CStr> {
-        let mut extensions = vec![ash::khr::device_address_commands::NAME];
-        if self.host_image_copy {
-            extensions.push(ash::ext::host_image_copy::NAME);
-        }
-        if self.present {
-            extensions.push(ash::khr::swapchain::NAME);
-        }
-        if self.debug_utils {
-            // extensions.push(ash::ext::device_address_binding_report::NAME);
-        }
-        if self.device_debug_utils {
-            extensions.push(ash::ext::debug_utils::NAME);
-        }
-        if self.mesh {
-            extensions.push(ash::ext::mesh_shader::NAME);
-        }
-        if self.memory_budget {
-            extensions.push(ash::ext::memory_budget::NAME);
-        }
-        if self.shader_clock {
-            extensions.push(ash::khr::shader_clock::NAME);
-        }
-        if self.performance_query {
-            extensions.push(ash::khr::performance_query::NAME);
-        }
-        if self.calibrated_timestamps {
-            extensions.push(ash::khr::calibrated_timestamps::NAME);
-        }
-        if self.acceleration_structure {
-            extensions.push(ash::khr::deferred_host_operations::NAME);
-            extensions.push(ash::khr::acceleration_structure::NAME);
-        }
-        if self.ray_query {
-            extensions.push(ash::khr::ray_query::NAME);
-        }
-        if self.ray_tracing_pipeline {
-            extensions.push(ash::khr::ray_tracing_pipeline::NAME);
-        }
-        extensions
-    }
-
-    fn features<'a>(
-        &self,
-        vk11: &'a mut vk::PhysicalDeviceVulkan11Features,
-        vk12: &'a mut vk::PhysicalDeviceVulkan12Features,
-        vk13: &'a mut vk::PhysicalDeviceVulkan13Features,
-        mesh: &'a mut vk::PhysicalDeviceMeshShaderFeaturesEXT,
-        ray: &'a mut vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
-        acc: &'a mut vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
-        query: &'a mut vk::PhysicalDeviceRayQueryFeaturesKHR,
-        host_image_copy: &'a mut vk::PhysicalDeviceHostImageCopyFeaturesEXT,
-        clock: &'a mut vk::PhysicalDeviceShaderClockFeaturesKHR,
-        performance: &'a mut vk::PhysicalDevicePerformanceQueryFeaturesKHR,
-        address_commands: &'a mut vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR,
-    ) -> vk::PhysicalDeviceFeatures2<'a> {
-        *address_commands = address_commands.device_address_commands(true);
-        *vk11 = vk11.shader_draw_parameters(true);
-        *vk12 = vk12
-            .runtime_descriptor_array(true)
-            .buffer_device_address(true)
-            .descriptor_indexing(true)
-            .shader_sampled_image_array_non_uniform_indexing(true)
-            .shader_storage_image_array_non_uniform_indexing(true)
-            .shader_float16(true)
-            .descriptor_binding_storage_buffer_update_after_bind(true)
-            .descriptor_binding_partially_bound(true)
-            .descriptor_binding_variable_descriptor_count(true)
-            .descriptor_binding_storage_image_update_after_bind(true)
-            .descriptor_binding_sampled_image_update_after_bind(true)
-            .descriptor_binding_update_unused_while_pending(true)
-            .timeline_semaphore(true)
-            .draw_indirect_count(true)
-            .scalar_block_layout(true)
-            .storage_push_constant8(true)
-            .vulkan_memory_model(true)
-            .vulkan_memory_model_device_scope(true)
-            .storage_buffer8_bit_access(true)
-            .shader_buffer_int64_atomics(true)
-            .shader_int8(true)
-            // Query pools are reset on the host; Vulkan 1.2 devices all have it.
-            .host_query_reset(true);
-        *vk13 = vk13
-            .dynamic_rendering(true)
-            .maintenance4(true)
-            // What `discard` compiles to.
-            .shader_demote_to_helper_invocation(true)
-            .synchronization2(true);
-        let phfeatures = vk::PhysicalDeviceFeatures::default()
-            .shader_int64(true)
-            .texture_compression_bc(true)
-            .fill_mode_non_solid(true)
-            // Per-attachment `Blend` modes.
-            .independent_blend(true)
-            .fragment_stores_and_atomics(true)
-            .shader_int16(true)
-            .pipeline_statistics_query(self.pipeline_statistics)
-            .occlusion_query_precise(self.precise_occlusion)
-            .vertex_pipeline_stores_and_atomics(true);
-
-        let mut features = vk::PhysicalDeviceFeatures2::default()
-            .features(phfeatures)
-            .push(vk11)
-            .push(vk12)
-            .push(vk13)
-            .push(address_commands);
-        if self.host_image_copy {
-            *host_image_copy =
-                vk::PhysicalDeviceHostImageCopyFeaturesEXT::default().host_image_copy(true);
-            features = features.push(host_image_copy);
-        }
-        if self.mesh {
-            *mesh = mesh
-                .task_shader(true)
-                .mesh_shader(true)
-                .mesh_shader_queries(self.mesh_queries);
-            features = features.push(mesh);
-        }
-        if self.shader_clock {
-            *clock = clock.shader_subgroup_clock(true);
-            features = features.push(clock);
-        }
-        if self.performance_query {
-            *performance = performance.performance_counter_query_pools(true);
-            features = features.push(performance);
-        }
-        if self.acceleration_structure {
-            *acc = acc.acceleration_structure(true);
-            features = features.push(acc);
-        }
-        if self.ray_query {
-            *query = query.ray_query(true);
-            features = features.push(query);
-        }
-        if self.ray_tracing_pipeline {
-            *ray = ray
-                .ray_tracing_pipeline(true)
-                .ray_tracing_pipeline_trace_rays_indirect(true);
-            features = features.push(ray);
-        }
-        features
-    }
-}
-
 pub struct Functions {
     instance: ash::Instance,
     host_image_copy: ash::ext::host_image_copy::Device,
+    dynamic_state2: ash::ext::extended_dynamic_state2::Device,
+    dynamic_state3: ash::ext::extended_dynamic_state3::Device,
+    color_write: ash::ext::color_write_enable::Device,
+    line_rasterization: ash::khr::line_rasterization::Device,
+    depth_clamp_control: ash::ext::depth_clamp_control::Device,
     device_address_commands: ash::khr::device_address_commands::Device,
     entry: ash::Entry,
     swapchain: ash::khr::swapchain::Device,
@@ -553,6 +386,21 @@ impl Functions {
     }
     pub(crate) fn device_address_commands() -> &'static ash::khr::device_address_commands::Device {
         &get().device_address_commands
+    }
+    pub(crate) fn dynamic_state2() -> &'static ash::ext::extended_dynamic_state2::Device {
+        &get().dynamic_state2
+    }
+    pub(crate) fn dynamic_state3() -> &'static ash::ext::extended_dynamic_state3::Device {
+        &get().dynamic_state3
+    }
+    pub(crate) fn color_write() -> &'static ash::ext::color_write_enable::Device {
+        &get().color_write
+    }
+    pub(crate) fn line_rasterization() -> &'static ash::khr::line_rasterization::Device {
+        &get().line_rasterization
+    }
+    pub(crate) fn depth_clamp_control() -> &'static ash::ext::depth_clamp_control::Device {
+        &get().depth_clamp_control
     }
     pub(crate) fn instance() -> &'static ash::Instance {
         &get().instance
@@ -643,6 +491,7 @@ pub(super) fn create_device(
     mut queue_families: Vec<(u32, u32)>,
     physical_device: &PhysicalDevice,
     features: &Features,
+    extensions: &[&CStr],
     instance: &ash::Instance,
 ) -> Result<ash::Device> {
     // One priority per queue: every queue of a selected family is created, so that threads
@@ -663,34 +512,15 @@ pub(super) fn create_device(
         })
         .collect::<Vec<_>>();
 
-    let required_extensions = features.extensions();
-    let device_extensions_as_ptr = required_extensions
-        .into_iter()
-        .map(|e| e.as_ptr() as *const i8)
-        .collect::<Vec<_>>();
-
-    let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut host_image_copy, mut clock) =
-        Default::default();
-    let (mut query, mut performance, mut address_commands) = Default::default();
-    let mut features = features.features(
-        &mut vk11,
-        &mut vk12,
-        &mut vk13,
-        &mut mesh,
-        &mut ray,
-        &mut acc,
-        &mut query,
-        &mut host_image_copy,
-        &mut clock,
-        &mut performance,
-        &mut address_commands,
-    );
+    let extension_names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
+    let mut enabled = FeatureChain::enabling(features);
+    let mut features2 = enabled.chain(&|name| extensions.contains(&name));
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
-        .enabled_extension_names(device_extensions_as_ptr.as_slice());
-    // `features` carries its own chain, which `push` refuses; every struct in it is a live
-    // local of this function.
-    let device_create_info = unsafe { device_create_info.extend(&mut features) };
+        .enabled_extension_names(&extension_names);
+    // `features2` carries its own chain, which `push` refuses; every struct in it lives in
+    // `enabled`.
+    let device_create_info = unsafe { device_create_info.extend(&mut features2) };
 
     let device =
         unsafe { instance.create_device(physical_device.handel, &device_create_info, None)? };
@@ -704,198 +534,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing_subscriber::{Layer, layer::SubscriberExt};
-
-    fn names(features: &Features) -> Vec<String> {
-        features
-            .extensions()
-            .into_iter()
-            .map(|e| e.to_str().unwrap().to_owned())
-            .collect()
-    }
-
-    #[test]
-    fn headless_devices_need_no_extension() {
-        assert_eq!(
-            names(&Features::default()),
-            ["VK_KHR_device_address_commands"]
-        );
-    }
-
-    #[test]
-    fn each_feature_adds_its_device_extensions() {
-        // Without the extension every device needs.
-        let only = |f: Features| names(&f).split_off(1);
-        assert_eq!(
-            only(Features {
-                present: true,
-                ..Default::default()
-            }),
-            ["VK_KHR_swapchain"]
-        );
-        assert_eq!(
-            only(Features {
-                host_image_copy: true,
-                ..Default::default()
-            }),
-            ["VK_EXT_host_image_copy"]
-        );
-        assert_eq!(
-            only(Features {
-                mesh: true,
-                ..Default::default()
-            }),
-            ["VK_EXT_mesh_shader"]
-        );
-        assert_eq!(
-            only(Features {
-                memory_budget: true,
-                ..Default::default()
-            }),
-            ["VK_EXT_memory_budget"]
-        );
-        assert_eq!(
-            only(Features {
-                shader_clock: true,
-                ..Default::default()
-            }),
-            ["VK_KHR_shader_clock"]
-        );
-        assert_eq!(
-            only(Features {
-                performance_query: true,
-                ..Default::default()
-            }),
-            ["VK_KHR_performance_query"]
-        );
-        assert_eq!(
-            only(Features {
-                device_debug_utils: true,
-                ..Default::default()
-            }),
-            ["VK_EXT_debug_utils"]
-        );
-        assert_eq!(
-            only(Features {
-                acceleration_structure: true,
-                ..Default::default()
-            }),
-            [
-                "VK_KHR_deferred_host_operations",
-                "VK_KHR_acceleration_structure"
-            ]
-        );
-        assert_eq!(
-            only(Features {
-                ray_query: true,
-                ..Default::default()
-            }),
-            ["VK_KHR_ray_query"]
-        );
-        assert_eq!(
-            only(Features {
-                ray_tracing_pipeline: true,
-                ..Default::default()
-            }),
-            ["VK_KHR_ray_tracing_pipeline"]
-        );
-        // Instance-level validation alone needs no device extension.
-        assert!(
-            only(Features {
-                debug_utils: true,
-                ..Default::default()
-            })
-            .is_empty()
-        );
-    }
-
-    /// Runs `Features::features` and returns the optional feature structs it filled in.
-    fn requested(
-        features: &Features,
-    ) -> (
-        vk::PhysicalDeviceVulkan12Features<'static>,
-        vk::PhysicalDeviceVulkan13Features<'static>,
-        vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
-        vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
-        vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
-        vk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
-    ) {
-        let (mut vk11, mut vk12, mut vk13, mut mesh, mut ray, mut acc, mut hic) =
-            Default::default();
-        let (mut query, mut clock, mut performance, mut address_commands) = Default::default();
-        features.features(
-            &mut vk11,
-            &mut vk12,
-            &mut vk13,
-            &mut mesh,
-            &mut ray,
-            &mut acc,
-            &mut query,
-            &mut hic,
-            &mut clock,
-            &mut performance,
-            &mut address_commands,
-        );
-        // Detach the copies from the pNext chain that borrowed them.
-        vk12.p_next = std::ptr::null_mut();
-        vk13.p_next = std::ptr::null_mut();
-        mesh.p_next = std::ptr::null_mut();
-        ray.p_next = std::ptr::null_mut();
-        acc.p_next = std::ptr::null_mut();
-        query.p_next = std::ptr::null_mut();
-        (vk12, vk13, mesh, ray, acc, query)
-    }
-
-    #[test]
-    fn core_features_lava_relies_on_are_always_requested() {
-        let (vk12, vk13, mesh, ray, acc, query) = requested(&Features::default());
-        // Bindless descriptors, buffer pointers in push constants, sync2 barriers, dynamic rendering.
-        assert_eq!(vk12.buffer_device_address, vk::TRUE);
-        assert_eq!(vk12.runtime_descriptor_array, vk::TRUE);
-        assert_eq!(vk12.descriptor_binding_partially_bound, vk::TRUE);
-        assert_eq!(vk12.descriptor_binding_variable_descriptor_count, vk::TRUE);
-        assert_eq!(
-            vk12.descriptor_binding_update_unused_while_pending,
-            vk::TRUE
-        );
-        assert_eq!(vk12.timeline_semaphore, vk::TRUE);
-        assert_eq!(vk12.scalar_block_layout, vk::TRUE);
-        assert_eq!(vk13.synchronization2, vk::TRUE);
-        assert_eq!(vk13.dynamic_rendering, vk::TRUE);
-        assert_eq!(vk13.shader_demote_to_helper_invocation, vk::TRUE);
-
-        assert_eq!(mesh.mesh_shader, vk::FALSE);
-        assert_eq!(ray.ray_tracing_pipeline, vk::FALSE);
-        assert_eq!(acc.acceleration_structure, vk::FALSE);
-        assert_eq!(query.ray_query, vk::FALSE);
-    }
-
-    #[test]
-    fn optional_features_are_requested_only_when_enabled() {
-        let (_, _, mesh, ray, acc, query) = requested(&Features {
-            mesh: true,
-            ..Default::default()
-        });
-        assert_eq!((mesh.mesh_shader, mesh.task_shader), (vk::TRUE, vk::TRUE));
-        assert_eq!(ray.ray_tracing_pipeline, vk::FALSE);
-        assert_eq!(acc.acceleration_structure, vk::FALSE);
-        assert_eq!(query.ray_query, vk::FALSE);
-
-        let (_, _, mesh, ray, acc, query) = requested(&Features {
-            acceleration_structure: true,
-            ray_query: true,
-            ray_tracing_pipeline: true,
-            ..Default::default()
-        });
-        assert_eq!(mesh.mesh_shader, vk::FALSE);
-        assert_eq!(acc.acceleration_structure, vk::TRUE);
-        assert_eq!(
-            acc.descriptor_binding_acceleration_structure_update_after_bind,
-            vk::FALSE
-        );
-        assert_eq!(query.ray_query, vk::TRUE);
-        assert_eq!(ray.ray_tracing_pipeline, vk::TRUE);
-        assert_eq!(ray.ray_tracing_pipeline_trace_rays_indirect, vk::TRUE);
-    }
 
     #[test]
     fn debug_names_end_at_the_first_nul() {

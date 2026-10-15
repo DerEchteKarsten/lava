@@ -1,7 +1,7 @@
 #pragma once
-#define NUM_SAMPLERS 3
+// The application's samplers (`lava::Config::samplers`), then the sampled images.
 [vk::binding(0, 0)] SamplerState SamplerHeap[];
-[vk::binding(NUM_SAMPLERS, 0)] __DynamicResource TextureHeap[];
+[vk::binding(1, 0)] __DynamicResource TextureHeap[];
 [vk::binding(0, 1)] __DynamicResource RWTextureHeap[];
 
 /// Index of an unset bindless slot; matches `lava::bindless::NULL_HANDLE`.

@@ -1,9 +1,9 @@
-//! Global bindless descriptor sets: immutable samplers, caller-indexed image descriptors, handles
+//! Global bindless descriptor sets: the application's immutable samplers (`SamplerDesc`), caller-indexed image descriptors, handles
 use ash::vk::TaggedStructure;
 use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
-use ash::vk::{self, BorderColor, SamplerAddressMode, SamplerMipmapMode};
+use ash::vk::{self, BorderColor, Filter, SamplerAddressMode, SamplerMipmapMode};
 use bytemuck::{Pod, Zeroable};
 use lava_macros::validation_trace;
 
@@ -17,7 +17,6 @@ use crate::{
 pub struct Bindless {
     /// Descriptors allocated in the sampled (set 0) and storage (set 1) image arrays.
     counts: [u32; 2],
-    num_samplers: u32,
     layout: vk::PipelineLayout,
     layouts: [vk::DescriptorSetLayout; 2],
     /// Sampled images and storage images.
@@ -26,6 +25,76 @@ pub struct Bindless {
 }
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
+
+/// The binding of the sampled images in set 0, after the samplers' array (binding 0).
+const SAMPLED_IMAGES_BINDING: u32 = 1;
+
+/// An immutable sampler, which shaders pick by its index in `Config::samplers`
+/// (`Sample(uv, sampler)` in `bindless.slang`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplerDesc {
+    pub mag_filter: Filter,
+    pub min_filter: Filter,
+    pub mipmap_mode: SamplerMipmapMode,
+    /// Used for every coordinate.
+    pub address_mode: SamplerAddressMode,
+    /// The color outside the image with `CLAMP_TO_BORDER`.
+    pub border_color: BorderColor,
+    /// Anisotropic filtering up to this ratio; needs `Features::sampler_anisotropy`.
+    pub max_anisotropy: Option<f32>,
+}
+
+/// The samplers of `Config::new`: 0 takes the nearest texel of the nearest mip and 1 filters
+/// bilinearly within the nearest mip, both clamped to a white border; 2 filters trilinearly
+/// and repeats, for mipmapped textures.
+pub const DEFAULT_SAMPLERS: [SamplerDesc; 3] = [
+    SamplerDesc {
+        mag_filter: Filter::NEAREST,
+        min_filter: Filter::NEAREST,
+        mipmap_mode: SamplerMipmapMode::NEAREST,
+        address_mode: SamplerAddressMode::CLAMP_TO_BORDER,
+        border_color: BorderColor::FLOAT_OPAQUE_WHITE,
+        max_anisotropy: None,
+    },
+    SamplerDesc {
+        mag_filter: Filter::LINEAR,
+        min_filter: Filter::LINEAR,
+        mipmap_mode: SamplerMipmapMode::NEAREST,
+        address_mode: SamplerAddressMode::CLAMP_TO_BORDER,
+        border_color: BorderColor::FLOAT_OPAQUE_WHITE,
+        max_anisotropy: None,
+    },
+    SamplerDesc {
+        mag_filter: Filter::LINEAR,
+        min_filter: Filter::LINEAR,
+        mipmap_mode: SamplerMipmapMode::LINEAR,
+        address_mode: SamplerAddressMode::REPEAT,
+        border_color: BorderColor::FLOAT_TRANSPARENT_BLACK,
+        max_anisotropy: None,
+    },
+];
+
+impl SamplerDesc {
+    fn create(&self) -> Result<vk::Sampler> {
+        let mut info = vk::SamplerCreateInfo::default()
+            .mag_filter(self.mag_filter)
+            .min_filter(self.min_filter)
+            .mipmap_mode(self.mipmap_mode)
+            .address_mode_u(self.address_mode)
+            .address_mode_v(self.address_mode)
+            .address_mode_w(self.address_mode)
+            .border_color(self.border_color)
+            .max_lod(vk::LOD_CLAMP_NONE);
+        if let Some(ratio) = self.max_anisotropy {
+            assert!(
+                Ctx::features().sampler_anisotropy,
+                "anisotropic samplers need `Features::sampler_anisotropy`"
+            );
+            info = info.anisotropy_enable(true).max_anisotropy(ratio);
+        }
+        Ok(unsafe { Ctx::device().create_sampler(&info, None) }?)
+    }
+}
 
 static ON_DROP: OnceLock<fn(BindlessHandle)> = OnceLock::new();
 
@@ -140,7 +209,7 @@ pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
         .iter()
         .map(|(set, index, info)| {
             let (binding, ty) = match set {
-                0 => (bindless.num_samplers, vk::DescriptorType::SAMPLED_IMAGE),
+                0 => (SAMPLED_IMAGES_BINDING, vk::DescriptorType::SAMPLED_IMAGE),
                 _ => (0, vk::DescriptorType::STORAGE_IMAGE),
             };
             vk::WriteDescriptorSet::default()
@@ -163,45 +232,13 @@ impl Bindless {
     pub(crate) fn layout() -> vk::PipelineLayout {
         Self::get().layout
     }
-    pub(crate) fn init() -> Result<()> {
+    pub(crate) fn init(samplers: &[SamplerDesc]) -> Result<()> {
+        assert!(!samplers.is_empty(), "shaders sample with sampler 0 by default");
         let mut layouts = [vk::DescriptorSetLayout::default(); 2];
-        // Sampler 0: nearest texel of the nearest mip, clamped to a white border.
-        let sci2 = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
-            .mipmap_mode(SamplerMipmapMode::NEAREST)
-            .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
-            .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
-            .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
-            .border_color(BorderColor::FLOAT_OPAQUE_WHITE)
-            .max_lod(vk::LOD_CLAMP_NONE);
-
-        // Sampler 1: bilinear within the nearest mip, clamped to a white border.
-        let sci = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .border_color(BorderColor::FLOAT_OPAQUE_WHITE)
-            .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
-            .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
-            .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
-            .mipmap_mode(SamplerMipmapMode::NEAREST)
-            .max_lod(vk::LOD_CLAMP_NONE);
-
-        // Sampler 2: trilinear + repeat, what mipmapped material textures use.
-        let sci3 = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(SamplerMipmapMode::LINEAR)
-            .address_mode_u(SamplerAddressMode::REPEAT)
-            .address_mode_v(SamplerAddressMode::REPEAT)
-            .address_mode_w(SamplerAddressMode::REPEAT)
-            .max_lod(vk::LOD_CLAMP_NONE);
-
-        let samplers = [
-            unsafe { Ctx::device().create_sampler(&sci2, None) }?,
-            unsafe { Ctx::device().create_sampler(&sci, None) }?,
-            unsafe { Ctx::device().create_sampler(&sci3, None) }?,
-        ];
+        let samplers = samplers
+            .iter()
+            .map(SamplerDesc::create)
+            .collect::<Result<Vec<_>>>()?;
         let descriptor_binding_flags = [
             vk::DescriptorBindingFlags::empty(),
             vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
@@ -232,7 +269,7 @@ impl Bindless {
             }
             .immutable_samplers(&samplers),
             vk::DescriptorSetLayoutBinding {
-                binding: samplers.len() as u32,
+                binding: SAMPLED_IMAGES_BINDING,
                 descriptor_count: desc_counts[0],
                 descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                 stage_flags: vk::ShaderStageFlags::ALL,
@@ -321,7 +358,6 @@ impl Bindless {
         BINDLESS
             .set(Self {
                 counts: desc_counts,
-                num_samplers: samplers.len() as u32,
                 layout,
                 layouts,
                 sets,
