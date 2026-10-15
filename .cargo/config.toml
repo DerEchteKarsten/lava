@@ -1,0 +1,6 @@
+[env]
+# The Slang SDK lava-build-slang compiles with (gitignored; any Slang release or Vulkan SDK works).
+SLANG_DIR = { value = "slang-sdk", relative = true }
+
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/home/karsten/code/lava/slang-sdk/lib"]

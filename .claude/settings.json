@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo run -q --release --manifest-path ../GameEngine/tools/Cargo.toml --target-dir ../GameEngine/target/tools -- --root . --print",
+            "timeout": 180
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(./target/**)",
+      "Read(./slang-sdk/**)",
+      "Read(./**/*.spv)",
+      "Read(./Cargo.lock)"
+    ]
+  }
+}
