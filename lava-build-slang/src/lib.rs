@@ -78,7 +78,8 @@ impl Shaders {
             println!("cargo::rerun-if-changed={dir}");
         }
         println!("cargo::rerun-if-changed={SLANG_DIR}");
-        let out_dir = Path::new(&env::var("OUT_DIR").expect("called from a build script")).join("lava");
+        let out_dir =
+            Path::new(&env::var("OUT_DIR").expect("called from a build script")).join("lava");
         codegen::generate(&self, &out_dir);
     }
 }

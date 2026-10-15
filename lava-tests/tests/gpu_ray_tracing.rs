@@ -14,9 +14,10 @@ use lava::{
     },
     command_buffer::{CommandBuffer, TraceRaysIndirectCommand},
     image::{Image, format::R8G8B8A8Unorm, usage::StorageTransferSrcTransferDst},
+    query::QueryPool,
     state::Ctx,
     vkobjects::acceleration_structure::{
-        Aabb, Aabbs, Blas, BlasGeometry, BuildFlags, CompactedSizes, Instance, Instances, Tlas,
+        Aabb, Aabbs, Blas, BlasGeometry, BuildFlags, Instance, Instances, Tlas,
         Triangles, scratch_alignment,
     },
 };
@@ -395,12 +396,12 @@ fn compacted_structures_trace_the_same_image() {
         _inputs,
     } = scene(&gpu, compactable, BuildFlags::default());
 
-    let queried = CompactedSizes::new(3).unwrap();
+    let queried = QueryPool::compacted_sizes(3).unwrap();
     let mut sizes = [0; 3];
     // Polling never waits: nothing was queried yet.
-    assert!(!queried.read(&mut sizes).unwrap());
-    gpu.submit(|cmd| cmd.query_compacted_sizes(&[&wall, &triangle, &sphere], &queried));
-    assert!(queried.read(&mut sizes).unwrap());
+    assert!(!queried.read(0, &mut sizes).unwrap());
+    gpu.submit(|cmd| cmd.query_compacted_sizes(&[&wall, &triangle, &sphere], &queried, 0));
+    assert!(queried.read(0, &mut sizes).unwrap());
     for (size, blas) in sizes.iter().zip([&wall, &triangle, &sphere]) {
         assert!(0 < *size && *size <= blas.size(), "compacted {size} of {}", blas.size());
     }

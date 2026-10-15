@@ -1,23 +1,8 @@
-//! GPU profiling: the timestamps and pass queries (pipeline statistics and hardware counters), two independent systems, plus GPU memory
+//! GPU memory: what lava's allocator holds, and each heap's usage and budget
 use ash::vk;
 use ash::vk::TaggedStructure;
 
-use crate::{
-    error::Result,
-    state::{Ctx, Functions},
-};
-
-pub mod counters;
-pub mod timestamps;
-
-pub use counters::{
-    Counter, CounterUnit, MAX_COUNTERS, PassCounters, PassQueries, PassResult, PipelineStats,
-};
-pub use timestamps::{GpuScope, TimestampQueries};
-
-pub(crate) fn init() -> Result<()> {
-    counters::init()
-}
+use crate::state::{Ctx, Functions};
 
 /// GPU memory: what lava's allocator holds, and what each heap has in use.
 #[derive(Clone, Debug, Default)]

@@ -127,6 +127,7 @@ impl PhysicalDevice {
             .push(&mut address_commands);
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
         let pipeline_statistics = features2.features.pipeline_statistics_query == vk::TRUE;
+        let precise_occlusion = features2.features.occlusion_query_precise == vk::TRUE;
 
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut rt_pipeline_properties)
@@ -150,8 +151,7 @@ impl PhysicalDevice {
         };
         let acceleration_structure = has_extension(ash::khr::acceleration_structure::NAME)
             && has_extension(ash::khr::deferred_host_operations::NAME)
-            && acceleration_struct_feature.acceleration_structure == vk::TRUE
-            && features12.host_query_reset == vk::TRUE;
+            && acceleration_struct_feature.acceleration_structure == vk::TRUE;
         let device_address_commands = has_extension(ash::khr::device_address_commands::NAME)
             && address_commands.device_address_commands == vk::TRUE;
         let features = Features {
@@ -183,6 +183,7 @@ impl PhysicalDevice {
             performance_query: has_extension(ash::khr::performance_query::NAME)
                 && performance.performance_counter_query_pools == vk::TRUE,
             calibrated_timestamps: has_extension(ash::khr::calibrated_timestamps::NAME),
+            precise_occlusion,
         };
 
         Ok(Self {
@@ -298,10 +299,9 @@ impl PhysicalDevice {
         features.mesh_queries = device.supported_features.mesh_queries;
         features.memory_budget = device.supported_features.memory_budget;
         features.shader_clock = device.supported_features.shader_clock;
-        features.performance_query =
-            cfg!(feature = "profiling") && device.supported_features.performance_query;
-        features.calibrated_timestamps =
-            cfg!(feature = "profiling") && device.supported_features.calibrated_timestamps;
+        features.performance_query = device.supported_features.performance_query;
+        features.calibrated_timestamps = device.supported_features.calibrated_timestamps;
+        features.precise_occlusion = device.supported_features.precise_occlusion;
         Ok((device.clone(), graphics, transfer_queue))
     }
 }
@@ -530,6 +530,7 @@ mod tests {
             shader_clock: true,
             performance_query: true,
             calibrated_timestamps: true,
+            precise_occlusion: true,
         };
 
         // Without validation the device debug utils stay off, and `present` is the caller's.

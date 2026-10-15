@@ -16,6 +16,7 @@ use crate::{
     command_buffer::{BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE},
     epoch,
     error::{Error, Result},
+    query::{CompactedSize, QueryPool},
     state::{Ctx, Functions},
 };
 
@@ -33,7 +34,7 @@ const TRACE_READ: vk::AccessFlags2 =
 /// What `vkCreateAccelerationStructure2KHR` requires of a structure's address and size.
 const STRUCTURE_ALIGNMENT: u64 = 256;
 
-fn functions() -> Result<&'static ash::khr::acceleration_structure::Device> {
+pub(crate) fn functions() -> Result<&'static ash::khr::acceleration_structure::Device> {
     Functions::acceleration_structure().ok_or_else(|| {
         Error::message(
             "acceleration structures aren't supported by this device (`Ctx::features().acceleration_structure`)",
@@ -252,7 +253,7 @@ impl<L: Level> AccelerationStructure<L> {
         self.update_scratch
     }
 
-    /// An unbuilt structure of `size` bytes (read with [`CompactedSizes::read`]) with this
+    /// An unbuilt structure of `size` bytes (read from a `QueryPool<CompactedSize>`) with this
     /// one's flags, for [`CommandBuffer::compact`].
     pub fn compacted(&self, size: u64) -> Result<Self> {
         Self::create(
@@ -648,57 +649,6 @@ impl Describe for Instances<'_> {
     }
 }
 
-// ---- compaction -------------------------------------------------------------------------
-
-/// The compacted sizes [`CommandBuffer::query_compacted_sizes`] writes, read on the host once
-/// that submission finished. Destroyed once no frame can reach it any more (`epoch`).
-pub struct CompactedSizes {
-    pool: vk::QueryPool,
-    count: u32,
-}
-
-impl CompactedSizes {
-    /// Room for the sizes of `count` structures.
-    pub fn new(count: u32) -> Result<Self> {
-        functions()?;
-        let pool = unsafe {
-            Ctx::device().create_query_pool(
-                &vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
-                    .query_count(count),
-                None,
-            )?
-        };
-        // Unavailable until written, so `read` can poll before the query ran.
-        unsafe { Ctx::device().reset_query_pool(pool, 0, count) };
-        Ok(Self { pool, count })
-    }
-
-    /// Never waits: writes the sizes of the first `sizes.len()` structures and returns true
-    /// once the submission that queried them finished, else returns false.
-    pub fn read(&self, sizes: &mut [u64]) -> Result<bool> {
-        assert!(sizes.len() as u32 <= self.count);
-        if sizes.is_empty() {
-            return Ok(true);
-        }
-        let result = unsafe {
-            Ctx::device().get_query_pool_results(self.pool, 0, sizes, vk::QueryResultFlags::TYPE_64)
-        };
-        match result {
-            Ok(()) => Ok(true),
-            Err(vk::Result::NOT_READY) => Ok(false),
-            Err(err) => Err(err.into()),
-        }
-    }
-}
-
-impl Drop for CompactedSizes {
-    fn drop(&mut self) {
-        let pool = self.pool;
-        epoch::retire(move || unsafe { Ctx::device().destroy_query_pool(pool, None) });
-    }
-}
-
 // ---- commands ---------------------------------------------------------------------------
 
 impl CommandBuffer {
@@ -852,18 +802,19 @@ impl CommandBuffer {
     }
 
     /// Writes the compacted sizes of `structures` (each with `allow_compaction`, built before)
-    /// into the first queries of `sizes`.
+    /// into the queries of `sizes` from `first` on.
     #[validation_trace]
     pub fn query_compacted_sizes<L: Level>(
         &mut self,
         structures: &[&AccelerationStructure<L>],
-        sizes: &CompactedSizes,
+        sizes: &QueryPool<CompactedSize>,
+        first: u32,
     ) {
         let count = structures.len() as u32;
         assert!(
-            count <= sizes.count,
-            "{count} sizes don't fit {} queries",
-            sizes.count
+            first + count <= sizes.count(),
+            "{count} sizes from {first} on don't fit {} queries",
+            sizes.count()
         );
         assert!(
             structures.iter().all(|s| s.flags.allow_compaction),
@@ -871,15 +822,15 @@ impl CommandBuffer {
         );
         let accesses: SmallVec<[_; 8]> = structures.iter().map(|s| s.access(BUILD, READ)).collect();
         self.flush_pending(std::iter::empty(), accesses.iter().cloned());
+        sizes.record(self.epoch);
         let handles: SmallVec<[_; 8]> = structures.iter().map(|s| s.handle).collect();
         unsafe {
-            Ctx::device().cmd_reset_query_pool(self.handle, sizes.pool, 0, count);
             command_functions().cmd_write_acceleration_structures_properties(
                 self.handle,
                 &handles,
                 vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
-                sizes.pool,
-                0,
+                sizes.handle,
+                first,
             );
         }
     }

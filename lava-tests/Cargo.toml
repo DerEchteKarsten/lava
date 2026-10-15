@@ -20,11 +20,6 @@ smallvec = { workspace = true }
 [build-dependencies]
 lava-build-slang = { path = "../lava-build-slang" }
 
-[features]
-default = ["profiling"]
-# lava's feature, so `--no-default-features` tests lava without it.
-profiling = []
-
 [[test]]
 name = "gpu_window"
 harness = false

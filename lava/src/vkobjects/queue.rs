@@ -1,12 +1,6 @@
 //! Queue submission and sync: queue leases with their pending accesses, semaphores, fences, frame slots with their epochs, presenting
 use ash::vk::TaggedStructure;
-use std::{
-    fmt::Debug,
-    marker::PhantomData,
-    ops::Range,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{fmt::Debug, marker::PhantomData, ops::Range, sync::Mutex};
 
 use crate::error::{Error, Result};
 use ash::vk;
@@ -16,7 +10,6 @@ use smallvec::SmallVec;
 use crate::{
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
     epoch::{self, Epoch},
-    profiling::{Counter, GpuScope, PassCounters, PassQueries, TimestampQueries},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -443,10 +436,6 @@ pub struct FrameSlot {
     fence: Fence,
     submitted: bool,
     family: u32,
-    timestamps_on: bool,
-    timestamps: Option<TimestampQueries>,
-    counter_selection: Option<Arc<[&'static Counter]>>,
-    counters: Option<PassQueries>,
 }
 
 impl FrameSlot {
@@ -461,25 +450,7 @@ impl FrameSlot {
             fence: Fence::new()?,
             submitted: false,
             family: queue.family.family,
-            timestamps_on: false,
-            timestamps: None,
-            counter_selection: None,
-            counters: None,
         })
-    }
-
-    /// Times the scopes of the frames begun from now on; see [`Frame::last_timestamps`]. Does
-    /// nothing without the `profiling` feature.
-    pub fn set_timestamps(&mut self, on: bool) {
-        self.timestamps_on = on && cfg!(feature = "profiling");
-    }
-
-    /// Counts every pass and rendering of the frames begun from now on, with pipeline
-    /// statistics and the hardware counters of `selection` (`None`: no pass queries); see
-    /// [`Frame::last_counters`]. A selection of more than `MAX_COUNTERS` or more than one pass
-    /// fails the next `begin`. Does nothing without the `profiling` feature.
-    pub fn set_counters(&mut self, selection: Option<Arc<[&'static Counter]>>) {
-        self.counter_selection = selection.filter(|_| cfg!(feature = "profiling"));
     }
 
     /// Waits for the frame this slot submitted last, completes its epoch, and begins one of
@@ -489,36 +460,12 @@ impl FrameSlot {
     pub fn begin(&mut self, epoch: Epoch) -> Result<Frame<'_>> {
         if self.submitted {
             tracing::info_span!("wait for frame slot").in_scope(|| self.fence.wait())?;
-            if let Some(timestamps) = &mut self.timestamps {
-                timestamps.read()?;
-            }
-            if let Some(counters) = &mut self.counters {
-                counters.read()?;
-            }
             self.fence.reset()?;
             self.pool.reset()?;
             self.submitted = false;
         }
         // Also after a frame that failed before it was submitted.
         self.epoch = Some(epoch);
-        // The pools are idle now. A new counter selection needs new ones.
-        if !self.timestamps_on {
-            self.timestamps = None;
-        } else if self.timestamps.is_none() {
-            self.timestamps = Some(TimestampQueries::new(self.family)?);
-        }
-        let selection = &self.counter_selection;
-        let current = |counters: &PassQueries| {
-            selection
-                .as_ref()
-                .is_some_and(|s| Arc::ptr_eq(s, counters.selection()))
-        };
-        if !self.counters.as_ref().is_some_and(current) {
-            self.counters = None;
-            if let Some(selection) = selection {
-                self.counters = Some(PassQueries::new(self.family, selection.clone())?);
-            }
-        }
         Ok(Frame { slot: self })
     }
 }
@@ -528,22 +475,6 @@ pub struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    /// The GPU scopes of the frame this slot submitted before, if it was timed.
-    pub fn last_timestamps(&self) -> Option<&[GpuScope]> {
-        self.slot.timestamps.as_ref()?.results()
-    }
-
-    /// When the root scope of `last_timestamps` started, on the host's clock: from
-    /// `VK_KHR_calibrated_timestamps` (`Features::calibrated_timestamps`), `None` without it.
-    pub fn last_timestamps_start(&self) -> Option<Instant> {
-        self.slot.timestamps.as_ref()?.root_start()
-    }
-
-    /// The pass queries of the frame this slot submitted before, if it was counted.
-    pub fn last_counters(&self) -> Option<&PassCounters> {
-        self.slot.counters.as_ref()?.results()
-    }
-
     /// Records `executor` and submits it to `queue`, after the earlier submissions to it. A
     /// frame that fails before it is submitted completes its epoch right away.
     #[validation_trace]
@@ -617,9 +548,7 @@ impl<A> PendingWrite<A> {
     }
 }
 
-/// Records `executor` into `buffer` and submits it. With `timestamps`, the recording is
-/// timed: the root scope "frame" around it, plus every pass and `begin_scope`. With
-/// `counters`, every pass is counted.
+/// Records `executor` into the slot's command buffer and submits it.
 #[validation_trace]
 fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     queue: &Queue<Q>,
@@ -633,12 +562,13 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     // barriers were computed in.
     let mut pending = queue.family.pending[queue.index].lock().unwrap();
     unsafe {
-        let mut cmd_buffer = CommandBuffer {
-            handle: buffer.handle,
-            pending_accesses: std::mem::take(&mut *pending),
-            timestamps: slot.timestamps.take(),
-            counters: slot.counters.take(),
-        };
+        let epoch = slot.epoch.as_ref().map_or(0, Epoch::value);
+        let mut cmd_buffer = CommandBuffer::new(
+            buffer.handle,
+            std::mem::take(&mut *pending),
+            epoch,
+            slot.family,
+        );
 
         // Put back whatever happens: they describe what earlier submissions do.
         let recorded = cmd_buffer.begin();
@@ -646,20 +576,10 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
             *pending = cmd_buffer.pending_accesses;
             return recorded;
         }
-        if let Some(timestamps) = &mut cmd_buffer.timestamps {
-            timestamps.reset(buffer.handle);
-        }
-        if let Some(counters) = &mut cmd_buffer.counters {
-            counters.reset(buffer.handle);
-        }
-        cmd_buffer.begin_scope("frame");
         let prev = CALLSITE.replace(None);
         executor(&mut cmd_buffer);
         CALLSITE.set(prev);
-        cmd_buffer.end_scope();
         host_barrier(buffer.handle);
-        slot.timestamps = cmd_buffer.timestamps.take();
-        slot.counters = cmd_buffer.counters.take();
         *pending = std::mem::take(&mut cmd_buffer.pending_accesses);
         cmd_buffer.end()?;
 

@@ -1,4 +1,4 @@
-//! Headless GPU tests: buffers, images, sync, command recording, and golden images per pass type
+//! Headless GPU tests: buffers, images, sync, command recording, queries, and golden images per pass type
 //!
 //! These run on the real GPU with the validation layer on; every test fails if the layer
 //! reports an error. The passes come from `lava-tests/shaders`, not from the engine.
@@ -32,7 +32,10 @@ use lava::{
             Storage as StorageImage, StorageTransferSrcTransferDst,
         },
     },
-    profiling::counters,
+    query::{
+        Performance, PipelineStatistics, PipelineStats, QueryPipelineStatisticFlags as Statistics,
+        QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Timestamp, counters,
+    },
     state::Ctx,
     vkobjects::queue::{Binary, FrameSlot, Gfx, Queue, Semaphore, Timeline},
 };
@@ -292,16 +295,15 @@ fn frame_slot_can_be_reused_and_what_its_frame_used_lives_until_the_frame_is_don
 }
 
 /// A group of two compute passes, then a rendering if the device has mesh shaders.
-#[cfg(feature = "profiling")]
 fn record_profiled(cmd: &mut CommandBuffer, target: &Target) {
-    cmd.begin_scope("group");
-    for color in [Vec4::ONE, Vec4::ZERO] {
-        cmd.compute(
-            &TestComputeImage::push_bindings(target.whole_view(), color, UVec2::ZERO, EXTENT),
-            [SIZE / 8, SIZE / 8, 1],
-        );
-    }
-    cmd.end_scope();
+    cmd.scope("group", |cmd| {
+        for color in [Vec4::ONE, Vec4::ZERO] {
+            cmd.compute(
+                &TestComputeImage::push_bindings(target.whole_view(), color, UVec2::ZERO, EXTENT),
+                [SIZE / 8, SIZE / 8, 1],
+            );
+        }
+    });
     if Ctx::features().mesh {
         cmd.raster(EXTENT)
             .color_attachment(target.whole_view(), None)
@@ -314,135 +316,299 @@ fn record_profiled(cmd: &mut CommandBuffer, target: &Target) {
     }
 }
 
-/// Submits `record_profiled` from `slot` and begins it again, which reads the results back.
-#[cfg(feature = "profiling")]
-fn submit_profiled<'a>(
-    gpu: &common::Gpu,
-    slot: &'a mut FrameSlot,
-    target: &Target,
-) -> lava::vkobjects::queue::Frame<'a> {
-    slot.begin(epoch::reserve())
-        .unwrap()
-        .execute(&gpu.queue, &[], &[], |cmd| {
-            record_profiled(cmd, target)
-        })
-        .unwrap();
-    slot.begin(epoch::reserve()).unwrap()
+/// Submits `record_profiled` measured by `observer` under the root "frame", and waits for it.
+fn submit_profiled(gpu: &common::Gpu, observer: &mut TestObserver, target: &Target) {
+    gpu.submit(|cmd| cmd.measure(Some(observer), "frame", |cmd| record_profiled(cmd, target)));
+}
+
+/// Logs every scope it sees and times it with two timestamps, and gives every pass a statistics
+/// and a counter query if it has the pools and no query of that kind is active.
+struct TestObserver {
+    timestamps: QueryPool<Timestamp>,
+    statistics: Option<QueryPool<PipelineStatistics>>,
+    counters: Option<QueryPool<Performance>>,
+    /// Every hook call: name, depth, pass, and whether it entered.
+    events: Vec<(&'static str, u16, bool, bool)>,
+    /// Per scope in entry order, and per pass in entry order with its queries.
+    scopes: usize,
+    passes: Vec<(&'static str, Option<u32>, Option<u32>)>,
+    /// Per open scope: its index and, for a pass, its index in `passes`.
+    open: Vec<(usize, Option<usize>)>,
+}
+
+impl TestObserver {
+    fn new(statistics: Statistics, counters: &[&'static counters::Counter]) -> Self {
+        Self {
+            timestamps: QueryPool::timestamps(32).unwrap(),
+            statistics: (!statistics.is_empty())
+                .then(|| QueryPool::statistics(8, statistics).unwrap()),
+            counters: (!counters.is_empty()).then(|| QueryPool::performance(8, counters).unwrap()),
+            events: Vec::new(),
+            scopes: 0,
+            passes: Vec::new(),
+            open: Vec::new(),
+        }
+    }
+
+    /// The start and end of every scope in entry order, in ns since the first started.
+    fn times(&self) -> Vec<(u64, u64)> {
+        let mut ticks = vec![0; 2 * self.scopes];
+        assert!(self.timestamps.read(0, &mut ticks).unwrap(), "the recording finished");
+        let ns = |tick| self.timestamps.elapsed_ns(ticks[0], tick);
+        ticks.chunks(2).map(|t| (ns(t[0]), ns(t[1]))).collect()
+    }
+}
+
+impl ScopeObserver for TestObserver {
+    fn on_enter(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo) {
+        self.events.push((scope.name, scope.depth, scope.pass, true));
+        let index = self.scopes;
+        self.scopes += 1;
+        let start = 2 * index as u32;
+        queries.write_timestamp(&self.timestamps, start, lava::PipelineStageFlags2::NONE);
+        let mut pass = None;
+        if scope.pass {
+            let used = self.passes.len() as u32;
+            let statistics = (self.statistics.as_ref())
+                .filter(|_| !queries.is_active::<PipelineStatistics>())
+                .map(|pool| {
+                    queries.begin_query(pool, used);
+                    used
+                });
+            let counters = (self.counters.as_ref())
+                .filter(|_| !queries.is_active::<Performance>())
+                .map(|pool| {
+                    queries.begin_query(pool, used);
+                    used
+                });
+            pass = Some(self.passes.len());
+            self.passes.push((scope.name, statistics, counters));
+        }
+        self.open.push((index, pass));
+    }
+
+    fn on_exit(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo) {
+        self.events.push((scope.name, scope.depth, scope.pass, false));
+        let (index, pass) = self.open.pop().unwrap();
+        if let Some(pass) = pass {
+            let (_, statistics, counters) = self.passes[pass];
+            if let (Some(pool), Some(query)) = (&self.counters, counters) {
+                queries.end_query(pool, query);
+            }
+            if let (Some(pool), Some(query)) = (&self.statistics, statistics) {
+                queries.end_query(pool, query);
+            }
+        }
+        let end = 2 * index as u32 + 1;
+        queries.write_timestamp(&self.timestamps, end, lava::PipelineStageFlags2::ALL_COMMANDS);
+    }
 }
 
 #[test]
-#[cfg(feature = "profiling")]
-fn timestamps_time_scopes_and_passes() {
+fn observers_see_every_scope_and_pass_once_in_nesting_order() {
     let gpu = gpu();
     let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(0);
-    let mut slot = FrameSlot::new(&gpu.queue).unwrap();
-    slot.set_timestamps(true);
-    assert!(
-        slot.begin(epoch::reserve()).unwrap().last_timestamps().is_none(),
-        "nothing was submitted yet"
-    );
-    let frame = submit_profiled(&gpu, &mut slot, &target);
-    let scopes = frame
-        .last_timestamps()
-        .expect("the frame was timed")
-        .to_vec();
-    assert!(frame.last_counters().is_none(), "pass queries are off");
-    drop(frame);
-    let names: Vec<_> = scopes.iter().map(|s| (s.name, s.depth)).collect();
+    let mut observer = TestObserver::new(Statistics::empty(), &[]);
+    submit_profiled(&gpu, &mut observer, &target);
     let mut expected = vec![
-        ("frame", 0),
-        ("group", 1),
-        ("TestComputeImage", 2),
-        ("TestComputeImage", 2),
+        ("frame", 0, false, true),
+        ("group", 1, false, true),
+        ("TestComputeImage", 2, true, true),
+        ("TestComputeImage", 2, true, false),
+        ("TestComputeImage", 2, true, true),
+        ("TestComputeImage", 2, true, false),
+        ("group", 1, false, false),
     ];
     if Ctx::features().mesh {
-        expected.push(("TestMesh", 1));
+        expected.extend([("TestMesh", 1, true, true), ("TestMesh", 1, true, false)]);
     }
-    assert_eq!(names, expected);
-    for scope in &scopes {
-        assert!(scope.start_ns <= scope.end_ns, "{scope:?}");
+    expected.push(("frame", 0, false, false));
+    assert_eq!(observer.events, expected);
+
+    // Scopes in entry order: frame, group, the two passes.
+    let times = observer.times();
+    for (start, end) in &times {
+        assert!(start <= end, "{times:?}");
     }
-    assert_eq!(scopes[0].start_ns, 0);
-    assert!(scopes[0].end_ns > 0);
+    assert!(times[0].1 > 0);
     let inside = |child: usize, parent: usize| {
-        scopes[parent].start_ns <= scopes[child].start_ns
-            && scopes[child].end_ns <= scopes[parent].end_ns
+        times[parent].0 <= times[child].0 && times[child].1 <= times[parent].1
     };
     assert!(inside(1, 0) && inside(2, 1) && inside(3, 1));
-    assert!(
-        scopes[3].start_ns >= scopes[2].end_ns,
-        "passes run in order"
-    );
+    assert!(times[3].0 >= times[2].1, "passes run in order");
 
-    slot.set_timestamps(false);
-    assert!(
-        submit_profiled(&gpu, &mut slot, &target)
-            .last_timestamps()
-            .is_none()
-    );
+    // Without an observer, a scope is only a label.
+    gpu.submit(|cmd| cmd.measure(None, "frame", |cmd| record_profiled(cmd, &target)));
+    assert_eq!(observer.events.len(), expected.len());
 }
 
 #[test]
-#[cfg(feature = "profiling")]
-fn pass_queries_count_passes_and_renderings() {
+fn observers_count_passes_and_renderings_with_queries() {
     let gpu = gpu();
     let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(0);
-    let mesh = Ctx::features().mesh;
+    let features = Ctx::features();
+    let mesh = features.mesh;
     // One counter, which always fits a single pass. A time counter, if the device has one,
     // can't be 0 for a pass.
     let all = counters::counters();
     let counter = (all.iter())
         .find(|c| c.unit == counters::CounterUnit::Nanoseconds)
         .or(all.first());
-    let selection: std::sync::Arc<[&'static counters::Counter]> = counter.into_iter().collect();
-    let mut slot = FrameSlot::new(&gpu.queue).unwrap();
-    slot.set_counters(Some(selection.clone()));
-    let frame = submit_profiled(&gpu, &mut slot, &target);
-    let results = frame
-        .last_counters()
-        .expect("the frame was counted")
-        .clone();
-    assert!(frame.last_timestamps().is_none(), "timestamps are off");
-    drop(frame);
-    assert!(std::sync::Arc::ptr_eq(&results.counters, &selection));
+    let selection: Vec<&'static counters::Counter> = counter.into_iter().collect();
+    let mut statistics = Statistics::empty();
+    if features.pipeline_statistics {
+        statistics = Statistics::FRAGMENT_SHADER_INVOCATIONS | Statistics::COMPUTE_SHADER_INVOCATIONS;
+    }
+    if features.pipeline_statistics && features.mesh_queries {
+        statistics |= Statistics::MESH_SHADER_INVOCATIONS_EXT;
+    }
+    let mut observer = TestObserver::new(statistics, &selection);
+    submit_profiled(&gpu, &mut observer, &target);
 
-    // Groups aren't counted, only passes and renderings.
-    let names: Vec<_> = results.passes.iter().map(|p| p.name).collect();
+    let names: Vec<_> = observer.passes.iter().map(|p| p.0).collect();
     let mut expected = vec!["TestComputeImage", "TestComputeImage"];
     if mesh {
         expected.push("TestMesh");
     }
     assert_eq!(names, expected);
-    if Ctx::features().pipeline_statistics {
-        for pass in &results.passes[..2] {
-            let stats = pass.stats.unwrap();
-            assert_eq!(stats.compute, (SIZE * SIZE) as u64);
-            assert_eq!(stats.fragment, 0);
+    let passes = observer.passes.len();
+    if let Some(pool) = &observer.statistics {
+        let mut stats = vec![PipelineStats::default(); passes];
+        assert!(pool.read(0, &mut stats).unwrap());
+        let count = |pass: usize, statistic| stats[pass].get(statistic);
+        for pass in 0..2 {
+            let compute = Statistics::COMPUTE_SHADER_INVOCATIONS;
+            assert_eq!(count(pass, compute), Some((SIZE * SIZE) as u64));
+            assert_eq!(count(pass, Statistics::FRAGMENT_SHADER_INVOCATIONS), Some(0));
         }
         if mesh {
-            let stats = results.passes[2].stats.unwrap();
-            assert!(stats.fragment > 0 && stats.compute == 0);
-            if Ctx::features().mesh_queries {
-                assert!(stats.mesh > 0);
+            assert!(count(2, Statistics::FRAGMENT_SHADER_INVOCATIONS).unwrap() > 0);
+            assert_eq!(count(2, Statistics::COMPUTE_SHADER_INVOCATIONS), Some(0));
+            if features.mesh_queries {
+                assert!(count(2, Statistics::MESH_SHADER_INVOCATIONS_EXT).unwrap() > 0);
             }
         }
     }
-    for pass in &results.passes {
-        assert_eq!(pass.values.is_some(), counter.is_some(), "{}", pass.name);
-        if let (Some(values), Some(counter)) = (pass.values, counter) {
-            assert!(values[0].is_finite() && values[0] >= 0.0, "{}", values[0]);
+    if let (Some(pool), Some(counter)) = (&observer.counters, counter) {
+        let mut values = vec![0.0; passes];
+        assert!(pool.read(0, &mut values).unwrap());
+        for (value, (name, ..)) in values.iter().zip(&observer.passes) {
+            assert!(value.is_finite() && *value >= 0.0, "{name}: {value}");
             if counter.unit == counters::CounterUnit::Nanoseconds {
-                assert!(values[0] > 0.0, "{}: {}", pass.name, values[0]);
+                assert!(*value > 0.0, "{name}: {value}");
             }
         }
+    }
+}
+
+#[test]
+fn a_panic_inside_measure_detaches_the_observer() {
+    let gpu = gpu();
+    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(0);
+    let mut observer = TestObserver::new(Statistics::empty(), &[]);
+    gpu.submit(|cmd| {
+        let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cmd.measure(Some(&mut observer), "frame", |_| panic!("the recording failed"))
+        }));
+        assert!(measured.is_err());
+        // The observer's borrow ended, so this pass must not reach it.
+        cmd.compute(
+            &TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT),
+            [SIZE / 8, SIZE / 8, 1],
+        );
+    });
+    assert_eq!(observer.events, [("frame", 0, false, true)]);
+}
+
+#[test]
+fn timestamp_pools_are_read_without_waiting_and_hold_one_recording() {
+    let gpu = gpu();
+    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(0);
+    let pool = QueryPool::timestamps(2).unwrap();
+    let mut ticks = [0; 2];
+    assert!(!pool.read(0, &mut ticks).unwrap(), "nothing was written yet");
+    gpu.submit(|cmd| {
+        cmd.write_timestamp(&pool, 0, lava::PipelineStageFlags2::NONE);
+        cmd.compute(
+            &TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT),
+            [SIZE / 8, SIZE / 8, 1],
+        );
+        cmd.write_timestamp(&pool, 1, lava::PipelineStageFlags2::ALL_COMMANDS);
+    });
+    assert!(pool.read(0, &mut ticks).unwrap());
+    assert!(pool.elapsed_ns(ticks[0], ticks[1]) > 0, "the dispatch took time");
+    if Ctx::features().calibrated_timestamps {
+        assert!(pool.instant(ticks[0]).unwrap() <= std::time::Instant::now());
     }
 
-    slot.set_counters(None);
-    assert!(
-        submit_profiled(&gpu, &mut slot, &target)
-            .last_counters()
-            .is_none()
-    );
+    // A recording resets the pool, so what it didn't write reads as unavailable.
+    gpu.submit(|cmd| cmd.write_timestamp(&pool, 0, lava::PipelineStageFlags2::ALL_COMMANDS));
+    assert!(!pool.read(0, &mut ticks).unwrap(), "query 1 belongs to the older recording");
+    assert!(pool.read(0, &mut ticks[..1]).unwrap());
+}
+
+#[test]
+fn statistics_queries_count_their_commands_and_keep_observers_from_nesting_one() {
+    let gpu = gpu();
+    if !Ctx::features().pipeline_statistics {
+        return;
+    }
+    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(0);
+    let compute = Statistics::COMPUTE_SHADER_INVOCATIONS;
+    let pool = QueryPool::statistics(1, compute).unwrap();
+    let mut observer = TestObserver::new(compute, &[]);
+    gpu.submit(|cmd| {
+        cmd.measure(Some(&mut observer), "frame", |cmd| {
+            cmd.query(&pool, 0, |cmd| {
+                for color in [Vec4::ONE, Vec4::ZERO] {
+                    let bindings = TestComputeImage::push_bindings(
+                        target.whole_view(),
+                        color,
+                        UVec2::ZERO,
+                        EXTENT,
+                    );
+                    cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1]);
+                }
+            })
+        })
+    });
+    let mut stats = [PipelineStats::default()];
+    assert!(pool.read(0, &mut stats).unwrap());
+    assert_eq!(stats[0].get(compute), Some(2 * (SIZE * SIZE) as u64));
+    assert_eq!(stats[0].get(Statistics::FRAGMENT_SHADER_INVOCATIONS), None);
+    // One statistics query can be active at a time: the observer saw it and began none.
+    assert_eq!(observer.passes.len(), 2);
+    assert!(observer.passes.iter().all(|(_, statistics, _)| statistics.is_none()));
+}
+
+#[test]
+fn occlusion_queries_count_the_samples_of_a_draw() {
+    let gpu = gpu();
+    let vertices = overlapping_triangles();
+    let depth = Image::<D32Sfloat, DepthAttachment>::new(UVec2::new(SIZE, SIZE)).unwrap();
+    let pool = QueryPool::occlusion(3, true).unwrap();
+    render(&gpu, |cmd, target| {
+        let near = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
+        let far = TestRaster::push_bindings(vertices.range(3..), Vec2::ZERO);
+        cmd.raster(EXTENT)
+            .color_attachment(target.whole_view(), None)
+            .depth_attachment(depth.whole_view(), Some([0.0]))
+            .draw(&near, 3, 1, RasterState::default())
+            .count_samples(&pool, 0)
+            .draw(&far, 3, 1, RasterState::default())
+            .count_samples(&pool, 1)
+            .draw(&far, 3, 0, RasterState::default())
+            .count_samples(&pool, 2)
+            .record("occluded")
+    });
+    let mut samples = [0; 3];
+    assert!(pool.read(0, &mut samples).unwrap());
+    assert!(samples[0] > 0, "the near triangle is visible");
+    if Ctx::features().precise_occlusion {
+        assert!(samples[0] < (SIZE * SIZE) as u64, "{}", samples[0]);
+    }
+    assert_eq!(samples[1], 0, "the far triangle is hidden behind it");
+    assert_eq!(samples[2], 0, "a skipped draw counts nothing");
 }
 
 // ---- buffer commands -------------------------------------------------------------------------

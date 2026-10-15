@@ -37,7 +37,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 5. ~~**The default `hot-reload` feature makes binaries non-relocatable.**~~ **Done
    (2026-10-15):** `PassEntry.spirv` is always `include_bytes!`'d and hot reload compiles from
    the absolute source path (lava-build-slang's `BuiltPass.source`), so a moved binary runs
-   with the pipelines it was built with. lava's only feature is now `profiling` (default on); hot reload is lava-build-slang's.
+   with the pipelines it was built with. lava has no features now; hot reload is lava-build-slang's.
 6. **Nightly.** `generic_const_exprs` (incomplete and prone to compiler crashes) leaks to every
    user (`core/src/lib.rs:4`, `tests/gpu_headless.rs:7`), and it exists only for `RasterBuilder`
    (see 4.1). `range_into_bounds`/`range_bounds_is_empty` serve one line
@@ -85,9 +85,9 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    copies the source's `max_primitives` and build scratch (`acceleration_structure.rs:255-265`),
    and `record_builds` only checks primitive counts. So `cmd.build` on a compacted structure
    writes a full build past its smaller buffer.
-5. **Reused `CompactedSizes` read stale sizes.** The reset is recorded in the command buffer
-   (`acceleration_structure.rs:676-692,876`), so `read()` returns the previous results as ready
-   until it executes. Reset on the host instead; `hostQueryReset` is already required.
+5. ~~**Reused `CompactedSizes` read stale sizes.**~~ **Done (2026-10-15):** `CompactedSizes`
+   became `QueryPool<CompactedSize>`, and every query pool is reset on the host when a
+   recording first touches it, after checking that the frames that used it before completed.
 6. **`wait_idle` races other threads' submissions** (`lib.rs:74-78`, `epoch.rs:70-72`).
    - `vkDeviceWaitIdle` needs every queue externally synchronised, and lava doesn't lock them.
    - `device_idle()` completes every epoch marked submitted, including one submitted after the
@@ -110,10 +110,10 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    - After one panic, every later `execute` on that queue panics.
    - Every destruction panics in `for_each_pending`.
    - A drop during unwinding aborts the process.
-10. **An unbalanced `begin_scope`/`end_scope` wedges the frame slot when timestamps are on.**
-    The root scope's end timestamp is never written, so `read` returns `NOT_READY`.
-    `FrameSlot::begin` returns that error before resetting the fence and pool, so every later
-    `begin` fails the same way (`timestamps.rs:100-127`, `queue.rs:488-497`).
+10. ~~**An unbalanced `begin_scope`/`end_scope` wedges the frame slot when timestamps are on.**~~
+    **Done (2026-10-15):** scopes are closures (`cmd.scope(name, f)`), and frame slots no
+    longer own or read queries: a user's `ScopeObserver` sees every scope and pass of a
+    `cmd.measure` and records its own queries there.
 11. **`Queue<Transfer>` is unusable as built.**
     - Every command buffer binds descriptor sets at the graphics and compute bind points, which
       is invalid on a transfer-only family.
@@ -183,7 +183,8 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     while stencil is `[u8]` but shaders read `uint` (`format.rs:175,325-328,403-405,424-426`).
 29. **`#[validation_trace]` reads the proc-macro crate's `debug_assertions`, not the user's**
     (`lava-macros/src/lib.rs:12-21`).
-30. **Timestamps are written on families with `timestamp_valid_bits == 0`** *(plausible)*.
+30. ~~**Timestamps are written on families with `timestamp_valid_bits == 0`**~~ **Done
+    (2026-10-15):** writing a timestamp on such a family panics.
 
 ### Free checks that are missing (a few integer compares each)
 - **Zero and limit checks:**
@@ -356,8 +357,9 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 13. **Indirect commands need byte gymnastics.** Core uses
     `byte_range(offset_of!..).cast::<MeshletDraw>()` and a 16→12-byte cast. Add field projection,
     and let indirect draws take any `T` that starts with the command, using its stride.
-14. **Scopes are fragile.** `begin_scope`/`end_scope` aren't guarded, and names must be
-    `&'static str`. Add `cmd.scope(name, |cmd| ..)` that takes `&str`.
+14. **Scopes are fragile.** *Partly done (2026-10-15):* `cmd.scope(name, |cmd| ..)` replaced
+    `begin_scope`/`end_scope`, so scopes can't be unbalanced. Names must still be
+    `&'static str`.
 15. **Resize and grow is hand-rolled.** `RenderResources::fit`, a `fresh` flag and
     `grow_overflowed` could become `Image::fit(extent)` and `Buffer::reserve(len)` that keep the
     bound slots.
@@ -371,23 +373,21 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     - `BuildFlags` can't say "no preference"; flags are raw `vk::GeometryInstanceFlagsKHR`;
       `VertexPosition` is open and exposes `vk::Format`.
     - `Instance` has no getters, and `Describe`/`Described` are public.
-17. **The counters API mirrors one engine's UI.**
-    - Selections must fit one pass, only the graphics family is counted, and the identity is
-      `Arc::ptr_eq`.
-    - Errors surface at the next `begin`, and `values` is a fixed array.
-    - **Direction:** validate in `set_counters`, compare by content, return `&[f64]`, and offer a
-      multi-pass capture for tools.
+17. **The counters API mirrors one engine's UI.** *Partly done (2026-10-15):* a counter
+    selection is a `QueryPool::performance`, validated when it is created, and results are
+    `&[f64]`.
+    - Selections must still fit one pass, and only the graphics family is counted.
+    - **Direction:** a multi-pass capture for tools (STATE.md).
 18. **Generated types belong to lava,** so users can't implement serde or `Reflect` on them
     (the orphan rule). Generating into the user crate fixes this, with configurable derives.
 19. **The surface is messy.**
     - Deep paths (`lava::vkobjects::queue::..`, `lava::image::slice::ImageView`).
     - No prelude, and glam and bytemuck aren't re-exported.
     - Unused re-exports: `VkPipeline`, `VkShaderModule`, `ShaderHash`.
-    - Public internals: `PassEntry`, `Functions`, `PhysicalDevice`, `CALLSITE`, `TimestampQueries`,
-      `PassQueries`, `RaytracingPipeline`, `ShaderBindingTable`.
+    - Public internals: `PassEntry`, `Functions`, `PhysicalDevice`, `CALLSITE`,
+      `RaytracingPipeline`, `ShaderBindingTable`.
     - Typos: `aquire_image`, `QueueFamilie`, `handel`, `Filter::Liniear`, `extend` for extent,
       `enable_gpu_assited_validation`, `unsupports_extensions`.
-    - Stale doc: `FrameSlot::set_profiling` at `command_buffer.rs:1112`.
     - Fix these before 0.1, since renames break users afterwards.
 20. **Codegen errors lack context.** Panics give no file or field (`build.rs:111,118,236`), the
     first failing pass hides the rest, and Slang warnings aren't forwarded.
@@ -437,8 +437,9 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
   usages, image count, composite alpha, `FIFO_LATEST_READY`, swapchain maintenance1,
   present_id/present_wait for pacing, presenting several swapchains in one call, discard on
   acquire.
-- **Queries outside `profiling`:** timestamps (for dynamic resolution), occlusion queries,
-  conditional rendering, pipeline statistics with chosen flags.
+- ~~**Queries outside `profiling`:** timestamps (for dynamic resolution), occlusion queries,
+  pipeline statistics with chosen flags.~~ **Done (2026-10-15):** user-owned `QueryPool`s of
+  every kind. Conditional rendering is still missing.
 - **Debug:** object names on buffers, images and structures; labels in release builds whenever
   the extension exists; `insert_label`.
 - **Escape hatches:**

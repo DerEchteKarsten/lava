@@ -1,8 +1,10 @@
-//! Command recording for generated passes: barriers, renderings and dispatches (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with the swapchain)
+//! Command recording for generated passes: barriers, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with the swapchain)
 use std::{
     fmt::Debug,
     iter,
     ops::{IntoBounds, RangeBounds},
+    panic::AssertUnwindSafe,
+    ptr::NonNull,
     range::Range,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -21,7 +23,7 @@ use crate::{
         usage::{IsColorAttachment, IsDepthAttachment},
     },
     pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterHash, pass_map, pipelines},
-    profiling::{PassQueries, TimestampQueries},
+    query::{Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp},
     state::{Ctx, Functions},
     vkobjects::queue::{PendingAccesses, PendingWrite},
 };
@@ -32,6 +34,7 @@ use lava_macros::validation_trace;
 use smallvec::{SmallVec, smallvec};
 
 mod binding_output;
+use binding_output::Sections;
 pub use binding_output::{BindingOutput, Bindings, kind};
 
 /// A pass's access of a buffer range, made by `BufferSlice::access` (a binding generator's
@@ -132,8 +135,25 @@ impl ImageUse<'_> {
 pub struct CommandBuffer {
     pub(crate) handle: vk::CommandBuffer,
     pub(crate) pending_accesses: PendingAccesses,
-    pub(crate) timestamps: Option<TimestampQueries>,
-    pub(crate) counters: Option<PassQueries>,
+    /// The epoch of the frame being recorded, which the query pools it touches remember.
+    pub(crate) epoch: u64,
+    pub(crate) family: u32,
+    /// What `measure` attached, for the duration of its closure (its lifetime erased).
+    observer: Option<NonNull<dyn ScopeObserver>>,
+    /// How many scopes the observer is inside.
+    depth: u16,
+    /// The kinds of the active queries (`query_bit`): one of each can be active.
+    pub(crate) active_queries: u32,
+}
+
+/// A bit per kind of query that is begun and ended, of which one can be active at a time.
+pub(crate) fn query_bit(kind: vk::QueryType) -> u32 {
+    match kind {
+        vk::QueryType::OCCLUSION => 1,
+        vk::QueryType::PIPELINE_STATISTICS => 2,
+        vk::QueryType::PERFORMANCE_QUERY_KHR => 4,
+        _ => 0,
+    }
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Default)]
@@ -226,6 +246,8 @@ struct Draw<'a, const COLOR_ATTACHMENTS: usize> {
     extra: SmallVec<[BufferAccess; 2]>,
     command: DrawCommand,
     state: RasterState<COLOR_ATTACHMENTS>,
+    /// The occlusion query counting its samples (`RasterBuilder::count_samples`).
+    samples: Option<(&'a QueryPool<Occlusion>, u32)>,
 }
 
 #[derive(Debug)]
@@ -528,6 +550,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             extra,
             command,
             state,
+            samples: None,
         };
         RasterBuilder {
             draws: append(self.draws, draw),
@@ -544,6 +567,22 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             depth_access: self.depth_access,
             clear_depth: self.clear_depth,
         }
+    }
+
+    /// Counts the samples of the draw added last that pass the depth and stencil tests into
+    /// query `index` of `pool`.
+    pub fn count_samples(mut self, pool: &'a QueryPool<Occlusion>, index: u32) -> Self {
+        assert!(
+            index < pool.count(),
+            "query {index} of a pool of {}",
+            pool.count()
+        );
+        let draw = self
+            .draws
+            .last_mut()
+            .expect("`count_samples` follows a draw");
+        draw.samples = Some((pool, index));
+        self
     }
 
     /// The depth attachment's access: also a write when it is cleared or a draw writes depth.
@@ -635,7 +674,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
 
         let device = Ctx::device();
         let handle = self.cmd_buf.handle;
-        self.cmd_buf.begin_pass(name);
+        self.cmd_buf.enter(name, true);
         unsafe {
             device.cmd_begin_rendering(handle, &rendering_info);
             device.cmd_set_viewport(
@@ -653,84 +692,104 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             device.cmd_set_scissor(handle, 0, &self.scissors);
         }
         for (draw, sections) in self.draws.iter().zip(&sections) {
-            // The validation layer warns about direct draws of nothing, and an empty index
-            // range can't be bound without `nullDescriptor`.
-            if let DrawCommand::Draw { instances: 0, .. }
-            | DrawCommand::Indexed { instances: 0, .. }
-            | DrawCommand::Indexed { count: 0, .. } = draw.command
-            {
-                continue;
+            if let Some((pool, query)) = draw.samples {
+                self.cmd_buf.begin_query(pool, query);
             }
-            let key = self.pipeline_key(&draw.state);
-            let pipeline = pipelines().raster(&key, sections.constants, sections.pass);
-            self.cmd_buf.push_constants(sections.push_constants);
-            unsafe {
-                device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                match draw.command {
-                    DrawCommand::Draw {
-                        vertices,
-                        instances,
-                    } => device.cmd_draw(handle, vertices, instances, 0, 0),
-                    DrawCommand::Indexed {
-                        indices,
-                        flags,
-                        count,
-                        instances,
-                    } => {
-                        address_commands().cmd_bind_index_buffer3(
-                            handle,
-                            &vk::BindIndexBuffer3InfoKHR::default()
-                                .address_range(indices)
-                                .address_flags(flags)
-                                .index_type(IndexType::UINT32),
-                        );
-                        device.cmd_draw_indexed(handle, count, instances, 0, 0, 0);
-                    }
-                    DrawCommand::Indirect {
-                        draws,
-                        flags,
-                        count,
-                    } => address_commands().cmd_draw_indirect2(
-                        handle,
-                        &vk::DrawIndirect2InfoKHR::default()
-                            .address_range(draws)
-                            .address_flags(flags)
-                            .draw_count(count),
-                    ),
-                    DrawCommand::IndirectCount {
-                        draws,
-                        flags,
-                        count,
-                        count_flags,
-                        max_count,
-                    } => address_commands().cmd_draw_indirect_count2(
-                        handle,
-                        &vk::DrawIndirectCount2InfoKHR::default()
-                            .address_range(draws)
-                            .address_flags(flags)
-                            .count_address_range(count)
-                            .count_address_flags(count_flags)
-                            .max_draw_count(max_count),
-                    ),
-                    DrawCommand::Launch([x, y, z]) => {
-                        mesh_functions().cmd_draw_mesh_tasks(handle, x, y, z)
-                    }
-                    DrawCommand::LaunchIndirect {
-                        draws,
-                        flags,
-                        count,
-                    } => address_commands().cmd_draw_mesh_tasks_indirect2(
-                        handle,
-                        &vk::DrawIndirect2InfoKHR::default()
-                            .address_range(draws)
-                            .address_flags(flags)
-                            .draw_count(count),
-                    ),
-                }
+            // The validation layer warns about direct draws of nothing, and an empty index
+            // range can't be bound without `nullDescriptor`. Their queries count 0.
+            if !matches!(
+                draw.command,
+                DrawCommand::Draw { instances: 0, .. }
+                    | DrawCommand::Indexed { instances: 0, .. }
+                    | DrawCommand::Indexed { count: 0, .. }
+            ) {
+                let key = self.pipeline_key(&draw.state);
+                record_draw(self.cmd_buf, &key, &draw.command, *sections);
+            }
+            if let Some((pool, query)) = draw.samples {
+                self.cmd_buf.end_query(pool, query);
             }
         }
         unsafe { device.cmd_end_rendering(handle) };
-        self.cmd_buf.end_pass();
+        self.cmd_buf.exit(name, true);
+    }
+}
+
+/// Binds the pipeline `key` of a draw's pass and records the draw.
+fn record_draw(
+    cmd_buf: &mut CommandBuffer,
+    key: &RasterHash,
+    command: &DrawCommand,
+    sections: Sections,
+) {
+    let (device, handle) = (Ctx::device(), cmd_buf.handle);
+    {
+        let pipeline = pipelines().raster(key, sections.constants, sections.pass);
+        cmd_buf.push_constants(sections.push_constants);
+        unsafe {
+            device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            match *command {
+                DrawCommand::Draw {
+                    vertices,
+                    instances,
+                } => device.cmd_draw(handle, vertices, instances, 0, 0),
+                DrawCommand::Indexed {
+                    indices,
+                    flags,
+                    count,
+                    instances,
+                } => {
+                    address_commands().cmd_bind_index_buffer3(
+                        handle,
+                        &vk::BindIndexBuffer3InfoKHR::default()
+                            .address_range(indices)
+                            .address_flags(flags)
+                            .index_type(IndexType::UINT32),
+                    );
+                    device.cmd_draw_indexed(handle, count, instances, 0, 0, 0);
+                }
+                DrawCommand::Indirect {
+                    draws,
+                    flags,
+                    count,
+                } => address_commands().cmd_draw_indirect2(
+                    handle,
+                    &vk::DrawIndirect2InfoKHR::default()
+                        .address_range(draws)
+                        .address_flags(flags)
+                        .draw_count(count),
+                ),
+                DrawCommand::IndirectCount {
+                    draws,
+                    flags,
+                    count,
+                    count_flags,
+                    max_count,
+                } => address_commands().cmd_draw_indirect_count2(
+                    handle,
+                    &vk::DrawIndirectCount2InfoKHR::default()
+                        .address_range(draws)
+                        .address_flags(flags)
+                        .count_address_range(count)
+                        .count_address_flags(count_flags)
+                        .max_draw_count(max_count),
+                ),
+                DrawCommand::Launch([x, y, z]) => {
+                    mesh_functions().cmd_draw_mesh_tasks(handle, x, y, z)
+                }
+                DrawCommand::LaunchIndirect {
+                    draws,
+                    flags,
+                    count,
+                } => address_commands().cmd_draw_mesh_tasks_indirect2(
+                    handle,
+                    &vk::DrawIndirect2InfoKHR::default()
+                        .address_range(draws)
+                        .address_flags(flags)
+                        .draw_count(count),
+                ),
+            }
+        }
     }
 }
 
@@ -795,7 +854,7 @@ impl CommandBuffer {
 
         let pipeline = pipelines().compute(sections.pass, sections.constants);
 
-        self.begin_pass(pass.name);
+        self.enter(pass.name, true);
         unsafe {
             Ctx::device().cmd_bind_pipeline(self.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
             if let Some(slice) = indirect_buffer {
@@ -809,7 +868,7 @@ impl CommandBuffer {
                 Ctx::device().cmd_dispatch(self.handle, dispatch[0], dispatch[1], dispatch[2]);
             }
         }
-        self.end_pass();
+        self.exit(pass.name, true);
     }
 
     #[validation_trace]
@@ -843,7 +902,7 @@ impl CommandBuffer {
         );
         self.push_constants(sections.push_constants);
 
-        self.begin_pass(pass.name);
+        self.enter(pass.name, true);
         let functions = Functions::raytracing_pipeline()
             .expect("a pass that can be recorded has its pipeline functions");
         pipelines().ray_tracing(sections.pass, sections.constants, |pipeline| unsafe {
@@ -874,7 +933,7 @@ impl CommandBuffer {
                 ),
             }
         });
-        self.end_pass();
+        self.exit(pass.name, true);
     }
 
     /// Traces `rays` (width, height, depth) raygen invocations of a ray tracing pass.
@@ -954,36 +1013,150 @@ impl CommandBuffer {
         unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
     }
 
-    /// Opens a named group of the commands recorded until [`Self::end_scope`]. Profiled
-    /// frames time it (see `FrameSlot::set_profiling`), and debug builds label it for
-    /// RenderDoc/Nsight. Every pass is such a scope on its own.
-    pub fn begin_scope(&mut self, name: &'static str) {
+    /// Records `f` as a named group: a debug label for RenderDoc/Nsight in debug builds, and a
+    /// scope the observer of [`Self::measure`] sees. Every pass and rendering is such a scope on
+    /// its own.
+    pub fn scope<R>(&mut self, name: &'static str, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.enter(name, false);
+        let result = f(self);
+        self.exit(name, false);
+        result
+    }
+
+    /// Records `f` as the scope `name` with `observer` attached, which sees it and every scope
+    /// and pass inside it (see [`ScopeObserver`]); with `None` just as a scope. Doesn't nest.
+    pub fn measure<R>(
+        &mut self,
+        observer: Option<&mut dyn ScopeObserver>,
+        name: &'static str,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(observer) = observer else {
+            return self.scope(name, f);
+        };
+        assert!(self.observer.is_none(), "`measure` doesn't nest");
+        // SAFETY: only the lifetime is erased. The pointer is cleared before `observer`'s borrow
+        // ends, also when `f` panics, and until then only this command buffer reaches it.
+        let observer = unsafe {
+            std::mem::transmute::<NonNull<dyn ScopeObserver + '_>, NonNull<dyn ScopeObserver>>(
+                NonNull::from(observer),
+            )
+        };
+        self.observer = Some(observer);
+        self.depth = 0;
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| self.scope(name, f)));
+        self.observer = None;
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// Opens a scope: its debug label, and the observer's `on_enter`.
+    fn enter(&mut self, name: &'static str, pass: bool) {
         Functions::cmd_start_label(&self.handle, name);
-        if let Some(timestamps) = &mut self.timestamps {
-            timestamps.begin(self.handle, name);
+        if let Some(mut observer) = self.observer {
+            let scope = ScopeInfo {
+                name,
+                depth: self.depth,
+                pass,
+            };
+            self.depth += 1;
+            // SAFETY: see `measure`.
+            unsafe { observer.as_mut() }.on_enter(&mut QueryRecorder { cmd: self }, &scope);
         }
     }
 
-    pub fn end_scope(&mut self) {
-        if let Some(timestamps) = &mut self.timestamps {
-            timestamps.end(self.handle);
+    fn exit(&mut self, name: &'static str, pass: bool) {
+        if let Some(mut observer) = self.observer {
+            self.depth -= 1;
+            let scope = ScopeInfo {
+                name,
+                depth: self.depth,
+                pass,
+            };
+            // SAFETY: see `measure`.
+            unsafe { observer.as_mut() }.on_exit(&mut QueryRecorder { cmd: self }, &scope);
         }
         Functions::cmd_end_label(&self.handle);
     }
 
-    /// A scope that the pass queries count too.
-    fn begin_pass(&mut self, name: &'static str) {
-        self.begin_scope(name);
-        if let Some(counters) = &mut self.counters {
-            counters.begin(self.handle, name);
-        }
+    /// Writes the device's clock into query `index` of `pool` once the commands recorded before
+    /// reached `stage`: `NONE` for when they started, `ALL_COMMANDS` for when they finished.
+    pub fn write_timestamp(
+        &mut self,
+        pool: &QueryPool<Timestamp>,
+        index: u32,
+        stage: vk::PipelineStageFlags2,
+    ) {
+        assert!(
+            index < pool.count(),
+            "query {index} of a pool of {}",
+            pool.count()
+        );
+        pool.record_on(self.epoch, self.family);
+        unsafe { Ctx::device().cmd_write_timestamp2(self.handle, stage, pool.handle, index) };
     }
 
-    fn end_pass(&mut self) {
-        if let Some(counters) = &mut self.counters {
-            counters.end(self.handle);
+    /// Records `f` inside query `index` of `pool`, which counts what its commands do. One query
+    /// of a kind can be active at a time, also counting an observer's (`QueryRecorder::is_active`).
+    /// A performance query's pool has to exist before the recording begins.
+    pub fn query<K: Scoped, R>(
+        &mut self,
+        pool: &QueryPool<K>,
+        index: u32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        assert!(
+            index < pool.count(),
+            "query {index} of a pool of {}",
+            pool.count()
+        );
+        self.begin_query(pool, index);
+        let result = f(self);
+        self.end_query(pool, index);
+        result
+    }
+
+    pub(crate) fn begin_query<K: Scoped>(&mut self, pool: &QueryPool<K>, index: u32) {
+        let bit = query_bit(K::TYPE);
+        assert!(
+            self.active_queries & bit == 0,
+            "a query of this kind is already active, and queries of one kind don't nest"
+        );
+        if K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR {
+            assert_eq!(
+                self.family,
+                Ctx::gfx_queue_index(),
+                "hardware counters are only recorded on the graphics family"
+            );
         }
-        self.end_scope();
+        pool.record(self.epoch);
+        let flags = pool.kind.control_flags();
+        unsafe { Ctx::device().cmd_begin_query(self.handle, pool.handle, index, flags) };
+        self.active_queries |= bit;
+    }
+
+    pub(crate) fn end_query<K: QueryKind>(&mut self, pool: &QueryPool<K>, index: u32) {
+        let bit = query_bit(K::TYPE);
+        assert!(self.active_queries & bit != 0, "no query of this kind is active");
+        unsafe { Ctx::device().cmd_end_query(self.handle, pool.handle, index) };
+        self.active_queries &= !bit;
+    }
+
+    /// A command buffer recording into `handle` for the frame of `epoch` on queue `family`.
+    pub(crate) fn new(
+        handle: vk::CommandBuffer,
+        pending_accesses: PendingAccesses,
+        epoch: u64,
+        family: u32,
+    ) -> Self {
+        Self {
+            handle,
+            pending_accesses,
+            epoch,
+            family,
+            observer: None,
+            depth: 0,
+            active_queries: 0,
+        }
     }
 
     pub(crate) fn begin(&mut self) -> Result<()> {
@@ -1458,12 +1631,7 @@ mod tests {
 
     /// A command buffer that is never handed to Vulkan: enough for state-only code paths.
     fn offline_cmd() -> CommandBuffer {
-        CommandBuffer {
-            handle: vk::CommandBuffer::null(),
-            pending_accesses: PendingAccesses::default(),
-            timestamps: None,
-            counters: None,
-        }
+        CommandBuffer::new(vk::CommandBuffer::null(), PendingAccesses::default(), 0, 0)
     }
 
     fn view<F: StaticFormat, U: StaticUsage>(layout: &AtomicU32) -> ImageView<'_, F, U> {

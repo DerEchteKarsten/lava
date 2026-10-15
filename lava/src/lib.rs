@@ -42,9 +42,9 @@ pub mod command_buffer;
 pub mod epoch;
 pub mod error;
 pub mod image;
+pub mod memory;
 pub mod pipeline;
-pub mod profiling;
-pub mod scratchpad;
+pub mod query;
 pub mod state;
 pub mod vkobjects;
 use raw_window_handle::RawDisplayHandle;
@@ -78,7 +78,7 @@ pub fn init(
     Ctx::init(display, enable_validation, enable_gpu_assited_validation)?;
     pipeline::set_pass_map(passes);
     Bindless::init()?;
-    profiling::init()?;
+    query::init()?;
     pipeline::init();
     Ok(())
 }

@@ -346,8 +346,7 @@ pub struct Features {
     pub debug_utils: bool,
     pub mesh: bool,
     /// `VK_KHR_acceleration_structure`: `Blas`/`Tlas` and their builds. `ray_query` and
-    /// `ray_tracing_pipeline` need it. Also enables host query reset, which `CompactedSizes`
-    /// uses to poll a query before it ran.
+    /// `ray_tracing_pipeline` need it.
     pub acceleration_structure: bool,
     /// `VK_KHR_ray_query`: tracing from compute, mesh and fragment passes.
     pub ray_query: bool,
@@ -362,13 +361,14 @@ pub struct Features {
     /// `VK_KHR_shader_clock` with subgroup clocks (`OpReadClockKHR Subgroup`, which shader
     /// clock regions read).
     pub shader_clock: bool,
-    /// `VK_KHR_performance_query` with query pools, for the hardware counters of
-    /// `profiling::counters`; only enabled with the `profiling` feature. Also enables host query
-    /// reset, since a counter pool may not be reset in a command buffer that uses it.
+    /// `VK_KHR_performance_query` with query pools: `QueryPool::performance`, the hardware
+    /// counters of `query::counters`.
     pub performance_query: bool,
-    /// `VK_KHR_calibrated_timestamps`, which puts a frame's GPU scopes on the host's clock
-    /// (`Frame::last_timestamps_start`); only enabled with the `profiling` feature.
+    /// `VK_KHR_calibrated_timestamps`, which puts timestamps on the host's clock
+    /// (`QueryPool::instant`).
     pub calibrated_timestamps: bool,
+    /// Occlusion queries that count samples exactly (`QueryPool::occlusion`).
+    pub precise_occlusion: bool,
 }
 impl Features {
     /// The device extensions to enable. `VK_KHR_device_address_commands` is always required:
@@ -453,7 +453,8 @@ impl Features {
             .storage_buffer8_bit_access(true)
             .shader_buffer_int64_atomics(true)
             .shader_int8(true)
-            .host_query_reset(self.performance_query || self.acceleration_structure);
+            // Query pools are reset on the host; Vulkan 1.2 devices all have it.
+            .host_query_reset(true);
         *vk13 = vk13
             .dynamic_rendering(true)
             .maintenance4(true)
@@ -469,6 +470,7 @@ impl Features {
             .fragment_stores_and_atomics(true)
             .shader_int16(true)
             .pipeline_statistics_query(self.pipeline_statistics)
+            .occlusion_query_precise(self.precise_occlusion)
             .vertex_pipeline_stores_and_atomics(true);
 
         let mut features = vk::PhysicalDeviceFeatures2::default()
