@@ -16,10 +16,9 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    the application's passes and writes the SPIR-V and the bindings into its `OUT_DIR`, which
    it includes with `lava::include_passes!()`.
 2. ~~**The runtime is sized from the generated code.**~~ **Done (2026-10-15)**, differently from
-   the direction sketched here: the generated `PASS_MAP` (a `PassMap`: the entries and the profiling
-   setting; the frontend keeps its hot reload's compile options itself) goes to `lava::init`, and lava sizes its pipeline arrays from it,
+   the direction sketched here: the generated `PASS_MAP` (a `PassMap`: the entries; the frontend keeps its hot reload's compile options itself) goes to `lava::init`, and lava sizes its pipeline arrays from it,
    so there is still one pass set per application (an app and a library on lava can't both
-   bring passes yet). The caps are fixed in `pipeline.rs`, `PROFILE_PASS` stays the map index,
+   bring passes yet). The caps are fixed in `pipeline.rs`,
    and the generated code uses public API (`Bindings::new`/`with_constants`,
    `BufferSlice::access`, `ImageView::access`, `Tlas::trace_accesses`), documented for other
    binding generators, instead of a `__private` module. lava-build-slang ships `bindless.slang`,
@@ -260,7 +259,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 - **There is no readback memory.** The only host-visible location is `CpuToGpu` (write-combined).
   That fits core's headless readback taking about 10 ms for 3.7 MB. Add `GpuToCpu` (cached).
 - **With ReBAR, every buffer goes into the BAR heap,** scratch included, and spills silently to
-  system memory when it fills. The SBT and the clock counters are host-visible too.
+  system memory when it fills. The SBT is host-visible too.
 - **No staging path.** Without `host_image_copy`, which lava only enables on ReBAR devices,
   textures, the font atlas and previews can't be uploaded, so core's UI can't start on such a
   device.
@@ -275,10 +274,9 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 - **The debug callback works for every message.** It enables VERBOSE and INFO and formats each
   message before `tracing` filters it.
 - **Descriptor heaps or descriptor buffers** would turn `bind` into a memcpy. They would remove
-  the pool, the update-after-bind flags and the per-command-buffer binds of three sets, and make
+  the pool, the update-after-bind flags and the per-command-buffer binds of two sets, and make
   user samplers and buffer descriptors cheap.
-- **Shader builds.** Each pass has its own Slang session, compiled serially; `PROFILE_PASS` as a
-  macro forces this. There is always `Maximal` optimisation and never debug info, so no
+- **Shader builds.** Each pass has its own Slang session, compiled serially. There is always `Maximal` optimisation and never debug info, so no
   source-level shader debugging.
 
 ---

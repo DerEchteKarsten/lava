@@ -105,8 +105,7 @@ fn compute(cmd: &mut CommandBuffer, r: &Resources) {
                 Vec4::splat(i as f32 / 16.0),
                 UVec2::ZERO,
                 UVec2::splat(8),
-            )
-            .constant_bindings(),
+            ),
             [1, 1, 1],
         );
     }

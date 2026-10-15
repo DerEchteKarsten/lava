@@ -1,24 +1,21 @@
-//! GPU profiling: the timestamps, pass queries (pipeline statistics and hardware counters) and shader clocks, three independent systems, plus GPU memory
-use ash::vk::TaggedStructure;
+//! GPU profiling: the timestamps and pass queries (pipeline statistics and hardware counters), two independent systems, plus GPU memory
 use ash::vk;
+use ash::vk::TaggedStructure;
 
 use crate::{
     error::Result,
     state::{Ctx, Functions},
 };
 
-pub mod clock;
 pub mod counters;
 pub mod timestamps;
 
-pub use clock::RegionTime;
 pub use counters::{
     Counter, CounterUnit, MAX_COUNTERS, PassCounters, PassQueries, PassResult, PipelineStats,
 };
 pub use timestamps::{GpuScope, TimestampQueries};
 
 pub(crate) fn init() -> Result<()> {
-    clock::init()?;
     counters::init()
 }
 

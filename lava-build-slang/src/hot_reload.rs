@@ -174,8 +174,6 @@ fn compile_pass(
         search_paths: build.search_paths,
         defines: build.defines,
         optimization: build.optimization,
-        profiling: pass_map().profiling,
-        pass_index,
     };
     let session = compile::session(global, &options);
     let program = compile::link(&session, pass.source).map_err(|e| e.to_string())?;

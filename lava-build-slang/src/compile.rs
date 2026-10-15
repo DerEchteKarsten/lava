@@ -6,22 +6,12 @@ pub use shader_slang as slang;
 
 use crate::{Optimization, SLANG_DIR};
 
-/// The specialization constant ids of a pass's shader clock region hashes (`CLOCK_REGION_0..`
-/// in `profile.slang`), which codegen bakes into the pass's `constant_bindings` instead of
-/// making them parameters. A copy of lava's `profiling::clock::CLOCK_REGION_IDS`.
-pub const CLOCK_REGION_IDS: std::ops::Range<u32> = 901..909;
-
-/// How a pass compiles: what the build script was given, and which pass it is.
+/// How a pass compiles: what the build script was given.
 pub struct Options<'a> {
     /// Absolute include directories; lava-build-slang's own `slang/` is always searched too.
     pub search_paths: &'a [&'a str],
     pub defines: &'a [(&'a str, &'a str)],
     pub optimization: Optimization,
-    /// Defines `PROFILING`: lava was built with its `profiling` feature.
-    pub profiling: bool,
-    /// The pass's index in `PASS_MAP`, defined as `PROFILE_PASS` for the shader clocks of
-    /// `profile.slang`.
-    pub pass_index: usize,
 }
 
 /// A session that compiles a pass, named by its absolute path, to SPIR-V 1.6.
@@ -46,13 +36,9 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
         .optimization(optimization)
         .vulkan_use_entry_point_name(true)
         .matrix_layout_column(true);
-    if options.profiling {
-        compiler = compiler.macro_define("PROFILING", "1");
-    }
     for (name, value) in options.defines {
         compiler = compiler.macro_define(name, value);
     }
-    compiler = compiler.macro_define("PROFILE_PASS", &options.pass_index.to_string());
     global
         .create_session(
             &slang::SessionDesc::default()
@@ -61,13 +47,6 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
                 .options(&compiler),
         )
         .expect("failed to create a slang session")
-}
-
-/// The names of the clock regions in a linked pass: the strings it hashes, which only
-/// `CLOCK_REGION` does.
-pub fn clock_regions(program: &slang::ComponentType) -> Vec<String> {
-    let layout = program.layout(0).expect("a linked pass has a layout");
-    layout.hashed_strings().map(str::to_string).collect()
 }
 
 /// A hash of what the generated bindings of a pass depend on: its push constant fields (name,

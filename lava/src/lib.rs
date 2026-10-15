@@ -8,15 +8,10 @@
 //! What every frontend's shaders and generated code must match:
 //! - Descriptor set 0: binding 0 holds the three immutable samplers (nearest and bilinear,
 //!   both clamped to a white border; trilinear repeat), binding 3 the bindless sampled images.
-//!   Set 1, binding 0: the bindless storage images. Set 2, binding 0: the shader clock counters
-//!   (a `u64` storage buffer, laid out as in [`profiling::clock`]). Passes have no other
-//!   descriptors.
+//!   Set 1, binding 0: the bindless storage images. Passes have no other descriptors.
 //! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes,
 //!   zeroed when a command buffer begins; a pass pushes its own struct from offset 0.
 //!   Specialization constants have no size limit.
-//! - Specialization constants [`profiling::clock::CLOCK_REGION_IDS`] are a clocked pass's
-//!   region name hashes (in slot order, 0 for none), which the generated `constant_bindings`
-//!   bake; a pass indexes the clock counters by its position in the pass map (`PROFILE_PASS`).
 //! - [`bindless::BindlessHandle`] (two `u32` indices, sampled then storage,
 //!   [`bindless::NULL_HANDLE`] for none) and [`vkobjects::acceleration_structure::Instance`]
 //!   (`VkAccelerationStructureInstanceKHR`) are the layouts shaders see; a TLAS is a `u64`
@@ -34,10 +29,10 @@ use crate::{bindless::Bindless, state::Ctx};
 
 pub use crate::error::{Error, Result};
 pub use ash::vk::Pipeline as VkPipeline;
-pub use ash::vk::ShaderModule as VkShaderModule;
-pub use ash::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
 /// What `Error::Vulkan` holds, e.g. `ERROR_OUT_OF_DATE_KHR` from `Swapchain::aquire_image`.
 pub use ash::vk::Result as VkResult;
+pub use ash::vk::ShaderModule as VkShaderModule;
+pub use ash::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
 /// What `format::Dynamic`, `image::usage::Dynamic` and `buffer::usage::Dynamic` hold.
 pub use ash::vk::{BufferUsageFlags, Format as VkFormat, ImageUsageFlags};
 
@@ -80,13 +75,6 @@ pub fn init(
     enable_gpu_assited_validation: bool,
     passes: &'static pipeline::PassMap,
 ) -> Result<()> {
-    assert_eq!(
-        passes.profiling,
-        cfg!(feature = "profiling"),
-        "the passes were compiled for lava {} its `profiling` feature: run lava-build-slang from the \
-         build script of a crate that depends on lava directly",
-        if passes.profiling { "with" } else { "without" }
-    );
     Ctx::init(display, enable_validation, enable_gpu_assited_validation)?;
     pipeline::set_pass_map(passes);
     Bindless::init()?;

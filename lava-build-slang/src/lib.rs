@@ -7,8 +7,8 @@ pub mod compile;
 pub mod hot_reload;
 
 /// The Slang side of lava's shader contract (lava's crate docs; `bindless.slang`,
-/// `profile.slang`, `ray_tracing.slang`: the descriptor sets, the clock counters, acceleration
-/// structure instances), searched by every session.
+/// `ray_tracing.slang`: the descriptor sets, acceleration structure instances), plus the shader
+/// clock helpers of `profile.slang`, searched by every session.
 pub const SLANG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/slang");
 
 /// Slang's optimization level for every pass.
@@ -78,11 +78,8 @@ impl Shaders {
             println!("cargo::rerun-if-changed={dir}");
         }
         println!("cargo::rerun-if-changed={SLANG_DIR}");
-        // lava's build script sets it with its `profiling` feature (`links = "lava"`).
-        println!("cargo::rerun-if-env-changed=DEP_LAVA_PROFILING");
-        let profiling = env::var_os("DEP_LAVA_PROFILING").is_some();
         let out_dir = Path::new(&env::var("OUT_DIR").expect("called from a build script")).join("lava");
-        codegen::generate(&self, profiling, &out_dir);
+        codegen::generate(&self, &out_dir);
     }
 }
 

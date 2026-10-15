@@ -2,10 +2,6 @@
 name = "lava"
 version.workspace = true
 edition.workspace = true
-build = "build.rs"
-# Hands the `profiling` feature to lava-build-slang in the application's build script
-# (`DEP_LAVA_PROFILING`).
-links = "lava"
 
 [dependencies]
 glam = {workspace = true}
@@ -22,7 +18,4 @@ smallvec.workspace = true
 tracing-subscriber = { workspace = true }
 
 [features]
-default = ["profiling"]
-# GPU timestamps, pipeline statistics and shader clocks (`PROFILING` in the frontend's
-# `profile.slang`).
-profiling = []
+default = []

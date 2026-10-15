@@ -297,8 +297,7 @@ impl PhysicalDevice {
         features.pipeline_statistics = device.supported_features.pipeline_statistics;
         features.mesh_queries = device.supported_features.mesh_queries;
         features.memory_budget = device.supported_features.memory_budget;
-        features.shader_clock =
-            cfg!(feature = "profiling") && device.supported_features.shader_clock;
+        features.shader_clock = device.supported_features.shader_clock;
         features.performance_query =
             cfg!(feature = "profiling") && device.supported_features.performance_query;
         features.calibrated_timestamps =

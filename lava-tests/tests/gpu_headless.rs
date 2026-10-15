@@ -32,12 +32,12 @@ use lava::{
             Storage as StorageImage, StorageTransferSrcTransferDst,
         },
     },
-    profiling::{clock, counters},
+    profiling::counters,
     state::Ctx,
     vkobjects::queue::{Binary, FrameSlot, Gfx, Queue, Semaphore, Timeline},
 };
 use lava_tests::bindings::{
-    PASS_MAP, TestComputeBuffer, TestComputeImage, TestComputeVolume, TestConstants, TestMesh,
+    PASS_MAP, TestClock, TestClocks, TestComputeBuffer, TestComputeImage, TestComputeVolume, TestConstants, TestMesh,
     TestRaster, TestRasterTextured, TestTexturedVertex, TestVertex,
 };
 
@@ -297,8 +297,7 @@ fn record_profiled(cmd: &mut CommandBuffer, target: &Target) {
     cmd.begin_scope("group");
     for color in [Vec4::ONE, Vec4::ZERO] {
         cmd.compute(
-            &TestComputeImage::push_bindings(target.whole_view(), color, UVec2::ZERO, EXTENT)
-                .constant_bindings(),
+            &TestComputeImage::push_bindings(target.whole_view(), color, UVec2::ZERO, EXTENT),
             [SIZE / 8, SIZE / 8, 1],
         );
     }
@@ -444,37 +443,6 @@ fn pass_queries_count_passes_and_renderings() {
             .last_counters()
             .is_none()
     );
-}
-
-#[test]
-#[cfg(feature = "profiling")]
-fn shader_clocks_count_only_while_enabled() {
-    if !Ctx::features().shader_clock {
-        return;
-    }
-    let gpu = gpu();
-    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(0);
-    let read = || {
-        let mut times = Vec::new();
-        clock::read(|time| times.push(time));
-        times
-    };
-    // `test_compute_image.slang` has the one clock region "fill"; the other passes have none.
-    clock::set_enabled(true);
-    read();
-    gpu.submit(|cmd| record_profiled(cmd, &target));
-    let times = read();
-    let regions: Vec<_> = times.iter().map(|r| (r.pass, r.region)).collect();
-    assert_eq!(regions, [("TestComputeImage", "fill")]);
-    // Both dispatches, at most one subgroup per invocation.
-    let time = &times[0];
-    assert!(time.subgroups >= 2 && time.subgroups <= 2 * (SIZE * SIZE) as u64);
-    assert!(time.ticks > 0);
-
-    // Off, the passes are built without their region names and count nothing.
-    clock::set_enabled(false);
-    gpu.submit(|cmd| record_profiled(cmd, &target));
-    assert!(read().is_empty());
 }
 
 // ---- buffer commands -------------------------------------------------------------------------
@@ -903,8 +871,7 @@ fn compute_image_bindings<'a>(
                 Vec4::new(1.0, 1.0, 1.0, 1.0),
                 offset,
                 size,
-            )
-            .constant_bindings(),
+            ),
             [SIZE / 8, SIZE / 8, 1],
         )
     }
@@ -935,8 +902,7 @@ fn compute_pass_push_constants_reach_the_shader() {
                 Vec4::new(0.0, 1.0, 0.0, 1.0),
                 UVec2::new(16, 24),
                 UVec2::new(32, 16),
-            )
-            .constant_bindings(),
+            ),
             [SIZE / 8, SIZE / 8, 1],
         )
     });
@@ -966,8 +932,7 @@ fn indirect_compute_dispatch_matches_the_direct_one() {
     }]);
     let indirect = render(&gpu, |cmd, target| {
         cmd.compute_indirect(
-            &TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT)
-                .constant_bindings(),
+            &TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT),
             dispatch.range(..),
         )
     });
@@ -996,6 +961,38 @@ fn compute_pass_reads_and_writes_buffers() {
         })
         .collect();
     assert_eq!(dst.host(), expected);
+}
+
+/// The generated clock readout: `regions` lists the fields in order, `take` splits each
+/// counter into ticks and subgroups and zeroes it.
+#[test]
+fn clock_regions_count_every_subgroup_once() {
+    let gpu = gpu();
+    if !Ctx::features().shader_clock {
+        eprintln!("skipping clock_regions_count_every_subgroup_once: no subgroup clocks");
+        return;
+    }
+    const INVOCATIONS: usize = 256;
+    let mut clocks = zeroed_buffer::<TestClocks, Storage>(1);
+    let out = zeroed_buffer::<u32, Storage>(INVOCATIONS);
+    gpu.submit(|cmd| {
+        cmd.compute(
+            &TestClock::push_bindings(clocks.address, out.range(..)),
+            [INVOCATIONS as u32 / 64, 1, 1],
+        )
+    });
+    let expected: Vec<u32> = (1..=INVOCATIONS as u32).collect();
+    assert_eq!(out.host(), expected);
+    let regions = clocks.host_mut()[0].regions();
+    let names: Vec<&str> = regions.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["first", "second"]);
+    for (name, clock) in regions {
+        let (_, subgroups) = clock.take();
+        // Subgroups have 4 to 128 lanes.
+        let lanes = INVOCATIONS as u64 / subgroups.max(1);
+        assert!((4..=128).contains(&lanes), "{name}: {subgroups} subgroups");
+        assert_eq!(clock.take(), (0, 0), "{name} is zeroed");
+    }
 }
 
 /// A compute pass between transfer commands on the same buffers, in one command buffer: the
@@ -2037,8 +2034,7 @@ mod generated {
         let mut target = image.whole_view();
         target.handle.descriptor_index_set1 = 5;
         let bindings =
-            TestComputeImage::push_bindings(target, Vec4::ONE, UVec2::ZERO, UVec2::new(8, 8))
-                .constant_bindings();
+            TestComputeImage::push_bindings(target, Vec4::ONE, UVec2::ZERO, UVec2::new(8, 8));
         let constants: CTestComputeImageBindings = push_constants(&bindings);
         assert_eq!(constants.target.descriptor_index_set1, 5);
         let [image]: [_; 1] = bindings.sections().images().collect::<Vec<_>>().try_into().expect("one image");

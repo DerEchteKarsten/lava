@@ -24,10 +24,8 @@ pub const MAX_PUSH_CONSTANTS_SIZE: usize = 256;
 
 /// Every pass of the application (the generated `PASS_MAP`).
 pub struct PassMap {
-    /// A pass's index here is its `BindingOutput::pass()` and its `PROFILE_PASS`.
+    /// A pass's index here is its `BindingOutput::pass()`.
     pub passes: &'static [PassEntry],
-    /// Compiled with `PROFILING`, for lava with its `profiling` feature.
-    pub profiling: bool,
 }
 
 static PASS_MAP: OnceLock<&'static PassMap> = OnceLock::new();
@@ -106,9 +104,6 @@ pub struct PassEntry {
     /// Where each specialization constant sits in `BindingOutput::constants`.
     pub constants: &'static [vk::SpecializationMapEntry],
     pub constants_size: usize,
-    /// The names of its shader clock regions (see the shader contract in the crate docs) in
-    /// slot order, whose hashes its `constant_bindings` sets. New names need a `cargo build`.
-    pub regions: &'static [&'static str],
     /// Its SPIR-V uses ray queries.
     pub ray_query: bool,
 }

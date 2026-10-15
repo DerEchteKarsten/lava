@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use shader_slang::{
     self as slang, ParameterCategory as Cat, ScalarType, TypeKind,
-    reflection::{TypeLayout, VariableLayout, compute_string_hash},
+    reflection::{TypeLayout, VariableLayout},
 };
 
 use crate::{Shaders, compile};
@@ -15,6 +15,8 @@ struct StructDef {
     size: usize,
     /// It mirrors a lava type (`MIRRORED_TYPES`), which isn't generated, only checked.
     mirror: bool,
+    /// Methods generated with the struct (the clock readout).
+    impls: String,
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +68,56 @@ const MIRRORED_TYPES: [(&str, &str); 1] = [(
     "AccelerationStructureInstance",
     "lava::vkobjects::acceleration_structure::Instance",
 )];
+
+/// `profile.slang`'s region counter, which gets a generated `take`, and every struct whose
+/// fields are all of it a generated `regions`.
+const CLOCK_TYPE: &str = "Clock";
+/// Copies of `CLOCK_STRIPE_WORDS` and `CLOCK_TICK_BITS` in `slang/profile.slang`.
+const CLOCK_STRIPE_WORDS: usize = 8;
+const CLOCK_TICK_BITS: u32 = 40;
+
+/// The readout of `Clock`, or of a struct of only `Clock`s.
+fn clock_impls(name: &str, t: &TypeLayout) -> String {
+    if name == CLOCK_TYPE {
+        return format!(
+            r#"
+impl {CLOCK_TYPE} {{
+    /// The ticks and subgroups `CLOCK_REGION` added since the last take, leaving the clock
+    /// zeroed. Only while no submitted work can still add to it.
+    pub fn take(&mut self) -> (u64, u64) {{
+        let stripes = self.counters.iter_mut().step_by({CLOCK_STRIPE_WORDS});
+        let sum: u64 = stripes.map(core::mem::take).sum();
+        (sum & ((1 << {CLOCK_TICK_BITS}) - 1), sum >> {CLOCK_TICK_BITS})
+    }}
+}}
+"#
+        );
+    }
+    let fields: Vec<&str> = t.fields().map(field_name).collect();
+    if fields.is_empty()
+        || !t
+            .fields()
+            .all(|f| is_struct_named(f.type_layout().unwrap(), &[CLOCK_TYPE]))
+    {
+        return String::new();
+    }
+    let regions: Vec<String> = fields
+        .iter()
+        .map(|f| format!("({f:?}, &mut self.{f})"))
+        .collect();
+    format!(
+        r#"
+impl {name} {{
+    /// Every region by its field name, in declaration order.
+    pub fn regions(&mut self) -> [(&'static str, &mut {CLOCK_TYPE}); {n}] {{
+        [{regions}]
+    }}
+}}
+"#,
+        n = fields.len(),
+        regions = regions.join(", "),
+    )
+}
 
 fn field_name(f: &VariableLayout) -> &str {
     f.variable().and_then(|v| v.name()).expect("unnamed field")
@@ -145,6 +197,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
                     signature,
                     size,
                     mirror: true,
+                    impls: String::new(),
                 });
                 return rust.to_string();
             }
@@ -168,6 +221,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
                     signature,
                     size,
                     mirror: false,
+                    impls: String::new(),
                 },
             );
             let mut body = String::new();
@@ -181,6 +235,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
             let def = structs.get_mut(&name).unwrap();
             def.body = body;
             def.checks = layout_checks(&name, t);
+            def.impls = clock_impls(&name, t);
             name
         }
         TypeKind::Pointer => {
@@ -417,42 +472,18 @@ struct SConst<'a> {
     name: String,
     id: u32,
     layout: &'a TypeLayout,
-    /// The value of one of lava's own constants, which `constant_bindings` sets without a
-    /// parameter.
-    value: Option<u32>,
 }
 
 /// The pass's specialization constants by id. `SCONST(T, name)` (`bindless.slang`) declares a
 /// `uint64_t name_sconst` whose `SConst` attribute names `T`, a buffer or image handle; any
-/// other one is a plain scalar. `CLOCK_REGION_IDS` (`profile.slang`) get the hashes of the
-/// pass's clock `regions`, which `constant_bindings` sets while `clock::enabled()`.
-fn sconsts<'a>(
-    layout: &'a slang::reflection::Shader,
-    file: &str,
-    regions: &[String],
-) -> Vec<SConst<'a>> {
-    let clock_ids = compile::CLOCK_REGION_IDS;
-    assert!(
-        regions.len() <= clock_ids.len(),
-        "{file} has {} clock regions, at most {} fit",
-        regions.len(),
-        clock_ids.len()
-    );
+/// other one is a plain scalar.
+fn sconsts<'a>(layout: &'a slang::reflection::Shader, file: &str) -> Vec<SConst<'a>> {
     let mut consts: Vec<SConst> = layout
         .parameters()
         .filter(|p| p.category() == Some(Cat::SpecializationConstant))
         .map(|p| (p, p.offset(Cat::SpecializationConstant) as u32))
         .map(|(p, id)| {
             let name = field_name(p);
-            if clock_ids.contains(&id) {
-                let region = regions.get((id - clock_ids.start) as usize);
-                return SConst {
-                    name: name.to_lowercase(),
-                    id,
-                    layout: p.type_layout().unwrap(),
-                    value: Some(region.map_or(0, |name| compute_string_hash(name))),
-                };
-            }
             let attribute = p
                 .variable()
                 .and_then(|v| v.user_attributes().find(|a| a.name() == Some("SConst")));
@@ -461,7 +492,6 @@ fn sconsts<'a>(
                     name: name.to_string(),
                     id,
                     layout: p.type_layout().unwrap(),
-                    value: None,
                 };
             };
             let ty = attribute.argument_value_string(0).unwrap();
@@ -482,7 +512,6 @@ fn sconsts<'a>(
                 name: name.trim_end_matches("_sconst").to_string(),
                 id,
                 layout,
-                value: None,
             }
         })
         .collect();
@@ -520,7 +549,6 @@ fn generate_pass(
     pass_name: &str,
     pc: &TypeLayout,
     consts: &[SConst],
-    regions: &[String],
     entries: &[compile::Entry],
     ray_query: bool,
     structs: &mut Structs,
@@ -637,7 +665,6 @@ fn generate_pass(
         index: {pipeline_index},
         constants: {constants},
         constants_size: {constants_size},
-        regions: &{regions:?},
         ray_query: {ray_query},
     }},"#
     ));
@@ -709,21 +736,11 @@ impl {pass_name} {{
         checks = push.checks.join("\n        "),
     ));
     if !consts.is_empty() {
-        let parameters = consts.iter().filter(|c| c.value.is_none());
         let new = build_new_fn(
-            parameters.map(|c| (c.name.as_str(), c.layout)),
+            consts.iter().map(|c| (c.name.as_str(), c.layout)),
             structs,
             stage,
         );
-        // Only the clock regions' hashes are baked, and only while clocks are on.
-        let baked = consts.iter().filter_map(|c| match c.value? {
-            0 => Some(format!("{}: 0", c.name)),
-            hash => Some(format!(
-                "{}: if lava::profiling::clock::enabled() {{ {hash:#x} }} else {{ 0 }}",
-                c.name
-            )),
-        });
-        let gpu_inits: Vec<String> = new.gpu_inits.iter().cloned().chain(baked).collect();
         let fields: Vec<String> = consts
             .iter()
             .map(|c| format!("    pub {}: {},", c.name, gpu_type(c.layout, structs)))
@@ -773,7 +790,7 @@ impl<'a> {incomplete}<'a> {{
             generics = fn_generics(&new, false),
             params = new.params.join(", "),
             checks = new.checks.join("\n        "),
-            gpu_inits = gpu_inits.join(", "),
+            gpu_inits = new.gpu_inits.join(", "),
             image_accesses = new.image_accesses.join(",\n"),
             buffer_accesses = new.buffer_accesses.join(",\n"),
         ));
@@ -816,7 +833,7 @@ fn camel_case(s: &str) -> String {
 /// Compiles every pass of `shaders`, writes its SPIR-V to `out_dir/passes/<Pass>.spv`, the
 /// bindings with `PASS_MAP` to `out_dir/bindings.rs`, and the `hot_reload::Build` that
 /// `watch!` includes to `out_dir/hot_reload.rs`.
-pub(crate) fn generate(shaders: &Shaders, profiling: bool, out_dir: &Path) {
+pub(crate) fn generate(shaders: &Shaders, out_dir: &Path) {
     let global = slang::GlobalSession::new().unwrap();
 
     // Every pass's absolute path: each directory's files sorted, directories in call order.
@@ -880,8 +897,6 @@ use lava::pipeline::*;
             search_paths: &search_paths,
             defines: &defines,
             optimization: shaders.optimization,
-            profiling,
-            pass_index: pass_map.len(),
         };
         let session = compile::session(&global, &options);
         let program = compile::link(&session, source).unwrap_or_else(|e| panic!("{source}:\n{e}"));
@@ -914,15 +929,13 @@ use lava::pipeline::*;
             .and_then(|t| t.element_type_layout())
             .unwrap_or_else(|| panic!("no push constant buffer found in {source}"));
 
-        let regions = compile::clock_regions(&program);
-        let consts = sconsts(layout, source, &regions);
+        let consts = sconsts(layout, source);
 
         let out = passes_dir.join(format!("{pass_name}.spv"));
         let code = generate_pass(
             &pass_name,
             pc,
             &consts,
-            &regions,
             &entries,
             compile::uses_ray_query(pass_spirv.as_slice()),
             &mut structs,
@@ -946,7 +959,6 @@ pub static PASS_MAP: PassMap = PassMap {{
     passes: &[
 {passes}
     ],
-    profiling: {profiling},
 }};
 "#,
         passes = pass_map.join("\n"),
@@ -958,8 +970,8 @@ pub static PASS_MAP: PassMap = PassMap {{
             continue;
         }
         bindings.push_str(&format!(
-            "\n#[derive(Pod, Copy, Clone, Zeroable, Debug, Default)]\n#[repr(C)]\npub struct {name} {{\n{}}}\n{}",
-            def.body, def.checks
+            "\n#[derive(Pod, Copy, Clone, Zeroable, Debug)]\n#[repr(C)]\npub struct {name} {{\n{}}}\n{}{}",
+            def.body, def.checks, def.impls
         ));
     }
 
