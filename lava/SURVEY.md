@@ -25,35 +25,31 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    `profile.slang` and `ray_tracing.slang` in its `slang/`, searched by every session, and
    lava's GPU tests moved to the `lava-tests` crate, an ordinary consumer, so `test-passes` is
    gone.
-3. **Git dependencies.** `shader-slang` comes from git (`lava-build-slang/Cargo.toml`), and
-   ash/ash-window/gpu-allocator are `[patch]`ed in the workspace. Patches don't reach
-   dependents, so a published lava would resolve ash 0.38, which lacks
-   `VK_KHR_device_address_commands`. Either wait for releases or hand-write that extension's
-   loader against released ash.
-4. **Slang is needed by every user.** *Partly done (2026-10-15):* only lava-build-slang depends on
-   `shader-slang` and links `slang-compiler`; lava never reaches Slang (hot reload lives in
-   lava-build-slang and hands lava SPIR-V through `pipeline::reload_pass`). Still open: `.cargo/config.toml` supplies `SLANG_DIR` and an absolute `/home/karsten/...`
-   rpath, and neither ships.
+3. ~~**Git dependencies.**~~ **Done (2026-10-16):** ash, ash-window, gpu-allocator and slang-rs are
+   lava's own forks (`github.com/DerEchteKarsten/{ash,gpu-allocator,slang-rs}`, branch `lava`),
+   to be published as `lava-ash`, `lava-ash-window`, `lava-gpu-allocator`, `lava-slang-sys`
+   and `lava-slang` with their upstream lib names. No `[patch]` is left. They are published
+   first; until then `lava` and `lava-build-slang` can't run `cargo package` with verification.
+4. ~~**Slang is needed by every user.**~~ **Done (2026-10-16):** lava-slang-sys loads Slang at
+   runtime from the path its build script finds (`SLANG_LIB_DIR`, `SLANG_DIR`, `VULKAN_SDK`,
+   else the system's loader), with pregenerated bindings, so no rpath, `LD_LIBRARY_PATH` or
+   clang is needed and docs.rs can build it. Only lava-build-slang reaches Slang.
 5. ~~**The default `hot-reload` feature makes binaries non-relocatable.**~~ **Done
    (2026-10-15):** `PassEntry.spirv` is always `include_bytes!`'d and hot reload compiles from
    the absolute source path (lava-build-slang's `BuiltPass.source`), so a moved binary runs
    with the pipelines it was built with. lava has no features now; hot reload is lava-build-slang's.
-6. **Nightly.** `generic_const_exprs` (incomplete and prone to compiler crashes) leaks to every
-   user (`core/src/lib.rs:4`, `tests/gpu_headless.rs:7`), and it exists only for `RasterBuilder`
-   (see 4.1). `range_into_bounds`/`range_bounds_is_empty` serve one line
-   (`command_buffer.rs:69`), and `const_trait_impl` looks unused.
-7. **Packaging.**
-   - No `description`, `license`, `repository` or `rust-version`.
-   - `pub mod scratchpad` is public.
-   - Check whether the name `lava` is free on crates.io.
-8. **Engine conventions are library behaviour.**
-   - Fixed raster state: front face `CLOCKWISE` (the bake's winding), depth compare `GREATER`
-     (reversed Z), and the depth test always on with a depth attachment (`pipeline.rs:667-673`).
-   - Swapchain: BGRA8_UNORM and storage usage (`swapchain.rs:96-104,252-266`).
-   - Three hard-coded samplers (`bindless.rs:171-207`).
-   - Required features every user must have, though only core needs them (`state.rs:463-472`):
-     BC compression (which excludes ASTC/ETC-only devices), `fill_mode_non_solid`,
-     `independent_blend`, float16 and int8/16.
+6. ~~**Nightly.**~~ **Done (2026-10-16):** lava, its tests and the generated code build on stable
+   (rust-version 1.96). Registrations became `cmd.record_access(access, stage)`, `RasterBuilder`
+   takes its attachments up front (see 4.1), and the range intersection is written out.
+7. **Packaging.** *Done (2026-10-16) but for the name:* MIT OR Apache-2.0, metadata, READMEs,
+   `include` lists, no scratchpad. The name `lava` belongs to an abandoned 2020 crate; its owner
+   was asked to hand it over. If they decline, the package becomes `lava-vk` with
+   `[lib] name = "lava"`.
+8. ~~**Engine conventions are library behaviour.**~~ **Done (2026-10-16):** the raster state is
+   all dynamic and overridable (the old values are the documented defaults), the swapchain
+   takes its usage as a type and its format from a preference list, samplers come from
+   `Config::samplers`, and the core-only features are optional (`Features`, `Config::required`;
+   passes are gated by their SPIR-V capabilities).
 
 ---
 
@@ -77,7 +73,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
       sampled reads in compute.
 
    **Direction:** keep (stages, accesses) pairs per barrier and check that one pair contains both.
-3. **Debug names and labels never turn on.** `device_debug_utils` looks for
+3. ~~**Debug names and labels never turn on.**~~ **Done (2026-10-16):** debug utils load with the instance extension whenever validation is on (debug builds); labels in release builds are still missing (section 5). `device_debug_utils` looks for
    `VK_EXT_debug_utils` among *device* extensions (`physical_device.rs:164-169`), but it is an
    instance extension. So `set_debug_name`, the scope labels and the swapchain image names do
    nothing, and the test at `state.rs:769-773` asserts the wrong behaviour.
@@ -148,7 +144,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
       panics on a discrete GPU without ReBAR.
     - `host()` returns `&[T]` over memory the GPU may be writing, which is UB under Rust's
       aliasing rules (a polling loop can be hoisted).
-17. **Required device features are requested but never checked** (`state.rs:418-515`).
+17. ~~**Required device features are requested but never checked**~~ **Done (2026-10-16):** `features.rs` checks lava's needs and `Config::required` when picking the GPU, and enables only optional features the device has. (`state.rs:418-515`).
     - A device lacking any of them fails `vkCreateDevice` with `ERROR_FEATURE_NOT_PRESENT`.
     - `task_shader(true)` is requested without checking it.
     - `bindless_supported` is computed and never read.
@@ -165,7 +161,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     `SampleLevel` and `GetDimensions` have it.
 22. **Passes with their own descriptor bindings aren't rejected.** A global `Texture2D t;` gets
     a Slang-assigned binding that collides with set 0 (`build.rs:917-925`).
-23. **Feature gating covers only ray tracing.** A mesh pass on a device without mesh shaders
+23. ~~**Feature gating covers only ray tracing.**~~ **Done (2026-10-16):** a pass's needs come from its SPIR-V capabilities (`Features::of_spirv`). A mesh pass on a device without mesh shaders
     reaches pipeline creation with a `MESH_EXT` stage before the friendly panic
     (`pipeline.rs:89-99`, `command_buffer.rs:830,907`). The same holds for int64, float16 and
     shader clock. Map every `OpCapability` to `Features` at build time.
@@ -221,6 +217,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 
 ### Recording and pipelines
 - **Per draw and dispatch** (`command_buffer.rs:829-833,1055-1065`):
+  *Done for draws (2026-10-16):* the pipeline key is formats plus constants, looked up once per pass and constants in a rendering, with redundant binds skipped; a pass pushes only its own bytes.
   - it builds a `RasterHash` (two SmallVecs plus 128 B of constants) and SipHashes it under the
     global `RwLock`;
   - it always calls `cmd_bind_pipeline`;
@@ -237,10 +234,12 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
   - Beyond `scratchpad.rs`: a per-pass `Mutex`, `FAIL_ON_PIPELINE_COMPILE_REQUIRED` for async
     compiles, `VK_KHR_pipeline_binary`, and deferred host operations for ray tracing pipelines.
 - **Dynamic state.** Use core 1.3 dynamic state for cull mode, front face, depth test, write and
+  *Done (2026-10-16):* every state this device supports is dynamic (`command_buffer/raster_state.rs`).
   compare, depth bias, stencil, topology and primitive restart, plus extended dynamic state 3
   where present for polygon mode, samples, blend and write masks. The pipeline key then shrinks
   to formats plus constants.
 - **`RasterBuilder` moves `[Draw; N]` (about 1.2 KB each) on every call.** That is O(n²) memcpy
+  *Done (2026-10-16):* the builder works through `&mut self` on a draw list the command buffer lends it.
   and one monomorphisation per draw count.
 - **Raster passes are coarse in barriers.** Every resource of a raster pass is accessed at
   `VERTEX|FRAGMENT` or `TASK|MESH|FRAGMENT` (`build.rs:30-41`).
@@ -285,6 +284,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 ## 4. API friction
 
 1. **`RasterBuilder` counts draws in its type**, so draws can't be added in a loop; core records
+     *Done (2026-10-16):* `cmd.raster(extent, [Attachment::color(..); N])`, draws in a reused list, addable in loops.
    draws of count 0. Only the attachment count needs checking. **Direction:**
    `cmd.raster(extent, [attachments; N], depth)` with a plain const `N` (stable Rust), and the
    draws in a `Vec` the `CommandBuffer` reuses.
@@ -292,6 +292,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    `BufferSlice<u32>`s or two `Mat4`s compiles. Generate a struct with named fields, with
    specialization constants as fields too (that removes `IncompleteX`).
 3. **Init takes positional bools** (`init(display, bool, bool)`).
+     *Partly done (2026-10-16):* `lava::init(&Config)` with passes, display, validation, samplers and required features. Still missing: app name, device choice, extra extensions and a `DeviceInfo`.
    - **Missing settings:** app name and version, required and optional features, device choice
      (ranked by capability, user override, presentation support), extra extensions and a pNext
      hook, validation settings and queue counts.
@@ -398,6 +399,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 
 - **Raster:**
   - **Fixed-function state:** topology (lines, points, strips), front face, depth compare and
+      *Done (2026-10-16) as dynamic state:* topology, front face, depth compare and test without write, stencil, depth bias values, write masks, custom and min/max blending, blend constants, depth clamp and bounds, conservative raster, line modes and stipple. MSAA states stay fixed until lava has MSAA.
     test-without-write, stencil, depth bias values (bias is enabled with zeros today), colour
     write masks, custom and premultiplied blending, min/max, blend constants, depth
     clamp/bounds, conservative raster.
@@ -418,6 +420,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
   - **Memory:** transient (lazily allocated) attachments, aliasing in shared memory blocks,
     sparse residency, external memory interop.
 - **Samplers:** user-created samplers, anisotropy (`samplerAnisotropy` is never enabled),
+    *Partly done (2026-10-16):* `Config::samplers` (`SamplerDesc`: filters, mipmap mode, address mode, border, anisotropy). Compare and min/max reduction samplers are still missing.
   clamp-to-edge, compare samplers for PCF, min/max reduction for depth pyramids, mirror.
 - **Slang coverage:**
   - **Types:** `half` and 16-bit ints (panic today, though float16 is enabled), non-square
