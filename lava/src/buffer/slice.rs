@@ -75,7 +75,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
 }
 
 impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
-    /// A pass's access of the slice, for [`crate::command_buffer::BindingOutput::new`].
+    /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`].
     pub fn access(
         &self,
         stage: vk::PipelineStageFlags2,
@@ -167,7 +167,7 @@ impl CommandBuffer {
     ) {
         self.flush_pending(
             std::iter::empty(),
-            std::iter::once(&BufferAccess {
+            std::iter::once(BufferAccess {
                 access: vk::AccessFlags2::TRANSFER_WRITE,
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 range: buffer.get_range(),
@@ -191,7 +191,7 @@ impl CommandBuffer {
     ) {
         self.flush_pending(
             iter::empty(),
-            iter::once(&BufferAccess {
+            iter::once(BufferAccess {
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 access: vk::AccessFlags2::TRANSFER_WRITE,
                 range: buffer.get_range(),
@@ -242,7 +242,7 @@ impl CommandBuffer {
                 ]
             })
             .collect::<SmallVec<[_; 4]>>();
-        self.flush_pending(iter::empty(), accesses.iter());
+        self.flush_pending(iter::empty(), accesses.iter().cloned());
         let copies = regions
             .iter()
             .map(|(src, dst)| {

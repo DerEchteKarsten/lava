@@ -11,7 +11,7 @@ pub mod bindings {
 mod tests {
     use std::ffi::CStr;
 
-    use lava::pipeline::{MAX_SPECIALIZATION_CONSTANTS_SIZE, PassKind};
+    use lava::pipeline::PassKind;
 
     use crate::bindings::PASS_MAP;
 
@@ -21,10 +21,9 @@ mod tests {
         let (mut specialized_compute, mut specialized_raytracing) = (Vec::new(), Vec::new());
         for pass in PASS_MAP.passes {
             let specialized = !pass.constants.is_empty();
-            // The constants fill their struct exactly, and fit every pipeline key.
+            // The constants fill their struct exactly.
             let end = pass.constants.iter().map(|c| c.offset as usize + c.size);
             assert_eq!(end.max().unwrap_or(0), pass.constants_size, "{}", pass.name);
-            assert!(pass.constants_size <= MAX_SPECIALIZATION_CONSTANTS_SIZE);
             let names: Vec<&str> = match pass.kind {
                 PassKind::Compute { entry } => {
                     if specialized {

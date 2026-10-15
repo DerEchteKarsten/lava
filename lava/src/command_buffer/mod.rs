@@ -2,7 +2,6 @@
 use std::{
     fmt::Debug,
     iter,
-    marker::PhantomData,
     ops::{IntoBounds, RangeBounds},
     range::Range,
     sync::atomic::{AtomicU32, Ordering},
@@ -13,32 +12,31 @@ use crate::{
     buffer::{
         self,
         slice::BufferSlice,
-        usage::{BufferUsage, IsIndex, IsIndirect},
+        usage::{IsIndex, IsIndirect},
     },
     error::Result,
     image::{
-        dim::Dim,
         format::{ColorAspect, DepthAspect, Format},
         slice::ImageView,
-        usage::{ImageUsage, IsColorAttachment, IsDepthAttachment},
+        usage::{IsColorAttachment, IsDepthAttachment},
     },
-    pipeline::{
-        Constants, MAX_PASS_BUFFERS, MAX_PASS_IMAGES, MAX_PUSH_CONSTANTS_SIZE, RasterHash,
-        pass_map, pipelines,
-    },
+    pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterHash, pass_map, pipelines},
     profiling::{PassQueries, TimestampQueries},
     state::{Ctx, Functions},
     vkobjects::queue::{PendingAccesses, PendingWrite},
 };
 use ash::vk::{self, IndexType};
-use bytemuck::{Pod, Zeroable, bytes_of};
+use bytemuck::{Pod, Zeroable};
 use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
 use smallvec::{SmallVec, smallvec};
 
+mod binding_output;
+pub use binding_output::{BindingOutput, Bindings, kind};
+
 /// A pass's access of a buffer range, made by `BufferSlice::access` (a binding generator's
-/// part of [`BindingOutput::new`]).
-#[derive(Debug, Clone)]
+/// part of [`Bindings::new`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct BufferAccess {
     pub stage: vk::PipelineStageFlags2,
     pub access: vk::AccessFlags2,
@@ -72,7 +70,7 @@ impl BufferAccess {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImageAccess {
     pub stage: vk::PipelineStageFlags2,
     pub access: vk::AccessFlags2,
@@ -84,7 +82,7 @@ pub struct ImageAccess {
 
 /// An image access of a command that isn't recorded yet, with the tracked layouts of its mips,
 /// which only move when the command is recorded (see [`compute_barriers`]). Made by
-/// `ImageView::access` (a binding generator's part of [`BindingOutput::new`]).
+/// `ImageView::access` (a binding generator's part of [`Bindings::new`]).
 #[derive(Debug, Clone)]
 pub struct ImageUse<'a> {
     pub access: ImageAccess,
@@ -142,210 +140,6 @@ pub struct CommandBuffer {
 pub struct ShaderHash {
     pub entry: &'static str,
     pub file: &'static str,
-}
-
-/// Marker types for the kind of pass a [`BindingOutput`] was made for, so that it can only be
-/// recorded the way its shaders run.
-pub mod kind {
-    pub struct Compute;
-    pub struct RayTracing;
-    pub struct RasterVertex;
-    pub struct RasterMesh;
-}
-
-/// A pass's push constants, specialization constants and the resources it accesses, made by
-/// the generated `Pass::push_bindings` (and `constant_bindings` for a pass with
-/// specialization constants). It borrows its images' tracked layouts until it is recorded.
-///
-/// [`Self::new`] and [`Self::with_constants`] are the API binding generators (lava-build-slang's,
-/// or one for another shader language) make them with.
-pub struct BindingOutput<'a, K> {
-    /// Index into the pass map `lava::init` was given.
-    pub(crate) pass: usize,
-    /// The pass's push-constant struct, zero-padded; always pushed whole.
-    pub(crate) push_constants: [u8; MAX_PUSH_CONSTANTS_SIZE],
-    /// The pass's specialization constants (laid out by `PassEntry.constants`); part of the
-    /// key of its pipeline.
-    pub(crate) constants: Constants,
-    pub(crate) images: SmallVec<[ImageUse<'a>; MAX_PASS_IMAGES]>,
-    pub(crate) buffers: SmallVec<[BufferAccess; MAX_PASS_BUFFERS]>,
-    /// Shader stages of the pass; accesses registered later use the same stages.
-    pub(crate) stage: vk::PipelineStageFlags2,
-    kind: PhantomData<K>,
-}
-
-impl<'a, K> BindingOutput<'a, K> {
-    /// The bindings of pass `pass` (its index in the pass map) with the push constants
-    /// `bindings`, run in `stage`, accessing `images` and `buffers`. `K` must be the pass's
-    /// kind.
-    pub fn new<G: Pod, const I: usize, const B: usize>(
-        pass: usize,
-        bindings: &G,
-        stage: vk::PipelineStageFlags2,
-        images: [ImageUse<'a>; I],
-        buffers: [BufferAccess; B],
-    ) -> Self {
-        assert!(size_of::<G>() <= MAX_PUSH_CONSTANTS_SIZE);
-        let mut push_constants = [0; MAX_PUSH_CONSTANTS_SIZE];
-        push_constants[..size_of::<G>()].copy_from_slice(bytes_of(bindings));
-        Self {
-            pass,
-            push_constants,
-            constants: Constants::NONE,
-            images: images.into_iter().collect(),
-            buffers: buffers.into_iter().collect(),
-            stage,
-            kind: PhantomData,
-        }
-    }
-
-    /// Sets the specialization constants, laid out as the pass's `PassEntry.constants` says,
-    /// and adds the accesses of the resources they name.
-    pub fn with_constants<G: Pod, const I: usize, const B: usize>(
-        mut self,
-        constants: &G,
-        images: [ImageUse<'a>; I],
-        buffers: [BufferAccess; B],
-    ) -> Self {
-        self.constants = Constants::new(bytes_of(constants));
-        self.images.extend(images);
-        self.buffers.extend(buffers);
-        self
-    }
-
-    /// The pass's index in the pass map.
-    pub fn pass(&self) -> usize {
-        self.pass
-    }
-
-    /// The push constants, zero-padded to [`MAX_PUSH_CONSTANTS_SIZE`].
-    pub fn push_constants(&self) -> &[u8; MAX_PUSH_CONSTANTS_SIZE] {
-        &self.push_constants
-    }
-
-    /// The specialization constants, empty for a pass without them.
-    pub fn constants(&self) -> &[u8] {
-        self.constants.bytes()
-    }
-
-    pub fn images(&self) -> &[ImageUse<'a>] {
-        &self.images
-    }
-
-    pub fn buffers(&self) -> &[BufferAccess] {
-        &self.buffers
-    }
-
-    /// Also shortens the borrow, so a longer-lived binding can join a rendering. A `SmallVec`
-    /// can't coerce to a shorter lifetime by itself: it is invariant in its items.
-    fn erase<'s>(self) -> BindingOutput<'s, ()>
-    where
-        'a: 's,
-    {
-        BindingOutput {
-            pass: self.pass,
-            push_constants: self.push_constants,
-            constants: self.constants,
-            // SAFETY: only the lifetime changes, which doesn't affect the layout, and it gets
-            // shorter ('a: 's) on a value owned here, so nothing can store a shorter-lived
-            // borrow where the longer one is expected.
-            images: unsafe {
-                std::mem::transmute::<
-                    SmallVec<[ImageUse<'a>; MAX_PASS_IMAGES]>,
-                    SmallVec<[ImageUse<'s>; MAX_PASS_IMAGES]>,
-                >(self.images)
-            },
-            buffers: self.buffers,
-            stage: self.stage,
-            kind: PhantomData,
-        }
-    }
-}
-
-/// Registering resources the pass reaches without naming them in its push constants, e.g.
-/// through a bindless handle or pointer stored in a buffer. Each call adds the access to the
-/// barriers recorded before the pass.
-impl<'a, K> BindingOutput<'a, K> {
-    /// The pass samples `image` (`Tex2D`, or a `DynImg` with a sampled index).
-    pub fn sampled_read<F: Format, U: crate::image::usage::IsSampled, D: Dim>(
-        self,
-        image: ImageView<'a, F, U, D>,
-    ) -> Self {
-        image.usage_check(vk::ImageUsageFlags::SAMPLED);
-        self.with_image(image, vk::AccessFlags2::SHADER_SAMPLED_READ)
-    }
-
-    /// The pass loads from `image` as a storage image (`Image2D`, or a `DynImg` without a
-    /// sampled index).
-    pub fn storage_read<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
-        self,
-        image: ImageView<'a, F, U, D>,
-    ) -> Self {
-        image.usage_check(vk::ImageUsageFlags::STORAGE);
-        self.with_image(image, vk::AccessFlags2::SHADER_STORAGE_READ)
-    }
-
-    /// The pass loads from and stores to `image` (`MutImage2D`).
-    pub fn storage_write<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
-        self,
-        image: ImageView<'a, F, U, D>,
-    ) -> Self {
-        image.usage_check(vk::ImageUsageFlags::STORAGE);
-        self.with_image(
-            image,
-            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        )
-    }
-
-    /// The pass traces `tlas` through an address it reads from a buffer (an `Accel` inside a
-    /// struct): its memory and the BLASes it names.
-    pub fn acceleration_structure_read(
-        mut self,
-        tlas: &crate::vkobjects::acceleration_structure::Tlas,
-    ) -> Self {
-        self.buffers.extend(tlas.trace_accesses(self.stage));
-        self
-    }
-
-    /// The pass reads `buffer` through a pointer (`Buf`).
-    pub fn buffer_read<V: Copy + Pod, U: crate::buffer::usage::IsStorage>(
-        self,
-        buffer: BufferSlice<'_, V, U>,
-    ) -> Self {
-        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
-        self.with_buffer(buffer, vk::AccessFlags2::SHADER_STORAGE_READ)
-    }
-
-    /// The pass reads and writes `buffer` through a pointer (`MutBuf`).
-    pub fn buffer_write<V: Copy + Pod, U: crate::buffer::usage::IsStorage>(
-        self,
-        buffer: BufferSlice<'_, V, U>,
-    ) -> Self {
-        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
-        self.with_buffer(
-            buffer,
-            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        )
-    }
-
-    fn with_image<F: Format, U: ImageUsage, D: Dim>(
-        mut self,
-        image: ImageView<'a, F, U, D>,
-        access: vk::AccessFlags2,
-    ) -> Self {
-        self.images
-            .push(image.access(self.stage, access, vk::ImageLayout::GENERAL));
-        self
-    }
-
-    fn with_buffer<V: Copy + Pod, U: BufferUsage>(
-        mut self,
-        buffer: BufferSlice<'_, V, U>,
-        access: vk::AccessFlags2,
-    ) -> Self {
-        self.buffers.push(buffer.access(self.stage, access));
-        self
-    }
 }
 
 /// One rendering being built: its `COLOR_ATTACHMENTS` and its `DRAWS` so far, which
@@ -427,7 +221,9 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
 }
 
 struct Draw<'a, const COLOR_ATTACHMENTS: usize> {
-    bindings: BindingOutput<'a, ()>,
+    bindings: &'a BindingOutput<'a, ()>,
+    /// The draw's index or indirect buffers, read at other stages than the pass's shaders.
+    extra: SmallVec<[BufferAccess; 2]>,
     command: DrawCommand,
     state: RasterState<COLOR_ATTACHMENTS>,
 }
@@ -614,9 +410,9 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
         self
     }
 
-    pub fn draw<'b: 'a>(
+    pub fn draw(
         self,
-        bindings: BindingOutput<'b, kind::RasterVertex>,
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
         vertices: u32,
         instances: u32,
         state: RasterState<COLOR_ATTACHMENTS>,
@@ -625,57 +421,57 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             vertices,
             instances,
         };
-        self.push(bindings.erase(), command, state)
+        self.push(bindings.erase(), SmallVec::new(), command, state)
     }
 
-    pub fn draw_indexed<'b: 'a, IDX: IsIndex>(
+    pub fn draw_indexed<IDX: IsIndex>(
         self,
-        bindings: BindingOutput<'b, kind::RasterVertex>,
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
         index_buffer: BufferSlice<'a, u32, IDX>,
         instances: u32,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         index_buffer.usage_check(vk::BufferUsageFlags::INDEX_BUFFER);
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(index_buffer.access(
+        let index_access = index_buffer.access(
             vk::PipelineStageFlags2::INDEX_INPUT,
             vk::AccessFlags2::INDEX_READ,
-        ));
+        );
         let command = DrawCommand::Indexed {
             indices: index_buffer.address_range(),
             flags: index_buffer.address_flags(),
             count: index_buffer.len() as u32,
             instances,
         };
-        self.push(bindings, command, state)
+        self.push(bindings.erase(), smallvec![index_access], command, state)
     }
 
-    pub fn draw_indirect<'b: 'a, IND: IsIndirect>(
+    pub fn draw_indirect<IND: IsIndirect>(
         self,
-        bindings: BindingOutput<'b, kind::RasterVertex>,
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
         buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::Indirect {
             draws: buffer.strided_range(),
             flags: buffer.address_flags(),
             count: buffer.len() as u32,
         };
-        self.push(bindings, command, state)
+        self.push(
+            bindings.erase(),
+            smallvec![indirect_access(buffer)],
+            command,
+            state,
+        )
     }
 
-    pub fn draw_indirect_count<'b: 'a, IND: IsIndirect, CNT: IsIndirect>(
+    pub fn draw_indirect_count<IND: IsIndirect, CNT: IsIndirect>(
         self,
-        bindings: BindingOutput<'b, kind::RasterVertex>,
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
         buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
         count_buffer: BufferSlice<'a, u32, CNT>,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(indirect_access(buffer));
-        bindings.buffers.push(indirect_access(count_buffer));
+        let extra = smallvec![indirect_access(buffer), indirect_access(count_buffer)];
         let command = DrawCommand::IndirectCount {
             draws: buffer.strided_range(),
             flags: buffer.address_flags(),
@@ -683,43 +479,53 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             count_flags: count_buffer.address_flags(),
             max_count: buffer.len() as u32,
         };
-        self.push(bindings, command, state)
+        self.push(bindings.erase(), extra, command, state)
     }
 
-    pub fn launch<'b: 'a>(
+    pub fn launch(
         self,
-        bindings: BindingOutput<'b, kind::RasterMesh>,
+        bindings: &'a BindingOutput<'a, kind::RasterMesh>,
         groups: [u32; 3],
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
-        self.push(bindings.erase(), DrawCommand::Launch(groups), state)
+        self.push(
+            bindings.erase(),
+            SmallVec::new(),
+            DrawCommand::Launch(groups),
+            state,
+        )
     }
 
     /// Launches the task (or, without a task shader, mesh) workgroup counts in `buffer`.
-    pub fn launch_indirect<'b: 'a, IND: IsIndirect>(
+    pub fn launch_indirect<IND: IsIndirect>(
         self,
-        bindings: BindingOutput<'b, kind::RasterMesh>,
+        bindings: &'a BindingOutput<'a, kind::RasterMesh>,
         buffer: BufferSlice<'a, DispatchIndirectCommand, IND>,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
-        let mut bindings = bindings.erase();
-        bindings.buffers.push(indirect_access(buffer));
         let command = DrawCommand::LaunchIndirect {
             draws: buffer.strided_range(),
             flags: buffer.address_flags(),
             count: buffer.len() as u32,
         };
-        self.push(bindings, command, state)
+        self.push(
+            bindings.erase(),
+            smallvec![indirect_access(buffer)],
+            command,
+            state,
+        )
     }
 
     fn push(
         self,
-        bindings: BindingOutput<'a, ()>,
+        bindings: &'a BindingOutput<'a, ()>,
+        extra: SmallVec<[BufferAccess; 2]>,
         command: DrawCommand,
         state: RasterState<COLOR_ATTACHMENTS>,
     ) -> RasterBuilder<'a, { DRAWS + 1 }, COLOR_ATTACHMENTS> {
         let draw = Draw {
             bindings,
+            extra,
             command,
             state,
         };
@@ -750,11 +556,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     }
 
     /// The pipeline key of a draw with `state` in this rendering.
-    fn pipeline_key(
-        &self,
-        state: &RasterState<COLOR_ATTACHMENTS>,
-        constants: &Constants,
-    ) -> RasterHash {
+    fn pipeline_key(&self, state: &RasterState<COLOR_ATTACHMENTS>) -> RasterHash {
         RasterHash {
             color_formats: SmallVec::from_slice(&self.color_formats),
             depth_format: self.depth_format,
@@ -763,7 +565,6 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             depth_write: state.depth_write,
             backface_culling: state.backface_culling,
             wire_frame: state.wire_frame,
-            constants: *constants,
         }
     }
 
@@ -775,15 +576,17 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
     pub fn record(self, name: &'static str) {
         let _span = tracing::info_span!("draw", pass = name).entered();
         let depth_access = self.depth_access();
+        let sections = self.draws.each_ref().map(|draw| draw.bindings.sections());
         self.cmd_buf.flush_pending(
-            self.draws
+            sections
                 .iter()
-                .flat_map(|draw| draw.bindings.images.iter())
-                .chain(&self.color_accesses)
-                .chain(&depth_access),
-            self.draws
+                .flat_map(|s| s.images())
+                .chain(self.color_accesses.iter().cloned())
+                .chain(depth_access.clone()),
+            sections
                 .iter()
-                .flat_map(|draw| draw.bindings.buffers.iter()),
+                .zip(&self.draws)
+                .flat_map(|(s, draw)| s.buffers().chain(draw.extra.iter().cloned())),
         );
 
         let color_attachments = self.color_attachments.map(|(view, clear)| {
@@ -849,7 +652,7 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             );
             device.cmd_set_scissor(handle, 0, &self.scissors);
         }
-        for draw in &self.draws {
+        for (draw, sections) in self.draws.iter().zip(&sections) {
             // The validation layer warns about direct draws of nothing, and an empty index
             // range can't be bound without `nullDescriptor`.
             if let DrawCommand::Draw { instances: 0, .. }
@@ -858,9 +661,9 @@ impl<'a, const DRAWS: usize, const COLOR_ATTACHMENTS: usize>
             {
                 continue;
             }
-            let key = self.pipeline_key(&draw.state, &draw.bindings.constants);
-            let pipeline = pipelines().raster(&key, draw.bindings.pass);
-            self.cmd_buf.push_constants(&draw.bindings.push_constants);
+            let key = self.pipeline_key(&draw.state);
+            let pipeline = pipelines().raster(&key, sections.constants, sections.pass);
+            self.cmd_buf.push_constants(sections.push_constants);
             unsafe {
                 device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 match draw.command {
@@ -975,19 +778,22 @@ impl CommandBuffer {
 
     fn compute_private<IND: IsIndirect>(
         &mut self,
-        mut bindings: BindingOutput<'_, kind::Compute>,
+        bindings: &BindingOutput<'_, kind::Compute>,
         dispatch: [u32; 3],
         indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand, IND>>,
     ) {
-        let pass = &pass_map().passes[bindings.pass];
+        let sections = bindings.sections();
+        let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("compute", pass = pass.name).entered();
-        bindings
-            .buffers
-            .extend(indirect_buffer.map(indirect_access));
-        self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
-        self.push_constants(&bindings.push_constants);
+        self.flush_pending(
+            sections.images(),
+            sections
+                .buffers()
+                .chain(indirect_buffer.map(indirect_access)),
+        );
+        self.push_constants(sections.push_constants);
 
-        let pipeline = pipelines().compute(bindings.pass, &bindings.constants);
+        let pipeline = pipelines().compute(sections.pass, sections.constants);
 
         self.begin_pass(pass.name);
         unsafe {
@@ -1009,35 +815,38 @@ impl CommandBuffer {
     #[validation_trace]
     pub fn compute_indirect<IND: IsIndirect>(
         &mut self,
-        bindings: BindingOutput<'_, kind::Compute>,
+        bindings: &BindingOutput<'_, kind::Compute>,
         buffer: BufferSlice<'_, DispatchIndirectCommand, IND>,
     ) {
         self.compute_private(bindings, [0, 0, 0], Some(buffer));
     }
 
     #[validation_trace]
-    pub fn compute(&mut self, bindings: BindingOutput<'_, kind::Compute>, dispatch: [u32; 3]) {
+    pub fn compute(&mut self, bindings: &BindingOutput<'_, kind::Compute>, dispatch: [u32; 3]) {
         self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None);
     }
 
     fn raytrace_private<IND: IsIndirect>(
         &mut self,
-        mut bindings: BindingOutput<'_, kind::RayTracing>,
+        bindings: &BindingOutput<'_, kind::RayTracing>,
         rays: [u32; 3],
         indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand, IND>>,
     ) {
-        let pass = &pass_map().passes[bindings.pass];
+        let sections = bindings.sections();
+        let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
-        bindings
-            .buffers
-            .extend(indirect_buffer.map(indirect_access));
-        self.flush_pending(bindings.images.iter(), bindings.buffers.iter());
-        self.push_constants(&bindings.push_constants);
+        self.flush_pending(
+            sections.images(),
+            sections
+                .buffers()
+                .chain(indirect_buffer.map(indirect_access)),
+        );
+        self.push_constants(sections.push_constants);
 
         self.begin_pass(pass.name);
         let functions = Functions::raytracing_pipeline()
             .expect("a pass that can be recorded has its pipeline functions");
-        pipelines().ray_tracing(bindings.pass, &bindings.constants, |pipeline| unsafe {
+        pipelines().ray_tracing(sections.pass, sections.constants, |pipeline| unsafe {
             Ctx::device().cmd_bind_pipeline(
                 self.handle,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1070,7 +879,7 @@ impl CommandBuffer {
 
     /// Traces `rays` (width, height, depth) raygen invocations of a ray tracing pass.
     #[validation_trace]
-    pub fn raytrace(&mut self, bindings: BindingOutput<'_, kind::RayTracing>, rays: [u32; 3]) {
+    pub fn raytrace(&mut self, bindings: &BindingOutput<'_, kind::RayTracing>, rays: [u32; 3]) {
         self.raytrace_private::<buffer::usage::Indirect>(bindings, rays, None);
     }
 
@@ -1078,13 +887,18 @@ impl CommandBuffer {
     #[validation_trace]
     pub fn raytrace_indirect<IND: IsIndirect>(
         &mut self,
-        bindings: BindingOutput<'_, kind::RayTracing>,
+        bindings: &BindingOutput<'_, kind::RayTracing>,
         buffer: BufferSlice<'_, TraceRaysIndirectCommand, IND>,
     ) {
         self.raytrace_private(bindings, [0, 0, 0], Some(buffer));
     }
 
-    fn push_constants(&mut self, constants: &[u8; MAX_PUSH_CONSTANTS_SIZE]) {
+    /// Pushes a pass's push constants from offset 0; the bytes past them keep what earlier
+    /// passes pushed, which the pass doesn't read.
+    fn push_constants(&mut self, constants: &[u8]) {
+        if constants.is_empty() {
+            return;
+        }
         unsafe {
             Ctx::device().cmd_push_constants(
                 self.handle,
@@ -1096,10 +910,10 @@ impl CommandBuffer {
         };
     }
 
-    pub(crate) fn flush_pending<'a: 'b, 'b>(
+    pub(crate) fn flush_pending<'a>(
         &mut self,
-        image_acceses: impl Iterator<Item = &'b ImageUse<'a>> + Clone,
-        buffer_acceses: impl Iterator<Item = &'b BufferAccess> + Clone,
+        image_acceses: impl Iterator<Item = ImageUse<'a>> + Clone,
+        buffer_acceses: impl Iterator<Item = BufferAccess> + Clone,
     ) {
         let barriers = compute_barriers(
             &self.pending_accesses,
@@ -1122,7 +936,7 @@ impl CommandBuffer {
         }
 
         self.pending_accesses
-            .record(image_acceses.map(|image| &image.access), buffer_acceses);
+            .record(image_acceses.map(|image| image.access), buffer_acceses);
     }
 
     /// Debugging aid: a full barrier that makes every command recorded before it finish, and
@@ -1176,6 +990,9 @@ impl CommandBuffer {
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info)? };
         Bindless::bind(&self.handle);
+        // Passes push only their own push constants; this sets the rest of the range once, so
+        // no byte of it is ever undefined.
+        self.push_constants(&[0; MAX_PUSH_CONSTANTS_SIZE]);
         Ok(())
     }
 
@@ -1205,10 +1022,10 @@ pub(crate) struct Barriers {
 /// It moves each image's tracked layout to the requested one, in the order of the accesses, so
 /// call it once per command, when the command is recorded. Command buffers that use the same
 /// image must still be recorded one after the other and submitted in that order.
-pub(crate) fn compute_barriers<'a: 'b, 'b>(
+pub(crate) fn compute_barriers<'a>(
     pending: &PendingAccesses,
-    image_acceses: impl Iterator<Item = &'b ImageUse<'a>> + Clone,
-    buffer_acceses: impl Iterator<Item = &'b BufferAccess>,
+    image_acceses: impl Iterator<Item = ImageUse<'a>> + Clone,
+    buffer_acceses: impl Iterator<Item = BufferAccess>,
 ) -> Option<Barriers> {
     let mut src_stage = vk::PipelineStageFlags2::NONE;
     let mut dst_stage = vk::PipelineStageFlags2::NONE;
@@ -1216,6 +1033,7 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
     let mut dst_access = vk::AccessFlags2::empty();
 
     for buffer_access in buffer_acceses {
+        let buffer_access = &buffer_access;
         let is_write = buffer_access.access.intersects(all_write_access());
         let is_read = buffer_access.access.intersects(all_read_access());
 
@@ -1244,7 +1062,7 @@ pub(crate) fn compute_barriers<'a: 'b, 'b>(
         }
     }
 
-    for image_access in image_acceses.clone().map(|image| &image.access) {
+    for image_access in image_acceses.clone().map(|image| image.access) {
         let is_write = image_access.access.intersects(all_write_access());
         let is_read = image_access.access.intersects(all_read_access());
 
@@ -1443,10 +1261,10 @@ impl PendingAccesses {
     /// partially overlapped write still has bytes nobody has synchronised with. A covered write
     /// is forgotten by a newer write, a covered read by a newer write, whose barrier waited for
     /// it. A newer read doesn't wait for older reads, so it takes over their stages and accesses.
-    pub(crate) fn record<'a>(
+    pub(crate) fn record(
         &mut self,
-        image_acceses: impl Iterator<Item = &'a ImageAccess>,
-        buffer_acceses: impl Iterator<Item = &'a BufferAccess>,
+        image_acceses: impl Iterator<Item = ImageAccess>,
+        buffer_acceses: impl Iterator<Item = BufferAccess>,
     ) {
         for access in buffer_acceses {
             let covers = |a: &BufferAccess| {
@@ -1558,11 +1376,13 @@ fn all_read_access() -> vk::AccessFlags2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::usage::ImageUsage;
     use crate::image::{
         format::{self, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
         usage::{self, ColorAttachment, DepthAttachment, StaticUsage},
     };
     use ash::vk::Handle;
+    use std::marker::PhantomData;
     use std::sync::atomic::AtomicU32;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
@@ -1621,16 +1441,19 @@ mod tests {
 
     fn pending(buffers: &[BufferAccess], images: &[ImageUse]) -> PendingAccesses {
         let mut pending = PendingAccesses::default();
-        pending.record(images.iter().map(|image| &image.access), buffers.iter());
+        pending.record(
+            images.iter().map(|image| image.access.clone()),
+            buffers.iter().cloned(),
+        );
         pending
     }
 
     fn buffer_barrier(pending: &PendingAccesses, access: &BufferAccess) -> Option<Barriers> {
-        compute_barriers(pending, iter::empty(), iter::once(access))
+        compute_barriers(pending, iter::empty(), iter::once(access.clone()))
     }
 
     fn image_barrier(pending: &PendingAccesses, access: &ImageUse) -> Option<Barriers> {
-        compute_barriers(pending, iter::once(access), iter::empty())
+        compute_barriers(pending, iter::once(access.clone()), iter::empty())
     }
 
     /// A command buffer that is never handed to Vulkan: enough for state-only code paths.
@@ -1845,7 +1668,7 @@ mod tests {
     #[test]
     fn a_structure_write_retires_the_read_of_every_structure() {
         let mut pending = pending(&[every_structure_read(), read(0..64)], &[]);
-        pending.record(iter::empty(), iter::once(&structure_write(1024..2048)));
+        pending.record(iter::empty(), iter::once(structure_write(1024..2048)));
         assert!(
             pending
                 .buffer_reads
@@ -1938,7 +1761,7 @@ mod tests {
         // Same range again: still a single entry, lists don't grow frame over frame.
         let mut pending = pending;
         for _ in 0..10 {
-            pending.record(iter::empty(), [write(0..100), read(0..100)].iter());
+            pending.record(iter::empty(), [write(0..100), read(0..100)].into_iter());
         }
         assert_eq!(pending.buffer_writes.len(), 1);
         assert_eq!(pending.buffer_reads.len(), 1);
@@ -2212,11 +2035,14 @@ mod tests {
         images: &[ImageUse],
         buffers: &[BufferAccess],
     ) -> Option<Barriers> {
-        let barriers = compute_barriers(pending, images.iter(), buffers.iter());
+        let barriers = compute_barriers(pending, images.iter().cloned(), buffers.iter().cloned());
         if let Some(barriers) = &barriers {
             pending.made_visible(barriers);
         }
-        pending.record(images.iter().map(|image| &image.access), buffers.iter());
+        pending.record(
+            images.iter().map(|image| image.access.clone()),
+            buffers.iter().cloned(),
+        );
         barriers
     }
 
@@ -2287,8 +2113,12 @@ mod tests {
             image_read(1),
             image(2, S::TRANSFER, A::TRANSFER_WRITE, L::UNDEFINED, L::GENERAL),
         ];
-        let barriers =
-            compute_barriers(&PendingAccesses::default(), accesses.iter(), iter::empty()).unwrap();
+        let barriers = compute_barriers(
+            &PendingAccesses::default(),
+            accesses.into_iter(),
+            iter::empty(),
+        )
+        .unwrap();
         assert_eq!(barriers.images.len(), 1);
         assert_eq!(barriers.images[0].image, vk::Image::from_raw(2));
     }
@@ -2309,7 +2139,8 @@ mod tests {
 
         let nothing = PendingAccesses::default();
         let transition = |access: &ImageUse| {
-            let barriers = compute_barriers(&nothing, iter::once(access), iter::empty()).unwrap();
+            let barriers =
+                compute_barriers(&nothing, iter::once(access.clone()), iter::empty()).unwrap();
             let [transition] = barriers.images.as_slice() else {
                 panic!("one transition");
             };
@@ -2328,7 +2159,10 @@ mod tests {
     #[test]
     fn flush_without_hazards_only_records_and_needs_no_device() {
         let mut cmd = offline_cmd();
-        cmd.flush_pending([image_write(1)].iter(), [write(0..10), read(20..30)].iter());
+        cmd.flush_pending(
+            [image_write(1)].into_iter(),
+            [write(0..10), read(20..30)].into_iter(),
+        );
         assert_eq!(cmd.pending_accesses.buffer_writes.len(), 1);
         assert_eq!(cmd.pending_accesses.buffer_reads.len(), 1);
         assert_eq!(cmd.pending_accesses.image_writes.len(), 1);
@@ -2341,8 +2175,8 @@ mod tests {
     const EXTENT: UVec2 = UVec2::new(640, 480);
 
     /// Bindings for draws that are never recorded.
-    fn no_bindings<K>() -> BindingOutput<'static, K> {
-        BindingOutput::new(0, &0u32, S::VERTEX_SHADER, [], [])
+    fn no_bindings<K>() -> Bindings<'static, K, 4, 0, 0, 0> {
+        Bindings::new(0, &0u32, [], [])
     }
 
     fn slice<T: Pod, U: crate::buffer::usage::StaticUsage>(
@@ -2403,13 +2237,13 @@ mod tests {
             .backface_culling(false)
             .wire_frame(true)
             .depth_write(false);
-        let key = builder.pipeline_key(&state, &Constants::NONE);
+        let key = builder.pipeline_key(&state);
         assert!(!key.backface_culling);
         assert!(key.wire_frame);
         assert!(!key.depth_write);
         assert_ne!(
             key,
-            builder.pipeline_key(&RasterState::default(), &Constants::NONE),
+            builder.pipeline_key(&RasterState::default()),
             "different state must not share a pipeline"
         );
     }
@@ -2428,7 +2262,7 @@ mod tests {
             Blend::Attenuate,
             Blend::Skip,
         ]
-        .map(|blend| builder.pipeline_key(&RasterState::default().blends([blend]), &Constants::NONE));
+        .map(|blend| builder.pipeline_key(&RasterState::default().blends([blend])));
         for (i, key) in keys.iter().enumerate() {
             assert!(!keys[i + 1..].contains(key), "{key:?}");
         }
@@ -2442,10 +2276,10 @@ mod tests {
             .raster(EXTENT)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&a), None)
             .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&b), None);
-        let key = builder.pipeline_key(&RasterState::default(), &Constants::NONE);
+        let key = builder.pipeline_key(&RasterState::default());
         assert_eq!(key.blends.as_slice(), [Blend::Replace; 2]);
         let explicit = RasterState::default().blends([Blend::Replace; 2]);
-        assert_eq!(key, builder.pipeline_key(&explicit, &Constants::NONE));
+        assert_eq!(key, builder.pipeline_key(&explicit));
     }
 
     #[test]
@@ -2489,7 +2323,7 @@ mod tests {
                 .color_attachment(view::<R8G8B8A8Unorm, ColorAttachment>(&color), None)
                 .depth_attachment(view::<D32Sfloat, DepthAttachment>(&depth), None);
             let depth = builder.depth_access();
-            let accesses = builder.color_accesses.iter().chain(&depth);
+            let accesses = builder.color_accesses.iter().chain(&depth).cloned();
             compute_barriers(&nothing, accesses, iter::empty()).map_or(vec![], |barriers| {
                 let transitions = barriers.images.iter();
                 transitions.map(|t| (t.old_layout, t.new_layout)).collect()
@@ -2535,10 +2369,11 @@ mod tests {
         let state = layout(L::GENERAL);
         let mut cmd = offline_cmd();
         let read_only = RasterState::default().depth_write(false);
+        let none = no_bindings();
         let builder = cmd
             .raster(EXTENT)
             .depth_attachment(view::<D32Sfloat, DepthAttachment>(&state), None)
-            .draw(no_bindings(), 3, 1, read_only.clone());
+            .draw(&none, 3, 1, read_only.clone());
 
         assert_eq!(builder.depth_format, vk::Format::D32_SFLOAT);
         assert_eq!(builder.stencil_format, vk::Format::UNDEFINED);
@@ -2551,8 +2386,8 @@ mod tests {
         );
         // Depth writes are pipeline state, so read-only draws get their own pipeline.
         assert_ne!(
-            builder.pipeline_key(&read_only, &Constants::NONE),
-            builder.pipeline_key(&RasterState::default(), &Constants::NONE)
+            builder.pipeline_key(&read_only),
+            builder.pipeline_key(&RasterState::default())
         );
     }
 
@@ -2561,15 +2396,11 @@ mod tests {
     fn cleared_read_only_depth_attachment_is_still_a_write_access() {
         let state = layout(L::UNDEFINED);
         let mut cmd = offline_cmd();
+        let none = no_bindings();
         let builder = cmd
             .raster(EXTENT)
             .depth_attachment(view::<D32Sfloat, DepthAttachment>(&state), Some([0.25]))
-            .draw(
-                no_bindings(),
-                3,
-                1,
-                RasterState::default().depth_write(false),
-            );
+            .draw(&none, 3, 1, RasterState::default().depth_write(false));
         assert_eq!(
             unsafe { builder.clear_depth.unwrap().depth_stencil.depth },
             0.25
@@ -2650,16 +2481,12 @@ mod tests {
     fn one_depth_writing_draw_makes_the_attachment_a_write_access() {
         let state = layout(L::UNDEFINED);
         let mut cmd = offline_cmd();
+        let none = no_bindings();
         let builder = cmd
             .raster(EXTENT)
             .depth_attachment(view::<D32Sfloat, DepthAttachment>(&state), None)
-            .draw(no_bindings(), 3, 1, RasterState::default())
-            .draw(
-                no_bindings(),
-                3,
-                1,
-                RasterState::default().depth_write(false),
-            );
+            .draw(&none, 3, 1, RasterState::default())
+            .draw(&none, 3, 1, RasterState::default().depth_write(false));
         assert_eq!(
             builder.depth_access().unwrap().access.access,
             A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE
@@ -2684,16 +2511,17 @@ mod tests {
     fn draws_keep_their_order_and_access_their_command_buffers() {
         use crate::buffer::usage::{Index, Indirect};
         let mut cmd = offline_cmd();
+        let (vertex, mesh) = (no_bindings(), no_bindings());
         let builder = cmd
             .raster(EXTENT)
             .draw_indexed(
-                no_bindings(),
+                &vertex,
                 slice::<u32, Index>(0x1000, 6),
                 2,
                 RasterState::default(),
             )
             .launch_indirect(
-                no_bindings(),
+                &mesh,
                 slice::<DispatchIndirectCommand, Indirect>(0x2000, 1),
                 RasterState::default(),
             );
@@ -2713,7 +2541,8 @@ mod tests {
             vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
                 | vk::AddressCommandFlagsKHR::FULLY_BOUND
         );
-        let index = &indexed.bindings.buffers[0];
+        assert_eq!(indexed.bindings.sections().buffers().len(), 0);
+        let index = &indexed.extra[0];
         assert_eq!((index.stage, index.access), (S::INDEX_INPUT, A::INDEX_READ));
         assert_eq!(index.range, (0x1000u64..0x1018).into());
 
@@ -2724,7 +2553,7 @@ mod tests {
             panic!("not the indirect launch: {:?}", launch.command);
         };
         assert_eq!((draws.address, draws.size, draws.stride), (0x2000, 12, 12));
-        let indirect = &launch.bindings.buffers[0];
+        let indirect = &launch.extra[0];
         assert_eq!(
             (indirect.stage, indirect.access),
             (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ)

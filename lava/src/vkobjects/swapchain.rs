@@ -313,7 +313,7 @@ impl CommandBuffer {
         swapchain_image: ImageView<'a, F, U>,
     ) {
         self.flush_pending(
-            iter::once(&swapchain_image.access(
+            iter::once(swapchain_image.access(
                 vk::PipelineStageFlags2::empty(),
                 vk::AccessFlags2::empty(),
                 vk::ImageLayout::PRESENT_SRC_KHR,

@@ -20,7 +20,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    setting; the frontend keeps its hot reload's compile options itself) goes to `lava::init`, and lava sizes its pipeline arrays from it,
    so there is still one pass set per application (an app and a library on lava can't both
    bring passes yet). The caps are fixed in `pipeline.rs`, `PROFILE_PASS` stays the map index,
-   and the generated code uses public API (`BindingOutput::new`/`with_constants`,
+   and the generated code uses public API (`Bindings::new`/`with_constants`,
    `BufferSlice::access`, `ImageView::access`, `Tlas::trace_accesses`), documented for other
    binding generators, instead of a `__private` module. lava-build-slang ships `bindless.slang`,
    `profile.slang` and `ray_tracing.slang` in its `slang/`, searched by every session, and

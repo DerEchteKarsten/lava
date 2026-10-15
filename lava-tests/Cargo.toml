@@ -33,3 +33,8 @@ harness = false
 [[bench]]
 name = "bindings"
 harness = false
+
+# Recording generated passes into real command buffers, headless.
+[[bench]]
+name = "recording"
+harness = false

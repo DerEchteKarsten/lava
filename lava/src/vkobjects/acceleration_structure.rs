@@ -800,7 +800,7 @@ impl CommandBuffer {
         if L::TY == vk::AccelerationStructureTypeKHR::TOP_LEVEL {
             accesses.push(every_structure_read(BUILD));
         }
-        self.flush_pending(std::iter::empty(), accesses.iter());
+        self.flush_pending(std::iter::empty(), accesses.iter().cloned());
 
         let geometries: SmallVec<[SmallVec<[vk::AccelerationStructureGeometryKHR; 1]>; 1]> =
             described
@@ -870,7 +870,7 @@ impl CommandBuffer {
             "only structures with `allow_compaction` have a compacted size"
         );
         let accesses: SmallVec<[_; 8]> = structures.iter().map(|s| s.access(BUILD, READ)).collect();
-        self.flush_pending(std::iter::empty(), accesses.iter());
+        self.flush_pending(std::iter::empty(), accesses.iter().cloned());
         let handles: SmallVec<[_; 8]> = structures.iter().map(|s| s.handle).collect();
         unsafe {
             Ctx::device().cmd_reset_query_pool(self.handle, sizes.pool, 0, count);
@@ -897,7 +897,7 @@ impl CommandBuffer {
             "only a structure with `allow_compaction` can be compacted"
         );
         let accesses = [src.access(BUILD, READ), dst.access(BUILD, WRITE)];
-        self.flush_pending(std::iter::empty(), accesses.iter());
+        self.flush_pending(std::iter::empty(), accesses.iter().cloned());
         unsafe {
             command_functions().cmd_copy_acceleration_structure(
                 self.handle,

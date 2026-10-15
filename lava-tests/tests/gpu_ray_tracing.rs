@@ -82,14 +82,14 @@ fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 3]) {
 /// The ray query pass's image of `tlas`.
 fn trace_query(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
     cmd.compute(
-        TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT),
+        &TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT),
         [SIZE / 8, SIZE / 8, 1],
     );
 }
 
 fn trace_pipeline(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
     cmd.raytrace(
-        TestRayTracing::push_bindings(target.whole_view(), tlas, EXTENT),
+        &TestRayTracing::push_bindings(target.whole_view(), tlas, EXTENT),
         [SIZE, SIZE, 1],
     );
 }
@@ -266,7 +266,7 @@ fn indirect_traces_read_their_size_on_the_gpu() {
             },
         );
         cmd.raytrace_indirect(
-            TestRayTracing::push_bindings(target.whole_view(), &scene.tlas, EXTENT),
+            &TestRayTracing::push_bindings(target.whole_view(), &scene.tlas, EXTENT),
             command.range(..),
         );
     });
@@ -285,7 +285,7 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
     let scratch = scratch(tlas.build_scratch_size());
     let pixels = render(&gpu, |cmd, target| {
         cmd.compute(
-            TestWriteInstances::push_bindings(
+            &TestWriteInstances::push_bindings(
                 written.range(..),
                 scene.wall.address(),
                 scene.triangle.address(),

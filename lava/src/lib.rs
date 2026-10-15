@@ -12,8 +12,8 @@
 //!   (a `u64` storage buffer, laid out as in [`profiling::clock`]). Passes have no other
 //!   descriptors.
 //! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes,
-//!   pushed whole; at most [`pipeline::MAX_SPECIALIZATION_CONSTANTS_SIZE`] bytes of
-//!   specialization constants.
+//!   zeroed when a command buffer begins; a pass pushes its own struct from offset 0.
+//!   Specialization constants have no size limit.
 //! - Specialization constants [`profiling::clock::CLOCK_REGION_IDS`] are a clocked pass's
 //!   region name hashes (in slot order, 0 for none), which the generated `constant_bindings`
 //!   bake; a pass indexes the clock counters by its position in the pass map (`PROFILE_PASS`).

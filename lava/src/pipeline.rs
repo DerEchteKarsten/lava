@@ -18,14 +18,9 @@ use crate::{
     vkobjects::rt_pipeline::RaytracingPipeline,
 };
 
-/// The push constants every pass gets, pushed whole; Vulkan 1.4 guarantees 256 bytes.
+/// The most bytes of push constants a pass can have, the range of the shared pipeline layout;
+/// Vulkan 1.4 guarantees 256 bytes.
 pub const MAX_PUSH_CONSTANTS_SIZE: usize = 256;
-/// The most bytes of specialization constants a pass can have.
-pub const MAX_SPECIALIZATION_CONSTANTS_SIZE: usize = 128;
-/// The images and buffers a [`crate::command_buffer::BindingOutput`] holds inline; more spill
-/// to the heap.
-pub const MAX_PASS_IMAGES: usize = 8;
-pub const MAX_PASS_BUFFERS: usize = 16;
 
 /// Every pass of the application (the generated `PASS_MAP`).
 pub struct PassMap {
@@ -72,6 +67,21 @@ pub enum PassKind {
         mesh: &'static str,
         fragment: &'static str,
     },
+}
+
+impl PassKind {
+    /// The stages its shaders run in, which its resource accesses happen in.
+    pub fn stages(&self) -> vk::PipelineStageFlags2 {
+        type S = vk::PipelineStageFlags2;
+        match self {
+            PassKind::Compute { .. } => S::COMPUTE_SHADER,
+            PassKind::RayTracing { .. } => S::RAY_TRACING_SHADER_KHR,
+            PassKind::RasterVertex { .. } => S::VERTEX_SHADER | S::FRAGMENT_SHADER,
+            PassKind::RasterMesh { .. } => {
+                S::TASK_SHADER_EXT | S::MESH_SHADER_EXT | S::FRAGMENT_SHADER
+            }
+        }
+    }
 }
 
 /// The entry points of a hit group: triangles without an intersection shader, else procedural.
@@ -128,48 +138,7 @@ impl PassEntry {
     }
 }
 
-/// The specialization constants of a pipeline, as `BindingOutput` holds them: the pass's
-/// first `len` bytes count, the rest are zeros, so a pipeline key hashes no more than the
-/// pass has.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Constants {
-    bytes: [u8; MAX_SPECIALIZATION_CONSTANTS_SIZE],
-    len: usize,
-}
-
-impl Constants {
-    /// Those of a pass without specialization constants.
-    pub(crate) const NONE: Self = Self {
-        bytes: [0; MAX_SPECIALIZATION_CONSTANTS_SIZE],
-        len: 0,
-    };
-
-    pub(crate) fn new(bytes: &[u8]) -> Self {
-        let mut constants = Self::NONE;
-        constants.bytes[..bytes.len()].copy_from_slice(bytes);
-        constants.len = bytes.len();
-        constants
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl PartialEq for Constants {
-    fn eq(&self, other: &Self) -> bool {
-        self.bytes() == other.bytes()
-    }
-}
-
-impl Eq for Constants {}
-
-impl Hash for Constants {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.bytes().hash(state);
-    }
-}
-
+/// The raster state a raster pipeline is made for, besides its specialization constants.
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub(crate) struct RasterHash {
     pub(crate) color_formats: SmallVec<[vk::Format; 4]>,
@@ -179,9 +148,12 @@ pub(crate) struct RasterHash {
     pub(crate) depth_write: bool,
     pub(crate) backface_culling: bool,
     pub(crate) wire_frame: bool,
-    /// Zeros for a pass without specialization constants.
-    pub(crate) constants: Constants,
 }
+
+/// A pass's pipelines by state `K` (`()` for compute and ray tracing passes, which have none)
+/// and specialization constants. The constants are copied to the heap only when a pipeline is
+/// made, so a lookup takes the binding's bytes as they are, and they have no size limit.
+type Specialized<K, V> = HashMap<K, HashMap<Box<[u8]>, V>>;
 
 static PIPELINES: OnceLock<PipelineManager> = OnceLock::new();
 
@@ -213,10 +185,10 @@ pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
 pub(crate) struct PipelineManager {
     shader_modules: RwLock<Box<[vk::ShaderModule]>>,
     compute_pipelines: RwLock<Box<[vk::Pipeline]>>,
-    specialized_compute_pipelines: RwLock<Box<[HashMap<Constants, vk::Pipeline>]>>,
+    specialized_compute_pipelines: RwLock<Box<[Specialized<(), vk::Pipeline>]>>,
     raytracing_pipelines: RwLock<Box<[Option<RaytracingPipeline>]>>,
-    specialized_raytracing_pipelines: RwLock<Box<[HashMap<Constants, RaytracingPipeline>]>>,
-    raster_pipelines: RwLock<Box<[HashMap<RasterHash, vk::Pipeline>]>>,
+    specialized_raytracing_pipelines: RwLock<Box<[Specialized<(), RaytracingPipeline>]>>,
+    raster_pipelines: RwLock<Box<[Specialized<RasterHash, vk::Pipeline>]>>,
 }
 
 impl PipelineManager {
@@ -241,7 +213,7 @@ impl PipelineManager {
                     Some(_) => vk::Pipeline::null(),
                     None => must(
                         pass,
-                        create_compute_pipeline(modules[pass_index], pass, &Constants::NONE),
+                        create_compute_pipeline(modules[pass_index], pass, &[]),
                     ),
                 },
             )),
@@ -252,7 +224,7 @@ impl PipelineManager {
                 pass.missing_feature().is_none().then(|| {
                     must(
                         pass,
-                        create_raytracing_pipeline(modules[pass_index], pass, &Constants::NONE),
+                        create_raytracing_pipeline(modules[pass_index], pass, &[]),
                     )
                 })
             })),
@@ -270,17 +242,23 @@ impl PipelineManager {
     }
 
     /// The compute pipeline of `pass_index` with `constants`.
-    pub(crate) fn compute(&self, pass_index: usize, constants: &Constants) -> vk::Pipeline {
+    pub(crate) fn compute(&self, pass_index: usize, constants: &[u8]) -> vk::Pipeline {
         let pass = &pass_map().passes[pass_index];
         pass.assert_supported();
         if pass.constants.is_empty() {
             return self.compute_pipelines.read().unwrap()[pass.index];
         }
-        cached(&self.specialized_compute_pipelines, pass, constants, || {
-            // Held until the pipeline exists, so a reload can't destroy the module before.
-            let module = self.shader_modules.read().unwrap()[pass_index];
-            must(pass, create_compute_pipeline(module, pass, constants))
-        })
+        cached(
+            &self.specialized_compute_pipelines,
+            pass,
+            &(),
+            constants,
+            || {
+                // Held until the pipeline exists, so a reload can't destroy the module before.
+                let module = self.shader_modules.read().unwrap()[pass_index];
+                must(pass, create_compute_pipeline(module, pass, constants))
+            },
+        )
     }
 
     /// Calls `record` with the ray tracing pipeline of `pass_index` with `constants`, while
@@ -288,7 +266,7 @@ impl PipelineManager {
     pub(crate) fn ray_tracing<R>(
         &self,
         pass_index: usize,
-        constants: &Constants,
+        constants: &[u8],
         record: impl FnOnce(&RaytracingPipeline) -> R,
     ) -> R {
         let pass = &pass_map().passes[pass_index];
@@ -301,28 +279,44 @@ impl PipelineManager {
             );
         }
         let maps = &self.specialized_raytracing_pipelines;
-        if !maps.read().unwrap()[pass.index].contains_key(constants) {
+        let cached = |maps: &[Specialized<(), RaytracingPipeline>]| {
+            maps[pass.index]
+                .get(&())
+                .is_some_and(|m| m.contains_key(constants))
+        };
+        if !cached(&maps.read().unwrap()) {
             let map = &mut maps.write().unwrap()[pass.index];
-            let cached = map.len();
-            map.entry(*constants).or_insert_with(|| {
-                note_new_pipeline(pass, cached);
-                let modules = self.shader_modules.read().unwrap();
-                must(
-                    pass,
-                    create_raytracing_pipeline(modules[pass_index], pass, constants),
-                )
-            });
+            let count = pipeline_count(map);
+            map.entry(())
+                .or_default()
+                .entry(constants.into())
+                .or_insert_with(|| {
+                    note_new_pipeline(pass, count);
+                    let modules = self.shader_modules.read().unwrap();
+                    must(
+                        pass,
+                        create_raytracing_pipeline(modules[pass_index], pass, constants),
+                    )
+                });
         }
-        record(&maps.read().unwrap()[pass.index][constants])
+        record(&maps.read().unwrap()[pass.index][&()][constants])
     }
 
-    /// The pipeline of raster pass `pass_index` for `hash`.
-    pub(crate) fn raster(&self, hash: &RasterHash, pass_index: usize) -> vk::Pipeline {
+    /// The pipeline of raster pass `pass_index` for `hash` and `constants`.
+    pub(crate) fn raster(
+        &self,
+        hash: &RasterHash,
+        constants: &[u8],
+        pass_index: usize,
+    ) -> vk::Pipeline {
         let pass = &pass_map().passes[pass_index];
         pass.assert_supported();
-        cached(&self.raster_pipelines, pass, hash, || {
+        cached(&self.raster_pipelines, pass, hash, constants, || {
             let module = self.shader_modules.read().unwrap()[pass_index];
-            must(pass, create_raster_pipeline(module, hash, pass_index))
+            must(
+                pass,
+                create_raster_pipeline(module, hash, constants, pass_index),
+            )
         })
     }
 
@@ -343,7 +337,7 @@ impl PipelineManager {
         let result: Result<()> = (|| {
             match pass.kind {
                 PassKind::Compute { .. } if unspecialized => {
-                    let pipeline = create_compute_pipeline(module, pass, &Constants::NONE)?;
+                    let pipeline = create_compute_pipeline(module, pass, &[])?;
                     let pipelines = &mut self.compute_pipelines.write().unwrap()[pass.index];
                     retire([std::mem::replace(pipelines, pipeline)]);
                 }
@@ -351,23 +345,23 @@ impl PipelineManager {
                     retire(rebuild(
                         &self.specialized_compute_pipelines,
                         pass,
-                        |constants| create_compute_pipeline(module, pass, constants),
+                        |(), constants| create_compute_pipeline(module, pass, constants),
                     )?);
                 }
                 PassKind::RayTracing { .. } if unspecialized => {
-                    let pipeline = create_raytracing_pipeline(module, pass, &Constants::NONE)?;
+                    let pipeline = create_raytracing_pipeline(module, pass, &[])?;
                     let pipelines = &mut self.raytracing_pipelines.write().unwrap()[pass.index];
                     retire(pipelines.replace(pipeline));
                 }
                 PassKind::RayTracing { .. } => {
                     let maps = &self.specialized_raytracing_pipelines;
-                    retire(rebuild(maps, pass, |constants| {
+                    retire(rebuild(maps, pass, |(), constants| {
                         create_raytracing_pipeline(module, pass, constants)
                     })?);
                 }
                 PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. } => {
-                    retire(rebuild(&self.raster_pipelines, pass, |hash| {
-                        create_raster_pipeline(module, hash, pass_index)
+                    retire(rebuild(&self.raster_pipelines, pass, |hash, constants| {
+                        create_raster_pipeline(module, hash, constants, pass_index)
                     })?);
                 }
             }
@@ -406,14 +400,17 @@ fn retire<P: Into<vk::Pipeline> + Send + 'static>(pipelines: impl IntoIterator<I
 /// Makes the pipeline of every key in the pass's map with `create`, then swaps them all in
 /// and returns the replaced ones. If one fails, the new ones are destroyed and nothing changes.
 fn rebuild<K: Hash + Eq + Clone, P: Into<vk::Pipeline> + Send + 'static>(
-    maps: &RwLock<Box<[HashMap<K, P>]>>,
+    maps: &RwLock<Box<[Specialized<K, P>]>>,
     pass: &PassEntry,
-    mut create: impl FnMut(&K) -> Result<P>,
+    mut create: impl FnMut(&K, &[u8]) -> Result<P>,
 ) -> Result<Vec<P>> {
-    let keys: Vec<K> = maps.read().unwrap()[pass.index].keys().cloned().collect();
+    let keys: Vec<(K, Box<[u8]>)> = maps.read().unwrap()[pass.index]
+        .iter()
+        .flat_map(|(key, map)| map.keys().map(|constants| (key.clone(), constants.clone())))
+        .collect();
     let mut new = Vec::with_capacity(keys.len());
-    for key in &keys {
-        match create(key) {
+    for (key, constants) in &keys {
+        match create(key, constants) {
             Ok(pipeline) => new.push(pipeline),
             Err(err) => {
                 retire(new);
@@ -424,7 +421,7 @@ fn rebuild<K: Hash + Eq + Clone, P: Into<vk::Pipeline> + Send + 'static>(
     let map = &mut maps.write().unwrap()[pass.index];
     let replaced = keys.into_iter().zip(new);
     Ok(replaced
-        .filter_map(|(key, pipeline)| map.insert(key, pipeline))
+        .filter_map(|((key, constants), pipeline)| map.get_mut(&key)?.insert(constants, pipeline))
         .collect())
 }
 
@@ -460,23 +457,35 @@ fn create_unspecialized<T>(
 /// (or raster states) change too often, so they should be push constants.
 const MANY_PIPELINES: usize = 16;
 
-/// The pipeline of `key` in the pass's map, made by `create` at first use.
+/// The pipeline of `key` and `constants` in the pass's map, made by `create` at first use.
 fn cached<K: Hash + Eq + Clone, V: Clone>(
-    maps: &RwLock<Box<[HashMap<K, V>]>>,
+    maps: &RwLock<Box<[Specialized<K, V>]>>,
     pass: &PassEntry,
     key: &K,
+    constants: &[u8],
     create: impl FnOnce() -> V,
 ) -> V {
-    if let Some(pipeline) = maps.read().unwrap()[pass.index].get(key) {
-        return pipeline.clone();
+    let cached = maps.read().unwrap()[pass.index]
+        .get(key)
+        .and_then(|map| map.get(constants).cloned());
+    if let Some(pipeline) = cached {
+        return pipeline;
     }
     let map = &mut maps.write().unwrap()[pass.index];
-    let cached = map.len();
-    let pipeline = map.entry(key.clone()).or_insert_with(|| {
-        note_new_pipeline(pass, cached);
-        create()
-    });
+    let count = pipeline_count(map);
+    let pipeline = map
+        .entry(key.clone())
+        .or_default()
+        .entry(constants.into())
+        .or_insert_with(|| {
+            note_new_pipeline(pass, count);
+            create()
+        });
     pipeline.clone()
+}
+
+fn pipeline_count<K, V>(map: &Specialized<K, V>) -> usize {
+    map.values().map(HashMap::len).sum()
 }
 
 fn note_new_pipeline(pass: &PassEntry, cached: usize) {
@@ -500,14 +509,14 @@ fn create_module(bytes: &[u8]) -> Result<vk::ShaderModule> {
 fn create_compute_pipeline(
     module: vk::ShaderModule,
     pass: &PassEntry,
-    constants: &Constants,
+    constants: &[u8],
 ) -> Result<vk::Pipeline> {
     let PassKind::Compute { entry } = pass.kind else {
         unreachable!("{} is a compute pass", pass.name)
     };
     let info = vk::SpecializationInfo::default()
         .map_entries(pass.constants)
-        .data(constants.bytes());
+        .data(constants);
     let stage = make_shader_stage(entry, vk::ShaderStageFlags::COMPUTE, module, &info);
     let create_info = vk::ComputePipelineCreateInfo::default()
         .layout(Bindless::layout())
@@ -524,7 +533,7 @@ fn create_compute_pipeline(
 fn create_raytracing_pipeline(
     module: vk::ShaderModule,
     pass: &PassEntry,
-    constants: &Constants,
+    constants: &[u8],
 ) -> Result<RaytracingPipeline> {
     let PassKind::RayTracing {
         raygen,
@@ -538,7 +547,7 @@ fn create_raytracing_pipeline(
     };
     let info = vk::SpecializationInfo::default()
         .map_entries(pass.constants)
-        .data(constants.bytes());
+        .data(constants);
     let mut stages: SmallVec<[vk::PipelineShaderStageCreateInfo; 8]> = SmallVec::new();
     let mut groups: SmallVec<[vk::RayTracingShaderGroupCreateInfoKHR; 8]> = SmallVec::new();
     // Adds the stage and returns its index, or `SHADER_UNUSED_KHR` without one.
@@ -606,6 +615,7 @@ fn make_shader_stage<'a>(
 fn create_raster_pipeline(
     module: vk::ShaderModule,
     hash: &RasterHash,
+    constants: &[u8],
     pass_index: usize,
 ) -> Result<vk::Pipeline> {
     let _span = tracing::info_span!("create raster pipeline").entered();
@@ -613,7 +623,7 @@ fn create_raster_pipeline(
     let pass = &pass_map().passes[pass_index];
     let c = vk::SpecializationInfo::default()
         .map_entries(pass.constants)
-        .data(hash.constants.bytes());
+        .data(constants);
     let stages = match pass.kind {
         PassKind::RasterVertex { vertex, fragment } => {
             smallvec![

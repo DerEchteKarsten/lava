@@ -52,7 +52,7 @@ enum FieldKind {
 
 type Structs = BTreeMap<String, StructDef>;
 
-/// The push constants every pass gets, pushed whole; Vulkan 1.4 guarantees 256 bytes. A copy
+/// The most bytes of push constants a pass can have; Vulkan 1.4 guarantees 256 bytes. A copy
 /// of `lava::pipeline::MAX_PUSH_CONSTANTS_SIZE`.
 const MAX_PUSH_CONSTANTS_SIZE: usize = 256;
 
@@ -402,6 +402,16 @@ fn build_new_fn<'a>(
     out
 }
 
+/// The bytes of a specialization constant of Rust type `ty`: a scalar or a handle.
+fn constant_size(ty: &str) -> usize {
+    match ty {
+        "u8" => 1,
+        "u32" | "i32" | "f32" => 4,
+        "u64" | "BindlessHandle" => 8,
+        other => panic!("a specialization constant of type {other}"),
+    }
+}
+
 /// A specialization constant of a pass, which lava bakes into its pipelines.
 struct SConst<'a> {
     name: String,
@@ -641,7 +651,7 @@ fn generate_pass(
     let size = pc.size(Cat::Uniform);
     assert!(
         size <= MAX_PUSH_CONSTANTS_SIZE,
-        "the push constants of {source} take {size} bytes, more than the {MAX_PUSH_CONSTANTS_SIZE} every pass gets"
+        "the push constants of {source} take {size} bytes, more than the {MAX_PUSH_CONSTANTS_SIZE} a pass can have"
     );
 
     let gpu_struct = generate_gpu_struct(&gpu_name, pc, structs);
@@ -651,16 +661,17 @@ fn generate_pass(
         structs,
         stage,
     );
-    let output = format!("BindingOutput<'a, kind::{kind_marker}>");
+    // The generated types spell out each section's size, so a binding is as big as its pass.
+    let (images, buffers) = (push.image_accesses.len(), push.buffer_accesses.len());
+    let output = format!("Bindings<'a, kind::{kind_marker}, {size}, {images}, {buffers}, 0>");
     let incomplete = format!("Incomplete{pass_name}");
 
     let binding_output = format!(
-        r#"BindingOutput::new(
+        r#"Bindings::new(
             {index},
             &{gpu_name} {{
                 {gpu_inits}
             }},
-            {stage},
             [
                 {image_accesses}
             ],
@@ -717,6 +728,15 @@ impl {pass_name} {{
             .iter()
             .map(|c| format!("    pub {}: {},", c.name, gpu_type(c.layout, structs)))
             .collect();
+        let constants_size: usize = consts
+            .iter()
+            .map(|c| constant_size(&gpu_type(c.layout, structs)))
+            .sum();
+        let complete = format!(
+            "Bindings<'a, kind::{kind_marker}, {size}, {}, {}, {constants_size}>",
+            images + new.image_accesses.len(),
+            buffers + new.buffer_accesses.len(),
+        );
         out.push_str(&format!(
             r#"
 /// Packed: the specialization constant data is read at each entry's offset.
@@ -727,16 +747,13 @@ pub struct {consts_name} {{
 }}
 unsafe impl bytemuck::Pod for {consts_name} {{}}
 unsafe impl bytemuck::Zeroable for {consts_name} {{}}
-const _: () = assert!(
-    size_of::<{consts_name}>() <= MAX_SPECIALIZATION_CONSTANTS_SIZE,
-    "the specialization constants of {source} take more than lava's MAX_SPECIALIZATION_CONSTANTS_SIZE bytes"
-);
+const _: () = assert!(size_of::<{consts_name}>() == {constants_size});
 
 #[must_use = "`{pass_name}` has specialization constants: call `.constant_bindings(..)`"]
 pub struct {incomplete}<'a>({output});
 
 impl<'a> {incomplete}<'a> {{
-    pub fn constant_bindings{generics}(self, {params}) -> {output} {{
+    pub fn constant_bindings{generics}(self, {params}) -> {complete} {{
         {checks}
         self.0.with_constants(
             &{consts_name} {{

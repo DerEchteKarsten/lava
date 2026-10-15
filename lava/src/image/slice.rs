@@ -115,7 +115,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
 
     /// The access of a command that wants the view's mips in `layout`. It borrows their
     /// tracked layouts, which move to `layout` only when the command is recorded. A pass's
-    /// access, for [`crate::command_buffer::BindingOutput::new`].
+    /// access, for [`crate::command_buffer::Bindings::new`].
     pub fn access(
         &self,
         stage: vk::PipelineStageFlags2,
@@ -213,7 +213,7 @@ impl CommandBuffer {
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         self.flush_pending(
-            std::iter::once(&image.access(
+            std::iter::once(image.access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
                 vk::ImageLayout::GENERAL,
@@ -257,7 +257,7 @@ impl CommandBuffer {
                     vk::ImageLayout::GENERAL,
                 ),
             ]
-            .iter(),
+            .into_iter(),
             iter::empty(),
         );
 
@@ -292,12 +292,12 @@ impl CommandBuffer {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         self.flush_pending(
-            iter::once(&dst.view.access(
+            iter::once(dst.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
                 vk::ImageLayout::GENERAL,
             )),
-            iter::once(&BufferAccess {
+            iter::once(BufferAccess {
                 access: vk::AccessFlags2::TRANSFER_READ,
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 range: src.get_range(),
@@ -340,12 +340,12 @@ impl CommandBuffer {
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         self.flush_pending(
-            iter::once(&src.view.access(
+            iter::once(src.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
                 vk::ImageLayout::GENERAL,
             )),
-            iter::once(&BufferAccess {
+            iter::once(BufferAccess {
                 access: vk::AccessFlags2::TRANSFER_WRITE,
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 range: dst.get_range(),
