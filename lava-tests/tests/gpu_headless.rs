@@ -15,7 +15,9 @@ use lava::{
     },
     epoch,
     command_buffer::{
-        Access, Attachment,
+        Access, Attachment, BlendEquation, BlendFactor, BlendOp, ColorComponentFlags, CompareOp,
+        CullModeFlags, FrontFace, LogicOp, PolygonMode, PrimitiveTopology, Stencil, StencilFace,
+        StencilOp,
         BindingOutput, Blend, CommandBuffer, DispatchIndirectCommand, DrawIndirectCommand,
         RasterState, Scissor, Viewport, kind,
     },
@@ -306,7 +308,7 @@ fn record_profiled(cmd: &mut CommandBuffer, target: &Target) {
             .launch(
                 &TestMesh::push_bindings(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
                 [2, 1, 1],
-                RasterState::default().backface_culling(false),
+                RasterState::default().cull_mode(CullModeFlags::NONE),
             )
             .record("TestMesh");
     }
@@ -1233,7 +1235,7 @@ fn bindings(
 }
 
 fn unculled() -> RasterState<1> {
-    RasterState::default().backface_culling(false)
+    RasterState::default().cull_mode(CullModeFlags::NONE)
 }
 
 /// Draws the first `vertex_count` vertices of [`two_triangles`] with backface culling on/off.
@@ -1245,7 +1247,11 @@ fn draw_triangles(gpu: &common::Gpu, vertex_count: u32, culling: bool) -> Vec<u8
                 &bindings(&vertices),
                 vertex_count,
                 1,
-                RasterState::default().backface_culling(culling),
+                RasterState::default().cull_mode(if culling {
+                    CullModeFlags::BACK
+                } else {
+                    CullModeFlags::NONE
+                }),
             )
             .record("triangles")
     })
@@ -1281,7 +1287,7 @@ fn wireframe_draws_only_the_edges() {
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&bindings(&vertices), 6, 1, unculled().wire_frame(true))
+            .draw(&bindings(&vertices), 6, 1, unculled().polygon_mode(PolygonMode::LINE))
             .record("wireframe")
     });
     // The interior stays empty, the bottom edge (y = 0.8 -> row 57) is drawn.
@@ -1513,6 +1519,132 @@ fn skipped_attachment_keeps_its_content() {
     assert_pixel(&pixels, 32, 40, [255, 0, 0, 255]);
     let second = readback.host();
     assert!(second.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
+}
+
+/// With counter-clockwise front faces the other triangle is culled.
+#[test]
+fn front_face_decides_which_winding_is_culled() {
+    let gpu = gpu();
+    let vertices = two_triangles();
+    let pixels = render(&gpu, |cmd, target| {
+        let state = RasterState::default().front_face(FrontFace::COUNTER_CLOCKWISE);
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&bindings(&vertices), 6, 1, state)
+            .record("counter-clockwise");
+    });
+    assert_pixel(&pixels, IN_LEFT.0, IN_LEFT.1, BLACK);
+    assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, [255, 255, 0, 255]);
+}
+
+#[test]
+fn line_lists_draw_only_edges() {
+    let gpu = gpu();
+    let vertices = two_triangles();
+    let pixels = render(&gpu, |cmd, target| {
+        let state = unculled().topology(PrimitiveTopology::LINE_LIST);
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&bindings(&vertices), 6, 1, state)
+            .record("lines");
+    });
+    assert_pixel(&pixels, IN_LEFT.0, IN_LEFT.1, BLACK);
+    assert!(pixels.chunks_exact(4).any(|p| p != BLACK));
+}
+
+#[test]
+fn write_masks_keep_the_masked_components() {
+    let gpu = gpu();
+    let vertices = overlapping_triangles();
+    let pixels = render(&gpu, |cmd, target| {
+        let blue = Attachment::color(target.whole_view(), Some([0.0, 0.0, 1.0, 1.0]));
+        let state = RasterState::default().write_masks([ColorComponentFlags::R]);
+        cmd.raster(EXTENT, [blue])
+            .draw(&bindings(&vertices), 6, 1, state)
+            .record("red only");
+    });
+    // The red triangle's red over the cleared blue; the green one wrote nothing.
+    assert_pixel(&pixels, 32, 40, [255, 0, 255, 255]);
+}
+
+#[test]
+fn blend_equations_take_any_factors_and_ops() {
+    let gpu = gpu();
+    let vertices = overlapping_triangles();
+    let min = BlendEquation {
+        src_color: BlendFactor::ONE,
+        dst_color: BlendFactor::ONE,
+        color_op: BlendOp::MIN,
+        src_alpha: BlendFactor::ONE,
+        dst_alpha: BlendFactor::ONE,
+        alpha_op: BlendOp::MIN,
+    };
+    let pixels = render(&gpu, |cmd, target| {
+        let white = Attachment::color(target.whole_view(), Some([1.0; 4]));
+        let state = RasterState::default().blends([Blend::Equation(min)]);
+        cmd.raster(EXTENT, [white])
+            .draw(&bindings(&vertices), 6, 1, state)
+            .record("min");
+    });
+    // White, then the minimum with green, then with red.
+    assert_pixel(&pixels, 32, 40, [0, 0, 0, 255]);
+    assert_pixel(&pixels, 2, 2, [255; 4]);
+}
+
+#[test]
+fn logic_ops_replace_blending() {
+    let gpu = gpu();
+    if !Ctx::features().logic_op {
+        eprintln!("SKIPPED logic_ops_replace_blending: the device lacks `Features::logic_op`");
+        return;
+    }
+    let vertices = overlapping_triangles();
+    let pixels = render(&gpu, |cmd, target| {
+        let white = Attachment::color(target.whole_view(), Some([1.0; 4]));
+        let state = RasterState::default().logic_op(Some(LogicOp::XOR));
+        cmd.raster(EXTENT, [white])
+            .draw(&bindings(&vertices), 6, 1, state)
+            .record("xor");
+    });
+    // White XOR green XOR red.
+    assert_pixel(&pixels, 32, 40, [0, 0, 255, 255]);
+}
+
+/// The left triangle only marks the stencil; then both triangles are drawn where it is set.
+#[test]
+fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
+    let gpu = gpu();
+    let vertices = two_triangles();
+    let depth = Image::<D32SfloatS8Uint, DepthAttachment>::new(UVec2::new(SIZE, SIZE)).unwrap();
+    let mark = StencilFace {
+        pass: StencilOp::REPLACE,
+        reference: 1,
+        ..Default::default()
+    };
+    let marked = StencilFace {
+        compare: CompareOp::EQUAL,
+        reference: 1,
+        ..Default::default()
+    };
+    let pixels = render(&gpu, |cmd, target| {
+        let marking = unculled()
+            .depth_test(None)
+            .stencil(Some(Stencil {
+                front: mark,
+                back: mark,
+            }))
+            .write_masks([ColorComponentFlags::empty()]);
+        let drawing = unculled().depth_test(None).stencil(Some(Stencil {
+            front: marked,
+            back: marked,
+        }));
+        let left = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .depth_attachment(depth.whole_view(), Some((0.0, 0)))
+            .draw(&left, 3, 1, marking)
+            .draw(&bindings(&vertices), 6, 1, drawing)
+            .record("stencil");
+    });
+    assert_ne!(pixel(&pixels, IN_LEFT.0, IN_LEFT.1), BLACK);
+    assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, BLACK);
 }
 
 #[test]

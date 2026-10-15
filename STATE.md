@@ -46,7 +46,7 @@ Found in a read-only review; details, line numbers and directions are in `lava/S
 ## Performance
 --- find solutions ---
 - Pipelines are created synchronously on first use, under a write lock, with no `VkPipelineCache` (`command_buffer.rs:233-244`, `:405`, `:602-607`, `:768`). (Ideas: per-pass locks, a warm-up list, a `VkPipelineCache` file.)
-- Recording a draw costs about four times a dispatch on the CPU (`lava-tests` recording bench, 2026-10-15: 64 indexed draws in 8 renderings about 94 µs, 64 compute dispatches about 22 µs). Not profiled yet. Suspects: every draw builds a `RasterHash` (two `SmallVec::from_slice`, a `Constants` copy) and hashes it under the pipeline cache's read lock, and each rendering adds its span, scope and attachment setup.
+- Recording a draw costs about three times a dispatch on the CPU (`lava-tests` recording bench, 2026-10-16, with dynamic state: 64 indexed draws in 8 renderings about 66 µs, 64 compute dispatches about 23 µs). Not profiled yet. Suspects: the per-draw state diff and push constants, and each rendering's span, scope and attachment setup.
 
 --- intended ---
 - Hot reload recompiles every pass serially on any include change (`lava-build-slang/src/hot_reload.rs`).

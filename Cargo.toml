@@ -17,6 +17,7 @@ gpu-allocator = { package = "lava-gpu-allocator", version = "0.28", path = "../f
 shader-slang = { package = "lava-slang", version = "0.1.0", path = "../forks/slang-rs" }
 raw-window-handle = "0.6.2"
 smallvec = { version = "1.15.1", features = ["union", "const_generics"] }
+hashbrown = "0.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 notify = "8.2.0"

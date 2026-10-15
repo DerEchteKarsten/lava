@@ -1,18 +1,18 @@
 //! Pass pipelines: the pass map a frontend generates and `init` takes, its entries (ray tracing passes with their shader groups), the cache of every pass's pipelines per specialization and raster state, their creation (none for passes the device lacks the features of), and `reload_pass`, which replaces a pass's pipelines and retires the old ones
 use ash::vk::TaggedStructure;
 use std::{
-    collections::HashMap,
     ffi::CStr,
     hash::Hash,
     sync::{OnceLock, RwLock},
 };
 
 use ash::vk;
+use hashbrown::{Equivalent, HashMap};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
     bindless::Bindless,
-    command_buffer::Blend,
+    command_buffer::dynamic_states,
     error::{Error, Result},
     features::Features,
     state::{Ctx, Functions},
@@ -107,22 +107,62 @@ pub struct PassEntry {
     pub constants_size: usize,
 }
 
-/// The raster state a raster pipeline is made for, besides its specialization constants.
+/// What a raster pipeline is made for: its rendering's attachment formats and its
+/// specialization constants (every other state is dynamic), as the cache keeps it.
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
-pub(crate) struct RasterHash {
-    pub(crate) color_formats: SmallVec<[vk::Format; 4]>,
-    pub(crate) depth_format: vk::Format,
-    pub(crate) stencil_format: vk::Format,
-    pub(crate) blends: SmallVec<[Blend; 4]>,
-    pub(crate) depth_write: bool,
-    pub(crate) backface_culling: bool,
-    pub(crate) wire_frame: bool,
+pub(crate) struct RasterKey {
+    color_formats: SmallVec<[vk::Format; 4]>,
+    depth_format: vk::Format,
+    stencil_format: vk::Format,
+    constants: Box<[u8]>,
 }
 
-/// A pass's pipelines by state `K` (`()` for compute and ray tracing passes, which have none)
-/// and specialization constants. The constants are copied to the heap only when a pipeline is
-/// made, so a lookup takes the binding's bytes as they are, and they have no size limit.
-type Specialized<K, V> = HashMap<K, HashMap<Box<[u8]>, V>>;
+/// A [`RasterKey`] as a draw has it, borrowed, which looks the pipeline up without copying.
+/// It hashes like the key it stands for: the same fields in the same order, and slices,
+/// `SmallVec`s and boxed slices all hash as slices.
+#[derive(Hash, Clone, Copy, Debug)]
+pub(crate) struct RasterKeyRef<'a> {
+    pub(crate) color_formats: &'a [vk::Format],
+    pub(crate) depth_format: vk::Format,
+    pub(crate) stencil_format: vk::Format,
+    pub(crate) constants: &'a [u8],
+}
+
+impl Equivalent<RasterKey> for RasterKeyRef<'_> {
+    fn equivalent(&self, key: &RasterKey) -> bool {
+        self.color_formats == key.color_formats.as_slice()
+            && self.depth_format == key.depth_format
+            && self.stencil_format == key.stencil_format
+            && self.constants == &*key.constants
+    }
+}
+
+impl RasterKeyRef<'_> {
+    fn to_key(self) -> RasterKey {
+        RasterKey {
+            color_formats: SmallVec::from_slice(self.color_formats),
+            depth_format: self.depth_format,
+            stencil_format: self.stencil_format,
+            constants: self.constants.into(),
+        }
+    }
+}
+
+impl RasterKey {
+    fn as_ref(&self) -> RasterKeyRef<'_> {
+        RasterKeyRef {
+            color_formats: &self.color_formats,
+            depth_format: self.depth_format,
+            stencil_format: self.stencil_format,
+            constants: &self.constants,
+        }
+    }
+}
+
+/// A pass's pipelines by key `K`: its specialization constants for compute and ray tracing
+/// passes, a [`RasterKey`] for raster passes. The key is copied to the heap only when a
+/// pipeline is made, and the constants have no size limit.
+type Specialized<K, V> = HashMap<K, V>;
 
 static PIPELINES: OnceLock<PipelineManager> = OnceLock::new();
 
@@ -156,10 +196,10 @@ pub(crate) struct PipelineManager {
     missing: Box<[Vec<&'static str>]>,
     shader_modules: RwLock<Box<[vk::ShaderModule]>>,
     compute_pipelines: RwLock<Box<[vk::Pipeline]>>,
-    specialized_compute_pipelines: RwLock<Box<[Specialized<(), vk::Pipeline>]>>,
+    specialized_compute_pipelines: RwLock<Box<[Specialized<Box<[u8]>, vk::Pipeline>]>>,
     raytracing_pipelines: RwLock<Box<[Option<RaytracingPipeline>]>>,
-    specialized_raytracing_pipelines: RwLock<Box<[Specialized<(), RaytracingPipeline>]>>,
-    raster_pipelines: RwLock<Box<[Specialized<RasterHash, vk::Pipeline>]>>,
+    specialized_raytracing_pipelines: RwLock<Box<[Specialized<Box<[u8]>, RaytracingPipeline>]>>,
+    raster_pipelines: RwLock<Box<[Specialized<RasterKey, vk::Pipeline>]>>,
 }
 
 impl PipelineManager {
@@ -238,8 +278,8 @@ impl PipelineManager {
         cached(
             &self.specialized_compute_pipelines,
             pass,
-            &(),
             constants,
+            |constants| constants.into(),
             || {
                 // Held until the pipeline exists, so a reload can't destroy the module before.
                 let module = self.shader_modules.read().unwrap()[pass_index];
@@ -266,44 +306,28 @@ impl PipelineManager {
             );
         }
         let maps = &self.specialized_raytracing_pipelines;
-        let cached = |maps: &[Specialized<(), RaytracingPipeline>]| {
-            maps[pass.index]
-                .get(&())
-                .is_some_and(|m| m.contains_key(constants))
-        };
-        if !cached(&maps.read().unwrap()) {
+        if !maps.read().unwrap()[pass.index].contains_key(constants) {
             let map = &mut maps.write().unwrap()[pass.index];
-            let count = pipeline_count(map);
-            map.entry(())
-                .or_default()
-                .entry(constants.into())
-                .or_insert_with(|| {
-                    note_new_pipeline(pass, count);
-                    let modules = self.shader_modules.read().unwrap();
-                    must(
-                        pass,
-                        create_raytracing_pipeline(modules[pass_index], pass, constants),
-                    )
-                });
+            let count = map.len();
+            map.entry(constants.into()).or_insert_with(|| {
+                note_new_pipeline(pass, count);
+                let modules = self.shader_modules.read().unwrap();
+                must(
+                    pass,
+                    create_raytracing_pipeline(modules[pass_index], pass, constants),
+                )
+            });
         }
-        record(&maps.read().unwrap()[pass.index][&()][constants])
+        record(&maps.read().unwrap()[pass.index][constants])
     }
 
-    /// The pipeline of raster pass `pass_index` for `hash` and `constants`.
-    pub(crate) fn raster(
-        &self,
-        hash: &RasterHash,
-        constants: &[u8],
-        pass_index: usize,
-    ) -> vk::Pipeline {
+    /// The pipeline of raster pass `pass_index` for `key`.
+    pub(crate) fn raster(&self, key: &RasterKeyRef, pass_index: usize) -> vk::Pipeline {
         let pass = &pass_map().passes[pass_index];
         self.assert_supported(pass_index);
-        cached(&self.raster_pipelines, pass, hash, constants, || {
+        cached(&self.raster_pipelines, pass, key, |key| key.to_key(), || {
             let module = self.shader_modules.read().unwrap()[pass_index];
-            must(
-                pass,
-                create_raster_pipeline(module, hash, constants, pass_index),
-            )
+            must(pass, create_raster_pipeline(module, key, pass_index))
         })
     }
 
@@ -340,7 +364,7 @@ impl PipelineManager {
                     retire(rebuild(
                         &self.specialized_compute_pipelines,
                         pass,
-                        |(), constants| create_compute_pipeline(module, pass, constants),
+                        |constants| create_compute_pipeline(module, pass, constants),
                     )?);
                 }
                 PassKind::RayTracing { .. } if unspecialized => {
@@ -350,13 +374,13 @@ impl PipelineManager {
                 }
                 PassKind::RayTracing { .. } => {
                     let maps = &self.specialized_raytracing_pipelines;
-                    retire(rebuild(maps, pass, |(), constants| {
+                    retire(rebuild(maps, pass, |constants| {
                         create_raytracing_pipeline(module, pass, constants)
                     })?);
                 }
                 PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. } => {
-                    retire(rebuild(&self.raster_pipelines, pass, |hash, constants| {
-                        create_raster_pipeline(module, hash, constants, pass_index)
+                    retire(rebuild(&self.raster_pipelines, pass, |key| {
+                        create_raster_pipeline(module, &key.as_ref(), pass_index)
                     })?);
                 }
             }
@@ -397,15 +421,12 @@ fn retire<P: Into<vk::Pipeline> + Send + 'static>(pipelines: impl IntoIterator<I
 fn rebuild<K: Hash + Eq + Clone, P: Into<vk::Pipeline> + Send + 'static>(
     maps: &RwLock<Box<[Specialized<K, P>]>>,
     pass: &PassEntry,
-    mut create: impl FnMut(&K, &[u8]) -> Result<P>,
+    mut create: impl FnMut(&K) -> Result<P>,
 ) -> Result<Vec<P>> {
-    let keys: Vec<(K, Box<[u8]>)> = maps.read().unwrap()[pass.index]
-        .iter()
-        .flat_map(|(key, map)| map.keys().map(|constants| (key.clone(), constants.clone())))
-        .collect();
+    let keys: Vec<K> = maps.read().unwrap()[pass.index].keys().cloned().collect();
     let mut new = Vec::with_capacity(keys.len());
-    for (key, constants) in &keys {
-        match create(key, constants) {
+    for key in &keys {
+        match create(key) {
             Ok(pipeline) => new.push(pipeline),
             Err(err) => {
                 retire(new);
@@ -416,7 +437,7 @@ fn rebuild<K: Hash + Eq + Clone, P: Into<vk::Pipeline> + Send + 'static>(
     let map = &mut maps.write().unwrap()[pass.index];
     let replaced = keys.into_iter().zip(new);
     Ok(replaced
-        .filter_map(|((key, constants), pipeline)| map.get_mut(&key)?.insert(constants, pipeline))
+        .filter_map(|(key, pipeline)| map.insert(key, pipeline))
         .collect())
 }
 
@@ -449,38 +470,29 @@ fn create_unspecialized<T>(
 }
 
 /// A pass whose pipeline cache grows this large gets one warning: its specialization constants
-/// (or raster states) change too often, so they should be push constants.
+/// (or attachment formats) change too often, so they should be push constants.
 const MANY_PIPELINES: usize = 16;
 
-/// The pipeline of `key` and `constants` in the pass's map, made by `create` at first use.
-fn cached<K: Hash + Eq + Clone, V: Clone>(
+/// The pipeline of `key` (borrowed as `Q`) in the pass's map, made by `create` and kept under
+/// `to_owned(key)` at first use.
+fn cached<K: Hash + Eq, Q: Hash + Equivalent<K> + ?Sized, V: Clone>(
     maps: &RwLock<Box<[Specialized<K, V>]>>,
     pass: &PassEntry,
-    key: &K,
-    constants: &[u8],
+    key: &Q,
+    to_owned: impl FnOnce(&Q) -> K,
     create: impl FnOnce() -> V,
 ) -> V {
-    let cached = maps.read().unwrap()[pass.index]
-        .get(key)
-        .and_then(|map| map.get(constants).cloned());
-    if let Some(pipeline) = cached {
-        return pipeline;
+    if let Some(pipeline) = maps.read().unwrap()[pass.index].get(key) {
+        return pipeline.clone();
     }
     let map = &mut maps.write().unwrap()[pass.index];
-    let count = pipeline_count(map);
-    let pipeline = map
-        .entry(key.clone())
-        .or_default()
-        .entry(constants.into())
-        .or_insert_with(|| {
-            note_new_pipeline(pass, count);
-            create()
-        });
-    pipeline.clone()
-}
-
-fn pipeline_count<K, V>(map: &Specialized<K, V>) -> usize {
-    map.values().map(HashMap::len).sum()
+    if let Some(pipeline) = map.get(key) {
+        return pipeline.clone();
+    }
+    note_new_pipeline(pass, map.len());
+    let pipeline = create();
+    map.insert(to_owned(key), pipeline.clone());
+    pipeline
 }
 
 fn note_new_pipeline(pass: &PassEntry, cached: usize) {
@@ -609,10 +621,10 @@ fn make_shader_stage<'a>(
 
 fn create_raster_pipeline(
     module: vk::ShaderModule,
-    hash: &RasterHash,
-    constants: &[u8],
+    key: &RasterKeyRef,
     pass_index: usize,
 ) -> Result<vk::Pipeline> {
+    let constants = key.constants;
     let _span = tracing::info_span!("create raster pipeline").entered();
 
     let pass = &pass_map().passes[pass_index];
@@ -669,87 +681,26 @@ fn create_raster_pipeline(
         .vertex_input_state(&vertex_input_state);
 
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(&hash.color_formats)
-        .depth_attachment_format(hash.depth_format)
-        .stencil_attachment_format(hash.stencil_format)
+        .color_attachment_formats(key.color_formats)
+        .depth_attachment_format(key.depth_format)
+        .stencil_attachment_format(key.stencil_format)
         .view_mask(0);
-    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
-        .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
-
+    // Every other state is dynamic (`dynamic_states`); what these structs hold is ignored.
+    let dynamic_states = dynamic_states(matches!(pass.kind, PassKind::RasterMesh { .. }));
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-        .sample_shading_enable(false)
-        .min_sample_shading(1.0)
-        .alpha_to_coverage_enable(false)
-        .alpha_to_one_enable(false)
-        .sample_mask(&[]);
-
-    let color_blend_attachments = hash
-        .blends
-        .iter()
-        .map(|blend| {
-            use vk::BlendFactor as F;
-            let unblended = vk::PipelineColorBlendAttachmentState::default();
-            let (src_color, dst_color, src_alpha, dst_alpha) = match blend {
-                Blend::Replace => return unblended.color_write_mask(vk::ColorComponentFlags::RGBA),
-                Blend::Skip => return unblended,
-                Blend::Alpha => (F::SRC_ALPHA, F::ONE_MINUS_SRC_ALPHA, F::ONE, F::ZERO),
-                Blend::Add => (F::ONE, F::ONE, F::ONE, F::ONE),
-                Blend::Attenuate => (
-                    F::ZERO,
-                    F::ONE_MINUS_SRC_COLOR,
-                    F::ZERO,
-                    F::ONE_MINUS_SRC_ALPHA,
-                ),
-            };
-            vk::PipelineColorBlendAttachmentState::default()
-                .blend_enable(true)
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .src_color_blend_factor(src_color)
-                .dst_color_blend_factor(dst_color)
-                .color_blend_op(vk::BlendOp::ADD)
-                .src_alpha_blend_factor(src_alpha)
-                .dst_alpha_blend_factor(dst_alpha)
-                .alpha_blend_op(vk::BlendOp::ADD)
-        })
-        .collect::<Vec<_>>();
-    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
-        .attachments(color_blend_attachments.as_slice())
-        .logic_op_enable(false)
-        .logic_op(vk::LogicOp::COPY)
-        .blend_constants([1.0, 1.0, 1.0, 1.0]);
-
-    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .scissor_count(1)
-        .viewport_count(1);
-    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
-        .depth_clamp_enable(false)
-        .rasterizer_discard_enable(false)
-        .line_width(1.0)
-        .polygon_mode(if hash.wire_frame {
-            vk::PolygonMode::LINE
-        } else {
-            vk::PolygonMode::FILL
-        })
-        .cull_mode(if hash.backface_culling {
-            vk::CullModeFlags::BACK
-        } else {
-            vk::CullModeFlags::NONE
-        })
-        .front_face(vk::FrontFace::CLOCKWISE)
-        .depth_bias_enable(true);
-    let depth_stencil_state = if hash.depth_format != vk::Format::UNDEFINED {
-        vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_bounds_test_enable(false)
-            .depth_compare_op(vk::CompareOp::GREATER)
-            .depth_test_enable(true)
-            .depth_write_enable(hash.depth_write)
-            .min_depth_bounds(1.0)
-            .max_depth_bounds(0.0)
-            .stencil_test_enable(false)
-    } else {
-        vk::PipelineDepthStencilStateCreateInfo::default()
-    };
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let color_blend_attachments =
+        vec![vk::PipelineColorBlendAttachmentState::default(); key.color_formats.len()];
+    let color_blend_state =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default();
+    // The mode is dynamic; the overestimation size, which needs its own feature, isn't.
+    let mut conservative = vk::PipelineRasterizationConservativeStateCreateInfoEXT::default();
+    let rasterization_state =
+        vk::PipelineRasterizationStateCreateInfo::default().push(&mut conservative);
+    let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default();
 
     create_info = create_info
         .stages(&stages)
@@ -789,6 +740,33 @@ mod tests {
         );
         assert_eq!(stage.stage, vk::ShaderStageFlags::VERTEX);
         assert_eq!(unsafe { CStr::from_ptr(stage.p_name) }, c"main_vs");
+    }
+
+    /// A lookup by a draw's borrowed key finds the pipeline kept under its owned copy.
+    #[test]
+    fn borrowed_keys_hash_and_compare_like_their_owned_copies() {
+        use std::hash::BuildHasher;
+        let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::R16G16B16A16_SFLOAT];
+        let key = RasterKeyRef {
+            color_formats: &formats,
+            depth_format: vk::Format::D32_SFLOAT,
+            stencil_format: vk::Format::UNDEFINED,
+            constants: &[1, 2, 3, 4],
+        };
+        let owned = key.to_key();
+        let hasher = hashbrown::DefaultHashBuilder::default();
+        assert_eq!(hasher.hash_one(key), hasher.hash_one(&owned));
+        assert!(key.equivalent(&owned));
+        let other = RasterKeyRef {
+            constants: &[1, 2, 3, 5],
+            ..key
+        };
+        assert!(!other.equivalent(&owned));
+
+        let mut map = HashMap::new();
+        map.insert(owned, 7);
+        assert_eq!(map.get(&key), Some(&7));
+        assert_eq!(map.get(&other), None);
     }
 
     #[test]

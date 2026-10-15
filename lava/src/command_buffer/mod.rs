@@ -21,7 +21,7 @@ use crate::{
         slice::ImageView,
         usage::{IsColorAttachment, IsDepthAttachment, IsSampled, IsStorage},
     },
-    pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterHash, pass_map, pipelines},
+    pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterKeyRef, pass_map, pipelines},
     query::{Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp},
     state::{Ctx, Functions},
     vkobjects::{
@@ -36,7 +36,9 @@ use lava_macros::validation_trace;
 use smallvec::{SmallVec, smallvec};
 
 mod binding_output;
+mod raster_state;
 use binding_output::Sections;
+pub use raster_state::*;
 pub use binding_output::{BindingOutput, Bindings, kind};
 
 /// A pass's access of a buffer range, made by `BufferSlice::access` (a binding generator's
@@ -224,78 +226,6 @@ impl<'a> Attachment<'a> {
             view: image.view,
             clear: clear.map(|e| image.format().clear_value(e).into()),
             access,
-        }
-    }
-}
-
-/// How a color attachment combines a fragment's output `src` with the stored value `dst`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Blend {
-    /// `src`, unblended.
-    Replace,
-    /// `src.rgb * src.a + dst.rgb * (1 - src.a)`; alpha becomes `src.a`.
-    Alpha,
-    /// `src + dst`.
-    Add,
-    /// `dst * (1 - src)`: `src` is how much of `dst` the fragment hides.
-    Attenuate,
-    /// `dst`: the draw leaves the attachment untouched.
-    Skip,
-}
-
-/// The pipeline state of one draw into `COLOR_ATTACHMENTS` color attachments.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RasterState<const COLOR_ATTACHMENTS: usize> {
-    blends: [Blend; COLOR_ATTACHMENTS],
-    depth_write: bool,
-    backface_culling: bool,
-    wire_frame: bool,
-}
-
-impl<const COLOR_ATTACHMENTS: usize> Default for RasterState<COLOR_ATTACHMENTS> {
-    fn default() -> Self {
-        Self {
-            blends: [Blend::Replace; COLOR_ATTACHMENTS],
-            depth_write: true,
-            backface_culling: true,
-            wire_frame: false,
-        }
-    }
-}
-
-impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
-    /// One blend per color attachment, in attachment order.
-    pub fn blends(mut self, blends: [Blend; COLOR_ATTACHMENTS]) -> Self {
-        self.blends = blends;
-        self
-    }
-
-    /// Whether fragments that pass the depth test write their depth.
-    pub fn depth_write(mut self, depth_write: bool) -> Self {
-        self.depth_write = depth_write;
-        self
-    }
-
-    pub fn backface_culling(mut self, backface_culling: bool) -> Self {
-        self.backface_culling = backface_culling;
-        self
-    }
-
-    pub fn wire_frame(mut self, wire_frame: bool) -> Self {
-        self.wire_frame = wire_frame;
-        self
-    }
-
-    /// The same state in a list of any rendering's draws: the blends past the first
-    /// `COLOR_ATTACHMENTS` are never read.
-    fn widen(self) -> RasterState<MAX_COLOR_ATTACHMENTS> {
-        let mut blends = [Blend::Replace; MAX_COLOR_ATTACHMENTS];
-        blends[..COLOR_ATTACHMENTS].copy_from_slice(&self.blends);
-        RasterState {
-            blends,
-            depth_write: self.depth_write,
-            backface_culling: self.backface_culling,
-            wire_frame: self.wire_frame,
         }
     }
 }
@@ -583,22 +513,24 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
     /// The depth attachment's access: also a write when it is cleared or a draw writes depth.
     fn depth_access(&self) -> Option<ImageUse<'a>> {
         let mut depth = self.depth_access.clone()?;
-        if self.clear_depth.is_some() || self.draws.iter().any(|d| d.state.depth_write) {
+        let writes = |d: &Draw| d.state.writes_depth() || d.state.stencil.is_some();
+        if self.clear_depth.is_some() || self.draws.iter().any(writes) {
             depth.access.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
         }
         Some(depth)
     }
 
-    /// The pipeline key of a draw with `state` in this rendering.
-    fn pipeline_key(&self, state: &RasterState<MAX_COLOR_ATTACHMENTS>) -> RasterHash {
-        RasterHash {
-            color_formats: self.color.iter().map(|c| c.format).collect(),
+    /// The pipeline key of a draw of `sections` in this rendering.
+    fn pipeline_key<'k>(
+        &self,
+        color_formats: &'k [vk::Format],
+        sections: &Sections<'k, '_>,
+    ) -> RasterKeyRef<'k> {
+        RasterKeyRef {
+            color_formats,
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
-            blends: SmallVec::from_slice(&state.blends[..N]),
-            depth_write: state.depth_write,
-            backface_culling: state.backface_culling,
-            wire_frame: state.wire_frame,
+            constants: sections.constants,
         }
     }
 
@@ -672,9 +604,8 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         self.cmd_buf.enter(name, true);
         unsafe {
             device.cmd_begin_rendering(handle, &rendering_info);
-            device.cmd_set_viewport(
+            device.cmd_set_viewport_with_count(
                 handle,
-                0,
                 &[vk::Viewport {
                     x: self.viewport.offset.x as f32,
                     y: self.viewport.offset.y as f32,
@@ -684,8 +615,19 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
                     max_depth: 1.0,
                 }],
             );
-            device.cmd_set_scissor(handle, 0, &self.scissors);
+            device.cmd_set_scissor_with_count(handle, &self.scissors);
         }
+        let color_formats = self.color.each_ref().map(|c| c.format);
+        let rendering = Rendering {
+            color_attachments: N,
+            depth: depth_access.is_some(),
+            stencil: self.stencil_format != vk::Format::UNDEFINED,
+        };
+        // What the previous draws set: the state, the input assembly, the pipeline of a pass
+        // with its constants.
+        let mut state: Option<&RasterState<MAX_COLOR_ATTACHMENTS>> = None;
+        let mut assembly: Assembly = None;
+        let mut bound: Option<(usize, &[u8])> = None;
         for draw in &self.draws {
             if let Some((pool, query)) = draw.samples {
                 self.cmd_buf.begin_query(pool, query);
@@ -698,8 +640,24 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
                     | DrawCommand::Indexed { instances: 0, .. }
                     | DrawCommand::Indexed { count: 0, .. }
             ) {
-                let key = self.pipeline_key(&draw.state);
-                record_draw(self.cmd_buf, &key, &draw.command, draw.bindings.sections());
+                let sections = draw.bindings.sections();
+                if bound != Some((sections.pass, sections.constants)) {
+                    let key = self.pipeline_key(&color_formats, &sections);
+                    let pipeline = pipelines().raster(&key, sections.pass);
+                    unsafe {
+                        device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline)
+                    };
+                    bound = Some((sections.pass, sections.constants));
+                }
+                self.cmd_buf.push_constants(sections.push_constants);
+                let vertex = !matches!(
+                    draw.command,
+                    DrawCommand::Launch(_) | DrawCommand::LaunchIndirect { .. }
+                );
+                draw.state
+                    .record(state, rendering, vertex, &mut assembly, handle);
+                state = Some(&draw.state);
+                record_draw(handle, &draw.command);
             }
             if let Some((pool, query)) = draw.samples {
                 self.cmd_buf.end_query(pool, query);
@@ -712,19 +670,11 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
     }
 }
 
-/// Binds the pipeline `key` of a draw's pass and records the draw.
-fn record_draw(
-    cmd_buf: &mut CommandBuffer,
-    key: &RasterHash,
-    command: &DrawCommand,
-    sections: Sections,
-) {
-    let (device, handle) = (Ctx::device(), cmd_buf.handle);
+/// Records a draw with the pipeline, push constants and state already set.
+fn record_draw(handle: vk::CommandBuffer, command: &DrawCommand) {
+    let device = Ctx::device();
     {
-        let pipeline = pipelines().raster(key, sections.constants, sections.pass);
-        cmd_buf.push_constants(sections.push_constants);
         unsafe {
-            device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline);
             match *command {
                 DrawCommand::Draw {
                     vertices,
@@ -2544,68 +2494,43 @@ mod tests {
     }
 
     #[test]
-    fn raster_state_defaults_to_filled_backface_culled_depth_writing_draws() {
+    fn raster_state_defaults_to_filled_backface_culled_reversed_depth_draws() {
         let state = RasterState::<2>::default();
-        assert!(state.backface_culling);
-        assert!(!state.wire_frame);
-        assert!(state.depth_write);
+        assert_eq!(state.cull_mode, CullModeFlags::BACK);
+        assert_eq!(state.front_face, FrontFace::CLOCKWISE);
+        assert_eq!(state.polygon_mode, PolygonMode::FILL);
+        assert_eq!(state.depth_test, Some(CompareOp::GREATER));
+        assert!(state.writes_depth());
         assert_eq!(state.blends, [Blend::Replace; 2]);
+        assert_eq!(state.write_masks, [ColorComponentFlags::RGBA; 2]);
     }
 
+    /// Draw state is dynamic: a pipeline is keyed by the rendering's attachment formats and
+    /// the pass's constants alone.
     #[test]
-    fn raster_state_setters_end_up_in_the_pipeline_key() {
-        let mut cmd = offline_cmd();
-        let builder = cmd.raster(EXTENT, []);
-        let state = RasterState::<0>::default()
-            .backface_culling(false)
-            .wire_frame(true)
-            .depth_write(false)
-            .widen();
-        let key = builder.pipeline_key(&state);
-        assert!(!key.backface_culling);
-        assert!(key.wire_frame);
-        assert!(!key.depth_write);
-        assert_ne!(
-            key,
-            builder.pipeline_key(&RasterState::<0>::default().widen()),
-            "different state must not share a pipeline"
-        );
-    }
-
-    #[test]
-    fn blend_modes_get_their_own_pipelines() {
+    fn pipelines_are_keyed_by_attachment_formats_and_constants() {
         let state = layout(L::UNDEFINED);
         let mut cmd = offline_cmd();
         let target = view::<R8G8B8A8Unorm, ColorAttachment>(&state);
         let builder = cmd.raster(EXTENT, [Attachment::color(target, None)]);
-        let keys = [
-            Blend::Replace,
-            Blend::Alpha,
-            Blend::Add,
-            Blend::Attenuate,
-            Blend::Skip,
-        ]
-        .map(|blend| builder.pipeline_key(&RasterState::default().blends([blend]).widen()));
-        for (i, key) in keys.iter().enumerate() {
-            assert!(!keys[i + 1..].contains(key), "{key:?}");
-        }
+        let bindings = no_bindings::<kind::RasterVertex>();
+        let formats = [vk::Format::R8G8B8A8_UNORM];
+        let key = builder.pipeline_key(&formats, &bindings.sections());
+        assert_eq!(key.color_formats, formats);
+        assert_eq!(key.depth_format, vk::Format::UNDEFINED);
+        assert!(key.constants.is_empty());
     }
 
+    /// Widening keeps a draw's blends and masks for its attachments in front.
     #[test]
-    fn without_blends_every_attachment_is_replaced() {
-        let (a, b) = (layout(L::UNDEFINED), layout(L::UNDEFINED));
-        let mut cmd = offline_cmd();
-        let builder = cmd.raster(
-            EXTENT,
-            [
-                Attachment::color(view::<R8G8B8A8Unorm, ColorAttachment>(&a), None),
-                Attachment::color(view::<R8G8B8A8Unorm, ColorAttachment>(&b), None),
-            ],
-        );
-        let key = builder.pipeline_key(&RasterState::<2>::default().widen());
-        assert_eq!(key.blends.as_slice(), [Blend::Replace; 2]);
-        let explicit = RasterState::default().blends([Blend::Replace; 2]).widen();
-        assert_eq!(key, builder.pipeline_key(&explicit));
+    fn widened_state_keeps_the_attachments_blends_in_front() {
+        let state = RasterState::<2>::default()
+            .blends([Blend::Alpha, Blend::Skip])
+            .write_masks([ColorComponentFlags::R, ColorComponentFlags::RGBA]);
+        let wide = state.clone().widen();
+        assert_eq!(wide.blends[..2], [Blend::Alpha, Blend::Skip]);
+        assert_eq!(wide.write_masks[..2], state.write_masks);
+        assert_eq!(wide.cull_mode, state.cull_mode);
     }
 
     #[test]
@@ -2697,11 +2622,6 @@ mod tests {
         assert_eq!(
             access.stage,
             S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS
-        );
-        // Depth writes are pipeline state, so read-only draws get their own pipeline.
-        assert_ne!(
-            builder.pipeline_key(&read_only.widen()),
-            builder.pipeline_key(&RasterState::<0>::default().widen())
         );
     }
 
