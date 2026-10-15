@@ -1,4 +1,4 @@
-//! Pass bindings as generated code builds them (`Bindings`, sized by the pass) and as commands borrow them (`BindingOutput`, unsized bytes): the push constants, accesses and specialization constants of one pass, and the accesses registered on top
+//! Pass bindings as generated code builds them (`Bindings`, sized by the pass) and as commands borrow them (`BindingOutput`, unsized bytes): the push constants, accesses and specialization constants of one pass
 use std::{
     marker::PhantomData,
     mem::{MaybeUninit, transmute},
@@ -7,15 +7,10 @@ use std::{
     sync::atomic::AtomicU32,
 };
 
-use ash::vk;
 use bytemuck::{Pod, bytes_of};
 
-use super::{BufferAccess, ImageUse, append};
-use crate::{
-    buffer::slice::BufferSlice,
-    image::{dim::Dim, format::Format, slice::ImageView, usage::ImageUsage},
-    pipeline::{MAX_PUSH_CONSTANTS_SIZE, pass_map},
-};
+use super::{BufferAccess, ImageUse};
+use crate::pipeline::MAX_PUSH_CONSTANTS_SIZE;
 
 /// Marker types for the kind of pass a [`BindingOutput`] was made for, so that it can only be
 /// recorded the way its shaders run.
@@ -119,8 +114,9 @@ impl<'a, K> BindingOutput<'a, K> {
 
 /// A pass's bindings as the generated functions build them: the [`BindingOutput`] it derefs
 /// to, sized by what the pass has: `P` bytes of push constants, `I` image and `B` buffer
-/// accesses, `C` bytes of specialization constants. Registering an access returns it one
-/// access larger. Binding generators make it with [`Self::new`] and [`Self::with_constants`].
+/// accesses, `C` bytes of specialization constants. Binding generators make it with
+/// [`Self::new`] and [`Self::with_constants`]. Resources a pass reaches without naming them
+/// (through a handle or pointer in a buffer) are declared with `CommandBuffer::record_access`.
 #[repr(C, packed)]
 pub struct Bindings<'a, K, const P: usize, const I: usize, const B: usize, const C: usize> {
     header: Header,
@@ -154,18 +150,23 @@ impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I
     }
 
     /// Sets the specialization constants (`C` bytes), laid out as the pass's
-    /// `PassEntry.constants` says, and adds the accesses of the resources they name.
-    pub fn with_constants<G: Pod, const C: usize, const I2: usize, const B2: usize>(
+    /// `PassEntry.constants` says, and adds the accesses of the resources they name: `IO` and
+    /// `BO` are `I + I2` and `B + B2`, which the generated code's return type spells out.
+    pub fn with_constants<
+        G: Pod,
+        const C: usize,
+        const I2: usize,
+        const B2: usize,
+        const IO: usize,
+        const BO: usize,
+    >(
         self,
         constants: &G,
         images: [ImageUse<'a>; I2],
         buffers: [BufferAccess; B2],
-    ) -> Bindings<'a, K, P, { I + I2 }, { B + B2 }, C>
-    where
-        [(); I + I2]:,
-        [(); B + B2]:,
-    {
-        let pass = self.pass();
+    ) -> Bindings<'a, K, P, IO, BO, C> {
+        const { assert!(IO == I + I2 && BO == B + B2) };
+        let pass = self.header[0] as usize;
         let Self {
             push_constants,
             images: own_images,
@@ -173,7 +174,7 @@ impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I
             ..
         } = self;
         Bindings {
-            header: header(pass, P, I + I2, B + B2, C),
+            header: header(pass, P, IO, BO, C),
             push_constants,
             images: concat(own_images, images),
             buffers: concat(own_buffers, buffers),
@@ -182,163 +183,6 @@ impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I
                 .expect("`C` is the size of the specialization constants"),
             marker: PhantomData,
         }
-    }
-}
-
-/// Registering resources the pass reaches without naming them in its push constants, e.g.
-/// through a bindless handle or pointer stored in a buffer. Each call adds the access to the
-/// barriers recorded before the pass.
-impl<'a, K, const P: usize, const I: usize, const B: usize, const C: usize>
-    Bindings<'a, K, P, I, B, C>
-{
-    fn pass(&self) -> usize {
-        let header = self.header;
-        header[0] as usize
-    }
-
-    /// The stages of the pass's shaders, which its accesses happen in.
-    fn stage(&self) -> vk::PipelineStageFlags2 {
-        pass_map().passes[self.pass()].kind.stages()
-    }
-
-    fn with_image(self, image: ImageUse<'a>) -> Bindings<'a, K, P, { I + 1 }, B, C>
-    where
-        [(); I + 1]:,
-    {
-        let pass = self.pass();
-        let Self {
-            push_constants,
-            images,
-            buffers,
-            constants,
-            ..
-        } = self;
-        Bindings {
-            header: header(pass, P, I + 1, B, C),
-            push_constants,
-            images: append(images, image),
-            buffers,
-            constants,
-            marker: PhantomData,
-        }
-    }
-
-    fn with_buffers<const N: usize>(
-        self,
-        accesses: [BufferAccess; N],
-    ) -> Bindings<'a, K, P, I, { B + N }, C>
-    where
-        [(); B + N]:,
-    {
-        let pass = self.pass();
-        let Self {
-            push_constants,
-            images,
-            buffers,
-            constants,
-            ..
-        } = self;
-        Bindings {
-            header: header(pass, P, I, B + N, C),
-            push_constants,
-            images,
-            buffers: concat(buffers, accesses),
-            constants,
-            marker: PhantomData,
-        }
-    }
-
-    fn image_access<F: Format, U: ImageUsage, D: Dim>(
-        &self,
-        image: ImageView<'a, F, U, D>,
-        access: vk::AccessFlags2,
-    ) -> ImageUse<'a> {
-        image.access(self.stage(), access, vk::ImageLayout::GENERAL)
-    }
-
-    /// The pass samples `image` (`Tex2D`, or a `DynImg` with a sampled index).
-    pub fn sampled_read<F: Format, U: crate::image::usage::IsSampled, D: Dim>(
-        self,
-        image: ImageView<'a, F, U, D>,
-    ) -> Bindings<'a, K, P, { I + 1 }, B, C>
-    where
-        [(); I + 1]:,
-    {
-        image.usage_check(vk::ImageUsageFlags::SAMPLED);
-        let access = self.image_access(image, vk::AccessFlags2::SHADER_SAMPLED_READ);
-        self.with_image(access)
-    }
-
-    /// The pass loads from `image` as a storage image (`Image2D`, or a `DynImg` without a
-    /// sampled index).
-    pub fn storage_read<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
-        self,
-        image: ImageView<'a, F, U, D>,
-    ) -> Bindings<'a, K, P, { I + 1 }, B, C>
-    where
-        [(); I + 1]:,
-    {
-        image.usage_check(vk::ImageUsageFlags::STORAGE);
-        let access = self.image_access(image, vk::AccessFlags2::SHADER_STORAGE_READ);
-        self.with_image(access)
-    }
-
-    /// The pass loads from and stores to `image` (`MutImage2D`).
-    pub fn storage_write<F: Format, U: crate::image::usage::IsStorage, D: Dim>(
-        self,
-        image: ImageView<'a, F, U, D>,
-    ) -> Bindings<'a, K, P, { I + 1 }, B, C>
-    where
-        [(); I + 1]:,
-    {
-        image.usage_check(vk::ImageUsageFlags::STORAGE);
-        let access = self.image_access(
-            image,
-            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        );
-        self.with_image(access)
-    }
-
-    /// The pass traces `tlas` through an address it reads from a buffer (an `Accel` inside a
-    /// struct): its memory and the BLASes it names.
-    pub fn acceleration_structure_read(
-        self,
-        tlas: &crate::vkobjects::acceleration_structure::Tlas,
-    ) -> Bindings<'a, K, P, I, { B + 2 }, C>
-    where
-        [(); B + 2]:,
-    {
-        let accesses = tlas.trace_accesses(self.stage());
-        self.with_buffers(accesses)
-    }
-
-    /// The pass reads `buffer` through a pointer (`Buf`).
-    pub fn buffer_read<V: Copy + Pod, U: crate::buffer::usage::IsStorage>(
-        self,
-        buffer: BufferSlice<'_, V, U>,
-    ) -> Bindings<'a, K, P, I, { B + 1 }, C>
-    where
-        [(); B + 1]:,
-    {
-        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
-        let access = buffer.access(self.stage(), vk::AccessFlags2::SHADER_STORAGE_READ);
-        self.with_buffers([access])
-    }
-
-    /// The pass reads and writes `buffer` through a pointer (`MutBuf`).
-    pub fn buffer_write<V: Copy + Pod, U: crate::buffer::usage::IsStorage>(
-        self,
-        buffer: BufferSlice<'_, V, U>,
-    ) -> Bindings<'a, K, P, I, { B + 1 }, C>
-    where
-        [(); B + 1]:,
-    {
-        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
-        let access = buffer.access(
-            self.stage(),
-            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        );
-        self.with_buffers([access])
     }
 }
 
@@ -359,8 +203,9 @@ impl<'a, K, const P: usize, const I: usize, const B: usize, const C: usize> Dere
     }
 }
 
-/// `a` followed by `b`.
-fn concat<T, const N: usize, const M: usize>(a: [T; N], b: [T; M]) -> [T; N + M] {
+/// `a` followed by `b`; `O` is `N + M`.
+fn concat<T, const N: usize, const M: usize, const O: usize>(a: [T; N], b: [T; M]) -> [T; O] {
+    const { assert!(O == N + M) };
     let mut items = a.into_iter().chain(b);
     std::array::from_fn(|_| items.next().unwrap())
 }
@@ -369,7 +214,7 @@ fn concat<T, const N: usize, const M: usize>(a: [T; N], b: [T; M]) -> [T; N + M]
 mod tests {
     use super::*;
     use crate::command_buffer::ImageAccess;
-    use ash::vk::Handle;
+    use ash::vk::{self, Handle};
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
     /// What a binding generator puts in comes back out of the unsized bytes unchanged.

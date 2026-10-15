@@ -1,7 +1,4 @@
 //! lava's GPU tests as an ordinary lava user: the test passes in `shaders/` compiled by lava-build-slang, and checks of the pass map it generates
-// Needed to call `RasterBuilder`'s attachment and draw methods, which return it one larger.
-#![allow(incomplete_features)]
-#![feature(generic_const_exprs)]
 
 pub mod bindings {
     lava::include_passes!();

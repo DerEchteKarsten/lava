@@ -16,12 +16,6 @@
 //!   [`bindless::NULL_HANDLE`] for none) and [`vkobjects::acceleration_structure::Instance`]
 //!   (`VkAccelerationStructureInstanceKHR`) are the layouts shaders see; a TLAS is a `u64`
 //!   device address.
-// `RasterBuilder` grows its arrays of draws and color attachments by one per call.
-#![allow(incomplete_features)]
-#![feature(generic_const_exprs)]
-#![feature(const_trait_impl)]
-#![feature(range_into_bounds)]
-#![feature(range_bounds_is_empty)]
 use std::panic::Location;
 
 use crate::state::CALLSITE;

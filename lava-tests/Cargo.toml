@@ -24,11 +24,6 @@ lava-build-slang = { path = "../lava-build-slang" }
 name = "gpu_window"
 harness = false
 
-# BindingOutput layout microbenchmark; no GPU.
-[[bench]]
-name = "bindings"
-harness = false
-
 # Recording generated passes into real command buffers, headless.
 [[bench]]
 name = "recording"

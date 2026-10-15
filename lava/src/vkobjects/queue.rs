@@ -579,6 +579,7 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         let prev = CALLSITE.replace(None);
         executor(&mut cmd_buffer);
         CALLSITE.set(prev);
+        cmd_buffer.flush_deferred();
         host_barrier(buffer.handle);
         *pending = std::mem::take(&mut cmd_buffer.pending_accesses);
         cmd_buffer.end()?;

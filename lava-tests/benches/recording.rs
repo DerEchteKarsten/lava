@@ -1,12 +1,10 @@
 //! Benchmark of recording lava-tests' passes into real command buffers, headless with the validation layer off: the CPU time of building the bindings and recording them, per scenario
 //!
-//! Run with `cargo +nightly bench -p lava-tests --bench recording`.
+//! Run with `cargo bench -p lava-tests --bench recording`.
 //!
 //! Every frame records one scenario into a command buffer of one of two frame slots and
 //! submits it; only the recording closure is timed. The GPU work is tiny (one workgroup per
 //! dispatch, a 64x64 target), so a slot's previous frame is done by the time it begins again.
-#![allow(incomplete_features)]
-#![feature(generic_const_exprs)]
 
 use std::{hint::black_box, time::Instant};
 
@@ -16,7 +14,7 @@ use lava::{
         Buffer,
         usage::{Index, Storage},
     },
-    command_buffer::{CommandBuffer, RasterState},
+    command_buffer::{Access, Attachment, CommandBuffer, RasterState},
     epoch,
     image::{
         Image,
@@ -24,7 +22,7 @@ use lava::{
         usage::{ColorAttachmentStorageTransferSrcTransferDst, SampledTransferDst},
     },
     state::Ctx,
-    vkobjects::queue::{FrameSlot, Gfx, Queue},
+    vkobjects::queue::{FrameSlot, Gfx, Queue, Stage},
 };
 use lava_tests::bindings::{
     PASS_MAP, TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster,
@@ -111,20 +109,22 @@ fn compute(cmd: &mut CommandBuffer, r: &Resources) {
     }
 }
 
-/// 8 renderings of 8 indexed draws, each with a vertex buffer, a texture and two registered
+/// 8 renderings of 8 indexed draws, each with a vertex buffer, a texture and two declared
 /// textures.
 fn many_draws(cmd: &mut CommandBuffer, r: &Resources) {
     let draw = |i: usize| {
         TestRasterTextured::push_bindings(r.textured[i].range(..), r.textures[i].whole_view(), 0)
-            .sampled_read(r.textures[(i + 1) % TEXTURES].whole_view())
-            .sampled_read(r.textures[(i + 32) % TEXTURES].whole_view())
     };
     let state = RasterState::default;
     for j in 0..8 {
         let i = j * 8;
         let indices = r.indices.range(..);
-        cmd.raster(EXTENT)
-            .color_attachment(r.target.whole_view(), None)
+        for d in i..i + 8 {
+            for t in [(d + 1) % TEXTURES, (d + 32) % TEXTURES] {
+                cmd.record_access(Access::sampled_read(r.textures[t].whole_view()), Stage::Raster);
+            }
+        }
+        cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
             .draw_indexed(&draw(i), indices, 1, state())
             .draw_indexed(&draw(i + 1), indices, 1, state())
             .draw_indexed(&draw(i + 2), indices, 1, state())
@@ -137,26 +137,20 @@ fn many_draws(cmd: &mut CommandBuffer, r: &Resources) {
     }
 }
 
-macro_rules! registrations {
-    ($bindings:expr, $r:expr, $base:expr; $($i:literal)*) => {
-        $bindings $(.sampled_read($r.textures[$base + $i].whole_view()))*
-    };
-}
-
-/// 4 renderings of one draw that registers 16 textures.
-fn registrations(cmd: &mut CommandBuffer, r: &Resources) {
+/// 4 renderings of one draw that reaches 16 declared textures.
+fn declared(cmd: &mut CommandBuffer, r: &Resources) {
     for j in 0..4 {
-        let t = j * 16;
-        cmd.raster(EXTENT)
-            .color_attachment(r.target.whole_view(), None)
+        for texture in &r.textures[j * 16..j * 16 + 16] {
+            cmd.record_access(Access::sampled_read(texture.whole_view()), Stage::Raster);
+        }
+        cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
             .draw(
-                &registrations!(TestRaster::push_bindings(r.vertices.range(..), Vec2::ZERO), r, t;
-                    0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15),
+                &TestRaster::push_bindings(r.vertices.range(..), Vec2::ZERO),
                 3,
                 1,
                 RasterState::default(),
             )
-            .record("registrations");
+            .record("declared");
     }
 }
 
@@ -165,8 +159,7 @@ fn mesh(cmd: &mut CommandBuffer, r: &Resources) {
     let launch = |i: u32| TestMesh::push_bindings(Vec4::ONE, Vec2::new(i as f32, 0.0), 0.1);
     let state = RasterState::default;
     for _ in 0..8 {
-        cmd.raster(EXTENT)
-            .color_attachment(r.target.whole_view(), None)
+        cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
             .launch(&launch(0), [1, 1, 1], state())
             .launch(&launch(1), [1, 1, 1], state())
             .launch(&launch(2), [1, 1, 1], state())
@@ -190,7 +183,7 @@ fn main() {
     let mut scenarios: Vec<(&str, fn(&mut CommandBuffer, &Resources))> = vec![
         ("compute", compute),
         ("many_draws", many_draws),
-        ("registrations", registrations),
+        ("declared", declared),
     ];
     if Ctx::features().mesh {
         scenarios.push(("mesh", mesh));

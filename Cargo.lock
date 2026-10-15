@@ -696,6 +696,9 @@ dependencies = [
 [[package]]
 name = "lava-slang-sys"
 version = "0.1.0"
+dependencies = [
+ "libloading",
+]
 
 [[package]]
 name = "lava-tests"
