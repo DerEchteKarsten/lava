@@ -1,4 +1,4 @@
-//! Slang session and pass linking shared by the build script and lava's shader hot reload, plus the reflection both read: entry point stages and attributes, ray tracing groups, layout hashes
+//! Slang session and pass linking shared by the build script and the hot reload, plus the reflection both read: entry point stages and attributes, ray tracing groups, layout hashes
 use std::{collections::BTreeMap, ffi::CString};
 
 /// The Slang bindings, for the sessions and programs these functions take and return.
@@ -13,7 +13,7 @@ pub const CLOCK_REGION_IDS: std::ops::Range<u32> = 901..909;
 
 /// How a pass compiles: what the build script was given, and which pass it is.
 pub struct Options<'a> {
-    /// Absolute include directories; lava-build's own `slang/` is always searched too.
+    /// Absolute include directories; lava-build-slang's own `slang/` is always searched too.
     pub search_paths: &'a [&'a str],
     pub defines: &'a [(&'a str, &'a str)],
     pub optimization: Optimization,

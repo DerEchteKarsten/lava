@@ -161,7 +161,7 @@ public struct Accel {
     }
 }
 
-/// Marks the `uint64_t` behind an `SCONST`; lava-build reads the type from it.
+/// Marks the `uint64_t` behind an `SCONST`; lava-build-slang reads the type from it.
 [__AttributeUsage(_AttributeTargets.Var)]
 public struct SConstAttribute { string type; };
 

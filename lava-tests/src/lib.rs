@@ -1,4 +1,4 @@
-//! lava's GPU tests as an ordinary lava user: the test passes in `shaders/` compiled by lava-build, and checks of the pass map it generates
+//! lava's GPU tests as an ordinary lava user: the test passes in `shaders/` compiled by lava-build-slang, and checks of the pass map it generates
 // Needed to call `RasterBuilder`'s attachment and draw methods, which return it one larger.
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
@@ -78,7 +78,7 @@ mod tests {
                 assert!(
                     CStr::from_bytes_with_nul(name.as_bytes()).is_ok(),
                     "{name:?} in {}",
-                    pass.source
+                    pass.name
                 );
             }
         }

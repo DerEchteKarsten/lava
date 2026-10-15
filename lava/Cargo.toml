@@ -3,7 +3,7 @@ name = "lava"
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
-# Hands the `profiling` feature to lava-build in the application's build script
+# Hands the `profiling` feature to lava-build-slang in the application's build script
 # (`DEP_LAVA_PROFILING`).
 links = "lava"
 
@@ -17,16 +17,12 @@ gpu-allocator = {workspace = true}
 raw-window-handle = {workspace = true}
 lava-macros = { version = "0.1.0", path = "../lava-macros" }
 smallvec.workspace = true
-notify = {workspace = true, optional = true}
-lava-build = { path = "../lava-build", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 
 [features]
-default = ["profiling", "hot-reload"]
-# GPU timestamps, pipeline statistics and shader clocks (`PROFILING` in `profile.slang`).
+default = ["profiling"]
+# GPU timestamps, pipeline statistics and shader clocks (`PROFILING` in the frontend's
+# `profile.slang`).
 profiling = []
-# Recompiles changed shaders at runtime (a debugging aid, `src/hot_reload.rs`); the only way
-# lava reaches Slang.
-hot-reload = ["dep:notify", "dep:lava-build"]

@@ -1953,7 +1953,7 @@ mod generated {
                 fragment: "test_raster_fragment\0"
             }
         ));
-        assert!(PASS_MAP.passes[raster].source.ends_with("/shaders/test_raster.slang"));
+        assert_eq!(PASS_MAP.passes[raster].name, "TestRaster");
     }
 
     #[test]

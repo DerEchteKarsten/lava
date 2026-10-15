@@ -131,7 +131,7 @@ impl BuildFlags {
 }
 
 /// An acceleration structure and the memory it owns. Shaders reach a [`Tlas`] by its address
-/// (`Accel` in Slang); instances name a [`Blas`] by its address. Builds write it through a
+/// (a `u64` in the shader contract); instances name a [`Blas`] by its address. Builds write it through a
 /// shared reference: the command buffer orders them with the traces. Destroyed once no frame
 /// can reach it any more (`epoch`); a TLAS that still names a dropped BLAS must not be traced
 /// after that.
@@ -542,8 +542,8 @@ impl Describe for BlasGeometry<'_> {
     }
 }
 
-/// An instance of a BLAS in a TLAS (`VkAccelerationStructureInstanceKHR`; Slang's
-/// `AccelerationStructureInstance` in `ray_tracing.slang`, so passes can write them).
+/// An instance of a BLAS in a TLAS (`VkAccelerationStructureInstanceKHR`, a layout of the
+/// shader contract, so passes can write them).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Instance {

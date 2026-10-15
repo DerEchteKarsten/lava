@@ -1,4 +1,4 @@
-//! Shader clock regions: the switch that bakes them into clocked passes, and the counters `CLOCK_REGION` in `profile.slang` adds subgroup clock ticks to, read per pass and region
+//! Shader clock regions: the switch that bakes them into clocked passes, and the counters a frontend's clock regions (`CLOCK_REGION` in lava-build-slang's `profile.slang`) add subgroup clock ticks to, read per pass and region
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,11 +20,13 @@ pub struct RegionTime {
     pub subgroups: u64,
 }
 
-/// The specialization constant ids of a pass's clock region hashes (`CLOCK_REGION_0..` in
-/// `profile.slang`), which generated `constant_bindings` set without parameters. lava-build
-/// keeps a copy.
+/// The specialization constant ids of a pass's clock region hashes (see the shader contract in
+/// the crate docs), which generated `constant_bindings` set without parameters. Frontends keep
+/// a copy.
 pub const CLOCK_REGION_IDS: std::ops::Range<u32> = 901..909;
-/// Mirrors `profile.slang`.
+/// The counter layout of the shader contract, which the frontend's shaders mirror: counter
+/// `((pass * MAX_REGIONS + region) * STRIPES + stripe) * STRIPE_WORDS`, one cache line per
+/// stripe.
 const MAX_REGIONS: usize = CLOCK_REGION_IDS.end as usize - CLOCK_REGION_IDS.start as usize;
 const STRIPES: usize = 64;
 const STRIPE_WORDS: usize = 8;
@@ -32,7 +34,7 @@ const STRIPE_WORDS: usize = 8;
 const TICK_BITS: u32 = 40;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-/// The buffer `profile.slang` adds to, in descriptor set 2.
+/// The buffer clocked passes add to, in descriptor set 2.
 static COUNTERS: OnceLock<Buffer<u64>> = OnceLock::new();
 /// Per pass and region, the sum of its stripes' counters at the last read.
 static LAST_READ: Mutex<Vec<u64>> = Mutex::new(Vec::new());

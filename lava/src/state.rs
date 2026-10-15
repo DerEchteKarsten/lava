@@ -359,8 +359,8 @@ pub struct Features {
     pub mesh_queries: bool,
     /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
     pub memory_budget: bool,
-    /// `VK_KHR_shader_clock` with subgroup clocks, which `profile.slang` reads. Passes with
-    /// `USE_CLOCKS` need it; only enabled with the `profiling` feature.
+    /// `VK_KHR_shader_clock` with subgroup clocks, which shader clock regions read. Clocked
+    /// passes need it; only enabled with the `profiling` feature.
     pub shader_clock: bool,
     /// `VK_KHR_performance_query` with query pools, for the hardware counters of
     /// `profiling::counters`; only enabled with the `profiling` feature. Also enables host query

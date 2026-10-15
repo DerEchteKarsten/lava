@@ -10,35 +10,35 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 
 ## 1. Publishing blockers
 
-1. ~~**Codegen is hard-wired to this workspace.**~~ **Done (2026-10-15):** the `lava-build`
+1. ~~**Codegen is hard-wired to this workspace.**~~ **Done (2026-10-15):** the `lava-build-slang`
    crate, called from the application's `build.rs`
    (`Shaders::new().passes(..).include(..).define(..).optimization(..).compile()`), compiles
    the application's passes and writes the SPIR-V and the bindings into its `OUT_DIR`, which
    it includes with `lava::include_passes!()`.
 2. ~~**The runtime is sized from the generated code.**~~ **Done (2026-10-15)**, differently from
-   the direction sketched here: the generated `PASS_MAP` (a `PassMap`: entries plus the compile
-   options hot reload needs) goes to `lava::init`, and lava sizes its pipeline arrays from it,
+   the direction sketched here: the generated `PASS_MAP` (a `PassMap`: the entries and the profiling
+   setting; the frontend keeps its hot reload's compile options itself) goes to `lava::init`, and lava sizes its pipeline arrays from it,
    so there is still one pass set per application (an app and a library on lava can't both
    bring passes yet). The caps are fixed in `pipeline.rs`, `PROFILE_PASS` stays the map index,
    and the generated code uses public API (`BindingOutput::new`/`with_constants`,
    `BufferSlice::access`, `ImageView::access`, `Tlas::trace_accesses`), documented for other
-   binding generators, instead of a `__private` module. lava-build ships `bindless.slang`,
+   binding generators, instead of a `__private` module. lava-build-slang ships `bindless.slang`,
    `profile.slang` and `ray_tracing.slang` in its `slang/`, searched by every session, and
    lava's GPU tests moved to the `lava-tests` crate, an ordinary consumer, so `test-passes` is
    gone.
-3. **Git dependencies.** `shader-slang` comes from git (`lava/Cargo.toml:18,21`), and
+3. **Git dependencies.** `shader-slang` comes from git (`lava-build-slang/Cargo.toml`), and
    ash/ash-window/gpu-allocator are `[patch]`ed in the workspace. Patches don't reach
    dependents, so a published lava would resolve ash 0.38, which lacks
    `VK_KHR_device_address_commands`. Either wait for releases or hand-write that extension's
    loader against released ash.
-4. **Slang is needed by every user.** *Partly done (2026-10-15):* only lava-build depends on
-   `shader-slang` and links `slang-compiler`, and lava reaches it only through `hot-reload`.
-   Still open: `.cargo/config.toml` supplies `SLANG_DIR` and an absolute `/home/karsten/...`
+4. **Slang is needed by every user.** *Partly done (2026-10-15):* only lava-build-slang depends on
+   `shader-slang` and links `slang-compiler`; lava never reaches Slang (hot reload lives in
+   lava-build-slang and hands lava SPIR-V through `pipeline::reload_pass`). Still open: `.cargo/config.toml` supplies `SLANG_DIR` and an absolute `/home/karsten/...`
    rpath, and neither ships.
 5. ~~**The default `hot-reload` feature makes binaries non-relocatable.**~~ **Done
    (2026-10-15):** `PassEntry.spirv` is always `include_bytes!`'d and hot reload compiles from
-   the absolute `PassEntry.source`, so a moved binary runs with the pipelines it was built
-   with. The default features are still `profiling` and `hot-reload`.
+   the absolute source path (lava-build-slang's `BuiltPass.source`), so a moved binary runs
+   with the pipelines it was built with. lava's only feature is now `profiling` (default on); hot reload is lava-build-slang's.
 6. **Nightly.** `generic_const_exprs` (incomplete and prone to compiler crashes) leaks to every
    user (`core/src/lib.rs:4`, `tests/gpu_headless.rs:7`), and it exists only for `RasterBuilder`
    (see 4.1). `range_into_bounds`/`range_bounds_is_empty` serve one line
@@ -467,7 +467,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 
 ## Suggested order
 
-1. **Decide the packaging architecture first,** since it reshapes the generated API: `lava-build`,
+1. **Decide the packaging architecture first,** since it reshapes the generated API: `lava-build-slang`,
    per-pass statics, Slang only at build time, stable Rust, and released ash.
 2. **Fix the soundness bugs (section 2),** most of them local.
 3. **Redesign the APIs users touch first:** `RasterBuilder`, init config, memory locations,

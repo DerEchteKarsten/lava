@@ -6,7 +6,7 @@
 // Not in fragment shaders: a fragment shader that writes a buffer loses early depth testing.
 //
 // Only a pass that `#define USE_CLOCKS` before its first include of this file counts; in every
-// other pass `CLOCK_REGION` is empty, so shared code can keep its regions. lava-build's Slang
+// other pass `CLOCK_REGION` is empty, so shared code can keep its regions. lava-build-slang's Slang
 // session defines `PROFILING` for lava with its `profiling` feature, and `PROFILE_PASS`, the
 // pass's index in `PASS_MAP`, for every pass.
 
@@ -14,7 +14,7 @@
 // The hashes of the pass's region names in slot order, 0 for unused slots, and 0 for all of
 // them while clocks are off (and without `PROFILING`), which folds every region away. Declared
 // with `USE_CLOCKS` alone, so a pass's generated bindings don't depend on the feature:
-// lava-build bakes the hashes into its `constant_bindings`, which takes no parameters for
+// lava-build-slang bakes the hashes into its `constant_bindings`, which takes no parameters for
 // them. The driver folds the comparisons in `clock_region_slot`.
 [vk::constant_id(901)] const uint CLOCK_REGION_0 = 0;
 [vk::constant_id(902)] const uint CLOCK_REGION_1 = 0;

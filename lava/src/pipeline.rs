@@ -1,4 +1,4 @@
-//! Pass pipelines: the pass map lava-build generates and `init` takes, its entries (ray tracing passes with their shader groups), the cache of every pass's pipelines per specialization and raster state, and their creation (none for passes the device lacks the features of); with `hot-reload`, reloads that replace a pass's pipelines and retire the old ones
+//! Pass pipelines: the pass map a frontend generates and `init` takes, its entries (ray tracing passes with their shader groups), the cache of every pass's pipelines per specialization and raster state, their creation (none for passes the device lacks the features of), and `reload_pass`, which replaces a pass's pipelines and retires the old ones
 use ash::vk::TaggedStructure;
 use std::{
     collections::HashMap,
@@ -18,8 +18,6 @@ use crate::{
     vkobjects::rt_pipeline::RaytracingPipeline,
 };
 
-/// The version of the code lava-build generates; the generated file asserts it matches.
-pub const CODEGEN_VERSION: u32 = 1;
 /// The push constants every pass gets, pushed whole; Vulkan 1.4 guarantees 256 bytes.
 pub const MAX_PUSH_CONSTANTS_SIZE: usize = 256;
 /// The most bytes of specialization constants a pass can have.
@@ -29,19 +27,10 @@ pub const MAX_SPECIALIZATION_CONSTANTS_SIZE: usize = 128;
 pub const MAX_PASS_IMAGES: usize = 8;
 pub const MAX_PASS_BUFFERS: usize = 16;
 
-/// Every pass of the application and how lava-build compiled them (the generated `PASS_MAP`),
-/// which hot reload compiles them with again.
+/// Every pass of the application (the generated `PASS_MAP`).
 pub struct PassMap {
     /// A pass's index here is its `BindingOutput::pass()` and its `PROFILE_PASS`.
     pub passes: &'static [PassEntry],
-    /// The absolute include directories.
-    pub search_paths: &'static [&'static str],
-    /// The preprocessor macros (name, value).
-    pub defines: &'static [(&'static str, &'static str)],
-    /// The absolute pass and include directories, which hot reload watches.
-    pub watch_dirs: &'static [&'static str],
-    /// lava-build's `Optimization` level.
-    pub optimization: u8,
     /// Compiled with `PROFILING`, for lava with its `profiling` feature.
     pub profiling: bool,
 }
@@ -64,7 +53,8 @@ pub enum PassKind {
     Compute {
         entry: &'static str,
     },
-    /// The shader groups in binding table order (`[Group(n)]` in `ray_tracing.slang`).
+    /// The shader groups in binding table order (`[Group(n)]` in the frontend's
+    /// `ray_tracing.slang`).
     RayTracing {
         raygen: &'static str,
         miss: &'static [&'static str],
@@ -96,24 +86,19 @@ pub struct PassEntry {
     /// The generated struct's name, e.g. `"BvhCull"`; also the GPU scope of a compute or ray
     /// tracing pass.
     pub name: &'static str,
-    /// The SPIR-V lava-build compiled, built into the binary; hot reloads replace its module.
+    /// The SPIR-V the frontend compiled, built into the binary; [`reload_pass`] replaces its
+    /// module.
     pub spirv: &'static [u8],
-    /// The absolute path of its `.slang` file.
-    pub source: &'static str,
     pub kind: PassKind,
     /// Index into the pipelines of its kind (the specialized ones if it has `constants`):
-    /// lava-build numbers each kind's passes densely in map order.
+    /// the frontend numbers each kind's passes densely in map order.
     pub index: usize,
     /// Where each specialization constant sits in `BindingOutput::constants`.
     pub constants: &'static [vk::SpecializationMapEntry],
     pub constants_size: usize,
-    /// The names of its shader clock regions (`CLOCK_REGION` in `profile.slang`) in slot
-    /// order, whose hashes its `constant_bindings` sets. New names need a `cargo build`.
+    /// The names of its shader clock regions (see the shader contract in the crate docs) in
+    /// slot order, whose hashes its `constant_bindings` sets. New names need a `cargo build`.
     pub regions: &'static [&'static str],
-    /// `lava_build::compile::layout_hash` of the push constants, specialization constants and
-    /// entry points the bindings were generated from; a hot reload refuses a pass whose
-    /// hash changed, since the Rust side can't follow.
-    pub layout: u64,
     /// Its SPIR-V uses ray queries.
     pub ray_query: bool,
 }
@@ -135,7 +120,10 @@ impl PassEntry {
     /// Panics if the device can't run the pass.
     fn assert_supported(&self) {
         if let Some(feature) = self.missing_feature() {
-            panic!("pass `{}` needs {feature}, which this device lacks", self.name);
+            panic!(
+                "pass `{}` needs {feature}, which this device lacks",
+                self.name
+            );
         }
     }
 }
@@ -203,21 +191,25 @@ pub(crate) fn pipelines() -> &'static PipelineManager {
         .expect("pipelines were not initialized; call `lava::init()` first")
 }
 
-/// Creates every pass's shader module and its pipelines without specialization constants;
-/// with `hot-reload`, also starts watching the shaders. Needs the pass map.
+/// Creates every pass's shader module and its pipelines without specialization constants.
+/// Needs the pass map.
 pub(crate) fn init() {
-    let manager = PIPELINES.get_or_init(PipelineManager::new);
-    #[cfg(feature = "hot-reload")]
-    crate::hot_reload::watch(manager);
-    #[cfg(not(feature = "hot-reload"))]
-    let _ = manager;
+    PIPELINES.get_or_init(PipelineManager::new);
+}
+
+/// Replaces the SPIR-V of pass `pass_index` (its index in the pass map) and every pipeline made
+/// from it, right away; the replaced pipelines are destroyed once no frame can use them. The
+/// entry point of a frontend's hot reload: the new SPIR-V must keep the layout the bindings
+/// were generated from. If the driver rejects it, nothing is replaced.
+pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
+    pipelines().reload_pass(pass_index, spirv)
 }
 
 /// Every pass's pipelines: compute and ray tracing passes without specialization constants
 /// have one, made at start; the others one per specialization (and raster state), made at
 /// first use. A pass the device can't run (`PassEntry::missing_feature`) has no module and no
-/// pipeline, and panics when it is recorded. With `hot-reload`, [`Self::reload_pass`] replaces a pass's module and pipelines,
-/// and the replaced pipelines are destroyed once no frame can use them (`epoch`).
+/// pipeline, and panics when it is recorded. [`Self::reload_pass`] replaces a pass's module and
+/// pipelines, and the replaced pipelines are destroyed once no frame can use them (`epoch`).
 pub(crate) struct PipelineManager {
     shader_modules: RwLock<Box<[vk::ShaderModule]>>,
     compute_pipelines: RwLock<Box<[vk::Pipeline]>>,
@@ -243,15 +235,16 @@ impl PipelineManager {
             })
             .collect();
         Self {
-            compute_pipelines: RwLock::new(create_unspecialized(false, |pass_index, pass| {
-                match pass.missing_feature() {
+            compute_pipelines: RwLock::new(create_unspecialized(
+                false,
+                |pass_index, pass| match pass.missing_feature() {
                     Some(_) => vk::Pipeline::null(),
                     None => must(
                         pass,
                         create_compute_pipeline(modules[pass_index], pass, &Constants::NONE),
                     ),
-                }
-            })),
+                },
+            )),
             specialized_compute_pipelines: maps(count(|p| {
                 matches!(p.kind, PassKind::Compute { .. }) && !p.constants.is_empty()
             })),
@@ -267,7 +260,10 @@ impl PipelineManager {
                 matches!(p.kind, PassKind::RayTracing { .. }) && !p.constants.is_empty()
             })),
             raster_pipelines: maps(count(|p| {
-                matches!(p.kind, PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. })
+                matches!(
+                    p.kind,
+                    PassKind::RasterVertex { .. } | PassKind::RasterMesh { .. }
+                )
             })),
             shader_modules: RwLock::new(modules),
         }
@@ -334,8 +330,7 @@ impl PipelineManager {
     /// destroyed once no frame can use it (`epoch`). If the driver rejects the module or one
     /// of the pipelines, nothing is replaced: every new pipeline is made before any is swapped
     /// in, and no lock is held while one fails. A pass the device can't run is skipped.
-    #[cfg(feature = "hot-reload")]
-    pub(crate) fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Result<()> {
+    fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Result<()> {
         let pass = &pass_map().passes[pass_index];
         if pass.missing_feature().is_some() {
             return Ok(());
@@ -399,7 +394,6 @@ impl Into<vk::Pipeline> for RaytracingPipeline {
 }
 
 /// Destroys `pipelines` once no frame can use them any more.
-#[cfg(feature = "hot-reload")]
 fn retire<P: Into<vk::Pipeline> + Send + 'static>(pipelines: impl IntoIterator<Item = P>) {
     let pipelines: Vec<P> = pipelines.into_iter().collect();
     crate::epoch::retire(move || {
@@ -411,7 +405,6 @@ fn retire<P: Into<vk::Pipeline> + Send + 'static>(pipelines: impl IntoIterator<I
 
 /// Makes the pipeline of every key in the pass's map with `create`, then swaps them all in
 /// and returns the replaced ones. If one fails, the new ones are destroyed and nothing changes.
-#[cfg(feature = "hot-reload")]
 fn rebuild<K: Hash + Eq + Clone, P: Into<vk::Pipeline> + Send + 'static>(
     maps: &RwLock<Box<[HashMap<K, P>]>>,
     pass: &PassEntry,
@@ -442,7 +435,7 @@ fn must<T>(pass: &PassEntry, result: Result<T>) -> T {
 }
 
 /// `create` called for every compute (or ray tracing) pass without specialization constants,
-/// as their array: lava-build numbers each array's passes in map order.
+/// as their array: the frontend numbers each array's passes in map order.
 fn create_unspecialized<T>(
     ray_tracing: bool,
     mut create: impl FnMut(usize, &'static PassEntry) -> T,
@@ -565,9 +558,12 @@ fn create_raytracing_pipeline(
             .intersection_shader(vk::SHADER_UNUSED_KHR)
     };
     let general = vk::RayTracingShaderGroupTypeKHR::GENERAL;
-    groups.push(group(general).general_shader(stage(Some(raygen), vk::ShaderStageFlags::RAYGEN_KHR)));
+    groups
+        .push(group(general).general_shader(stage(Some(raygen), vk::ShaderStageFlags::RAYGEN_KHR)));
     for &entry in miss {
-        groups.push(group(general).general_shader(stage(Some(entry), vk::ShaderStageFlags::MISS_KHR)));
+        groups.push(
+            group(general).general_shader(stage(Some(entry), vk::ShaderStageFlags::MISS_KHR)),
+        );
     }
     for g in hit {
         let ty = if g.intersection.is_some() {
@@ -579,7 +575,10 @@ fn create_raytracing_pipeline(
             group(ty)
                 .closest_hit_shader(stage(g.closest_hit, vk::ShaderStageFlags::CLOSEST_HIT_KHR))
                 .any_hit_shader(stage(g.any_hit, vk::ShaderStageFlags::ANY_HIT_KHR))
-                .intersection_shader(stage(g.intersection, vk::ShaderStageFlags::INTERSECTION_KHR)),
+                .intersection_shader(stage(
+                    g.intersection,
+                    vk::ShaderStageFlags::INTERSECTION_KHR,
+                )),
         );
     }
     for &entry in callable {

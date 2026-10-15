@@ -1,4 +1,26 @@
 //! Lava: typed, bindless Vulkan abstraction over ash with shader-generated passes
+//!
+//! Lava takes SPIR-V and knows no shader language: a frontend crate (`lava-build-slang`)
+//! compiles an application's passes in its build script and generates their bindings and
+//! `PASS_MAP`, and may hot reload them through [`pipeline::reload_pass`].
+//!
+//! # Shader contract
+//! What every frontend's shaders and generated code must match:
+//! - Descriptor set 0: binding 0 holds the three immutable samplers (nearest and bilinear,
+//!   both clamped to a white border; trilinear repeat), binding 3 the bindless sampled images.
+//!   Set 1, binding 0: the bindless storage images. Set 2, binding 0: the shader clock counters
+//!   (a `u64` storage buffer, laid out as in [`profiling::clock`]). Passes have no other
+//!   descriptors.
+//! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes,
+//!   pushed whole; at most [`pipeline::MAX_SPECIALIZATION_CONSTANTS_SIZE`] bytes of
+//!   specialization constants.
+//! - Specialization constants [`profiling::clock::CLOCK_REGION_IDS`] are a clocked pass's
+//!   region name hashes (in slot order, 0 for none), which the generated `constant_bindings`
+//!   bake; a pass indexes the clock counters by its position in the pass map (`PROFILE_PASS`).
+//! - [`bindless::BindlessHandle`] (two `u32` indices, sampled then storage,
+//!   [`bindless::NULL_HANDLE`] for none) and [`vkobjects::acceleration_structure::Instance`]
+//!   (`VkAccelerationStructureInstanceKHR`) are the layouts shaders see; a TLAS is a `u64`
+//!   device address.
 // `RasterBuilder` grows its arrays of draws and color attachments by one per call.
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
@@ -24,8 +46,6 @@ pub mod buffer;
 pub mod command_buffer;
 pub mod epoch;
 pub mod error;
-#[cfg(feature = "hot-reload")]
-mod hot_reload;
 pub mod image;
 pub mod pipeline;
 pub mod profiling;
@@ -41,7 +61,7 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// The bindings lava-build generated in the application's build script: every pass's
+/// The bindings lava-build-slang generated in the application's build script: every pass's
 /// `Pass::push_bindings`, the types its shaders share, and the `PASS_MAP` that goes to
 /// [`init`]. Expands where it is called, so `OUT_DIR` is the calling crate's.
 #[macro_export]
@@ -63,7 +83,7 @@ pub fn init(
     assert_eq!(
         passes.profiling,
         cfg!(feature = "profiling"),
-        "the passes were compiled for lava {} its `profiling` feature: run lava-build from the \
+        "the passes were compiled for lava {} its `profiling` feature: run lava-build-slang from the \
          build script of a crate that depends on lava directly",
         if passes.profiling { "with" } else { "without" }
     );

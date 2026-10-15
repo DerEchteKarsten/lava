@@ -1,43 +1,36 @@
-//! lava-build: compiles an application's Slang passes to SPIR-V and generates their typed bindings and `PASS_MAP` for lava, called from the application's build script
+//! lava-build-slang: compiles an application's Slang passes to SPIR-V and generates their typed bindings and `PASS_MAP` for lava, called from the application's build script; with `hot-reload`, recompiles them while the application runs
 use std::{env, fs, path::Path};
 
 mod codegen;
 pub mod compile;
+#[cfg(feature = "hot-reload")]
+pub mod hot_reload;
 
-/// lava's half of the shader contract (`bindless.slang`, `profile.slang`, `ray_tracing.slang`:
-/// the descriptor sets, the clock counters, acceleration structure instances), searched by
-/// every session.
+/// The Slang side of lava's shader contract (lava's crate docs; `bindless.slang`,
+/// `profile.slang`, `ray_tracing.slang`: the descriptor sets, the clock counters, acceleration
+/// structure instances), searched by every session.
 pub const SLANG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/slang");
 
 /// Slang's optimization level for every pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Optimization {
     /// For debugging the SPIR-V.
-    None = 0,
-    Default = 1,
+    None,
+    Default,
     #[default]
-    Maximal = 2,
-}
-
-impl Optimization {
-    /// The level `PassMap.optimization` stores (`level as u8`).
-    pub fn from_level(level: u8) -> Self {
-        match level {
-            0 => Self::None,
-            1 => Self::Default,
-            _ => Self::Maximal,
-        }
-    }
+    Maximal,
 }
 
 /// The passes of an application, compiled by its build script:
 /// ```ignore
-/// lava_build::Shaders::new()
+/// lava_build_slang::Shaders::new()
 ///     .passes("../shaders/passes")
 ///     .include("../shaders/include")
 ///     .compile();
 /// ```
-/// and included with `lava::include_passes!()`, whose `PASS_MAP` goes to `lava::init`.
+/// and included with `lava::include_passes!()`, whose `PASS_MAP` goes to `lava::init`. With
+/// the `hot-reload` feature, [`watch!`] (called in the same crate, after `lava::init`)
+/// recompiles them while the application runs.
 /// Relative paths are resolved against the package's directory.
 #[derive(Default)]
 pub struct Shaders {

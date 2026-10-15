@@ -1,0 +1,15 @@
+[package]
+name = "lava-build-slang"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
+lava = { path = "../lava", default-features = false, optional = true }
+notify = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+# Recompiles changed passes while the application runs (a debugging aid, `src/hot_reload.rs`),
+# for its normal dependency; the build script's stays free of lava.
+hot-reload = ["dep:lava", "dep:notify", "dep:tracing"]

@@ -1,4 +1,4 @@
-//! Shader hot reload (the `hot-reload` feature, a debugging aid): recompiles the passes whose sources change and replaces their pipelines right away
+//! lava-build-slang's hot reload (the `hot-reload` feature, a debugging aid): recompiles the passes whose sources change and hands their SPIR-V to lava, which replaces their pipelines right away
 use std::{
     iter,
     path::{Path, PathBuf},
@@ -6,17 +6,55 @@ use std::{
     time::Duration,
 };
 
-use lava_build::{
-    Optimization,
-    compile::{self, slang},
-};
+use lava::pipeline::{self, pass_map};
 use notify::EventHandler;
 
-use crate::pipeline::{PassEntry, PipelineManager, pass_map};
+use crate::{
+    Optimization, SLANG_DIR,
+    compile::{self, slang},
+};
 
-/// Watches the pass map's directories and lava-build's `slang/`, and compiles changed passes
-/// on a thread of its own.
-pub(crate) fn watch(manager: &'static PipelineManager) {
+/// How the build script compiled the passes, which the hot reload compiles them with again:
+/// generated next to the bindings (`$OUT_DIR/lava/hot_reload.rs`) and included by [`watch!`].
+pub struct Build {
+    /// The absolute include directories.
+    pub search_paths: &'static [&'static str],
+    /// The preprocessor macros (name, value).
+    pub defines: &'static [(&'static str, &'static str)],
+    /// The absolute pass and include directories.
+    pub watch_dirs: &'static [&'static str],
+    pub optimization: Optimization,
+    /// One per pass of `PASS_MAP`, in its order.
+    pub passes: &'static [BuiltPass],
+}
+
+pub struct BuiltPass {
+    /// The absolute path of its `.slang` file.
+    pub source: &'static str,
+    /// `compile::layout_hash` of the push constants, specialization constants and entry points
+    /// the bindings were generated from; a reload that changes it is refused, since the Rust
+    /// side can't follow.
+    pub layout: u64,
+}
+
+/// Starts the hot reload of the passes compiled by the calling crate's build script: call it
+/// in the crate that includes the bindings (it reads that crate's `OUT_DIR`), after
+/// `lava::init` got their `PASS_MAP`.
+#[macro_export]
+macro_rules! watch {
+    () => {{
+        use $crate::{
+            Optimization,
+            hot_reload::{Build, BuiltPass},
+        };
+        static BUILD: Build = include!(concat!(env!("OUT_DIR"), "/lava/hot_reload.rs"));
+        $crate::hot_reload::watch(&BUILD)
+    }};
+}
+
+/// Watches the build's directories and [`SLANG_DIR`], and compiles changed passes on a thread
+/// of its own; [`watch!`] calls it with the build of the calling crate. Later calls do nothing.
+pub fn watch(build: &'static Build) {
     use notify::Watcher;
 
     static WATCHER: OnceLock<Option<notify::RecommendedWatcher>> = OnceLock::new();
@@ -24,8 +62,11 @@ pub(crate) fn watch(manager: &'static PipelineManager) {
         let watch = || -> std::result::Result<notify::RecommendedWatcher, String> {
             // The source directories of the build machine: a moved binary has no shaders to
             // watch, and keeps the pipelines it started with.
-            let dirs: Vec<&Path> = (pass_map().watch_dirs.iter().copied())
-                .chain([lava_build::SLANG_DIR])
+            if build.passes.len() != pass_map().passes.len() {
+                return Err("its build isn't the one of lava's `PASS_MAP`".to_string());
+            }
+            let dirs: Vec<&Path> = (build.watch_dirs.iter().copied())
+                .chain([SLANG_DIR])
                 .map(Path::new)
                 .collect();
             if let Some(missing) = dirs.iter().find(|dir| !dir.is_dir()) {
@@ -41,7 +82,7 @@ pub(crate) fn watch(manager: &'static PipelineManager) {
             }
             std::thread::Builder::new()
                 .name("shader_hot_reload".into())
-                .spawn(move || compile_changed_passes(manager, rx))
+                .spawn(move || compile_changed_passes(build, rx))
                 .map_err(|e| e.to_string())?;
             Ok(watcher)
         };
@@ -81,7 +122,7 @@ impl EventHandler for FileWatcher {
     }
 }
 
-fn compile_changed_passes(manager: &'static PipelineManager, changed: mpsc::Receiver<PathBuf>) {
+fn compile_changed_passes(build: &Build, changed: mpsc::Receiver<PathBuf>) {
     let Some(global) = slang::GlobalSession::new() else {
         tracing::error!(target: "shader_file_watcher", "failed to create slang session, hot reloading is disabled");
         return;
@@ -91,14 +132,12 @@ fn compile_changed_passes(manager: &'static PipelineManager, changed: mpsc::Rece
         std::thread::sleep(Duration::from_millis(50));
         let paths: Vec<PathBuf> = iter::once(first).chain(changed.try_iter()).collect();
 
-        for pass_index in passes_to_reload(&paths, pass_map().passes) {
-            let pass = &pass_map().passes[pass_index];
+        for pass_index in passes_to_reload(&paths, build.passes) {
+            let pass = &build.passes[pass_index];
 
-            let reloaded = compile_pass(&global, pass_index).and_then(|spirv| {
+            let reloaded = compile_pass(&global, build, pass_index).and_then(|spirv| {
                 tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
-                manager
-                    .reload_pass(pass_index, spirv.as_slice())
-                    .map_err(|e| e.to_string())
+                pipeline::reload_pass(pass_index, spirv.as_slice()).map_err(|e| e.to_string())
             });
             if let Err(e) = reloaded {
                 tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
@@ -110,8 +149,8 @@ fn compile_changed_passes(manager: &'static PipelineManager, changed: mpsc::Rece
 /// Indices of the passes that have to be recompiled after `changed` files were modified:
 /// the passes whose own source changed, or every pass as soon as a non-pass file (an include)
 /// is among them.
-fn passes_to_reload(changed: &[PathBuf], passes: &[PassEntry]) -> Vec<usize> {
-    let is_source_of = |path: &PathBuf, pass: &PassEntry| path == Path::new(pass.source);
+fn passes_to_reload(changed: &[PathBuf], passes: &[BuiltPass]) -> Vec<usize> {
+    let is_source_of = |path: &PathBuf, pass: &BuiltPass| path == Path::new(pass.source);
     let all = changed
         .iter()
         .any(|path| !passes.iter().any(|pass| is_source_of(path, pass)));
@@ -127,15 +166,15 @@ fn passes_to_reload(changed: &[PathBuf], passes: &[PassEntry]) -> Vec<usize> {
 /// points changed, which only `cargo build` can follow.
 fn compile_pass(
     global: &slang::GlobalSession,
+    build: &Build,
     pass_index: usize,
 ) -> std::result::Result<slang::Blob, String> {
-    let map = pass_map();
-    let pass = &map.passes[pass_index];
+    let pass = &build.passes[pass_index];
     let options = compile::Options {
-        search_paths: map.search_paths,
-        defines: map.defines,
-        optimization: Optimization::from_level(map.optimization),
-        profiling: map.profiling,
+        search_paths: build.search_paths,
+        defines: build.defines,
+        optimization: build.optimization,
+        profiling: pass_map().profiling,
         pass_index,
     };
     let session = compile::session(global, &options);
@@ -154,21 +193,9 @@ fn compile_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::PassKind;
 
-    fn pass(source: &'static str) -> PassEntry {
-        PassEntry {
-            name: "",
-            spirv: &[],
-            source,
-            kind: PassKind::Compute { entry: "main\0" },
-            index: 0,
-            constants: &[],
-            constants_size: 0,
-            regions: &[],
-            layout: 0,
-            ray_query: false,
-        }
+    fn pass(source: &'static str) -> BuiltPass {
+        BuiltPass { source, layout: 0 }
     }
 
     #[test]

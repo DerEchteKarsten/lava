@@ -1,4 +1,4 @@
-//! Generates the typed pass bindings and `PASS_MAP` from the reflection of each compiled pass
+//! Generates the typed pass bindings and `PASS_MAP` from the reflection of each compiled pass, and what the hot reload compiles them with again
 use std::{collections::BTreeMap, fs, path::Path};
 
 use shader_slang::{
@@ -7,10 +7,6 @@ use shader_slang::{
 };
 
 use crate::{Shaders, compile};
-
-/// Checked by the generated file against `lava::pipeline::CODEGEN_VERSION`: bump both when
-/// the generated code changes what it needs from lava.
-const CODEGEN_VERSION: u32 = 1;
 
 struct StructDef {
     body: String,
@@ -47,7 +43,9 @@ impl PassKind {
 enum FieldKind {
     Plain,
     Buffer,
-    Image { usage: u64 },
+    Image {
+        usage: u64,
+    },
     /// A TLAS by its address.
     Accel,
 }
@@ -520,7 +518,6 @@ fn generate_pass(
     pipelines: &mut Pipelines,
     spirv: &Path,
     source: &str,
-    layout_hash: u64,
 ) -> String {
     let gpu_name = format!("C{pass_name}Bindings");
     let consts_name = format!("C{pass_name}Constants");
@@ -567,15 +564,19 @@ fn generate_pass(
             format!("Compute {{ entry: \"{compute}\\0\" }}")
         }
         PassKind::RayTracing => {
-            let groups = compile::ray_tracing_groups(entries)
-                .unwrap_or_else(|e| panic!("{source}: {e}"));
+            let groups =
+                compile::ray_tracing_groups(entries).unwrap_or_else(|e| panic!("{source}: {e}"));
             let name = |name: &str| format!("\"{name}\\0\"");
             let optional = |entry: &Option<String>| match entry {
                 Some(entry) => format!("Some({})", name(entry)),
                 None => "None".to_string(),
             };
             let names = |entries: &[String]| {
-                entries.iter().map(|e| name(e)).collect::<Vec<_>>().join(", ")
+                entries
+                    .iter()
+                    .map(|e| name(e))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             let hit: Vec<String> = groups
                 .hit
@@ -622,13 +623,11 @@ fn generate_pass(
         r#"    PassEntry {{
         name: "{pass_name}",
         spirv: include_bytes!({spirv:?}),
-        source: {source:?},
         kind: PassKind::{kind_fields},
         index: {pipeline_index},
         constants: {constants},
         constants_size: {constants_size},
         regions: &{regions:?},
-        layout: {layout_hash:#x},
         ray_query: {ray_query},
     }},"#
     ));
@@ -797,8 +796,9 @@ fn camel_case(s: &str) -> String {
         .collect()
 }
 
-/// Compiles every pass of `shaders`, writes its SPIR-V to `out_dir/passes/<Pass>.spv` and the
-/// bindings with `PASS_MAP` to `out_dir/bindings.rs`.
+/// Compiles every pass of `shaders`, writes its SPIR-V to `out_dir/passes/<Pass>.spv`, the
+/// bindings with `PASS_MAP` to `out_dir/bindings.rs`, and the `hot_reload::Build` that
+/// `watch!` includes to `out_dir/hot_reload.rs`.
 pub(crate) fn generate(shaders: &Shaders, profiling: bool, out_dir: &Path) {
     let global = slang::GlobalSession::new().unwrap();
 
@@ -840,16 +840,13 @@ use lava::image;
 use lava::command_buffer::*;
 #[allow(unused_imports)]
 use lava::pipeline::*;
-
-const _: () = assert!(
-    lava::pipeline::CODEGEN_VERSION == {CODEGEN_VERSION},
-    "lava-build and lava don't match: use the same version of both"
-);
 "#
     );
 
     let mut structs = Structs::new();
     let mut pass_map: Vec<String> = Vec::new();
+    // `hot_reload::BuiltPass`es, in map order.
+    let mut built_passes: Vec<String> = Vec::new();
     let mut pipelines = Pipelines::default();
 
     let passes_dir = out_dir.join("passes");
@@ -916,29 +913,26 @@ const _: () = assert!(
             &mut pipelines,
             &out,
             source,
-            compile::layout_hash(layout),
         );
+        built_passes.push(format!(
+            "        BuiltPass {{ source: {source:?}, layout: {:#x} }},",
+            compile::layout_hash(layout)
+        ));
         bindings.push_str(&code);
         write_if_changed(&out, pass_spirv.as_slice());
     }
 
-    let watch_dirs: Vec<&String> = shaders.passes.iter().chain(&shaders.includes).collect();
     bindings.push_str(&format!(
         r#"
-/// Every pass, and how they were compiled; hand it to `lava::init`.
+/// Every pass; hand it to `lava::init`.
 pub static PASS_MAP: PassMap = PassMap {{
     passes: &[
 {passes}
     ],
-    search_paths: &{search_paths:?},
-    defines: &{defines:?},
-    watch_dirs: &{watch_dirs:?},
-    optimization: {optimization},
     profiling: {profiling},
 }};
 "#,
         passes = pass_map.join("\n"),
-        optimization = shaders.optimization as u8,
     ));
 
     for (name, def) in &structs {
@@ -953,6 +947,24 @@ pub static PASS_MAP: PassMap = PassMap {{
     }
 
     write_if_changed(&out_dir.join("bindings.rs"), bindings.as_bytes());
+
+    // Only text here: the build script's lava-build-slang has no `hot_reload` module.
+    let watch_dirs: Vec<&String> = shaders.passes.iter().chain(&shaders.includes).collect();
+    let build = format!(
+        r#"Build {{
+    search_paths: &{search_paths:?},
+    defines: &{defines:?},
+    watch_dirs: &{watch_dirs:?},
+    optimization: Optimization::{optimization:?},
+    passes: &[
+{passes}
+    ],
+}}
+"#,
+        optimization = shaders.optimization,
+        passes = built_passes.join("\n"),
+    );
+    write_if_changed(&out_dir.join("hot_reload.rs"), build.as_bytes());
 }
 
 /// Only a changed file makes cargo rebuild the crate that includes it (`include!`,

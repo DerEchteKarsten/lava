@@ -157,8 +157,8 @@ pub mod kind {
 /// the generated `Pass::push_bindings` (and `constant_bindings` for a pass with
 /// specialization constants). It borrows its images' tracked layouts until it is recorded.
 ///
-/// [`Self::new`] and [`Self::with_constants`] are the API a binding generator other than
-/// lava-build's (e.g. one for GLSL) makes them with.
+/// [`Self::new`] and [`Self::with_constants`] are the API binding generators (lava-build-slang's,
+/// or one for another shader language) make them with.
 pub struct BindingOutput<'a, K> {
     /// Index into the pass map `lava::init` was given.
     pub(crate) pass: usize,
