@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs" }
+shader-slang.workspace = true
 lava = { path = "../lava", default-features = false, optional = true }
 notify = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
