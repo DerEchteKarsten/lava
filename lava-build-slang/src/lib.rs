@@ -3,6 +3,7 @@ use std::{env, fs, path::Path};
 
 mod codegen;
 pub mod compile;
+mod reflect;
 #[cfg(feature = "hot-reload")]
 pub mod hot_reload;
 

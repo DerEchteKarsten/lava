@@ -16,7 +16,8 @@ glam = { version = "0.32", features = ["bytemuck", "mint"] }
 ash = "0.38.0"
 ash-window = "0.13.0"
 gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
-shader-slang = { git = "https://github.com/FloatyMonkey/slang-rs", rev = "f9c9eece467aa84f3be1aa1137426f59591095fc" }
+shader-slang = "0.1.0"
+shader-slang-sys = "0.1.0"
 raw-window-handle = "0.6.2"
 smallvec = { version = "1.15.1", features = ["union", "const_generics"] }
 hashbrown = "0.17"

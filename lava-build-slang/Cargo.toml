@@ -14,6 +14,8 @@ include = ["build.rs", "src/**", "slang/**", "README.md", "LICENSE-*"]
 
 [dependencies]
 shader-slang.workspace = true
+# Only for `src/reflect.rs`, which checks the reflection results 0.1.0 doesn't.
+shader-slang-sys.workspace = true
 lava = { version = "0.1.0", path = "../lava", optional = true }
 notify = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }

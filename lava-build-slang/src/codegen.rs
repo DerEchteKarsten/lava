@@ -6,6 +6,10 @@ use shader_slang::{
     reflection::{TypeLayout, VariableLayout},
 };
 
+use crate::reflect::{
+    CheckedAttributes, CheckedGeneric, CheckedName, CheckedShader, CheckedTypeLayout,
+    CheckedVariableLayout,
+};
 use crate::{Shaders, compile};
 
 struct StructDef {
@@ -93,11 +97,11 @@ impl {CLOCK_TYPE} {{
 "#
         );
     }
-    let fields: Vec<&str> = t.fields().map(field_name).collect();
+    let fields: Vec<&str> = t.checked_fields().map(field_name).collect();
     if fields.is_empty()
         || !t
-            .fields()
-            .all(|f| is_struct_named(f.type_layout().unwrap(), &[CLOCK_TYPE]))
+            .checked_fields()
+            .all(|f| is_struct_named(f.checked_type_layout().unwrap(), &[CLOCK_TYPE]))
     {
         return String::new();
     }
@@ -120,11 +124,13 @@ impl {name} {{
 }
 
 fn field_name(f: &VariableLayout) -> &str {
-    f.variable().and_then(|v| v.name()).expect("unnamed field")
+    f.variable()
+        .and_then(|v| v.checked_name())
+        .expect("unnamed field")
 }
 
 fn type_name(t: &TypeLayout) -> &str {
-    t.name().unwrap_or("UnknownStruct")
+    t.checked_name().unwrap_or("UnknownStruct")
 }
 
 fn is_struct_named(t: &TypeLayout, names: &[&str]) -> bool {
@@ -132,14 +138,14 @@ fn is_struct_named(t: &TypeLayout, names: &[&str]) -> bool {
 }
 
 fn layout_signature(t: &TypeLayout) -> Vec<(String, usize)> {
-    t.fields()
+    t.checked_fields()
         .map(|f| (field_name(f).to_string(), f.offset(Cat::Uniform)))
         .collect()
 }
 
 fn layout_checks(rust_name: &str, t: &TypeLayout) -> String {
     let mut out = String::new();
-    for f in t.fields() {
+    for f in t.checked_fields() {
         out.push_str(&format!(
             "const _: () = assert!(core::mem::offset_of!({rust_name}, {}) == {});\n",
             field_name(f),
@@ -183,7 +189,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
         }
         TypeKind::Array => format!(
             "[{}; {}]",
-            rust_type(t.element_type_layout().unwrap(), structs),
+            rust_type(t.checked_element_type_layout().unwrap(), structs),
             t.element_count().unwrap()
         ),
         TypeKind::Struct => {
@@ -225,11 +231,11 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
                 },
             );
             let mut body = String::new();
-            for f in t.fields() {
+            for f in t.checked_fields() {
                 body.push_str(&format!(
                     "    pub {}: {},\n",
                     field_name(f),
-                    gpu_type(f.type_layout().unwrap(), structs)
+                    gpu_type(f.checked_type_layout().unwrap(), structs)
                 ));
             }
             let def = structs.get_mut(&name).unwrap();
@@ -239,7 +245,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
             name
         }
         TypeKind::Pointer => {
-            if let Some(pointee) = t.element_type_layout() {
+            if let Some(pointee) = t.checked_element_type_layout() {
                 rust_type(pointee, structs);
             }
             "u64".into()
@@ -254,7 +260,10 @@ fn gpu_type(t: &TypeLayout, structs: &mut Structs) -> String {
     } else if is_struct_named(t, &ACCEL_TYPES) {
         "u64".into()
     } else if is_struct_named(t, &BUFFER_TYPES) {
-        rust_type(t.field_by_index(0).unwrap().type_layout().unwrap(), structs);
+        rust_type(
+            t.field_by_index(0).unwrap().checked_type_layout().unwrap(),
+            structs,
+        );
         "u64".into()
     } else {
         rust_type(t, structs)
@@ -264,8 +273,8 @@ fn gpu_type(t: &TypeLayout, structs: &mut Structs) -> String {
 fn image_usage(t: &TypeLayout) -> u64 {
     let generics = t.ty().unwrap().generic_container().unwrap();
     generics
-        .value_parameters()
-        .find(|vp| vp.name() == Some("U"))
+        .checked_value_parameters()
+        .find(|vp| vp.checked_name() == Some("U"))
         .map(|vp| generics.concrete_int_val(vp) as u64)
         .unwrap_or(0)
 }
@@ -283,10 +292,10 @@ fn image_access(usage: u64) -> &'static str {
 fn image_dim(t: &TypeLayout) -> &'static str {
     let generics = t.ty().unwrap().generic_container().unwrap();
     let shape = generics
-        .type_parameters()
-        .find(|tp| tp.name() == Some("Shape"))
-        .and_then(|tp| generics.concrete_type(tp))
-        .and_then(|shape| shape.name());
+        .checked_type_parameters()
+        .find(|tp| tp.checked_name() == Some("Shape"))
+        .and_then(|tp| generics.checked_concrete_type(tp))
+        .and_then(|shape| shape.checked_name());
     match shape {
         Some("__Shape2D") => "image::D2",
         Some("__Shape3D") => "image::D3",
@@ -297,9 +306,9 @@ fn image_dim(t: &TypeLayout) -> &'static str {
 fn image_texel(t: &TypeLayout) -> Option<(&'static str, usize)> {
     let generics = t.ty().unwrap().generic_container().unwrap();
     let element = generics
-        .type_parameters()
-        .find(|tp| tp.name() == Some("E"))
-        .and_then(|tp| generics.concrete_type(tp))?;
+        .checked_type_parameters()
+        .find(|tp| tp.checked_name() == Some("E"))
+        .and_then(|tp| generics.checked_concrete_type(tp))?;
     let scalar = match element.scalar_type() {
         ScalarType::Float32 => "f32",
         ScalarType::Uint32 => "u32",
@@ -330,12 +339,12 @@ fn field_kind(t: &TypeLayout) -> FieldKind {
 
 fn generate_gpu_struct(name: &str, pc: &TypeLayout, structs: &mut Structs) -> String {
     let fields = pc
-        .fields()
+        .checked_fields()
         .map(|f| {
             format!(
                 "    pub {}: {},",
                 field_name(f),
-                gpu_type(f.type_layout().unwrap(), structs)
+                gpu_type(f.checked_type_layout().unwrap(), structs)
             )
         })
         .collect::<Vec<_>>()
@@ -418,8 +427,8 @@ fn build_new_fn<'a>(
                 ));
             }
             FieldKind::Buffer => {
-                let ptr = t.field_by_index(0).unwrap().type_layout().unwrap();
-                let inner = rust_type(ptr.element_type_layout().unwrap(), structs);
+                let ptr = t.field_by_index(0).unwrap().checked_type_layout().unwrap();
+                let inner = rust_type(ptr.checked_element_type_layout().unwrap(), structs);
                 let ty = format!("BufferSlice<'a, {inner}, U{suffix}>");
                 out.generics
                     .push(format!("U{suffix}: buffer::usage::IsStorage"));
@@ -479,19 +488,20 @@ struct SConst<'a> {
 /// other one is a plain scalar.
 fn sconsts<'a>(layout: &'a slang::reflection::Shader, file: &str) -> Vec<SConst<'a>> {
     let mut consts: Vec<SConst> = layout
-        .parameters()
-        .filter(|p| p.category() == Some(Cat::SpecializationConstant))
+        .checked_parameters()
+        .filter(|p| p.category() == Cat::SpecializationConstant)
         .map(|p| (p, p.offset(Cat::SpecializationConstant) as u32))
         .map(|(p, id)| {
             let name = field_name(p);
-            let attribute = p
-                .variable()
-                .and_then(|v| v.user_attributes().find(|a| a.name() == Some("SConst")));
+            let attribute = p.variable().and_then(|v| {
+                v.checked_user_attributes()
+                    .find(|a| a.checked_name() == Some("SConst"))
+            });
             let Some(attribute) = attribute else {
                 return SConst {
                     name: name.to_string(),
                     id,
-                    layout: p.type_layout().unwrap(),
+                    layout: p.checked_type_layout().unwrap(),
                 };
             };
             let ty = attribute.argument_value_string(0).unwrap();
@@ -681,8 +691,8 @@ fn generate_pass(
 
     let gpu_struct = generate_gpu_struct(&gpu_name, pc, structs);
     let push = build_new_fn(
-        pc.fields()
-            .map(|f| (field_name(f), f.type_layout().unwrap())),
+        pc.checked_fields()
+            .map(|f| (field_name(f), f.checked_type_layout().unwrap())),
         structs,
         stage,
     );
@@ -908,10 +918,10 @@ use lava::pipeline::*;
             .collect();
 
         let entries: Vec<compile::Entry> = layout
-            .entry_points()
+            .checked_entry_points()
             .map(|ep| compile::Entry {
                 stage: compile::stage_name(ep.stage()),
-                name: ep.name().unwrap(),
+                name: ep.checked_name().unwrap(),
                 group: compile::entry_attribute(ep, "Group"),
                 max_recursion: compile::entry_attribute(ep, "MaxRecursion"),
             })
@@ -921,10 +931,10 @@ use lava::pipeline::*;
             .unwrap_or_else(|e| panic!("{source}: {e}"));
 
         let pc = layout
-            .parameters()
-            .find(|p| p.category() == Some(Cat::PushConstantBuffer))
-            .and_then(|p| p.type_layout())
-            .and_then(|t| t.element_type_layout())
+            .checked_parameters()
+            .find(|p| p.category() == Cat::PushConstantBuffer)
+            .and_then(|p| p.checked_type_layout())
+            .and_then(|t| t.checked_element_type_layout())
             .unwrap_or_else(|| panic!("no push constant buffer found in {source}"));
 
         let consts = sconsts(layout, source);

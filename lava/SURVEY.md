@@ -25,12 +25,14 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    `profile.slang` and `ray_tracing.slang` in its `slang/`, searched by every session, and
    lava's GPU tests moved to the `lava-tests` crate, an ordinary consumer, so `test-passes` is
    gone.
-3. **Git dependencies.** *ash done (2026-10-16):* lava uses crates.io's ash 0.38, ash-window
-   0.13 and gpu-allocator 0.28 without patches, and defines what ash 0.38's headers (1.3.281)
-   lack itself (`lava::vk`: `VK_KHR_device_address_commands`, `VK_EXT_depth_clamp_control`).
-   *Still open:* lava-build-slang depends on slang-rs by git, which crates.io refuses. Fix: a
-   slang-rs release (ask its maintainers for one). *Tried and reverted (2026-10-16):* lava's
-   own forks (`lava-ash`, `lava-gpu-allocator`, `lava-slang`, ...); the user chose upstream.
+3. ~~**Git dependencies.**~~ **Done (2026-10-16):** every dependency is a crates.io release.
+   lava uses ash 0.38, ash-window 0.13 and gpu-allocator 0.28 without patches and defines what
+   ash 0.38's headers (1.3.281) lack itself (`lava::vk`: `VK_KHR_device_address_commands`,
+   `VK_EXT_depth_clamp_control`). lava-build-slang uses slang-rs 0.1.0 and checks the
+   reflection results 0.1.0 would turn from null into references (`src/reflect.rs`); the
+   generated bindings are byte-identical to those from slang-rs's fixed main. *Tried and
+   reverted (2026-10-16):* lava's own forks (`lava-ash`, `lava-gpu-allocator`, `lava-slang`,
+   ...); the user chose upstream.
 4. **Slang is needed by every user.** lava-build-slang links `slang-compiler` through slang-rs,
    whose build script runs bindgen (clang) on `slang.h` from `SLANG_DIR`/`VULKAN_SDK`. Build
    scripts and hot-reload binaries find the library through an absolute rpath (or

@@ -760,6 +760,7 @@ dependencies = [
  "lava",
  "notify",
  "shader-slang",
+ "shader-slang-sys",
  "tracing",
 ]
 
@@ -1554,7 +1555,8 @@ dependencies = [
 [[package]]
 name = "shader-slang"
 version = "0.1.0"
-source = "git+https://github.com/FloatyMonkey/slang-rs?rev=f9c9eece467aa84f3be1aa1137426f59591095fc#f9c9eece467aa84f3be1aa1137426f59591095fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f87ca0837663794c1d9db2c8c9383832557605a354a60ae754c7e56015596b7"
 dependencies = [
  "shader-slang-sys",
 ]
@@ -1562,7 +1564,8 @@ dependencies = [
 [[package]]
 name = "shader-slang-sys"
 version = "0.1.0"
-source = "git+https://github.com/FloatyMonkey/slang-rs?rev=f9c9eece467aa84f3be1aa1137426f59591095fc#f9c9eece467aa84f3be1aa1137426f59591095fc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "279effb991b113c13e73108899aad05fabbf0d7a62b51c646ebad0512c40a1e3"
 dependencies = [
  "bindgen",
 ]

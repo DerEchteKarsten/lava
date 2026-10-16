@@ -4,6 +4,10 @@ use std::{collections::BTreeMap, ffi::CString};
 /// The Slang bindings, for the sessions and programs these functions take and return.
 pub use shader_slang as slang;
 
+use crate::reflect::{
+    CheckedAttributes, CheckedEntryPoint, CheckedName, CheckedShader, CheckedTypeLayout,
+    CheckedVariableLayout,
+};
 use crate::{Optimization, SLANG_DIR};
 
 /// How a pass compiles: what the build script was given.
@@ -56,40 +60,43 @@ pub fn layout_hash(layout: &slang::reflection::Shader) -> u64 {
     use slang::ParameterCategory as Cat;
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    for parameter in layout.parameters() {
+    for parameter in layout.checked_parameters() {
         match parameter.category() {
-            Some(Cat::PushConstantBuffer) => {
+            Cat::PushConstantBuffer => {
                 let Some(fields) = parameter
-                    .type_layout()
-                    .and_then(|t| t.element_type_layout())
+                    .checked_type_layout()
+                    .and_then(|t| t.checked_element_type_layout())
                 else {
                     continue;
                 };
                 fields.size(Cat::Uniform).hash(&mut hasher);
-                for field in fields.fields() {
-                    field.variable().and_then(|v| v.name()).hash(&mut hasher);
+                for field in fields.checked_fields() {
+                    field
+                        .variable()
+                        .and_then(|v| v.checked_name())
+                        .hash(&mut hasher);
                     field.offset(Cat::Uniform).hash(&mut hasher);
                     field
-                        .type_layout()
+                        .checked_type_layout()
                         .map(|t| t.size(Cat::Uniform))
                         .hash(&mut hasher);
                 }
             }
-            Some(Cat::SpecializationConstant) => {
+            Cat::SpecializationConstant => {
                 parameter
                     .offset(Cat::SpecializationConstant)
                     .hash(&mut hasher);
                 parameter
-                    .type_layout()
+                    .checked_type_layout()
                     .map(|t| t.size(Cat::Uniform))
                     .hash(&mut hasher);
             }
             _ => {}
         }
     }
-    for entry in layout.entry_points() {
+    for entry in layout.checked_entry_points() {
         format!("{:?}", entry.stage()).hash(&mut hasher);
-        entry.name().hash(&mut hasher);
+        entry.checked_name().hash(&mut hasher);
         // The ray tracing groups, which the pass table bakes.
         entry_attribute(entry, "Group").hash(&mut hasher);
         entry_attribute(entry, "MaxRecursion").hash(&mut hasher);
@@ -130,9 +137,9 @@ pub const RAY_TRACING_STAGES: [&str; 6] = [
 /// `ray_tracing.slang`) on an entry point.
 pub fn entry_attribute(entry: &slang::reflection::EntryPoint, name: &str) -> Option<i32> {
     entry
-        .function()?
-        .user_attributes()
-        .find(|a| a.name() == Some(name))?
+        .checked_function()?
+        .checked_user_attributes()
+        .find(|a| a.checked_name() == Some(name))?
         .argument_value_int(0)
 }
 
@@ -181,7 +188,10 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
         }
         if let Some(depth) = entry.max_recursion {
             if entry.stage != "raygen" {
-                return Err(format!("`{}` isn't a raygen but has `MaxRecursion`", entry.name));
+                return Err(format!(
+                    "`{}` isn't a raygen but has `MaxRecursion`",
+                    entry.name
+                ));
             }
             if !(1..=31).contains(&depth) {
                 return Err(format!("`MaxRecursion({depth})` isn't between 1 and 31"));
@@ -247,8 +257,9 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
 /// The pass at the absolute path `source` with all its entry points, linked.
 pub fn link(session: &slang::Session, source: &str) -> slang::Result<slang::ComponentType> {
     let module = session.load_module(source)?;
-    let mut components: Vec<slang::ComponentType> = vec![module.clone().into()];
-    components.extend(module.entry_points().map(Into::into));
+    use slang::Downcast;
+    let mut components: Vec<slang::ComponentType> = vec![module.downcast().clone()];
+    components.extend(module.entry_points().map(|entry| entry.downcast().clone()));
     session.create_composite_component_type(&components)?.link()
 }
 
@@ -314,11 +325,18 @@ mod tests {
         let refused = |entries: &[Entry]| ray_tracing_groups(entries).unwrap_err();
         assert!(refused(&[entry("miss", "m", None)]).contains("needs a raygen"));
         assert!(refused(&[rg(), entry("raygen", "rg2", None)]).contains("exactly one raygen"));
-        assert!(refused(&[rg(), entry("miss", "a", None), entry("miss", "b", None)]).contains("two miss"));
+        assert!(
+            refused(&[rg(), entry("miss", "a", None), entry("miss", "b", None)])
+                .contains("two miss")
+        );
         assert!(refused(&[rg(), entry("miss", "a", Some(1))]).contains("skip group 0"));
         assert!(
-            refused(&[rg(), entry("closest_hit", "a", None), entry("closest_hit", "b", None)])
-                .contains("two closest_hit")
+            refused(&[
+                rg(),
+                entry("closest_hit", "a", None),
+                entry("closest_hit", "b", None)
+            ])
+            .contains("two closest_hit")
         );
         assert!(refused(&[rg(), entry("callable", "c", Some(-1))]).contains("negative"));
         let mut miss = entry("miss", "m", None);
@@ -328,5 +346,4 @@ mod tests {
         deep.max_recursion = Some(32);
         assert!(refused(&[deep]).contains("between 1 and 31"));
     }
-
 }
