@@ -1,5 +1,4 @@
 //! Global Vulkan context: instance, device, queues, features, and validation logging
-use ash::vk::TaggedStructure;
 use std::{
     cell::Cell,
     ffi::{c_char, c_void},
@@ -27,7 +26,7 @@ use crate::{
     vkobjects::{physical_device::PhysicalDevice, queue::FamilyQueues},
 };
 
-pub use ash::vk as raw_vulkan;
+pub use crate::vk as raw_vulkan;
 
 impl Debug for Ctx {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -131,7 +130,7 @@ impl Ctx {
 
             instance_info = instance_info
                 .enabled_layer_names(&layers_names_raw)
-                .push(&mut validation_features);
+                .push_next(&mut validation_features);
         }
         instance_info = instance_info
             .application_info(&app_info)
@@ -140,7 +139,7 @@ impl Ctx {
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
         let mut instance_debug_utils = None;
         if debug {
-            instance_debug_utils = Some(debug_utils::Instance::load(&entry, &instance));
+            instance_debug_utils = Some(debug_utils::Instance::new(&entry, &instance));
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
                     vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -162,7 +161,7 @@ impl Ctx {
             };
         }
 
-        let surface_fn = display.map(|_| ash::khr::surface::Instance::load(&entry, &instance));
+        let surface_fn = display.map(|_| ash::khr::surface::Instance::new(&entry, &instance));
 
         let physical_devices = PhysicalDevice::enumerate_physical_devices(&instance)?;
         let (physical_device, graphics_queue_family, transfer_queue_familie) =
@@ -187,7 +186,7 @@ impl Ctx {
         let device = create_device(queues, &physical_device, &features, &extensions, &instance)?;
         let mut debug_utils = None;
         if debug {
-            debug_utils = Some(ash::ext::debug_utils::Device::load(&instance, &device));
+            debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
         }
 
         let allocator = Allocator::new(&AllocatorCreateDesc {
@@ -209,37 +208,37 @@ impl Ctx {
         FUNCTIONS
             .set(Functions {
                 mesh: if features.mesh {
-                    Some(ash::ext::mesh_shader::Device::load(&instance, &device))
+                    Some(ash::ext::mesh_shader::Device::new(&instance, &device))
                 } else {
                     None
                 },
                 performance_query: features.performance_query.then(|| {
                     (
-                        ash::khr::performance_query::Instance::load(&entry, &instance),
-                        ash::khr::performance_query::Device::load(&instance, &device),
+                        ash::khr::performance_query::Instance::new(&entry, &instance),
+                        ash::khr::performance_query::Device::new(&instance, &device),
                     )
                 }),
                 raytracing_pipeline: features.ray_tracing_pipeline.then(|| {
-                    ash::khr::ray_tracing_pipeline::Device::load(&instance, &device)
+                    ash::khr::ray_tracing_pipeline::Device::new(&instance, &device)
                 }),
                 acceleration_structure: features.acceleration_structure.then(|| {
-                    ash::khr::acceleration_structure::Device::load(&instance, &device)
+                    ash::khr::acceleration_structure::Device::new(&instance, &device)
                 }),
                 calibrated_timestamps: features.calibrated_timestamps.then(|| {
-                    ash::khr::calibrated_timestamps::Device::load(&instance, &device)
+                    ash::khr::calibrated_timestamps::Device::new(&instance, &device)
                 }),
-                host_image_copy: ash::ext::host_image_copy::Device::load(&instance, &device),
-                dynamic_state2: ash::ext::extended_dynamic_state2::Device::load(&instance, &device),
-                dynamic_state3: ash::ext::extended_dynamic_state3::Device::load(&instance, &device),
-                color_write: ash::ext::color_write_enable::Device::load(&instance, &device),
-                line_rasterization: ash::khr::line_rasterization::Device::load(&instance, &device),
-                depth_clamp_control: ash::ext::depth_clamp_control::Device::load(
+                host_image_copy: ash::ext::host_image_copy::Device::new(&instance, &device),
+                dynamic_state2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
+                dynamic_state3: ash::ext::extended_dynamic_state3::Device::new(&instance, &device),
+                color_write: ash::ext::color_write_enable::Device::new(&instance, &device),
+                line_rasterization: ash::khr::line_rasterization::Device::new(&instance, &device),
+                depth_clamp_control: crate::vk::depth_clamp_control::Device::new(
                     &instance, &device,
                 ),
-                device_address_commands: ash::khr::device_address_commands::Device::load(
+                device_address_commands: crate::vk::device_address_commands::Device::new(
                     &instance, &device,
                 ),
-                swapchain: ash::khr::swapchain::Device::load(&instance, &device),
+                swapchain: ash::khr::swapchain::Device::new(&instance, &device),
                 instance,
                 entry,
                 surface: surface_fn,
@@ -352,8 +351,8 @@ pub struct Functions {
     dynamic_state3: ash::ext::extended_dynamic_state3::Device,
     color_write: ash::ext::color_write_enable::Device,
     line_rasterization: ash::khr::line_rasterization::Device,
-    depth_clamp_control: ash::ext::depth_clamp_control::Device,
-    device_address_commands: ash::khr::device_address_commands::Device,
+    depth_clamp_control: crate::vk::depth_clamp_control::Device,
+    device_address_commands: crate::vk::device_address_commands::Device,
     entry: ash::Entry,
     swapchain: ash::khr::swapchain::Device,
     surface: Option<ash::khr::surface::Instance>,
@@ -384,7 +383,7 @@ impl Functions {
     pub(crate) fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
         &get().host_image_copy
     }
-    pub(crate) fn device_address_commands() -> &'static ash::khr::device_address_commands::Device {
+    pub(crate) fn device_address_commands() -> &'static crate::vk::device_address_commands::Device {
         &get().device_address_commands
     }
     pub(crate) fn dynamic_state2() -> &'static ash::ext::extended_dynamic_state2::Device {
@@ -399,7 +398,7 @@ impl Functions {
     pub(crate) fn line_rasterization() -> &'static ash::khr::line_rasterization::Device {
         &get().line_rasterization
     }
-    pub(crate) fn depth_clamp_control() -> &'static ash::ext::depth_clamp_control::Device {
+    pub(crate) fn depth_clamp_control() -> &'static crate::vk::depth_clamp_control::Device {
         &get().depth_clamp_control
     }
     pub(crate) fn instance() -> &'static ash::Instance {
@@ -518,9 +517,8 @@ pub(super) fn create_device(
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
         .enabled_extension_names(&extension_names);
-    // `features2` carries its own chain, which `push` refuses; every struct in it lives in
-    // `enabled`.
-    let device_create_info = unsafe { device_create_info.extend(&mut features2) };
+    // `push_next` links `features2` with its whole chain; every struct in it lives in `enabled`.
+    let device_create_info = device_create_info.push_next(&mut features2);
 
     let device =
         unsafe { instance.create_device(physical_device.handel, &device_create_info, None)? };

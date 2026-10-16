@@ -1,9 +1,8 @@
 //! Queue submission and sync: queue leases with their pending accesses, semaphores, fences, frame slots with their epochs, presenting
-use ash::vk::TaggedStructure;
 use std::{fmt::Debug, marker::PhantomData, ops::Range, sync::Mutex};
 
 use crate::error::{Error, Result};
-use ash::vk;
+use crate::vk;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -108,7 +107,7 @@ impl SemaphoreType for Timeline {
             semaphore_type: vk::SemaphoreType::TIMELINE,
             ..Default::default()
         };
-        let create_info = vk::SemaphoreCreateInfo::default().push(&mut timeline);
+        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
         let handle = unsafe { Ctx::device().create_semaphore(&create_info, None)? };
         Ok(Semaphore {
             handle,
@@ -654,7 +653,7 @@ fn host_barrier(cmd: vk::CommandBuffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ash::vk::Handle;
+    use crate::vk::Handle;
 
     #[test]
     fn leases_take_unused_queues_before_sharing_the_least_used() {

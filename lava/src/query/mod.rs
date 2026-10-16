@@ -10,8 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ash::vk;
-use ash::vk::TaggedStructure;
+use crate::vk;
 
 use crate::{
     epoch,
@@ -23,7 +22,7 @@ use crate::{
 pub mod counters;
 pub mod observer;
 
-pub use ash::vk::QueryPipelineStatisticFlags;
+pub use crate::vk::QueryPipelineStatisticFlags;
 pub use counters::{Counter, CounterUnit, MAX_COUNTERS};
 pub use observer::{QueryRecorder, ScopeInfo, ScopeObserver};
 
@@ -367,7 +366,7 @@ impl QueryPool<Performance> {
         let mut performance = vk::QueryPoolPerformanceCreateInfoKHR::default()
             .queue_family_index(Ctx::gfx_queue_index())
             .counter_indices(&indices);
-        let info = vk::QueryPoolCreateInfo::default().push(&mut performance);
+        let info = vk::QueryPoolCreateInfo::default().push_next(&mut performance);
         let kind = Performance {
             counters: counters.into(),
         };

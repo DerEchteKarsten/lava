@@ -1,12 +1,11 @@
 //! Pass pipelines: the pass map a frontend generates and `init` takes, its entries (ray tracing passes with their shader groups), the cache of every pass's pipelines per specialization and raster state, their creation (none for passes the device lacks the features of), and `reload_pass`, which replaces a pass's pipelines and retires the old ones
-use ash::vk::TaggedStructure;
 use std::{
     ffi::CStr,
     hash::Hash,
     sync::{OnceLock, RwLock},
 };
 
-use ash::vk;
+use crate::vk;
 use hashbrown::{Equivalent, HashMap};
 use smallvec::{SmallVec, smallvec};
 
@@ -699,7 +698,7 @@ fn create_raster_pipeline(
     // The mode is dynamic; the overestimation size, which needs its own feature, isn't.
     let mut conservative = vk::PipelineRasterizationConservativeStateCreateInfoEXT::default();
     let rasterization_state =
-        vk::PipelineRasterizationStateCreateInfo::default().push(&mut conservative);
+        vk::PipelineRasterizationStateCreateInfo::default().push_next(&mut conservative);
     let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default();
 
     create_info = create_info
@@ -713,7 +712,7 @@ fn create_raster_pipeline(
         .depth_stencil_state(&depth_stencil_state)
         .base_pipeline_handle(vk::Pipeline::null())
         .base_pipeline_index(-1)
-        .push(&mut rendering);
+        .push_next(&mut rendering);
 
     let pipeline = unsafe {
         Ctx::device()

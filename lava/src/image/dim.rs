@@ -1,7 +1,7 @@
 //! Image dimensions: `D2` and `D3` marker types with their extent and offset vectors
 use std::{fmt::Debug, ops::Add};
 
-use ash::vk;
+use crate::vk;
 use glam::{IVec2, IVec3, UVec2, UVec3};
 
 /// The dimension of an image and its views. A 3D image's mips halve in depth too.

@@ -1,9 +1,8 @@
 //! Global bindless descriptor sets: the application's immutable samplers (`SamplerDesc`), caller-indexed image descriptors, handles
-use ash::vk::TaggedStructure;
 use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
-use ash::vk::{self, BorderColor, Filter, SamplerAddressMode, SamplerMipmapMode};
+use crate::vk::{self, BorderColor, Filter, SamplerAddressMode, SamplerMipmapMode};
 use bytemuck::{Pod, Zeroable};
 use lava_macros::validation_trace;
 
@@ -281,7 +280,7 @@ impl Bindless {
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL_EXT)
-            .push(&mut ext_flags);
+            .push_next(&mut ext_flags);
         layouts[0] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
         let descriptor_binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND_EXT
@@ -301,7 +300,7 @@ impl Bindless {
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL_EXT)
-            .push(&mut ext_flags);
+            .push_next(&mut ext_flags);
         layouts[1] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
         // Every pass pushes this many bytes.
@@ -350,7 +349,7 @@ impl Bindless {
         let allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts)
-            .push(&mut alloc_info);
+            .push_next(&mut alloc_info);
         let sets = unsafe { Ctx::device().allocate_descriptor_sets(&allocate_info) }?
             .try_into()
             .expect("allocated descriptor set count matches the two layouts");

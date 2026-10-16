@@ -13,9 +13,6 @@ repository = "https://github.com/DerEchteKarsten/lava"
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
 glam = { version = "0.32", features = ["bytemuck", "mint"] }
-# lava needs `VK_KHR_device_address_commands`, which ash's 0.38 release (April 2024) predates:
-# ash and ash-window come from ash's master and gpu-allocator from its `ash-next` branch, which
-# builds against it (see `[patch.crates-io]` below).
 ash = "0.38.0"
 ash-window = "0.13.0"
 gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
@@ -27,10 +24,3 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 notify = "8.2.0"
 png = "0.18"
-
-# Patches only apply in the workspace being built: an application using lava needs the same three
-# lines (the engine has them).
-[patch.crates-io]
-ash = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
-ash-window = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
-gpu-allocator = { git = "https://github.com/Traverse-Research/gpu-allocator", rev = "6a68a5b4c233361c07dfa8865043a16ade7512db" }

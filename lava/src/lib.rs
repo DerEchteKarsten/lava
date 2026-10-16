@@ -25,13 +25,13 @@ use crate::{bindless::Bindless, state::Ctx};
 
 pub use crate::error::{Error, Result};
 pub use crate::features::Features;
-pub use ash::vk::Pipeline as VkPipeline;
+pub use crate::vk::Pipeline as VkPipeline;
 /// What `Error::Vulkan` holds, e.g. `ERROR_OUT_OF_DATE_KHR` from `Swapchain::aquire_image`.
-pub use ash::vk::Result as VkResult;
-pub use ash::vk::ShaderModule as VkShaderModule;
-pub use ash::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
+pub use crate::vk::Result as VkResult;
+pub use crate::vk::ShaderModule as VkShaderModule;
+pub use crate::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
 /// What `format::Dynamic`, `image::usage::Dynamic` and `buffer::usage::Dynamic` hold.
-pub use ash::vk::{BufferUsageFlags, Format as VkFormat, ImageUsageFlags};
+pub use crate::vk::{BufferUsageFlags, Format as VkFormat, ImageUsageFlags};
 
 pub mod bindless;
 pub mod buffer;
@@ -44,6 +44,7 @@ pub mod memory;
 pub mod pipeline;
 pub mod query;
 pub mod state;
+pub mod vk;
 pub mod vkobjects;
 use raw_window_handle::RawDisplayHandle;
 

@@ -1,7 +1,7 @@
 //! Borrowed image views of a mip range and their slices, the only image types commands take, with the layouts they track for barriers, and the image transfer commands (clear, blit, copies to and from buffers)
 use std::{iter, range::Range, sync::atomic::AtomicU32};
 
-use ash::vk;
+use crate::vk;
 use bytemuck::Pod;
 use lava_macros::validation_trace;
 
@@ -401,7 +401,7 @@ mod tests {
         format::{D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
         usage::{DepthAttachment, Sampled, SampledStorage, StaticUsage, Storage},
     };
-    use ash::vk::Handle;
+    use crate::vk::Handle;
     use glam::{IVec2, UVec2};
     use std::sync::atomic::Ordering;
 

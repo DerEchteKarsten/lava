@@ -5,7 +5,7 @@ use crate::{
     bindless::BindlessHandle,
     error::{Error, Result},
 };
-use ash::vk::{self};
+use crate::vk::{self};
 use glam::UVec2;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;

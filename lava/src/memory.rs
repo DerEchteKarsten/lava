@@ -1,6 +1,5 @@
 //! GPU memory: what lava's allocator holds, and each heap's usage and budget
-use ash::vk;
-use ash::vk::TaggedStructure;
+use crate::vk;
 
 use crate::state::{Ctx, Functions};
 
@@ -31,7 +30,7 @@ pub fn memory_report() -> MemoryReport {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut properties = vk::PhysicalDeviceMemoryProperties2::default();
     if has_budget {
-        properties = properties.push(&mut budget);
+        properties = properties.push_next(&mut budget);
     }
     unsafe {
         Functions::instance()

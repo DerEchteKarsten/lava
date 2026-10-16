@@ -1,5 +1,4 @@
 //! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip, host uploads, type erasure, and their destruction once no frame can reach them
-use ash::vk::TaggedStructure;
 use std::{
     mem::{self, ManuallyDrop},
     range::Range,
@@ -7,7 +6,7 @@ use std::{
 };
 
 use crate::error::{Error, Result};
-use ash::vk;
+use crate::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
 
@@ -67,7 +66,7 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
         let image = unsafe { Ctx::device().create_image(&create_info, None) }?;
         let mut dedicated = vk::MemoryDedicatedRequirements::default();
         let requirements = {
-            let mut requirements = vk::MemoryRequirements2::default().push(&mut dedicated);
+            let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
             unsafe {
                 Ctx::device().get_image_memory_requirements2(
                     &vk::ImageMemoryRequirementsInfo2::default().image(image),

@@ -1,5 +1,5 @@
 //! Ray tracing pipelines: creation from a pass's shader groups, and their shader binding table (raygen, miss, hit and callable regions, handles only)
-use ash::vk;
+use crate::vk;
 
 use crate::{
     buffer::{Buffer, usage},

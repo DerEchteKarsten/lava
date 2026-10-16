@@ -1,5 +1,5 @@
 //! Image usages: one marker type per combination of usages Vulkan allows, mapping to Vulkan flags and the bindless sets they can be bound in, and `Dynamic`, whose usage is only known at runtime
-use ash::vk;
+use crate::vk;
 
 pub trait ImageUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     fn flags(&self) -> vk::ImageUsageFlags;

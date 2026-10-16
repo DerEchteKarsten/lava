@@ -214,7 +214,7 @@ fn concat<T, const N: usize, const M: usize, const O: usize>(a: [T; N], b: [T; M
 mod tests {
     use super::*;
     use crate::command_buffer::ImageAccess;
-    use ash::vk::{self, Handle};
+    use crate::vk::{self, Handle};
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
     /// What a binding generator puts in comes back out of the unsized bytes unchanged.

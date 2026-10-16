@@ -4,7 +4,7 @@ use std::{
     mem::{Discriminant, discriminant},
 };
 
-use ash::vk;
+use crate::vk;
 
 pub trait Format: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     /// The texels of a clear value: an array of the format's component type, `(depth, stencil)`

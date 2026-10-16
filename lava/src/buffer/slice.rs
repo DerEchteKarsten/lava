@@ -1,5 +1,5 @@
 //! Typed buffer slices: the address ranges commands take (no buffer handle or offset), sub-ranges, byte views and casts, and the buffer transfer commands (fill, update, copy)
-use ash::vk;
+use crate::vk;
 use bytemuck::Pod;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;

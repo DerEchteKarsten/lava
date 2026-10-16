@@ -1,5 +1,5 @@
 //! Window surface: an owned `SurfaceKHR` with its formats, present modes, and capabilities
-use ash::vk;
+use crate::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use crate::{
@@ -21,8 +21,13 @@ impl Surface {
     pub fn new(display: &RawDisplayHandle, window: &RawWindowHandle) -> Result<Self> {
         let surface_fn = surface_fn()?;
         let handle = unsafe {
-            ash_window::SurfaceFactory::new(Functions::entry(), Functions::instance(), *display)?
-                .create_surface(*window, None)?
+            ash_window::create_surface(
+                Functions::entry(),
+                Functions::instance(),
+                *display,
+                *window,
+                None,
+            )?
         };
         // From here on `Drop` destroys the handle on every error path.
         let mut surface = Self {

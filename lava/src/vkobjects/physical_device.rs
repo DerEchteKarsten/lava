@@ -1,9 +1,8 @@
 //! Physical device selection and queue family capability discovery
-use ash::vk::TaggedStructure;
 use std::ffi::CStr;
 
 use crate::error::{Error, Result};
-use ash::vk;
+use crate::vk;
 use lava_macros::validation_trace;
 
 use crate::features::{FeatureChain, Features};
@@ -112,10 +111,10 @@ impl PhysicalDevice {
         let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
 
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
-            .push(&mut rt_pipeline_properties)
-            .push(&mut acc_properties)
-            .push(&mut mesh_shader_properties)
-            .push(&mut vk12_properties);
+            .push_next(&mut rt_pipeline_properties)
+            .push_next(&mut acc_properties)
+            .push_next(&mut mesh_shader_properties)
+            .push_next(&mut vk12_properties);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
         // Detach them from the chain on this stack.
         mesh_shader_properties.p_next = std::ptr::null_mut();

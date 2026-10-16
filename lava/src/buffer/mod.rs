@@ -1,5 +1,4 @@
 //! Typed, usage-tagged GPU buffers backed by gpu-allocator memory, their host access (`host`, `host_mut`, `host_ptr`), type erasure, and their destruction once no frame can reach them
-use ash::vk::TaggedStructure;
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -8,7 +7,7 @@ use std::{
 };
 
 use crate::error::Result;
-use ash::vk::{self};
+use crate::vk::{self};
 use bytemuck::Pod;
 use gpu_allocator::{
     MemoryLocation,
@@ -113,7 +112,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         let buffer = unsafe { Ctx::device().create_buffer(&create_info, None)? };
         let mut dedicated = vk::MemoryDedicatedRequirements::default();
         let mut requirements = {
-            let mut requirements = vk::MemoryRequirements2::default().push(&mut dedicated);
+            let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
             unsafe {
                 Ctx::device().get_buffer_memory_requirements2(
                     &vk::BufferMemoryRequirementsInfo2::default().buffer(buffer),

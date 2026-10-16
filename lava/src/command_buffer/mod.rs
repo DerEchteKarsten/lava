@@ -29,7 +29,7 @@ use crate::{
         queue::{PendingAccesses, PendingWrite, Stage},
     },
 };
-use ash::vk::{self, IndexType};
+use crate::vk::{self, IndexType};
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
@@ -740,7 +740,7 @@ fn record_draw(handle: vk::CommandBuffer, command: &DrawCommand) {
     }
 }
 
-fn address_commands() -> &'static ash::khr::device_address_commands::Device {
+fn address_commands() -> &'static crate::vk::device_address_commands::Device {
     Functions::device_address_commands()
 }
 
@@ -1658,7 +1658,7 @@ mod tests {
         format::{self, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
         usage::{self, ColorAttachment, DepthAttachment, StaticUsage},
     };
-    use ash::vk::Handle;
+    use crate::vk::Handle;
     use std::marker::PhantomData;
     use std::sync::atomic::AtomicU32;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};

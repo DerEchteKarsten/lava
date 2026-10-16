@@ -1,7 +1,7 @@
 //! Hardware performance counters (`VK_KHR_performance_query`): the graphics family's counters, how many passes a selection needs, and the profiling lock counter pools hold
 use std::sync::{Mutex, OnceLock};
 
-use ash::vk;
+use crate::vk;
 
 use crate::{
     error::Result,

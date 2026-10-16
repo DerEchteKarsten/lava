@@ -1,7 +1,7 @@
 //! The state of a draw (`RasterState`): every rasterization, depth, stencil and blend setting, all of it dynamic state that a rendering sets once and then per draw only where it changed, so raster pipelines are keyed by their attachment formats and constants alone
-use ash::vk;
+use crate::vk;
 
-pub use ash::vk::{
+pub use crate::vk::{
     BlendFactor, BlendOp, ColorComponentFlags, CompareOp, ConservativeRasterizationModeEXT,
     CullModeFlags, FrontFace, LineRasterizationModeKHR, LogicOp, PolygonMode,
     PrimitiveTopology, ProvokingVertexModeEXT, StencilOp,
@@ -330,7 +330,7 @@ pub(crate) fn dynamic_states(mesh: bool) -> Vec<vk::DynamicState> {
         D::LOGIC_OP_EXT,
         D::POLYGON_MODE_EXT,
         D::DEPTH_CLAMP_ENABLE_EXT,
-        D::DEPTH_CLAMP_RANGE_EXT,
+        vk::DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT,
         D::DEPTH_CLIP_ENABLE_EXT,
         D::DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT,
         D::RASTERIZATION_SAMPLES_EXT,

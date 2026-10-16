@@ -1,5 +1,5 @@
 //! Buffer usages: one marker type per combination of usages, mapping to Vulkan buffer usage flags, and `Dynamic`, whose usage is only known at runtime
-use ash::vk;
+use crate::vk;
 
 /// Every buffer also gets `SHADER_DEVICE_ADDRESS`, `TRANSFER_SRC` and `TRANSFER_DST` (`Buffer::raw`):
 /// leaving the transfer usages out of buffers that don't need them made no measurable difference.

@@ -1,7 +1,7 @@
 //! Crate-wide error type and Result alias wrapping Vulkan, allocator, and IO failures
 use std::fmt;
 
-use ash::vk;
+use crate::vk;
 
 #[derive(Debug)]
 #[non_exhaustive]

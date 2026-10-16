@@ -1,7 +1,7 @@
 //! Device features: what lava itself needs of every device, the optional `Features` it enables wherever the device has them, the features a pass's SPIR-V declares, and the chain of Vulkan feature structs all of them are queried and enabled through
 use std::ffi::CStr;
 
-use ash::vk::{self, TaggedStructure};
+use crate::vk;
 
 macro_rules! features {
     ($($(#[doc = $doc:literal])* $name:ident,)*) => {
@@ -189,7 +189,7 @@ fn capabilities(spirv: &[u8]) -> impl Iterator<Item = u32> {
 /// The device extensions lava needs on every device: buffer address commands and the dynamic
 /// state of renderings.
 pub(crate) const LAVA_EXTENSIONS: [&CStr; 11] = [
-    ash::khr::device_address_commands::NAME,
+    crate::vk::device_address_commands::NAME,
     ash::ext::extended_dynamic_state2::NAME,
     ash::ext::extended_dynamic_state3::NAME,
     ash::ext::color_write_enable::NAME,
@@ -198,7 +198,7 @@ pub(crate) const LAVA_EXTENSIONS: [&CStr; 11] = [
     ash::ext::conservative_rasterization::NAME,
     ash::ext::depth_clip_enable::NAME,
     ash::ext::depth_clip_control::NAME,
-    ash::ext::depth_clamp_control::NAME,
+    crate::vk::depth_clamp_control::NAME,
     ash::ext::sample_locations::NAME,
 ];
 
@@ -266,20 +266,48 @@ impl FeatureChain {
             clock,
             performance,
         } = self;
+        // ash 0.38's `push_next` links the pushed struct's whole chain, and a queried chain
+        // still points at the structs it was linked to, so every struct starts unlinked.
+        macro_rules! unlink {
+            ($($field:ident),*) => {
+                $($field.p_next = core::ptr::null_mut();)*
+            };
+        }
+        unlink!(
+            vk11,
+            vk12,
+            vk13,
+            address_commands,
+            dynamic_state2,
+            dynamic_state3,
+            color_write,
+            lines,
+            provoking_vertex,
+            depth_clip_enable,
+            depth_clip_control,
+            depth_clamp_control,
+            mesh,
+            acceleration_structure,
+            ray_query,
+            ray_tracing_pipeline,
+            host_image_copy,
+            clock,
+            performance
+        );
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(*core)
-            .push(vk11)
-            .push(vk12)
-            .push(vk13);
+            .push_next(vk11)
+            .push_next(vk12)
+            .push_next(vk13);
         macro_rules! push_if {
             ($($extension:expr => $field:ident),* $(,)?) => {
                 $(if has($extension) {
-                    features = features.push($field);
+                    features = features.push_next($field);
                 })*
             };
         }
         push_if! {
-            ash::khr::device_address_commands::NAME => address_commands,
+            crate::vk::device_address_commands::NAME => address_commands,
             ash::ext::extended_dynamic_state2::NAME => dynamic_state2,
             ash::ext::extended_dynamic_state3::NAME => dynamic_state3,
             ash::ext::color_write_enable::NAME => color_write,
@@ -287,7 +315,7 @@ impl FeatureChain {
             ash::ext::provoking_vertex::NAME => provoking_vertex,
             ash::ext::depth_clip_enable::NAME => depth_clip_enable,
             ash::ext::depth_clip_control::NAME => depth_clip_control,
-            ash::ext::depth_clamp_control::NAME => depth_clamp_control,
+            crate::vk::depth_clamp_control::NAME => depth_clamp_control,
             ash::ext::mesh_shader::NAME => mesh,
             ash::khr::acceleration_structure::NAME => acceleration_structure,
             ash::khr::ray_query::NAME => ray_query,

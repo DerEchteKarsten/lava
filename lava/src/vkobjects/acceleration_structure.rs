@@ -1,7 +1,7 @@
 //! Ray tracing acceleration structures: `Blas`/`Tlas` owning their memory, their geometry (triangles, AABBs, instances), builds, refits and compaction with automatic barriers
 use std::{marker::PhantomData, range::Range};
 
-use ash::vk;
+use crate::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Affine3A, Vec3, Vec4};
 use lava_macros::validation_trace;
@@ -169,7 +169,7 @@ impl<L: Level> AccelerationStructure<L> {
             functions()?.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
                 &info,
-                Some(&max_primitives),
+                &max_primitives,
                 &mut sizes,
             )
         };
@@ -795,9 +795,15 @@ impl CommandBuffer {
                 }
             })
             .collect();
-        let ranges: SmallVec<[_; 1]> = ranges.iter().map(|r| Some(r.as_slice())).collect();
+        // The function pointer directly: ash 0.38's wrapper collects these pointers into a `Vec`.
+        let ranges: SmallVec<[_; 1]> = ranges.iter().map(|r| r.as_ptr()).collect();
         unsafe {
-            command_functions().cmd_build_acceleration_structures(self.handle, &infos, &ranges)
+            (command_functions().fp().cmd_build_acceleration_structures_khr)(
+                self.handle,
+                infos.len() as u32,
+                infos.as_ptr(),
+                ranges.as_ptr(),
+            )
         };
     }
 
