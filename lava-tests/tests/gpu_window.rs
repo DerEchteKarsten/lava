@@ -44,10 +44,14 @@ fn create_window(event_loop: &ActiveEventLoop, title: &str) -> Window {
 }
 
 fn surface_for(window: &Window) -> lava::Result<Surface> {
-    Surface::new(
-        &window.display_handle().unwrap().as_raw(),
-        &window.window_handle().unwrap().as_raw(),
-    )
+    // SAFETY: the windows stay open until the teardown waited for the device, which destroys
+    // the surfaces.
+    unsafe {
+        Surface::new(
+            &window.display_handle().unwrap().as_raw(),
+            &window.window_handle().unwrap().as_raw(),
+        )
+    }
 }
 
 /// Acquires an image, clears it, and presents it. The frame's semaphores are parked in
@@ -111,24 +115,24 @@ fn run(event_loop: &ActiveEventLoop) {
     step("init_with_display");
 
     let mut surface = surface_for(&window).unwrap();
-    assert!(!surface.formats.is_empty());
-    assert!(!surface.present_modes.is_empty());
-    assert!(surface.capabilities.min_image_count >= 1);
+    assert!(!surface.formats().is_empty());
+    assert!(!surface.present_modes().is_empty());
+    assert!(surface.capabilities().min_image_count >= 1);
     step("surface_reports_formats_modes_and_capabilities");
 
     let mut swapchain = Swapchain::new(&mut surface, None, Some(SIZE), &FORMATS).unwrap();
-    assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
+    assert_eq!(swapchain.image(0).handle(), BindlessHandle::none());
     swapchain.bind_storage(0..);
-    assert_eq!(swapchain.size, SIZE);
-    assert!(swapchain.num_images() >= surface.capabilities.min_image_count as usize);
+    assert_eq!(swapchain.size(), SIZE);
+    assert!(swapchain.num_images() >= surface.capabilities().min_image_count as usize);
     assert!(
         surface
-            .formats
+            .formats()
             .iter()
-            .any(|f| f.format == swapchain.format.vk_format())
+            .any(|f| f.format == swapchain.format().vk_format())
     );
     let handles: Vec<_> = (0..swapchain.num_images() as u32)
-        .map(|i| swapchain.image(i).handle)
+        .map(|i| swapchain.image(i).handle())
         .collect();
     for (i, handle) in handles.iter().enumerate() {
         assert_eq!(handle.descriptor_index_set1, i as u32);
@@ -146,13 +150,13 @@ fn run(event_loop: &ActiveEventLoop) {
     // The old swapchain is handed back and can be dropped: it is destroyed once the frames
     // and presents that may use it are done.
     let old = swapchain.recreate(&mut surface, new_size).unwrap();
-    assert_eq!(old.size, SIZE);
-    assert_eq!(swapchain.size, new_size);
+    assert_eq!(old.size(), SIZE);
+    assert_eq!(swapchain.size(), new_size);
     // Binding is left to the application: the old swapchain's slots stay in use until it is
     // destroyed, and the image count may change.
-    assert_eq!(swapchain.image(0).handle, BindlessHandle::none());
+    assert_eq!(swapchain.image(0).handle(), BindlessHandle::none());
     swapchain.bind_storage(16..);
-    assert_eq!(swapchain.image(0).handle.descriptor_index_set1, 16);
+    assert_eq!(swapchain.image(0).handle().descriptor_index_set1, 16);
     present_frame(&queue, &swapchain, [0.0, 0.0, 1.0, 1.0], &mut semaphores);
     drop(old);
     step("swapchain_recreate_is_unbound");
@@ -169,8 +173,8 @@ fn run(event_loop: &ActiveEventLoop) {
     let mut second_surface = surface_for(&second_window).unwrap();
     let mut second_swapchain = Swapchain::new(&mut second_surface, None, Some(SIZE), &FORMATS).unwrap();
     second_swapchain.bind_storage(8..);
-    assert_eq!(second_swapchain.image(0).handle.descriptor_index_set1, 8);
-    assert_ne!(second_surface.handle, surface.handle);
+    assert_eq!(second_swapchain.image(0).handle().descriptor_index_set1, 8);
+    assert_ne!(second_surface.handle(), surface.handle());
     present_frame(
         &queue,
         &second_swapchain,
@@ -180,10 +184,11 @@ fn run(event_loop: &ActiveEventLoop) {
     present_frame(&queue, &swapchain, [1.0, 0.0, 1.0, 1.0], &mut semaphores);
     step("second_window_has_its_own_surface_and_swapchain");
 
-    // Swapchains go before their surfaces, and surfaces are destroyed before their windows:
-    // waiting for the device destroys everything dropped before.
-    drop(second_swapchain);
+    // A swapchain keeps its surface, so it may go after it (destroying the surface first would
+    // be a validation error). Waiting for the device destroys everything dropped before, while
+    // the windows are still open.
     drop(second_surface);
+    drop(second_swapchain);
     drop(swapchain);
     drop(surface);
     drop(semaphores);

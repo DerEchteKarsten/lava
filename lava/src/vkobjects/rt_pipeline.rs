@@ -152,7 +152,7 @@ impl ShaderBindingTable {
             }
         }
 
-        let address = buffer.address;
+        let address = buffer.address();
         let regions = layout.regions.map(|(offset, size)| {
             if size == 0 {
                 return vk::StridedDeviceAddressRegionKHR::default();

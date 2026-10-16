@@ -85,6 +85,7 @@ fn trace_query(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
     cmd.compute(
         &TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT),
         [SIZE / 8, SIZE / 8, 1],
+        None,
     );
 }
 
@@ -92,6 +93,7 @@ fn trace_pipeline(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
     cmd.raytrace(
         &TestRayTracing::push_bindings(target.whole_view(), tlas, EXTENT),
         [SIZE, SIZE, 1],
+        None,
     );
 }
 
@@ -269,6 +271,7 @@ fn indirect_traces_read_their_size_on_the_gpu() {
         cmd.raytrace_indirect(
             &TestRayTracing::push_bindings(target.whole_view(), &scene.tlas, EXTENT),
             command.range(..),
+            None,
         );
     });
     assert_eq!(indirect, direct);
@@ -293,6 +296,7 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
                 scene.sphere.address(),
             ),
             [1, 1, 1],
+            None,
         );
         cmd.build(&[(&tlas, Instances::new(written.range(..)))], scratch.range(..));
         trace_query(cmd, target, &tlas);
@@ -429,5 +433,19 @@ fn compacted_structures_trace_the_same_image() {
     });
     assert_query_image(&pixels);
     assert_golden("ray_query", &pixels, [SIZE, SIZE]);
+
+    // A compacted structure only has its compacted size, which a build could write past.
+    assert!(compacted.iter().all(|c| c.is_compacted()));
+    let boxes = buffer_with::<Aabb, Storage>(&[Aabb {
+        min: Vec3::splat(-1.0),
+        max: Vec3::splat(1.0),
+    }]);
+    let geometry = [Aabbs::new(boxes.range(..))];
+    let rebuild = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gpu.submit(|cmd| {
+            cmd.build(&[(c_sphere, BlasGeometry::Aabbs(&geometry))], scratch.range(..))
+        })
+    }));
+    assert!(rebuild.is_err(), "building a compacted structure panics");
 }
 

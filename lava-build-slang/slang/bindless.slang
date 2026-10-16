@@ -18,7 +18,7 @@ public extension Img<E, Shape, 0> {
     typealias T = _Texture<E, Shape, 0, 0, 0, 0, 0, 0, 0>;
 
     [ForceInline] public E Load(vector<uint, Shape.dimensions> p) {
-        return TextureHeap[SampledIndex].asOpaqueDescriptor<T>()[p];
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>()[p];
     }
     [ForceInline] public E Sample(vector<float, Shape.dimensions> uv, uint sampler = 0) {
         return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().Sample(SamplerHeap[sampler], uv);
@@ -64,7 +64,7 @@ public extension Img<E, Shape, 1> {
     typealias T = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, 0>;
 
     [ForceInline] public E Load(vector<uint, Shape.dimensions> p) {
-        return RWTextureHeap[StorageIndex].asOpaqueDescriptor<T>()[p];
+        return RWTextureHeap[NonUniformResourceIndex(StorageIndex)].asOpaqueDescriptor<T>()[p];
     }
 }
 
@@ -73,10 +73,10 @@ public extension Img<E, Shape, 2> {
     typealias T = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, 0>;
 
     [ForceInline] public E Load(vector<uint, Shape.dimensions> p) {
-        return RWTextureHeap[StorageIndex].asOpaqueDescriptor<T>()[p];
+        return RWTextureHeap[NonUniformResourceIndex(StorageIndex)].asOpaqueDescriptor<T>()[p];
     }
     [ForceInline] public void Store(vector<uint, Shape.dimensions> p, E v) {
-        RWTextureHeap[StorageIndex].asOpaqueDescriptor<T>().Store(p, v);
+        RWTextureHeap[NonUniformResourceIndex(StorageIndex)].asOpaqueDescriptor<T>().Store(p, v);
     }
 
 }
@@ -89,10 +89,10 @@ public extension Img<E, Shape, 3> {
     typealias Storage = _Texture<E, Shape, 0, 0, 0, 1, 0, 0, 0>;
 
     [ForceInline] public E Load(vector<uint, Shape.dimensions> p) {
-        return TextureHeap[SampledIndex].asOpaqueDescriptor<Sampled>()[p];
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<Sampled>()[p];
     }
     [ForceInline] public void Store(vector<uint, Shape.dimensions> p, E v) {
-        RWTextureHeap[StorageIndex].asOpaqueDescriptor<Storage>().Store(p, v);
+        RWTextureHeap[NonUniformResourceIndex(StorageIndex)].asOpaqueDescriptor<Storage>().Store(p, v);
     }
 }
 
@@ -148,7 +148,9 @@ public typealias MutImage2D<E : ITexelElement = float4> = Img<E, __Shape2D, 2>;
 public typealias MutImage3D<E : ITexelElement = float4> = Img<E, __Shape3D, 2>;
 public typealias MutTex2D<E : ITexelElement = float4>   = Img<E, __Shape2D, 3>;
 
-public struct Buf<T>    { public T *val; }
+/// A buffer the pass only reads, which lava tracks as a read: its pointer is read-only, so a
+/// write through it doesn't compile. `MutBuf` is read and written.
+public struct Buf<T>    { public Ptr<T, Access.Read> val; }
 public struct MutBuf<T> { public T *val; }
 
 /// A top-level acceleration structure by its device address: lava's `&Tlas` in push constants,

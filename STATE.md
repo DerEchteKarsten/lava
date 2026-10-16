@@ -16,32 +16,20 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - `lava::init` takes one `PassMap`, so an application and a library on lava can't both bring passes; `BindingOutput` names its pass by index into that map.
 - The generated-binding tests need real buffers and images (`BufferSlice` and `ImageView` have no public constructor), so they run in `gpu_headless` instead of as unit tests.
 
-## lava: bugs from the publishing survey (2026-10-14, not triaged yet)
-Found in a read-only review; details, line numbers and directions are in `lava/SURVEY.md` section 2.
-- Generated push-constant structs are `unsafe impl Pod` with padding (`CBvhCullBindings`: fields end at 232, size 240), so `bytes_of` reads uninitialised bytes; the offsets also rely on glam's SIMD alignment.
-- `PendingWrite::visible_to` checks the stage and access unions separately, so a write made visible to (FRAGMENT, SAMPLED) and (COMPUTE, STORAGE) counts as visible to (COMPUTE, SAMPLED) and gets no barrier.
-- A compacted acceleration structure keeps the source's `max_primitives` and build scratch, so `cmd.build` on it writes past its smaller buffer.
-- `wait_idle` doesn't lock the queues and completes epochs submitted after the wait returned, so a frame submitted meanwhile can have its objects destroyed (plausible; core calls it from `Swapchain::drop`).
-- A `FrameSlot` that isn't begun again keeps its epoch open, which stops every later destruction process-wide; without any frame loop nothing is freed.
-- Dropping an `Epoch` inside `Frame::execute` can deadlock: a destructor's `forget_image` locks the `pending` mutex the recording holds (plausible).
-- A panic while recording poisons the queue's `pending` mutex: later submits and destructions panic, and a drop while unwinding aborts.
-- `Queue<Transfer>`: descriptor sets are bound at graphics/compute bind points on a transfer-only family, and there are no queue family ownership transfers for `EXCLUSIVE` resources.
-- An image that is an attachment and also read by a draw of the same rendering gets two transitions in one barrier and ends in `ATTACHMENT_OPTIMAL` while its descriptor says `GENERAL`.
-- Combined depth-stencil formats get views with both aspects, which can't be sampled; host copies pass both aspects too.
-- Pending reads are only dropped when a later access covers their whole range, never when their submission completed, so moving ring ranges grow the lists forever.
-- `Buffer`, `ImageView`, `Swapchain` and `Surface` have mutable pub fields through which safe code can cause out-of-bounds host reads or wrong barriers.
-- Buffers are mapped whenever the device has ReBAR, so core's `variables` buffer (`Buffer::new(1, false)`, read on the host) panics on a discrete GPU without it.
-- `Ctx::get()` blocks forever before `lava::init`; a second `init` leaks a whole instance and device.
-- Bindless `Load`/`Store` in `bindless.slang` lack `NonUniformResourceIndex`.
-- lava-build-slang accepts passes with their own descriptor bindings (they collide with set 0), and nested `Buf`/`Img` in push-constant structs are silently untracked.
-- Pending accesses and layouts are committed before `queue_submit2`, so a failed submit leaves the tracking describing work that never ran.
-- `copy_image_to_buffer` doesn't check the buffer size; with address commands nothing else does.
-- `R64*` formats have 32-bit texel types, stencil `[u8]` instead of `uint`.
+## lava: bugs from the publishing survey (2026-10-14)
+Found in a read-only review; details and directions are in `lava/SURVEY.md` section 2. The rest were fixed on 2026-10-16.
+----find solutions----
+- `Queue<Transfer>`: images are `EXCLUSIVE` to the graphics family and lava records no queue family ownership transfers, so a transfer-only family may touch no image (it panics); buffers are `CONCURRENT`. `CommandBuffer` isn't typed by family either: dispatches and renderings on a transfer-only family panic when recorded instead of failing to compile.
+- `Buffer::host()` hands out `&[T]` over memory a frame in flight may write, which Rust's aliasing rules don't allow (a polling loop over one slice can be hoisted). Needs an API that reads copies or volatile values.
+
+----intended----
+- `wait_idle` waits at most 1 s for the present fences after the device went idle, then gives up on the ones that didn't signal (a present that failed before it was queued) and leaks them.
+- Completed pending buffer writes are only folded (into one write of every address, which every later access is made visible to once) once there are more than 64; until then they stay, since a later submission still needs a barrier to see them.
 
 ## Performance
 --- find solutions ---
 - Pipelines are created synchronously on first use, under a write lock, with no `VkPipelineCache` (`command_buffer.rs:233-244`, `:405`, `:602-607`, `:768`). (Ideas: per-pass locks, a warm-up list, a `VkPipelineCache` file.)
-- Recording a draw costs about three times a dispatch on the CPU (`lava-tests` recording bench, 2026-10-16, with dynamic state: 64 indexed draws in 8 renderings about 66 µs, 64 compute dispatches about 23 µs). Not profiled yet. Suspects: the per-draw state diff and push constants, and each rendering's span, scope and attachment setup.
+- Recording a draw costs about twice a dispatch on the CPU (`lava-tests` recording bench, 2026-10-16, borrowed unsized draws: 64 indexed draws in 8 renderings about 85 µs, 64 compute dispatches 40 to 55 µs, noisy). Not profiled yet. Suspects: the per-draw state diff and push constants, and each rendering's span, scope and attachment setup.
 
 --- intended ---
 - Hot reload recompiles every pass serially on any include change (`lava-build-slang/src/hot_reload.rs`).

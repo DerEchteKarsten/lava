@@ -1,4 +1,6 @@
-//! Window surface: an owned `SurfaceKHR` with its formats, present modes, and capabilities
+//! Window surface: an owned `SurfaceKHR` with its formats, present modes, and capabilities, destroyed after the last swapchain made for it
+use std::sync::Arc;
+
 use crate::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
@@ -9,16 +11,26 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Surface {
-    pub handle: vk::SurfaceKHR,
-    pub formats: Vec<vk::SurfaceFormatKHR>,
-    pub present_modes: Vec<vk::PresentModeKHR>,
-    pub capabilities: vk::SurfaceCapabilitiesKHR,
+    handle: Arc<SurfaceHandle>,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    present_modes: Vec<vk::PresentModeKHR>,
+    capabilities: vk::SurfaceCapabilitiesKHR,
 }
+
+/// The `SurfaceKHR`, shared by the `Surface` and every swapchain made for it, and destroyed
+/// once the last of them is (`epoch`): a surface may not go before its swapchains.
+#[derive(Debug)]
+pub(crate) struct SurfaceHandle(vk::SurfaceKHR);
 
 impl Surface {
     /// Creates a surface for `window`. One surface per window; lava must have been
     /// initialised with a display handle.
-    pub fn new(display: &RawDisplayHandle, window: &RawWindowHandle) -> Result<Self> {
+    ///
+    /// # Safety
+    /// `display` and `window` must be valid handles, and the window must outlive the surface:
+    /// it is destroyed once the `Surface` and every swapchain made for it are dropped and the
+    /// frames and presents that may use them are done (`lava::wait_idle` finishes them).
+    pub unsafe fn new(display: &RawDisplayHandle, window: &RawWindowHandle) -> Result<Self> {
         let surface_fn = surface_fn()?;
         let handle = unsafe {
             ash_window::create_surface(
@@ -31,7 +43,7 @@ impl Surface {
         };
         // From here on `Drop` destroys the handle on every error path.
         let mut surface = Self {
-            handle,
+            handle: Arc::new(SurfaceHandle(handle)),
             formats: Vec::new(),
             present_modes: Vec::new(),
             capabilities: vk::SurfaceCapabilitiesKHR::default(),
@@ -61,6 +73,29 @@ impl Surface {
         Ok(surface)
     }
 
+    pub fn handle(&self) -> vk::SurfaceKHR {
+        self.handle.0
+    }
+
+    pub(crate) fn shared_handle(&self) -> Arc<SurfaceHandle> {
+        self.handle.clone()
+    }
+
+    /// The formats and colour spaces the surface supports.
+    pub fn formats(&self) -> &[vk::SurfaceFormatKHR] {
+        &self.formats
+    }
+
+    /// The present modes the surface supports.
+    pub fn present_modes(&self) -> &[vk::PresentModeKHR] {
+        &self.present_modes
+    }
+
+    /// Its capabilities as of the last `refresh_capabilities`.
+    pub fn capabilities(&self) -> &vk::SurfaceCapabilitiesKHR {
+        &self.capabilities
+    }
+
     /// Whether the surface has no extent to create a swapchain for right now (a minimised
     /// window), as of the last `refresh_capabilities`.
     pub fn is_minimised(&self) -> bool {
@@ -73,7 +108,7 @@ impl Surface {
         self.capabilities = unsafe {
             surface_fn()?.get_physical_device_surface_capabilities(
                 Ctx::physical_device().handel,
-                self.handle,
+                self.handle(),
             )?
         };
         Ok(())
@@ -86,11 +121,11 @@ fn surface_fn() -> Result<&'static ash::khr::surface::Instance> {
     })
 }
 
-/// Destroyed after the swapchains made for it, which are dropped first and destroyed in drop
-/// order (`epoch`).
-impl Drop for Surface {
+/// Destroyed after the swapchains made for it, which hold the handle too, once the presents that
+/// may use it are done (`epoch`).
+impl Drop for SurfaceHandle {
     fn drop(&mut self) {
-        let handle = self.handle;
+        let handle = self.0;
         crate::epoch::retire_after_present(move || {
             if let Some(surface_fn) = Functions::surface() {
                 unsafe { surface_fn.destroy_surface(handle, None) };

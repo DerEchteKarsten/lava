@@ -45,10 +45,31 @@ pub struct Ctx {
 }
 
 static STATE: OnceLock<Ctx> = OnceLock::new();
+
+/// Runs its closure when dropped, unless disarmed: undoes a step of `Ctx::init` when a later
+/// one fails, so a failed init leaks nothing.
+struct Undo<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Undo<F> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for Undo<F> {
+    fn drop(&mut self) {
+        if let Some(undo) = self.0.take() {
+            undo();
+        }
+    }
+}
+
 impl Ctx {
-    #[allow(static_mut_refs)]
+    /// Panics before `lava::init` succeeded.
     pub(crate) fn get() -> &'static Self {
-        STATE.wait()
+        STATE
+            .get()
+            .expect("lava isn't initialised: call `lava::init` first (and check that it succeeded)")
     }
     pub(crate) fn device() -> &'static Device {
         &Ctx::get().device
@@ -88,6 +109,9 @@ impl Ctx {
     /// Creates the instance, device, and allocator. With a display, the instance gets the
     /// platform surface extensions and the device gets a swapchain; without it lava runs headless.
     pub(super) fn init(config: &Config) -> Result<()> {
+        if STATE.get().is_some() {
+            return Err(Error::message("lava is already initialised"));
+        }
         let display = config.display.as_ref();
         let entry = unsafe { Entry::load()? };
         let app_info = vk::ApplicationInfo::default().api_version(make_api_version(0, 1, 4, 0));
@@ -109,6 +133,22 @@ impl Ctx {
                 .to_vec(),
             None => Vec::new(),
         };
+
+        // Present fences (`Features::present_fences`) need the surface maintenance instance
+        // extensions.
+        let surface_maintenance = [
+            ash::khr::get_surface_capabilities2::NAME,
+            ash::ext::surface_maintenance1::NAME,
+        ];
+        let present_fences = display.is_some() && {
+            let available = unsafe { entry.enumerate_instance_extension_properties(None)? };
+            surface_maintenance.iter().all(|name| {
+                (available.iter()).any(|e| e.extension_name_as_c_str() == Ok(*name))
+            })
+        };
+        if present_fences {
+            instance_extensions.extend(surface_maintenance.iter().map(|name| name.as_ptr()));
+        }
 
         // The validation layer and debug names and labels, in debug builds.
         let debug = cfg!(debug_assertions) && config.validation;
@@ -137,7 +177,12 @@ impl Ctx {
             .enabled_extension_names(&instance_extensions);
 
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
+        let undo_instance = Undo(Some({
+            let instance = instance.clone();
+            move || unsafe { instance.destroy_instance(None) }
+        }));
         let mut instance_debug_utils = None;
+        let mut messenger = vk::DebugUtilsMessengerEXT::null();
         if debug {
             instance_debug_utils = Some(debug_utils::Instance::new(&entry, &instance));
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -153,13 +198,22 @@ impl Ctx {
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 )
                 .pfn_user_callback(Some(vulkan_debug_callback));
-            unsafe {
+            messenger = unsafe {
                 instance_debug_utils
                     .as_ref()
                     .expect("debug utils instance was just created")
                     .create_debug_utils_messenger(&debug_info, None)?
             };
         }
+        // Destroyed before the instance.
+        let undo_messenger = Undo(Some({
+            let debug_utils = instance_debug_utils.clone();
+            move || {
+                if let Some(debug_utils) = debug_utils {
+                    unsafe { debug_utils.destroy_debug_utils_messenger(messenger, None) };
+                }
+            }
+        }));
 
         let surface_fn = display.map(|_| ash::khr::surface::Instance::new(&entry, &instance));
 
@@ -169,7 +223,13 @@ impl Ctx {
                 physical_devices.as_slice(),
                 &config.required,
             )?;
-        let features = physical_device.supported_features;
+        let mut features = physical_device.supported_features;
+        features.present_fences &= present_fences;
+        if config.required.present_fences && !features.present_fences {
+            return Err(Error::message(
+                "`present_fences` needs a display and the instance extensions VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1",
+            ));
+        }
         let mut extensions: Vec<&CStr> = LAVA_EXTENSIONS.to_vec();
         extensions.extend(features.extensions());
         if display.is_some() {
@@ -184,6 +244,11 @@ impl Ctx {
             queues.push((tqf.index, tqf.num_queues));
         }
         let device = create_device(queues, &physical_device, &features, &extensions, &instance)?;
+        // Destroyed before the messenger and the instance, after the allocator.
+        let undo_device = Undo(Some({
+            let device = device.clone();
+            move || unsafe { device.destroy_device(None) }
+        }));
         let mut debug_utils = None;
         if debug {
             debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
@@ -251,9 +316,13 @@ impl Ctx {
             &device,
             graphics_queue_family.index,
             graphics_queue_family.num_queues,
+            graphics_queue_family.handel.queue_flags,
+            true,
         );
-        let transfer_queues = transfer_queue_familie
-            .map(|family| FamilyQueues::new(&device, family.index, family.num_queues));
+        let transfer_queues = transfer_queue_familie.map(|family| {
+            let flags = family.handel.queue_flags;
+            FamilyQueues::new(&device, family.index, family.num_queues, flags, false)
+        });
         STATE
             .set(Ctx {
                 device,
@@ -265,6 +334,9 @@ impl Ctx {
                 physical_device: physical_device,
             })
             .map_err(|_| Error::message("Vulkan context was already initialized"))?;
+        undo_device.disarm();
+        undo_messenger.disarm();
+        undo_instance.disarm();
 
         Ok(())
     }

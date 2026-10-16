@@ -128,7 +128,7 @@ impl StencilAspect for Dynamic {}
 struct Info {
     aspects: vk::ImageAspectFlags,
     texel_size: usize,
-    /// The `TypeId` of its `Texels`.
+    /// The `TypeId` of the texels shaders read (`HasTexels`).
     texels: TypeId,
     /// The `ClearValue` variant it clears with.
     clear: Discriminant<ClearValue>,
@@ -171,9 +171,17 @@ macro_rules! formats {
     (@texels float $n:literal) => { [f32; $n] };
     (@texels uint $n:literal) => { [u32; $n] };
     (@texels sint $n:literal) => { [i32; $n] };
+    (@texels float64 $n:literal) => { [f64; $n] };
+    (@texels uint64 $n:literal) => { [u64; $n] };
+    (@texels sint64 $n:literal) => { [i64; $n] };
     (@texels depth) => { [f32; 1] };
-    (@texels stencil) => { [u8; 1] };
-    (@texels depth_stencil) => { (f32, u8) };
+    (@texels stencil) => { [u32; 1] };
+    (@texels depth_stencil) => { (f32, u32) };
+
+    // What shaders read (`HasTexels`): the texels, except for a combined depth-stencil format,
+    // whose views show shaders the depth aspect alone.
+    (@shader_texels depth_stencil) => { [f32; 1] };
+    (@shader_texels $kind:ident $($n:literal)?) => { formats!(@texels $kind $($n)?) };
 
     (@aspects depth) => { vk::ImageAspectFlags::DEPTH };
     (@aspects stencil) => { vk::ImageAspectFlags::STENCIL };
@@ -187,6 +195,14 @@ macro_rules! formats {
     (@clear float $v:expr) => { ClearValue::Float(pad($v)) };
     (@clear uint $v:expr) => { ClearValue::Uint(pad($v)) };
     (@clear sint $v:expr) => { ClearValue::Sint(pad($v)) };
+    // Clear values have 32 bits per component.
+    (@clear float64 $v:expr) => { ClearValue::Float(pad($v.map(|c| c as f32))) };
+    (@clear uint64 $v:expr) => {
+        ClearValue::Uint(pad($v.map(|c| u32::try_from(c).expect("a clear value fits 32 bits"))))
+    };
+    (@clear sint64 $v:expr) => {
+        ClearValue::Sint(pad($v.map(|c| i32::try_from(c).expect("a clear value fits 32 bits"))))
+    };
     (@clear depth $v:expr) => { ClearValue::DepthStencil { depth: $v[0], stencil: 0 } };
     (@clear stencil $v:expr) => {
         ClearValue::DepthStencil { depth: 0.0, stencil: $v[0] as u32 }
@@ -227,7 +243,7 @@ macro_rules! formats {
                 fn aspect_check(&self, _: vk::ImageAspectFlags) {}
                 fn texel_check<T: 'static>(&self) {}
             }
-            impl HasTexels<formats!(@texels $kind $($n)?)> for $name {}
+            impl HasTexels<formats!(@shader_texels $kind $($n)?)> for $name {}
             formats!(@traits $name $kind);
         )*
 
@@ -237,7 +253,7 @@ macro_rules! formats {
                 $(vk::Format::$vk => Some(Info {
                     aspects: formats!(@aspects $kind),
                     texel_size: $size,
-                    texels: TypeId::of::<Texels<$name>>(),
+                    texels: TypeId::of::<formats!(@shader_texels $kind $($n)?)>(),
                     clear: discriminant(&formats!(@clear $kind Texels::<$name>::default())),
                 }),)*
                 _ => None,
@@ -322,10 +338,10 @@ formats! {
     R32G32Sfloat => (R32G32_SFLOAT, 8, float, 2),
     R32G32B32Sfloat => (R32G32B32_SFLOAT, 12, float, 3),
     R32G32B32A32Sfloat => (R32G32B32A32_SFLOAT, 16, float, 4),
-    R64Sfloat => (R64_SFLOAT, 8, float, 1),
-    R64G64Sfloat => (R64G64_SFLOAT, 16, float, 2),
-    R64G64B64Sfloat => (R64G64B64_SFLOAT, 24, float, 3),
-    R64G64B64A64Sfloat => (R64G64B64A64_SFLOAT, 32, float, 4),
+    R64Sfloat => (R64_SFLOAT, 8, float64, 1),
+    R64G64Sfloat => (R64G64_SFLOAT, 16, float64, 2),
+    R64G64B64Sfloat => (R64G64B64_SFLOAT, 24, float64, 3),
+    R64G64B64A64Sfloat => (R64G64B64A64_SFLOAT, 32, float64, 4),
     B10G11R11UfloatPack32 => (B10G11R11_UFLOAT_PACK32, 4, float, 3),
     E5B9G9R9UfloatPack32 => (E5B9G9R9_UFLOAT_PACK32, 4, float, 4),
     BC1RgbUnormBlock => (BC1_RGB_UNORM_BLOCK, 0, float, 3),
@@ -399,10 +415,10 @@ formats! {
     R32G32Uint => (R32G32_UINT, 8, uint, 2),
     R32G32B32Uint => (R32G32B32_UINT, 12, uint, 3),
     R32G32B32A32Uint => (R32G32B32A32_UINT, 16, uint, 4),
-    R64Uint => (R64_UINT, 8, uint, 1),
-    R64G64Uint => (R64G64_UINT, 16, uint, 2),
-    R64G64B64Uint => (R64G64B64_UINT, 24, uint, 3),
-    R64G64B64A64Uint => (R64G64B64A64_UINT, 32, uint, 4),
+    R64Uint => (R64_UINT, 8, uint64, 1),
+    R64G64Uint => (R64G64_UINT, 16, uint64, 2),
+    R64G64B64Uint => (R64G64B64_UINT, 24, uint64, 3),
+    R64G64B64A64Uint => (R64G64B64A64_UINT, 32, uint64, 4),
     R8Sint => (R8_SINT, 1, sint, 1),
     R8G8Sint => (R8G8_SINT, 2, sint, 2),
     R8G8B8Sint => (R8G8B8_SINT, 3, sint, 3),
@@ -420,10 +436,10 @@ formats! {
     R32G32Sint => (R32G32_SINT, 8, sint, 2),
     R32G32B32Sint => (R32G32B32_SINT, 12, sint, 3),
     R32G32B32A32Sint => (R32G32B32A32_SINT, 16, sint, 4),
-    R64Sint => (R64_SINT, 8, sint, 1),
-    R64G64Sint => (R64G64_SINT, 16, sint, 2),
-    R64G64B64Sint => (R64G64B64_SINT, 24, sint, 3),
-    R64G64B64A64Sint => (R64G64B64A64_SINT, 32, sint, 4),
+    R64Sint => (R64_SINT, 8, sint64, 1),
+    R64G64Sint => (R64G64_SINT, 16, sint64, 2),
+    R64G64B64Sint => (R64G64B64_SINT, 24, sint64, 3),
+    R64G64B64A64Sint => (R64G64B64A64_SINT, 32, sint64, 4),
     D16Unorm => (D16_UNORM, 2, depth),
     X8D24UnormPack32 => (X8_D24_UNORM_PACK32, 4, depth),
     D32Sfloat => (D32_SFLOAT, 4, depth),
@@ -521,7 +537,6 @@ mod tests {
         let dynamic = Dynamic(format.vk_format());
         assert_eq!(dynamic.aspects(), format.aspects());
         assert_eq!(dynamic.texel_size(), format.texel_size());
-        dynamic.texel_check::<F::Texels>();
         dynamic.aspect_check(format.aspects());
         let clear = format.clear_value(texels);
         assert_eq!(dynamic.clear_value(clear), clear);
@@ -538,6 +553,31 @@ mod tests {
         same(D32Sfloat, [0.0]);
         same(S8Uint, [1]);
         same(D24UnormS8Uint, (1.0, 1));
+    }
+
+    /// What shaders read: 64-bit components for 64-bit formats, `uint` stencil, and the depth of
+    /// a combined depth-stencil format (its views show shaders that aspect).
+    fn reads<T: 'static, F: HasTexels<T>>(format: F) {
+        Dynamic(format.vk_format()).texel_check::<T>();
+    }
+
+    #[test]
+    fn shaders_read_texels_of_the_formats_component_type() {
+        reads::<[f32; 4], _>(R8G8B8A8Unorm);
+        reads::<[u32; 1], _>(R32Uint);
+        reads::<[f64; 1], _>(R64Sfloat);
+        reads::<[u64; 1], _>(R64Uint);
+        reads::<[i64; 2], _>(R64G64Sint);
+        reads::<[f32; 1], _>(D32Sfloat);
+        reads::<[u32; 1], _>(S8Uint);
+        reads::<[f32; 1], _>(D24UnormS8Uint);
+    }
+
+    #[test]
+    fn clear_values_of_64_bit_formats_have_32_bit_components() {
+        assert_eq!(R64Uint.clear_value([7]), ClearValue::Uint([7, 0, 0, 0]));
+        assert_eq!(R64G64Sint.clear_value([-2, 3]), ClearValue::Sint([-2, 3, 0, 0]));
+        assert_eq!(R64Sfloat.clear_value([0.5]), ClearValue::Float([0.5, 0.0, 0.0, 0.0]));
     }
 
     #[test]

@@ -1,5 +1,11 @@
-//! Queue submission and sync: queue leases with their pending accesses, semaphores, fences, frame slots with their epochs, presenting
-use std::{fmt::Debug, marker::PhantomData, ops::Range, sync::Mutex};
+//! Queue submission and sync: queue leases with their pending accesses, semaphores, fences, frame slots with their epochs (a failed recording is replaced by its barriers), presenting with present fences
+use std::{
+    fmt::Debug,
+    marker::PhantomData,
+    ops::Range,
+    panic::AssertUnwindSafe,
+    sync::{Mutex, MutexGuard},
+};
 
 use crate::error::{Error, Result};
 use crate::vk;
@@ -7,7 +13,7 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    command_buffer::{BufferAccess, CommandBuffer, ImageAccess},
+    command_buffer::{Barriers, BufferAccess, CommandBuffer, ImageAccess, QueueCaps},
     epoch::{self, Epoch},
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
@@ -241,10 +247,25 @@ pub struct FamilyQueues {
     /// wait for. Locked while a command buffer for the queue is recorded and submitted, so
     /// leases sharing a queue record one after the other.
     pending: Box<[Mutex<PendingAccesses>]>,
+    caps: QueueCaps,
+}
+
+/// Locks `mutex`, also after a panic while it was held: what lava keeps in these mutexes stays
+/// usable (pending accesses can only be more than what runs, which costs barriers at most).
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 impl FamilyQueues {
-    pub(crate) fn new(device: &ash::Device, family: u32, count: u32) -> Self {
+    /// The `count` queues of `family`, whose queues can do `flags`; `images`: it is the
+    /// graphics family, the only one that may access images.
+    pub(crate) fn new(
+        device: &ash::Device,
+        family: u32,
+        count: u32,
+        flags: vk::QueueFlags,
+        images: bool,
+    ) -> Self {
         Self {
             family,
             handles: (0..count)
@@ -252,6 +273,7 @@ impl FamilyQueues {
                 .collect(),
             leases: Mutex::new(vec![0; count as usize].into()),
             pending: (0..count).map(|_| Mutex::default()).collect(),
+            caps: QueueCaps { flags, images },
         }
     }
 
@@ -265,8 +287,15 @@ fn for_each_pending(mut f: impl FnMut(&mut PendingAccesses)) {
     let ctx = Ctx::get();
     let families = std::iter::once(&ctx.gfx_queues).chain(&ctx.transfer_queues);
     for pending in families.flat_map(|family| &family.pending) {
-        f(&mut pending.lock().unwrap());
+        f(&mut lock(pending));
     }
+}
+
+/// Every queue, locked: nothing can be submitted or presented while they are held.
+pub(crate) fn lock_all_queues() -> Vec<MutexGuard<'static, vk::Queue>> {
+    let ctx = Ctx::get();
+    let families = std::iter::once(&ctx.gfx_queues).chain(&ctx.transfer_queues);
+    families.flat_map(|family| &family.handles).map(lock).collect()
 }
 
 /// Forgets the pending accesses of an image that is being destroyed, on every queue, so an
@@ -294,7 +323,7 @@ pub struct Queue<Q: QueueFamilie> {
 impl<Q: QueueFamilie> Queue<Q> {
     pub fn new() -> Self {
         let family = Q::queues();
-        let index = lease(&mut family.leases.lock().unwrap());
+        let index = lease(&mut lock(&family.leases));
         Self {
             family,
             index,
@@ -306,7 +335,7 @@ impl<Q: QueueFamilie> Queue<Q> {
     /// while every queue was taken keep sharing after the others were dropped; this finds out,
     /// [`Self::reselect`] fixes it.
     pub fn is_optimal(&self) -> bool {
-        is_optimal(&self.family.leases.lock().unwrap(), self.index)
+        is_optimal(&lock(&self.family.leases), self.index)
     }
 
     /// Moves the lease to the least used queue of its family. It waits until the old queue is
@@ -321,23 +350,20 @@ impl<Q: QueueFamilie> Queue<Q> {
         self.with(|queue| unsafe { Ctx::device().queue_wait_idle(queue) })?;
         let old = self.index;
         {
-            let mut leases = self.family.leases.lock().unwrap();
+            let mut leases = lock(&self.family.leases);
             leases[old] -= 1;
             self.index = lease(&mut leases);
         }
         if self.index != old {
-            let pending = self.family.pending[old].lock().unwrap().clone();
-            self.family.pending[self.index]
-                .lock()
-                .unwrap()
-                .append(pending);
+            let pending = lock(&self.family.pending[old]).clone();
+            lock(&self.family.pending[self.index]).append(pending);
         }
         Ok(())
     }
 
     /// Calls `f` with the queue, locked.
     fn with<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
-        f(*self.family.handles[self.index].lock().unwrap())
+        f(*lock(&self.family.handles[self.index]))
     }
 }
 
@@ -349,7 +375,7 @@ impl<Q: QueueFamilie> Default for Queue<Q> {
 
 impl<Q: QueueFamilie> Drop for Queue<Q> {
     fn drop(&mut self) {
-        self.family.leases.lock().unwrap()[self.index] -= 1;
+        lock(&self.family.leases)[self.index] -= 1;
     }
 }
 
@@ -428,13 +454,16 @@ impl Drop for CommandBufferMemory {
 /// A command buffer with its pool and fence. Submit its frames through one [`Queue`] lease,
 /// so they reach the GPU in order and the barriers between them hold.
 pub struct FrameSlot {
-    /// The epoch of the frame begun last, completed (dropped) once its fence signalled.
+    /// The epoch of the frame begun last, completed (dropped) once its fence signalled, which
+    /// it may poll until then (`epoch`). Dropped first, before the fence is destroyed.
     epoch: Option<Epoch>,
     buffer: CommandBufferMemory,
     pool: CommandPool,
     fence: Fence,
     submitted: bool,
     family: u32,
+    /// Lent to each recording (`CommandBuffer::barrier_log`), so it allocates once.
+    barrier_log: Vec<Barriers>,
 }
 
 impl FrameSlot {
@@ -449,6 +478,7 @@ impl FrameSlot {
             fence: Fence::new()?,
             submitted: false,
             family: queue.family.family,
+            barrier_log: Vec::new(),
         })
     }
 
@@ -459,6 +489,8 @@ impl FrameSlot {
     pub fn begin(&mut self, epoch: Epoch) -> Result<Frame<'_>> {
         if self.submitted {
             tracing::info_span!("wait for frame slot").in_scope(|| self.fence.wait())?;
+            // Completed before the fence is reset: nothing polls it after that.
+            self.epoch = None;
             self.fence.reset()?;
             self.pool.reset()?;
             self.submitted = false;
@@ -474,8 +506,14 @@ pub struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    /// Records `executor` and submits it to `queue`, after the earlier submissions to it. A
-    /// frame that fails before it is submitted completes its epoch right away.
+    /// Records `executor` and submits it to `queue`, after the earlier submissions to it.
+    ///
+    /// A recording that doesn't reach the GPU, because `executor` panicked or recording or
+    /// submitting failed, still moved the tracked layouts and accesses: it is replaced by a
+    /// submission of just its barriers, waiting on `wait_on` and signalling the timeline
+    /// semaphores of `signal` (not the binary ones, which nothing will wait on), so the tracking
+    /// stays true. Then the panic continues, or the error is returned. A frame that fails before
+    /// it records anything completes its epoch right away.
     #[validation_trace]
     pub fn execute<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         self,
@@ -484,21 +522,7 @@ impl Frame<'_> {
         signal: &[SemaphoreInfo],
         executor: F,
     ) -> Result<()> {
-        let slot = self.slot;
-        let result = execute_command(queue, slot, wait_on, signal, executor);
-        match result {
-            Ok(()) => {
-                slot.submitted = true;
-                if let Some(epoch) = &slot.epoch {
-                    epoch.submitted();
-                }
-            }
-            Err(_) => {
-                slot.epoch = None;
-                slot.pool.reset()?;
-            }
-        }
-        result
+        execute_command(queue, self.slot, wait_on, signal, executor)
     }
 }
 
@@ -514,40 +538,94 @@ impl Drop for FrameSlot {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PendingAccesses {
-    pub(crate) buffer_reads: SmallVec<[BufferAccess; 8]>,
+    pub(crate) buffer_reads: SmallVec<[PendingRead; 8]>,
     pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
     pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
     pub(crate) image_writes: SmallVec<[PendingWrite<ImageAccess>; 8]>,
+    /// The epoch of the frame being recorded, which the accesses it records are tagged with.
+    pub(crate) epoch: u64,
 }
 
-/// A write later commands may have to wait for, and the stages and accesses a barrier recorded
-/// since already made it visible to: those need no barrier for it anymore.
+/// A buffer read later writes may have to wait for, with the epoch of the frame that made it:
+/// once that completed, nothing has to.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRead {
+    pub(crate) read: BufferAccess,
+    pub(crate) epoch: u64,
+}
+
+impl std::ops::Deref for PendingRead {
+    type Target = BufferAccess;
+    fn deref(&self) -> &BufferAccess {
+        &self.read
+    }
+}
+
+/// A write later commands may have to wait for, and what the barriers recorded since already
+/// made it visible to: those accesses need no barrier for it anymore.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingWrite<A> {
     pub(crate) write: A,
-    pub(crate) visible_stages: vk::PipelineStageFlags2,
-    pub(crate) visible_access: vk::AccessFlags2,
+    /// The epoch of the frame that made it.
+    pub(crate) epoch: u64,
+    /// The destination scopes of those barriers: each made the write visible to its accesses
+    /// at its stages (every pair of them), but not to its accesses at another barrier's stages.
+    pub(crate) visible: SmallVec<[(vk::PipelineStageFlags2, vk::AccessFlags2); 2]>,
 }
 
 impl<A> PendingWrite<A> {
-    pub(crate) fn new(write: A) -> Self {
+    pub(crate) fn new(write: A, epoch: u64) -> Self {
         Self {
             write,
-            visible_stages: vk::PipelineStageFlags2::NONE,
-            visible_access: vk::AccessFlags2::NONE,
+            epoch,
+            visible: SmallVec::new(),
         }
     }
 
+    /// Whether one barrier made the write visible to `access` at `stage`: two barriers, one to
+    /// sampled reads in fragment shaders and one to storage reads in compute shaders, don't
+    /// make it visible to sampled reads in compute shaders.
     pub(crate) fn visible_to(
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
     ) -> bool {
-        self.visible_stages.contains(stage) && self.visible_access.contains(access)
+        (self.visible.iter()).any(|&(stages, accesses)| {
+            stages.contains(stage) && accesses.contains(access)
+        })
+    }
+
+    /// Remembers that a barrier made the write visible to `access` at `stage`. A scope merges
+    /// into one of the same stages or the same accesses, or replaces one it contains: only then
+    /// is the merged scope exactly the pairs of both.
+    pub(crate) fn make_visible(&mut self, stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) {
+        if self.visible_to(stage, access) {
+            return;
+        }
+        (self.visible).retain(|&mut (stages, accesses)| {
+            !(stage.contains(stages) && access.contains(accesses))
+        });
+        for (stages, accesses) in &mut self.visible {
+            if *stages == stage {
+                *accesses |= access;
+                return;
+            }
+            if *accesses == access {
+                *stages |= stage;
+                return;
+            }
+        }
+        self.visible.push((stage, access));
     }
 }
 
-/// Records `executor` into the slot's command buffer and submits it.
+/// Why a recording didn't reach the GPU.
+enum Failed {
+    Panic(Box<dyn std::any::Any + Send>),
+    Error(Error),
+}
+
+/// Records `executor` into the slot's command buffer and submits it (see `Frame::execute`).
 #[validation_trace]
 fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     queue: &Queue<Q>,
@@ -556,58 +634,132 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     signal: &[SemaphoreInfo],
     executor: F,
 ) -> Result<()> {
-    let buffer = &slot.buffer;
     // Held until the submission, so the queue gets command buffers in the order their
     // barriers were computed in.
-    let mut pending = queue.family.pending[queue.index].lock().unwrap();
-    unsafe {
-        let epoch = slot.epoch.as_ref().map_or(0, Epoch::value);
-        let mut cmd_buffer = CommandBuffer::new(
-            buffer.handle,
-            std::mem::take(&mut *pending),
-            epoch,
-            slot.family,
-        );
+    let mut pending = lock(&queue.family.pending[queue.index]);
+    let epoch = slot.epoch.as_ref().map_or(0, Epoch::value);
+    let mut taken = std::mem::take(&mut *pending);
+    taken.retire(epoch::completed());
+    let mut cmd = CommandBuffer::new(
+        slot.buffer.handle,
+        taken,
+        epoch,
+        slot.family,
+        queue.family.caps,
+        std::mem::take(&mut slot.barrier_log),
+    );
 
-        // Put back whatever happens: they describe what earlier submissions do.
-        let recorded = cmd_buffer.begin();
-        if recorded.is_err() {
-            *pending = cmd_buffer.pending_accesses;
-            return recorded;
+    let result = match cmd.begin() {
+        // Nothing was recorded: the accesses describe what earlier submissions do.
+        Err(err) => {
+            *pending = std::mem::take(&mut cmd.pending_accesses);
+            slot.barrier_log = std::mem::take(&mut cmd.barrier_log);
+            slot.epoch = None;
+            if let Err(reset) = slot.pool.reset() {
+                tracing::error!(%reset, "failed to reset a frame slot's command pool");
+            }
+            return Err(err);
         }
-        let prev = CALLSITE.replace(None);
-        executor(&mut cmd_buffer);
-        CALLSITE.set(prev);
-        cmd_buffer.flush_deferred();
-        host_barrier(buffer.handle);
-        *pending = std::mem::take(&mut cmd_buffer.pending_accesses);
-        cmd_buffer.end()?;
+        Ok(()) => {
+            let prev = CALLSITE.replace(None);
+            let recorded = epoch::recording(|| {
+                std::panic::catch_unwind(AssertUnwindSafe(|| executor(&mut cmd)))
+            });
+            CALLSITE.set(prev);
+            match recorded {
+                Err(panic) => Err(Failed::Panic(panic)),
+                Ok(()) => {
+                    host_barrier(cmd.handle);
+                    (cmd.end())
+                        .and_then(|()| submit(queue, slot, cmd.handle, wait_on, signal, true))
+                        .map_err(Failed::Error)
+                }
+            }
+        }
+    };
+    // Whatever happened: the recording's accesses and layouts are tracked already.
+    *pending = std::mem::take(&mut cmd.pending_accesses);
+    let failed = match result {
+        Ok(()) => None,
+        Err(failed) => {
+            replay(queue, slot, &cmd, wait_on, signal);
+            Some(failed)
+        }
+    };
+    let mut log = std::mem::take(&mut cmd.barrier_log);
+    log.clear();
+    slot.barrier_log = log;
+    drop(pending);
+    match failed {
+        None => Ok(()),
+        Some(Failed::Error(err)) => Err(err),
+        Some(Failed::Panic(panic)) => std::panic::resume_unwind(panic),
+    }
+}
 
-        let cmd_buffer_submit_info =
-            vk::CommandBufferSubmitInfo::default().command_buffer(buffer.handle);
-        let wait_infos: SmallVec<[_; 1]> = wait_on
-            .iter()
-            .map(|sem| sem.to_vk(sem.stage.flags()))
-            .collect();
-        // Untracked work (queries, `flush_all`, host barriers) has to finish too.
-        let signal_infos: SmallVec<[_; 1]> = signal
-            .iter()
-            .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
-            .collect();
+/// Submits the slot's command buffer `handle`; on success the slot waits for its fence and
+/// polls it for its epoch. `binary_signals`: also signal the binary semaphores of `signal`.
+fn submit<Q: QueueFamilie>(
+    queue: &Queue<Q>,
+    slot: &mut FrameSlot,
+    handle: vk::CommandBuffer,
+    wait_on: &[SemaphoreInfo],
+    signal: &[SemaphoreInfo],
+    binary_signals: bool,
+) -> Result<()> {
+    let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default().command_buffer(handle);
+    let wait_infos: SmallVec<[_; 1]> = wait_on
+        .iter()
+        .map(|sem| sem.to_vk(sem.stage.flags()))
+        .collect();
+    // Untracked work (queries, `flush_all`, host barriers) has to finish too.
+    let signal_infos: SmallVec<[_; 1]> = signal
+        .iter()
+        .filter(|sem| binary_signals || sem.value.is_some())
+        .map(|sem| sem.to_vk(vk::PipelineStageFlags2::ALL_COMMANDS))
+        .collect();
+    let submit_info = vk::SubmitInfo2::default()
+        .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info))
+        .wait_semaphore_infos(&wait_infos)
+        .signal_semaphore_infos(&signal_infos);
+    queue.with(|queue| unsafe {
+        Ctx::device().queue_submit2(queue, std::slice::from_ref(&submit_info), slot.fence.handle)
+    })?;
+    slot.submitted = true;
+    if let Some(epoch) = &slot.epoch {
+        epoch.submitted(slot.fence.handle);
+    }
+    Ok(())
+}
 
-        let submit_info = vk::SubmitInfo2::default()
-            .command_buffer_infos(std::slice::from_ref(&cmd_buffer_submit_info))
-            .wait_semaphore_infos(&wait_infos)
-            .signal_semaphore_infos(&signal_infos);
-
-        queue.with(|handle| {
-            Ctx::device().queue_submit2(
-                handle,
-                std::slice::from_ref(&submit_info),
-                slot.fence.handle,
-            )
-        })?;
-        Ok(())
+/// Replaces a recording of `cmd` that didn't reach the GPU with a submission of just its
+/// barriers, in the order they were computed: the tracking already counts their layout
+/// transitions and accesses. If even that fails, the tracked layouts of the images it
+/// transitioned are wrong from now on, which is logged.
+fn replay<Q: QueueFamilie>(
+    queue: &Queue<Q>,
+    slot: &mut FrameSlot,
+    cmd: &CommandBuffer,
+    wait_on: &[SemaphoreInfo],
+    signal: &[SemaphoreInfo],
+) {
+    let replayed = (|| -> Result<()> {
+        slot.pool.reset()?;
+        let device = Ctx::device();
+        unsafe { device.begin_command_buffer(cmd.handle, &vk::CommandBufferBeginInfo::default())? };
+        cmd.replay_barriers();
+        unsafe { device.end_command_buffer(cmd.handle)? };
+        submit(queue, slot, cmd.handle, wait_on, signal, false)
+    })();
+    if let Err(err) = replayed {
+        tracing::error!(
+            %err,
+            "a frame that failed couldn't submit its barriers either: the layouts lava tracks for the images it used may be wrong"
+        );
+        slot.epoch = None;
+        if let Err(reset) = slot.pool.reset() {
+            tracing::error!(%reset, "failed to reset a frame slot's command pool");
+        }
     }
 }
 
@@ -620,16 +772,34 @@ impl Queue<Gfx> {
         image_index: u32,
         wait_on: &[&Semaphore<Binary>],
     ) -> Result<bool> {
-        let sc = [swapchain.handle];
+        let (_sync, handle) = swapchain.lock();
+        let sc = [handle];
         let ii = [image_index];
         let waits: SmallVec<[_; 2]> = wait_on.iter().map(|sem| sem.handle).collect();
         let _span = tracing::info_span!("present").entered();
-        let present_info = vk::PresentInfoKHR::default()
+        let mut present_info = vk::PresentInfoKHR::default()
             .swapchains(&sc)
             .image_indices(&ii)
             .wait_semaphores(waits.as_slice());
-        let presented = self
-            .with(|queue| unsafe { Functions::swapchain().queue_present(queue, &present_info) });
+        // Signalled once the present is done with the image and the semaphores, which may be
+        // destroyed then (`epoch`).
+        let fence = match Ctx::features().present_fences {
+            true => Some([epoch::present_fence()?]),
+            false => None,
+        };
+        let mut fence_info = vk::SwapchainPresentFenceInfoEXT::default();
+        if let Some(fence) = &fence {
+            fence_info = fence_info.fences(fence);
+            present_info = present_info.push_next(&mut fence_info);
+        }
+        let presented = self.with(|queue| {
+            let presented = unsafe { Functions::swapchain().queue_present(queue, &present_info) };
+            // While the queue is locked, so `wait_idle` sees every present made before it.
+            if let Some([fence]) = fence {
+                epoch::presented(fence);
+            }
+            presented
+        });
         match presented {
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(true),
             Ok(false) => Ok(false),

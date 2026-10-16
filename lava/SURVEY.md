@@ -43,7 +43,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    the absolute source path (lava-build-slang's `BuiltPass.source`), so a moved binary runs
    with the pipelines it was built with. lava has no features now; hot reload is lava-build-slang's.
 6. ~~**Nightly.**~~ **Done (2026-10-16):** lava, its tests and the generated code build on stable
-   (rust-version 1.96). Registrations became `cmd.record_access(access, stage)`, `RasterBuilder`
+   (rust-version 1.96). Registrations became the commands' `Accesses` parameter (`ImageUse::sampled_read(view)` and the like), `RasterBuilder`
    takes its attachments up front (see 4.1), and the range intersection is written out.
 7. **Packaging.** *Done (2026-10-16) but for the name:* MIT OR Apache-2.0, metadata, READMEs,
    `include` lists, no scratchpad. The name `lava` belongs to an abandoned 2020 crate; its owner
@@ -60,14 +60,14 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 ## 2. Correctness and soundness
 
 ### Bugs
-1. **Generated push-constant structs are `Pod` with padding.** `#[repr(C, align(16))]` plus
+1. ~~**Generated push-constant structs are `Pod` with padding.**~~ **Done (2026-10-16):** push-constant structs get an explicit zeroed `_pad` field per gap Slang leaves (tail included), `#[repr(C)]` without `align`, and derive `Pod`. `#[repr(C, align(16))]` plus
    `unsafe impl Pod` with gaps. `CBvhCullBindings` has fields up to byte 232 but a size of 240,
    and `CCompositeBindings` has interior padding. `bytes_of` (`command_buffer.rs:182`) then
    reads uninitialised bytes, which is UB. The offsets also only hold while glam uses SIMD
    alignment: glam's `scalar-math` anywhere in the dependency graph breaks the asserts.
    **Direction:** emit explicit `_pad` fields from the Slang offsets and derive `Pod`
    (`build.rs:291-301`).
-2. **Write visibility is tracked as two separate unions.** `PendingWrite::visible_to`
+2. ~~**Write visibility is tracked as two separate unions.**~~ **Done (2026-10-16):** `PendingWrite::visible` keeps each barrier's destination (stages, accesses) as a pair, merged only where that is exact; a regression test covers the sequence below. `PendingWrite::visible_to`
    (`queue.rs:611-617`) checks `visible_stages` and `visible_access` independently, and
    `made_visible` (`command_buffer.rs:1343-1383`) ORs both in. The failing sequence:
    1. Compute writes X.
@@ -81,19 +81,19 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    `VK_EXT_debug_utils` among *device* extensions (`physical_device.rs:164-169`), but it is an
    instance extension. So `set_debug_name`, the scope labels and the swapchain image names do
    nothing, and the test at `state.rs:769-773` asserts the wrong behaviour.
-4. **A compacted acceleration structure can be rebuilt into too little memory.** `compacted()`
+4. ~~**A compacted acceleration structure can be rebuilt into too little memory.**~~ **Done (2026-10-16):** `compacted()` structures are marked; `cmd.build` on one panics (updates still refit in place), and `compact` checks its destination came from `compacted`. `compacted()`
    copies the source's `max_primitives` and build scratch (`acceleration_structure.rs:255-265`),
    and `record_builds` only checks primitive counts. So `cmd.build` on a compacted structure
    writes a full build past its smaller buffer.
 5. ~~**Reused `CompactedSizes` read stale sizes.**~~ **Done (2026-10-15):** `CompactedSizes`
    became `QueryPool<CompactedSize>`, and every query pool is reset on the host when a
    recording first touches it, after checking that the frames that used it before completed.
-6. **`wait_idle` races other threads' submissions** (`lib.rs:74-78`, `epoch.rs:70-72`).
+6. ~~**`wait_idle` races other threads' submissions**~~ **Done (2026-10-16):** `wait_idle` locks every queue for the wait and marks the epochs done before unlocking, so only epochs submitted before it complete; destructors run after the unlock. (`lib.rs:74-78`, `epoch.rs:70-72`).
    - `vkDeviceWaitIdle` needs every queue externally synchronised, and lava doesn't lock them.
    - `device_idle()` completes every epoch marked submitted, including one submitted after the
      wait returned. Its destructors then run while the GPU is still using the objects.
    - Core calls it from `Swapchain::drop` while the render thread runs.
-7. **One idle `FrameSlot` stops all destruction, process-wide.** An epoch completes only at
+7. ~~**One idle `FrameSlot` stops all destruction, process-wide.**~~ **Done (2026-10-16):** `reserve` and `completed` poll the fences of the oldest submitted epochs (`vkGetFenceStatus`), so a slot that isn't begun again holds nothing back; `reserve` also runs what that frees. A slot completes its epoch before resetting its fence, so nothing polls a reset fence. An epoch completes only at
    the slot's next `begin` or its drop (`queue.rs:489-523`), and `completed()` stops at the
    oldest open epoch. A slot used once and kept, such as a tool's slot or a closed window's
    loop, leaks every later drop.
@@ -101,10 +101,10 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
      `wait_idle`.
    - **Direction:** one timeline semaphore per queue, with epochs mapped to its values and
      polled in `reserve`/`reclaim`.
-8. **Dropping an `Epoch` inside `Frame::execute` deadlocks** *(plausible trigger)*. The chain:
+8. ~~**Dropping an `Epoch` inside `Frame::execute` deadlocks**~~ **Done (2026-10-16):** destructors never run on a thread that is recording (`epoch::recording`); they wait for the next `reserve`, epoch drop or `wait_idle`. *(plausible trigger)*. The chain:
    `Epoch::drop` → `reclaim` → a destructor → `forget_image`/`forget_buffer` → `for_each_pending`
    locks every queue's `pending` mutex (`queue.rs:272-290`), which the recording already holds.
-9. **A panic while recording poisons the queue for good.** `execute_command` holds `pending`
+9. ~~**A panic while recording poisons the queue for good.**~~ **Done (2026-10-16):** the recording closure runs under `catch_unwind`; its pending accesses are put back, its barriers (logged in `CommandBuffer::barrier_log`) are submitted instead so the tracked layouts stay true, then the panic resumes. Lava's mutexes ignore poisoning. `execute_command` holds `pending`
    while the user's closure runs (`queue.rs:634`), and lava panics during recording on purpose
    (dynamic usage checks, unsupported passes).
    - After one panic, every later `execute` on that queue panics.
@@ -114,27 +114,28 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     **Done (2026-10-15):** scopes are closures (`cmd.scope(name, f)`), and frame slots no
     longer own or read queries: a user's `ScopeObserver` sees every scope and pass of a
     `cmd.measure` and records its own queries there.
-11. **`Queue<Transfer>` is unusable as built.**
+11. ~~**`Queue<Transfer>` is unusable as built.**~~ **Done (2026-10-16):** *in part:* a transfer-only family binds no descriptors and pushes no constants, dispatches, renderings and image accesses on it panic, and buffers are `CONCURRENT` between the graphics and transfer families. *Open:* images stay exclusive to graphics (no ownership transfers), and `CommandBuffer` still isn't typed by family.
     - Every command buffer binds descriptor sets at the graphics and compute bind points, which
       is invalid on a transfer-only family.
     - Resources are `EXCLUSIVE` (`image/mod.rs:54`, `buffer/mod.rs:112`), and lava never records
       a queue-family ownership transfer. So an upload on the transfer family leaves its contents
       undefined on graphics.
     - `CommandBuffer` isn't typed by family, so dispatches compile for a transfer queue.
-12. **An attachment that is also read by a shader in the same rendering ends in the wrong
-    layout.** The draws ask for `GENERAL` and the attachment for `ATTACHMENT_OPTIMAL`, so two
+12. ~~**An attachment that is also read by a shader in the same rendering ends in the wrong
+    layout.**~~ **Done (2026-10-16):** an attachment a draw of the same rendering reads is
+    rendered in `GENERAL` (`RasterBuilder::attachment_accesses`). The draws ask for `GENERAL` and the attachment for `ATTACHMENT_OPTIMAL`, so two
     transitions of one subresource go into one barrier, and the descriptor says `GENERAL`
     (`command_buffer.rs:746-755`). Read-only depth that is also sampled (soft particles, decals)
     hits this.
-13. **Depth-stencil formats get views with both aspects** (`image/mod.rs:126`). Sampling such a
+13. ~~**Depth-stencil formats get views with both aspects**~~ **Done (2026-10-16):** a sampled or storage image of a combined depth-stencil format gets a depth-only view per view, which bindless binds; `subresource_layers` names the depth aspect, and host copies of such formats are refused. (`image/mod.rs:126`). Sampling such a
     view is invalid (VUID-VkDescriptorImageInfo-imageView-01976), and host copies and
     `subresource_layers` pass both aspects.
-14. **Pending accesses never retire once the GPU is done.** A read is dropped only when a later
+14. ~~**Pending accesses never retire once the GPU is done.**~~ **Done (2026-10-16):** pending buffer reads are tagged with their frame's epoch and dropped once it completed; past 64 pending buffer writes, the completed ones fold into one write of every address (`EVERY_BUFFER`), which later accesses are made visible to once. Image accesses stay (one of each kind per image). A read is dropped only when a later
     access covers its whole range (`command_buffer.rs:1414-1475`). A ring whose read ranges move
     each frame adds entries forever, which grows every command's O(accesses × pending) scan and
     adds needless barriers. **Direction:** tag entries with the submission's serial and fold
     completed ones into one summary.
-15. **Safe code can corrupt lava's state through public mutable fields.**
+15. ~~**Safe code can corrupt lava's state through public mutable fields.**~~ **Done (2026-10-16):** the fields are private, with getters (`Buffer::address/handle`, `ImageView::image/view/mip_range/extent/handle`, `Swapchain::size/format/present_modes/present_mode` and `set_present_mode`, `Surface::handle/formats/present_modes/capabilities`); `BufferSlice::address` too.
     - `Buffer { handle, address, allocation }`: swapping allocations makes `host()` read out of
       bounds.
     - `ImageView { image, view, mip_range, extent, handle }`: retargeting a copy or widening
@@ -142,7 +143,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     - `Swapchain.size`/`format`/`present_mode` and `Surface.handle`.
 
     Make the fields private with getters.
-16. **Host access depends on the device.** With `rebar`, every buffer is mapped
+16. ~~**Host access depends on the device.**~~ **Done (2026-10-16):** *the first half:* host access works exactly on buffers created `cpu_writable`, on every device (core's `variables` is now `cpu_writable`). *Open:* `host()` still hands out `&[T]` over memory a frame in flight may write. With `rebar`, every buffer is mapped
     (`buffer/mod.rs:141-145`).
     - So core's `variables: Buffer::new(1, false)`, read through `Index` (`render.rs:605,638`),
       panics on a discrete GPU without ReBAR.
@@ -153,35 +154,35 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     - `task_shader(true)` is requested without checking it.
     - `bindless_supported` is computed and never read.
     - Missing extensions are only logged, and init carries on.
-18. **`Ctx::get()` blocks forever before `lava::init`** (`state.rs:47-50`). A second `init`
+18. ~~**`Ctx::get()` blocks forever before `lava::init`**~~ **Done (2026-10-16):** `Ctx::get()` panics before init; a second `init` fails before creating anything, and a failed init destroys what it created (device, messenger, instance). (`state.rs:47-50`). A second `init`
     builds a whole instance and device before failing, and leaks them; a partly failed init leaks
     too. Core works around the blocking with a lazy `OnceLock` in `material.rs`.
-19. **Acquire and present can race from safe code.** `aquire_image(&self)` and
+19. ~~**Acquire and present can race from safe code.**~~ **Done (2026-10-16):** a mutex in the swapchain is held by `aquire_image` and `Queue::present`. `aquire_image(&self)` and
     `present(&Swapchain)` don't synchronise the swapchain, and `Swapchain` is `Sync`.
-20. **`Surface::new` takes raw window handles but is safe** (a dangling handle is UB), and a
+20. ~~**`Surface::new` takes raw window handles but is safe**~~ **Done (2026-10-16):** `Surface::new` is `unsafe` with its contract documented, and every swapchain holds the surface's handle (`Arc`), so the surface is destroyed after its last swapchain whatever the drop order. (a dangling handle is UB), and a
     `Swapchain` doesn't own its surface, so drop order is left to field order in core.
-21. **Bindless `Load`/`Store` lack `NonUniformResourceIndex`** (`bindless.slang:21,67,76,79,92,95`).
+21. ~~**Bindless `Load`/`Store` lack `NonUniformResourceIndex`**~~ **Done (2026-10-16):** every `Load` and `Store` in `bindless.slang` indexes with `NonUniformResourceIndex`. (`bindless.slang:21,67,76,79,92,95`).
     Handles read from buffers are divergent, and AMD requires the qualifier. Only `Sample`,
     `SampleLevel` and `GetDimensions` have it.
-22. **Passes with their own descriptor bindings aren't rejected.** A global `Texture2D t;` gets
+22. ~~**Passes with their own descriptor bindings aren't rejected.**~~ **Done (2026-10-16):** lava-build-slang rejects global parameters other than push constants, specialization constants and lava's three bindless heaps (by name, binding and set). A global `Texture2D t;` gets
     a Slang-assigned binding that collides with set 0 (`build.rs:917-925`).
 23. ~~**Feature gating covers only ray tracing.**~~ **Done (2026-10-16):** a pass's needs come from its SPIR-V capabilities (`Features::of_spirv`). A mesh pass on a device without mesh shaders
     reaches pipeline creation with a `MESH_EXT` stage before the friendly panic
     (`pipeline.rs:89-99`, `command_buffer.rs:830,907`). The same holds for int64, float16 and
     shader clock. Map every `OpCapability` to `Features` at build time.
-24. **Handles nested in push-constant structs are silently untracked.** A `Buf`/`Img`/`Accel`
+24. ~~**Handles nested in push-constant structs are silently untracked.**~~ **Done (2026-10-16):** a handle in a struct or array of push constants is a build error; `Buf<T>`'s pointer is `Ptr<T, Access.Read>`, so writes through it don't compile (core's `instance_flags` helper takes such a pointer now). A `Buf`/`Img`/`Accel`
     inside a struct becomes a bare `u64` with no access or barrier (`build.rs:392-396`). `Buf<T>`
     is also writable in Slang (`bindless.slang:151`) but tracked as a read.
-25. **Submit failure leaves stale tracking.** Pending accesses and layouts are committed before
+25. ~~**Submit failure leaves stale tracking.**~~ **Done (2026-10-16):** see 9: a failed submit is replaced by one of its barriers, and a failed pool reset is logged instead of hiding the original error. Pending accesses and layouts are committed before
     `queue_submit2` (`queue.rs:660-689`), and `slot.pool.reset()?` can hide the original error.
-26. **Present retirement relies on a heuristic.** "One more epoch" assumes a later fence means
+26. ~~**Present retirement relies on a heuristic.**~~ **Done (2026-10-16):** with `Features::present_fences` (`VK_EXT_swapchain_maintenance1` and the surface maintenance instance extensions), every present signals a fence, and what a present may use waits for the presents made before its drop; `wait_idle` waits for them too (at most 1 s). Devices without it keep the heuristic. "One more epoch" assumes a later fence means
     earlier presents released their semaphores, which the spec doesn't promise. Use
     `VK_KHR_swapchain_maintenance1` present fences where available; this device has it.
-27. **Pool sizes and set counts use different limits.** The variable descriptor counts use the
+27. ~~**Pool sizes and set counts use different limits.**~~ **Done (2026-10-16):** the pool sizes are the variable descriptor counts the sets allocate. The variable descriptor counts use the
     update-after-bind limits, but the pool uses the non-UAB ones (`bindless.rs:218-227,296-314`).
-28. **Some texel types are wrong.** `R64Sfloat` texels are `[f32; 1]` and R64 ints are 32-bit,
+28. ~~**Some texel types are wrong.**~~ **Done (2026-10-16):** 64-bit formats have 64-bit texels (clear values must fit 32 bits), stencil is `[u32; 1]`, and combined depth-stencil formats read as `[f32; 1]` (their depth); lava-build-slang maps 64-bit shader element types too. `R64Sfloat` texels are `[f32; 1]` and R64 ints are 32-bit,
     while stencil is `[u8]` but shaders read `uint` (`format.rs:175,325-328,403-405,424-426`).
-29. **`#[validation_trace]` reads the proc-macro crate's `debug_assertions`, not the user's**
+29. ~~**`#[validation_trace]` reads the proc-macro crate's `debug_assertions`, not the user's**~~ **Done (2026-10-16):** the expansion is guarded by `cfg(debug_assertions)`/`cfg_attr`, evaluated in the crate that uses it.
     (`lava-macros/src/lib.rs:12-21`).
 30. ~~**Timestamps are written on families with `timestamp_valid_bits == 0`**~~ **Done
     (2026-10-15):** writing a timestamp on such a family panics.
@@ -190,9 +191,9 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 - **Zero and limit checks:**
   - zero-size buffers, zero extents, `mip_levels == 0` or beyond `log2(max) + 1`;
   - compute groups beyond `maxComputeWorkGroupCount`, raytrace dimensions beyond the device limit.
-- **Copy bounds:** blit and copy regions outside the mip. `copy_image_to_buffer` doesn't check
-  the buffer size, and with address commands the driver doesn't either, so it can write past
-  the buffer.
+- **Copy bounds:** blit and copy regions outside the mip. ~~`copy_image_to_buffer` doesn't
+  check the buffer size~~ *Done (2026-10-16): both buffer-image copies check the buffer holds
+  the texels.*
 - **Buffer commands:** `update_buffer` writes one `T` but tracks the whole slice, and checks
   neither 4-byte multiples nor 64 KiB. `fill_buffer` doesn't check alignment.
 - **Casts:** `BufferSlice::cast` doesn't check size divisibility or alignment, and `mapped()`
@@ -243,7 +244,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
   where present for polygon mode, samples, blend and write masks. The pipeline key then shrinks
   to formats plus constants.
 - **`RasterBuilder` moves `[Draw; N]` (about 1.2 KB each) on every call.** That is O(n²) memcpy
-  *Done (2026-10-16):* the builder works through `&mut self` on a draw list the command buffer lends it.
+  *Done (2026-10-16):* the builder works through `&mut self` and borrows its draws (unsized `DrawOutput`s, 16 inline).
   and one monomorphisation per draw count.
 - **Raster passes are coarse in barriers.** Every resource of a raster pass is accessed at
   `VERTEX|FRAGMENT` or `TASK|MESH|FRAGMENT` (`build.rs:30-41`).
@@ -288,7 +289,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 ## 4. API friction
 
 1. **`RasterBuilder` counts draws in its type**, so draws can't be added in a loop; core records
-     *Done (2026-10-16):* `cmd.raster(extent, [Attachment::color(..); N])`, draws in a reused list, addable in loops.
+     *Done (2026-10-16):* `cmd.raster(extent, [Attachment::color(..); N])`, borrowed draws, addable in loops.
    draws of count 0. Only the attachment count needs checking. **Direction:**
    `cmd.raster(extent, [attachments; N], depth)` with a plain const `N` (stable Rust), and the
    draws in a `Vec` the `CommandBuffer` reuses.

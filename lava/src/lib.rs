@@ -44,6 +44,7 @@ pub mod memory;
 pub mod pipeline;
 pub mod query;
 pub mod state;
+mod unsized_struct;
 pub mod vk;
 pub mod vkobjects;
 use raw_window_handle::RawDisplayHandle;
@@ -105,6 +106,7 @@ impl Config<'static> {
 /// (a pass whose SPIR-V needs a missing feature gets none and panics when recorded).
 pub fn init(config: &Config) -> Result<()> {
     Ctx::init(config)?;
+    epoch::set_present_fences(Ctx::features().present_fences);
     pipeline::set_pass_map(config.passes);
     Bindless::init(config.samplers)?;
     query::init()?;
@@ -114,11 +116,21 @@ pub fn init(config: &Config) -> Result<()> {
 
 /// Waits until the device finished everything submitted so far, e.g. before exiting. A stall;
 /// a dropped resource is destroyed once the frames that may use it are done anyway (`epoch`).
-/// Destroys what every submitted frame and present kept alive, so call it outside of
-/// `Frame::execute`.
+/// Destroys what the frames and presents submitted before it kept alive. Every queue is locked
+/// meanwhile (Vulkan wants them externally synchronised), so other threads' submissions and
+/// presents wait; call it outside of `Frame::execute`.
 pub fn wait_idle() -> Result<()> {
-    unsafe { Ctx::device().device_wait_idle()? };
-    epoch::device_idle();
+    {
+        let _queues = vkobjects::queue::lock_all_queues();
+        unsafe { Ctx::device().device_wait_idle()? };
+        // The presentation engine may still hold what the last presents use.
+        epoch::wait_for_presents(1_000_000_000);
+        // Before the queues are unlocked: what is submitted after it isn't done.
+        epoch::device_idle();
+    }
+    // Destructors lock the queues' pending accesses, which a recording holds while it waits
+    // to submit.
+    epoch::reclaim();
     Ok(())
 }
 

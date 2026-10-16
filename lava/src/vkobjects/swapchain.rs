@@ -1,5 +1,9 @@
 //! Swapchain creation (usage chosen by type, format by preference), image acquisition, resize-driven recreation, and the command that readies an image for presenting
-use std::{ffi::CStr, iter, sync::atomic::AtomicU32};
+use std::{
+    ffi::CStr,
+    iter,
+    sync::{Arc, Mutex, MutexGuard, atomic::AtomicU32},
+};
 
 use crate::{
     bindless::BindlessHandle,
@@ -23,7 +27,7 @@ use crate::{
     state::{Ctx, Functions},
     vkobjects::{
         queue::{Binary, Fence, Semaphore, forget_image},
-        surface::Surface,
+        surface::{Surface, SurfaceHandle},
     },
 };
 
@@ -39,27 +43,71 @@ struct SwapchainImage {
 /// color attachment and transfer destination by default).
 #[derive(Debug)]
 pub struct Swapchain<U: StaticUsage = ColorAttachmentTransferDst> {
-    pub size: UVec2,
+    size: UVec2,
     /// Picked from what the surface supports, by `preferred`; a recreated swapchain may pick
     /// another.
-    pub format: format::Dynamic,
+    format: format::Dynamic,
     /// The formats and colour spaces `new` was asked for, in order of preference.
     preferred: SmallVec<[vk::SurfaceFormatKHR; 2]>,
     /// The surface's supported modes of `PRESENT_MODES`, FIFO first, with their names.
-    pub present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,
-    /// Index into `present_modes`; set it and `recreate` to switch. A recreated swapchain keeps it.
-    pub present_mode: usize,
-    pub(crate) handle: vk::SwapchainKHR,
+    present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,
+    /// Index into `present_modes`. A recreated swapchain keeps it.
+    present_mode: usize,
+    handle: vk::SwapchainKHR,
+    /// Held while an image is acquired or presented: both need the swapchain externally
+    /// synchronised, and a `&Swapchain` can be on several threads.
+    sync: Mutex<()>,
     images: SmallVec<[SwapchainImage; 5]>,
     usage: U,
+    /// Keeps the surface until the swapchain is destroyed, whenever the `Surface` is dropped.
+    surface: Arc<SurfaceHandle>,
 }
 
 impl<U: StaticUsage> Swapchain<U> {
+    /// The extent of its images.
+    pub fn size(&self) -> UVec2 {
+        self.size
+    }
+
+    /// The format of its images, picked by `new`'s preference.
+    pub fn format(&self) -> format::Dynamic {
+        self.format
+    }
+
+    /// The present modes the surface supports, FIFO first, then by falling latency, with
+    /// their names.
+    pub fn present_modes(&self) -> &[(vk::PresentModeKHR, &'static str)] {
+        &self.present_modes
+    }
+
+    /// The index into `present_modes` of the mode it presents with.
+    pub fn present_mode(&self) -> usize {
+        self.present_mode
+    }
+
+    /// Picks the present mode `index` of `present_modes` for the swapchains `recreate` makes;
+    /// this one keeps its mode. Panics if there is no such mode.
+    pub fn set_present_mode(&mut self, index: usize) {
+        assert!(
+            index < self.present_modes.len(),
+            "present mode {index} of {} supported ones",
+            self.present_modes.len()
+        );
+        self.present_mode = index;
+    }
+
+    /// The swapchain locked for a present (`Queue::present`), with its handle.
+    pub(crate) fn lock(&self) -> (MutexGuard<'_, ()>, vk::SwapchainKHR) {
+        let guard = self.sync.lock().unwrap_or_else(|poison| poison.into_inner());
+        (guard, self.handle)
+    }
+
     pub fn image(&self, index: u32) -> ImageView<'_, format::Dynamic, U> {
         let image = &self.images[index as usize];
         ImageView {
             image: image.image,
             view: image.view,
+            shader_view: image.view,
             mip_range: (0..1).into(),
             extent: self.size,
             handle: image.handle,
@@ -98,35 +146,35 @@ impl<U: StaticUsage> Swapchain<U> {
                 .optimal_tiling_features
                 .contains(format_features(usage))
         };
-        let format = select_surface_format(&surface.formats, preferred, usable).ok_or_else(|| {
+        let format = select_surface_format(surface.formats(), preferred, usable).ok_or_else(|| {
             Error::message(format!(
                 "the surface has no format whose images support {usage:?}"
             ))
         })?;
 
-        let present_modes = supported_present_modes(&surface.present_modes);
+        let present_modes = supported_present_modes(surface.present_modes());
         let present_mode_index = old.map_or(0, |old| old.present_mode.min(present_modes.len() - 1));
         let present_mode = present_modes[present_mode_index].0;
-        let extent = select_extent(size, &surface.capabilities);
+        let extent = select_extent(size, surface.capabilities());
         if extent.width == 0 || extent.height == 0 {
             return Err(Error::message(
                 "the surface has no extent to create a swapchain for (a minimised window)",
             ));
         }
-        let supported = surface.capabilities.supported_usage_flags;
+        let supported = surface.capabilities().supported_usage_flags;
         if !supported.contains(usage) {
             return Err(Error::message(format!(
                 "the surface supports the image usages {supported:?}, swapchain images need {usage:?}"
             )));
         }
 
-        let image_count = surface.capabilities.min_image_count;
+        let image_count = surface.capabilities().min_image_count;
 
         let families_indices = [Ctx::gfx_queue_index(), Ctx::present_queue_index()];
 
         let create_info = {
             let mut builder = vk::SwapchainCreateInfoKHR::default()
-                .surface(surface.handle)
+                .surface(surface.handle())
                 .min_image_count(image_count)
                 .image_format(format.format)
                 .image_color_space(format.color_space)
@@ -147,7 +195,7 @@ impl<U: StaticUsage> Swapchain<U> {
             }
 
             builder
-                .pre_transform(surface.capabilities.current_transform)
+                .pre_transform(surface.capabilities().current_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                 .present_mode(present_mode)
                 .clipped(true)
@@ -206,6 +254,8 @@ impl<U: StaticUsage> Swapchain<U> {
             size: UVec2::new(extent.width, extent.height),
             present_modes,
             present_mode: present_mode_index,
+            sync: Mutex::new(()),
+            surface: surface.shared_handle(),
         })
     }
 
@@ -228,12 +278,15 @@ impl<U: StaticUsage> Swapchain<U> {
         );
     }
 
+    /// The index of the next image, once `wait_on` is signalled. Holds the swapchain while it
+    /// waits for an image, so a present of it from another thread waits too.
     #[validation_trace]
     pub fn aquire_image(&self, wait_on: &Semaphore<Binary>, fence: Option<&Fence>) -> Result<u32> {
         let _span = tracing::info_span!("wait for swapchain image").entered();
+        let (_sync, handle) = self.lock();
         let (image_index, _suboptimal) = unsafe {
             Functions::swapchain().acquire_next_image(
-                self.handle,
+                handle,
                 u64::MAX,
                 wait_on.handle,
                 fence.map(|e| e.handle).unwrap_or(vk::Fence::null()),
@@ -262,13 +315,18 @@ impl<U: StaticUsage> Drop for Swapchain<U> {
         let images: SmallVec<[_; 5]> = (self.images.iter())
             .map(|i| (i.image, i.view, i.handle))
             .collect();
-        epoch::retire_after_present(move || unsafe {
-            for (image, view, handle) in images {
-                forget_image(image);
-                bindless::release(handle);
-                Ctx::device().destroy_image_view(view, None);
+        // The surface is destroyed after its last swapchain.
+        let surface = self.surface.clone();
+        epoch::retire_after_present(move || {
+            unsafe {
+                for (image, view, handle) in images {
+                    forget_image(image);
+                    bindless::release(handle);
+                    Ctx::device().destroy_image_view(view, None);
+                }
+                Functions::swapchain().destroy_swapchain(handle, None);
             }
-            Functions::swapchain().destroy_swapchain(handle, None);
+            drop(surface);
         });
     }
 }

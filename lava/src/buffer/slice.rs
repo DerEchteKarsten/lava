@@ -25,8 +25,8 @@ use crate::{
 /// (`VK_KHR_device_address_commands`).
 #[derive(Copy, Clone, Debug)]
 pub struct BufferSlice<'a, T: Copy + Pod, U: BufferUsage = Storage> {
-    /// What generated push constants hold.
-    pub address: u64,
+    /// What generated push constants hold (`address()`).
+    pub(crate) address: u64,
     pub(crate) size: u64,
     pub(crate) usage: U,
     pub(crate) _marker: PhantomData<&'a [T]>,

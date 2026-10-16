@@ -12,6 +12,8 @@ use crate::{
     image::{
         Image, Views,
         dim::{D2, Dim},
+        expected_data_len,
+        format::bc_block,
         format::{ColorAspect, Format},
         usage::{ImageUsage, IsTransferDst, IsTransferSrc},
     },
@@ -22,12 +24,16 @@ use crate::{
 /// take these, whichever kind of image they come from (a swapchain's included).
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
-    pub image: vk::Image,
-    pub view: vk::ImageView,
-    pub mip_range: Range<u32>,
+    pub(crate) image: vk::Image,
+    /// Over every aspect: what attachments use.
+    pub(crate) view: vk::ImageView,
+    /// What descriptors use: `view`, except for a combined depth-stencil format, whose shaders
+    /// see the depth aspect alone (a sampled view can't have both).
+    pub(crate) shader_view: vk::ImageView,
+    pub(crate) mip_range: Range<u32>,
     /// The extent of mip `mip_range.start`.
-    pub extent: D::Extent,
-    pub handle: BindlessHandle,
+    pub(crate) extent: D::Extent,
+    pub(crate) handle: BindlessHandle,
     /// The tracked layouts: one for all of `mip_range` (an image with one view, or a swapchain
     /// image), or one per mip.
     pub(crate) layouts: &'a [AtomicU32],
@@ -37,6 +43,31 @@ pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
 }
 
 impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
+    /// The image the view is of.
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    /// The Vulkan view over every aspect of the view's mips.
+    pub fn view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    /// The mips the view covers.
+    pub fn mip_range(&self) -> Range<u32> {
+        self.mip_range
+    }
+
+    /// The extent of its first mip.
+    pub fn extent(&self) -> D::Extent {
+        self.extent
+    }
+
+    /// Where the view is bound in the bindless sets (`NULL_HANDLE`s where it isn't).
+    pub fn handle(&self) -> BindlessHandle {
+        self.handle
+    }
+
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange {
             aspect_mask: self.format.aspects(),
@@ -46,9 +77,11 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             layer_count: 1,
         }
     }
+    /// The layers of `mip_level` a copy or blit addresses: one aspect, the depth aspect of a
+    /// combined depth-stencil format.
     pub fn subresource_layers(&self, mip_level: u32) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
-            aspect_mask: self.format.aspects(),
+            aspect_mask: single_aspect(self.format.aspects()),
             mip_level,
             base_array_layer: 0,
             layer_count: 1,
@@ -103,6 +136,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         ImageView {
             image: self.image,
             view: self.view,
+            shader_view: self.shader_view,
             mip_range: self.mip_range,
             extent: self.extent,
             handle: self.handle,
@@ -166,6 +200,16 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageSlice<'a, F, U, D> {
             offset: self.offset,
             extend: self.extend,
         }
+    }
+}
+
+/// The aspect a view of a combined depth-stencil format shows shaders, and copies address:
+/// depth. Every other format has one aspect.
+pub(crate) fn single_aspect(aspects: vk::ImageAspectFlags) -> vk::ImageAspectFlags {
+    if aspects.contains(vk::ImageAspectFlags::DEPTH) {
+        vk::ImageAspectFlags::DEPTH
+    } else {
+        aspects
     }
 }
 
@@ -291,6 +335,7 @@ impl CommandBuffer {
     {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        check_copy_size(&dst, src.size(), "source");
         self.flush_pending(
             iter::once(dst.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -339,6 +384,7 @@ impl CommandBuffer {
     {
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
+        check_copy_size(&src, dst.size(), "destination");
         self.flush_pending(
             iter::once(src.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -366,6 +412,29 @@ impl CommandBuffer {
                     .regions(&regions),
             )
         };
+    }
+}
+
+/// Panics unless `buffer` holds the texels of `slice` tightly packed: with address commands,
+/// neither the driver nor the validation layer checks a copy's buffer size.
+fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
+    slice: &ImageSlice<'_, F, U, D>,
+    buffer_bytes: u64,
+    what: &str,
+) {
+    let format = slice.view.format;
+    let needed = expected_data_len(
+        D::extent_3d(slice.extend),
+        format.texel_size(),
+        bc_block(format.vk_format()),
+    );
+    if let Some(needed) = needed {
+        assert!(
+            needed as u64 <= buffer_bytes,
+            "the {what} buffer has {buffer_bytes} bytes, the copy of {:?} texels of {:?} takes {needed}",
+            slice.extend,
+            format.vk_format()
+        );
     }
 }
 
@@ -413,6 +482,7 @@ mod tests {
         ImageView {
             image: vk::Image::from_raw(42),
             view: vk::ImageView::null(),
+            shader_view: vk::ImageView::null(),
             mip_range: mips.into(),
             extent: UVec2::new(64, 32),
             handle: BindlessHandle::none(),
@@ -437,13 +507,12 @@ mod tests {
     }
 
     #[test]
-    fn subresource_layers_use_the_formats_aspects() {
+    fn subresource_layers_name_one_aspect() {
         let layout = undefined();
         let layers = view::<D32SfloatS8Uint, DepthAttachment>(&layout, 0..1).subresource_layers(3);
-        assert_eq!(
-            layers.aspect_mask,
-            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
-        );
+        assert_eq!(layers.aspect_mask, vk::ImageAspectFlags::DEPTH);
+        let color = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1).subresource_layers(0);
+        assert_eq!(color.aspect_mask, vk::ImageAspectFlags::COLOR);
         assert_eq!(layers.mip_level, 3);
         assert_eq!((layers.base_array_layer, layers.layer_count), (0, 1));
     }
@@ -554,6 +623,16 @@ mod tests {
         a.cast(R8G8B8A8Unorm, SampledStorage);
         assert!(std::panic::catch_unwind(|| a.cast(R8G8B8A8Unorm, DepthAttachment)).is_err());
         assert!(std::panic::catch_unwind(|| a.cast(D32SfloatS8Uint, Sampled)).is_err());
+    }
+
+    #[test]
+    fn copies_check_the_buffer_holds_the_texels() {
+        let layout = undefined();
+        let slice = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1).region(UVec2::new(4, 2));
+        check_copy_size(&slice, 32, "destination");
+        check_copy_size(&slice, 64, "destination");
+        let short = std::panic::catch_unwind(|| check_copy_size(&slice, 31, "destination"));
+        assert!(short.is_err());
     }
 
     #[test]

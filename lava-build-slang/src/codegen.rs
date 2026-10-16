@@ -314,6 +314,9 @@ fn image_texel(t: &TypeLayout) -> Option<(&'static str, usize)> {
         ScalarType::Uint32 => "u32",
         ScalarType::Int32 => "i32",
         ScalarType::Uint8 => "u8",
+        ScalarType::Float64 => "f64",
+        ScalarType::Uint64 => "u64",
+        ScalarType::Int64 => "i64",
         _ => return None,
     };
     let components = match element.kind() {
@@ -337,35 +340,137 @@ fn field_kind(t: &TypeLayout) -> FieldKind {
     }
 }
 
-fn generate_gpu_struct(name: &str, pc: &TypeLayout, structs: &mut Structs) -> String {
-    let fields = pc
+/// The gaps between the fields of `t` and after the last one up to Slang's size, as
+/// `(offset, bytes)`: where the generated struct needs explicit padding.
+fn padding(t: &TypeLayout) -> Vec<(usize, usize)> {
+    let mut gaps = Vec::new();
+    let mut end = 0;
+    for f in t.checked_fields() {
+        let offset = f.offset(Cat::Uniform);
+        if offset > end {
+            gaps.push((end, offset - end));
+        }
+        end = offset + f.checked_type_layout().unwrap().size(Cat::Uniform);
+    }
+    let size = t.size(Cat::Uniform);
+    if size > end {
+        gaps.push((end, size - end));
+    }
+    gaps
+}
+
+/// The push-constant struct of a pass. Every gap Slang leaves (between fields, and up to its
+/// size, which it rounds up to its alignment) is an explicit zeroed `_pad` field, so the struct
+/// has no padding bytes and derives `Pod`: its bytes, which `Bindings::new` copies, are all
+/// initialised. That needs no SIMD alignment of glam's types either.
+fn generate_gpu_struct(name: &str, pc: &TypeLayout, structs: &mut Structs) -> (String, Vec<String>) {
+    let gaps = padding(pc);
+    let mut fields: Vec<(usize, String)> = pc
         .checked_fields()
         .map(|f| {
-            format!(
+            let line = format!(
                 "    pub {}: {},",
                 field_name(f),
                 gpu_type(f.checked_type_layout().unwrap(), structs)
-            )
+            );
+            (f.offset(Cat::Uniform), line)
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    fields.extend(
+        gaps.iter()
+            .map(|(offset, bytes)| (*offset, format!("    _pad{offset}: [u8; {bytes}],"))),
+    );
+    // A gap starts where a field ends, so it sorts after the fields at its offset (none, or a
+    // zero-sized one).
+    fields.sort_by_key(|(offset, line)| (*offset, line.starts_with("    _pad")));
+    let fields: Vec<String> = fields.into_iter().map(|(_, line)| line).collect();
+    let fields = fields.join("\n");
     let checks = layout_checks(name, pc);
-    // Slang rounds the size up to its alignment (8 for a trailing `uint2` and `float`), which
-    // can be more than the Rust fields need.
-    let align = pc.alignment(Cat::Uniform).max(1);
+    let pad_inits = gaps
+        .iter()
+        .map(|(offset, bytes)| format!("_pad{offset}: [0; {bytes}]"))
+        .collect();
 
-    format!(
+    let code = format!(
         r#"
-#[derive(Clone, Copy)]
-#[repr(C, align({align}))]
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
 pub struct {name} {{
 {fields}
 }}
-{checks}
-unsafe impl bytemuck::Pod for {name} {{}}
-unsafe impl bytemuck::Zeroable for {name} {{}}
-"#
-    )
+{checks}"#
+    );
+    (code, pad_inits)
+}
+
+/// Panics if a plain push-constant field of `source` holds a buffer, image or acceleration
+/// structure handle in a struct or array: only top-level handle fields become typed
+/// parameters with tracked accesses.
+fn reject_nested_handles(field: &str, t: &TypeLayout, source: &str) {
+    let nested = |t: &TypeLayout| {
+        is_struct_named(t, &HANDLE_TYPES)
+            || is_struct_named(t, &BUFFER_TYPES)
+            || is_struct_named(t, &ACCEL_TYPES)
+    };
+    match t.kind() {
+        TypeKind::Array => {
+            let element = t.checked_element_type_layout().unwrap();
+            if nested(element) {
+                panic!(
+                    "{source}: push constant `{field}` is an array of `{}` handles, which lava \
+                     can't track: give each its own field",
+                    type_name(element)
+                );
+            }
+            reject_nested_handles(field, element, source);
+        }
+        TypeKind::Struct if !MIRRORED_TYPES.iter().any(|(slang, _)| *slang == type_name(t)) => {
+            for f in t.checked_fields() {
+                let inner = f.checked_type_layout().unwrap();
+                let path = format!("{field}.{}", field_name(f));
+                if nested(inner) {
+                    panic!(
+                        "{source}: push constant `{path}` is a `{}` inside a struct, which lava \
+                         can't track: make it a field of the push-constant struct itself",
+                        type_name(inner)
+                    );
+                }
+                reject_nested_handles(&path, inner, source);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// lava's bindless descriptors (`bindless.slang`) with their `(binding, set)`: the only
+/// descriptors a pass may have.
+const LAVA_DESCRIPTORS: [(&str, u32, u32); 3] = [
+    ("SamplerHeap", 0, 0),
+    ("TextureHeap", 1, 0),
+    ("RWTextureHeap", 0, 1),
+];
+
+/// Panics if the pass declares global parameters besides its push constants, specialization
+/// constants and lava's bindless descriptors: a descriptor of its own would get a binding that
+/// collides with lava's sets, and lava binds nothing else.
+fn reject_own_parameters(layout: &slang::reflection::Shader, source: &str) {
+    for p in layout.checked_parameters() {
+        let category = p.category();
+        if matches!(category, Cat::PushConstantBuffer | Cat::SpecializationConstant) {
+            continue;
+        }
+        let name = p.variable().and_then(|v| v.checked_name()).unwrap_or("?");
+        let lava = LAVA_DESCRIPTORS.iter().any(|&(lava, binding, set)| {
+            name == lava && p.binding_index() == binding && p.binding_space() == set
+        });
+        if !lava {
+            panic!(
+                "{source}: global parameter `{name}` ({category:?}): a pass has no descriptors or \
+                 uniforms of its own; reach resources through push-constant handles (`Img`, \
+                 `Buf`, `MutBuf`, `Accel`) instead"
+            );
+        }
+    }
 }
 
 struct NewFn {
@@ -420,7 +525,7 @@ fn build_new_fn<'a>(
                     "{name}: ImageView<'a, F{suffix}, U{suffix}, {}>",
                     image_dim(t)
                 ));
-                out.gpu_inits.push(format!("{name}: {name}.handle"));
+                out.gpu_inits.push(format!("{name}: {name}.handle()"));
                 out.image_accesses.push(format!(
                     "{name}.access({stage}, {access}, vk::ImageLayout::GENERAL)",
                     access = image_access(usage)
@@ -436,7 +541,7 @@ fn build_new_fn<'a>(
                     "{name}.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);"
                 ));
                 out.params.push(format!("{name}: {ty}"));
-                out.gpu_inits.push(format!("{name}: {name}.address"));
+                out.gpu_inits.push(format!("{name}: {name}.address()"));
                 let access = if type_name(t) == "MutBuf" {
                     "vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE"
                 } else {
@@ -689,13 +794,17 @@ fn generate_pass(
         "the push constants of {source} take {size} bytes, more than the {MAX_PUSH_CONSTANTS_SIZE} a pass can have"
     );
 
-    let gpu_struct = generate_gpu_struct(&gpu_name, pc, structs);
-    let push = build_new_fn(
+    let (gpu_struct, pad_inits) = generate_gpu_struct(&gpu_name, pc, structs);
+    for f in pc.checked_fields() {
+        reject_nested_handles(field_name(f), f.checked_type_layout().unwrap(), source);
+    }
+    let mut push = build_new_fn(
         pc.checked_fields()
             .map(|f| (field_name(f), f.checked_type_layout().unwrap())),
         structs,
         stage,
     );
+    push.gpu_inits.extend(pad_inits);
     // The generated types spell out each section's size, so a binding is as big as its pass.
     let (images, buffers) = (push.image_accesses.len(), push.buffer_accesses.len());
     let output = format!("Bindings<'a, kind::{kind_marker}, {size}, {images}, {buffers}, 0>");
@@ -938,6 +1047,7 @@ use lava::pipeline::*;
             .unwrap_or_else(|| panic!("no push constant buffer found in {source}"));
 
         let consts = sconsts(layout, source);
+        reject_own_parameters(layout, source);
 
         let out = passes_dir.join(format!("{pass_name}.spv"));
         let code = generate_pass(

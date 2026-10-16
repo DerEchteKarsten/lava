@@ -1,12 +1,15 @@
 //! Command recording for generated passes: barriers, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with the swapchain)
 use std::{
     fmt::Debug,
+    marker::PhantomData,
+    ops::Deref,
     panic::AssertUnwindSafe,
     ptr::NonNull,
     range::Range,
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use crate::vk::{self, IndexType, PipelineStageFlags2 as S2};
 use crate::{
     bindless::Bindless,
     buffer::{
@@ -22,14 +25,15 @@ use crate::{
         usage::{IsColorAttachment, IsDepthAttachment, IsSampled, IsStorage},
     },
     pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterKeyRef, pass_map, pipelines},
-    query::{Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp},
+    query::{
+        Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
+    },
     state::{Ctx, Functions},
     vkobjects::{
         acceleration_structure::Tlas,
-        queue::{PendingAccesses, PendingWrite, Stage},
+        queue::{PendingAccesses, PendingRead, PendingWrite},
     },
 };
-use crate::vk::{self, IndexType};
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
@@ -37,9 +41,10 @@ use smallvec::{SmallVec, smallvec};
 
 mod binding_output;
 mod raster_state;
+use crate::unsized_struct::unsized_struct;
 use binding_output::Sections;
-pub use raster_state::*;
 pub use binding_output::{BindingOutput, Bindings, kind};
+pub use raster_state::*;
 
 /// A pass's access of a buffer range, made by `BufferSlice::access` (a binding generator's
 /// part of [`Bindings::new`]).
@@ -59,6 +64,17 @@ pub(crate) const EVERY_ACCELERATION_STRUCTURE: Range<u64> = Range {
     start: u64::MAX,
     end: u64::MAX,
 };
+
+/// The range of the write that completed buffer writes are folded into once there are too
+/// many (`PendingAccesses::retire`): every address. No buffer covers it and none is destroyed
+/// with it, since none starts at address 0.
+pub(crate) const EVERY_BUFFER: Range<u64> = Range {
+    start: 0,
+    end: u64::MAX,
+};
+
+/// How many pending buffer writes are kept before the completed ones are folded into one.
+const MAX_PENDING_BUFFER_WRITES: usize = 64;
 
 impl BufferAccess {
     /// Whether the two accesses touch the same memory.
@@ -148,10 +164,48 @@ pub struct CommandBuffer {
     depth: u16,
     /// The kinds of the active queries (`query_bit`): one of each can be active.
     pub(crate) active_queries: u32,
-    /// The barriers of [`Self::record_access`]es, recorded with the next command's.
-    deferred: Option<Barriers>,
-    /// The draw list renderings reuse (`RasterBuilder::draws`), empty between them.
-    draws: Vec<Draw<'static>>,
+    /// What the queue family can do.
+    caps: QueueCaps,
+    /// Every barrier computed so far, in order: the tracking already counts them (layouts
+    /// moved, accesses recorded), so a recording that never reaches the GPU is replaced by one
+    /// of just these (`FrameSlot`), which keeps the tracking true.
+    pub(crate) barrier_log: Vec<Barriers>,
+}
+
+/// What a queue family can record, which `CommandBuffer` isn't typed by.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueueCaps {
+    pub(crate) flags: vk::QueueFlags,
+    /// Images are `EXCLUSIVE` to the graphics family, and lava records no ownership
+    /// transfers, so only it may access them.
+    pub(crate) images: bool,
+}
+
+impl QueueCaps {
+    /// A graphics family's: everything.
+    #[cfg(test)]
+    pub(crate) const ALL: QueueCaps = QueueCaps {
+        flags: vk::QueueFlags::from_raw(
+            vk::QueueFlags::GRAPHICS.as_raw() | vk::QueueFlags::COMPUTE.as_raw(),
+        ),
+        images: true,
+    };
+
+    fn require(&self, flags: vk::QueueFlags, what: &str) {
+        assert!(
+            self.flags.contains(flags),
+            "{what} can't be recorded on a queue family of {:?}",
+            self.flags
+        );
+    }
+
+    fn require_images(&self) {
+        assert!(
+            self.images,
+            "images are only accessed on the graphics family (`Queue<Gfx>`): they are \
+             exclusive to it, and lava records no ownership transfers"
+        );
+    }
 }
 
 /// A bit per kind of query that is begun and ended, of which one can be active at a time.
@@ -170,11 +224,11 @@ pub struct ShaderHash {
     pub file: &'static str,
 }
 
-/// The most color attachments a rendering can have.
-pub const MAX_COLOR_ATTACHMENTS: usize = 8;
+/// How many draws a rendering keeps without allocating.
+const INLINE_DRAWS: usize = 16;
 
 /// One rendering being built (`CommandBuffer::raster`): its `N` color attachments, an optional
-/// depth attachment and the draws so far, which [`Self::record`] records.
+/// depth attachment and the draws so far, which it borrows and [`Self::record`] records.
 pub struct RasterBuilder<'a, const N: usize> {
     cmd_buf: &'a mut CommandBuffer,
     extent: UVec2,
@@ -187,8 +241,8 @@ pub struct RasterBuilder<'a, const N: usize> {
     /// Only a read; [`Self::depth_access`] adds the write.
     depth_access: Option<ImageUse<'a>>,
     clear_depth: Option<vk::ClearValue>,
-    /// The command buffer's draw list, lent to this rendering.
-    draws: Vec<Draw<'a>>,
+    draws: SmallVec<[NonNull<DrawOutput<'static>>; INLINE_DRAWS]>,
+    marker: PhantomData<&'a DrawOutput<'a>>,
 }
 
 /// A color attachment of a rendering (`CommandBuffer::raster`): the view drawn to, cleared to
@@ -230,14 +284,207 @@ impl<'a> Attachment<'a> {
     }
 }
 
-struct Draw<'a> {
-    bindings: &'a BindingOutput<'a, ()>,
-    /// The draw's index or indirect buffers, read at other stages than the pass's shaders.
-    extra: SmallVec<[BufferAccess; 2]>,
-    command: DrawCommand,
-    state: RasterState<MAX_COLOR_ATTACHMENTS>,
-    /// The occlusion query counting its samples (`RasterBuilder::count_samples`).
-    samples: Option<(&'a QueryPool<Occlusion>, u32)>,
+unsized_struct! {
+    /// A draw of a rendering into `N` color attachments ([`RasterBuilder::draw`]), which also
+    /// reads `E` index or indirect buffers: the [`DrawOutput`] it derefs to, sized by those.
+    /// The builder borrows it, so build draws added in a loop before the rendering.
+    pub struct Draw<'a>[N, E];
+    /// A draw as a rendering borrows it, unsized.
+    pub struct DrawOutput {
+        bindings: &'a BindingOutput<'a, ()>,
+        command: DrawCommand,
+        /// The state without the blends and write masks, which are sections.
+        state: RasterState<0>,
+        /// The occlusion query counting its samples (`Draw::count_samples`).
+        samples: Option<(&'a QueryPool<Occlusion>, u32)>,
+        /// What the draw's pass reaches without naming it.
+        accesses: Option<Accesses<'a>>,
+    } sections {
+        /// The draw's index or indirect buffers, read at other stages than the pass's shaders.
+        extra: [BufferAccess; E],
+        blends: [Blend; N],
+        write_masks: [ColorComponentFlags; N],
+    }
+}
+
+impl<'a> DrawOutput<'a> {
+    fn draw_state(&self) -> DrawState<'_> {
+        DrawState {
+            state: &self.state,
+            blends: self.blends(),
+            write_masks: self.write_masks(),
+        }
+    }
+
+    /// The draw's image accesses: its bindings' and the ones it reaches unnamed.
+    fn image_accesses(&self) -> impl Iterator<Item = ImageUse<'a>> + Clone {
+        let (declared, _) = declared(self.accesses, RASTER_SHADERS);
+        self.bindings.sections().images().chain(declared)
+    }
+
+    /// The draw's buffer accesses: its bindings', its index or indirect buffers and the ones
+    /// it reaches unnamed.
+    fn buffer_accesses(&self) -> impl Iterator<Item = BufferAccess> + Clone {
+        let (_, declared) = declared(self.accesses, RASTER_SHADERS);
+        (self.bindings.sections().buffers())
+            .chain(self.extra().iter().cloned())
+            .chain(declared)
+    }
+}
+
+/// The shader stages of a draw, for the accesses it makes without naming them.
+const RASTER_SHADERS: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS.as_raw()
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw(),
+);
+
+impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
+    fn with(
+        bindings: &'a BindingOutput<'a, ()>,
+        command: DrawCommand,
+        extra: [BufferAccess; E],
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let (state, blends, write_masks) = state.split();
+        Self::from_parts(
+            bindings,
+            command,
+            state,
+            None,
+            accesses,
+            extra,
+            blends,
+            write_masks,
+        )
+    }
+
+    /// Counts the samples of the draw that pass the depth and stencil tests into query
+    /// `index` of `pool`.
+    pub fn count_samples(mut self, pool: &'a QueryPool<Occlusion>, index: u32) -> Self {
+        assert!(
+            index < pool.count(),
+            "query {index} of a pool of {}",
+            pool.count()
+        );
+        self.samples = Some((pool, index));
+        self
+    }
+}
+
+impl<'a, const N: usize> Draw<'a, N, 0> {
+    pub fn new(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        vertices: u32,
+        instances: u32,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let command = DrawCommand::Draw {
+            vertices,
+            instances,
+        };
+        Self::with(bindings.erase(), command, [], state, accesses)
+    }
+
+    pub fn launch(
+        bindings: &'a BindingOutput<'a, kind::RasterMesh>,
+        groups: [u32; 3],
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        Self::with(
+            bindings.erase(),
+            DrawCommand::Launch(groups),
+            [],
+            state,
+            accesses,
+        )
+    }
+}
+
+impl<'a, const N: usize> Draw<'a, N, 1> {
+    pub fn indexed<IDX: IsIndex>(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        index_buffer: BufferSlice<'a, u32, IDX>,
+        instances: u32,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        index_buffer.usage_check(vk::BufferUsageFlags::INDEX_BUFFER);
+        let index_access = index_buffer.access(
+            vk::PipelineStageFlags2::INDEX_INPUT,
+            vk::AccessFlags2::INDEX_READ,
+        );
+        let command = DrawCommand::Indexed {
+            indices: index_buffer.address_range(),
+            flags: index_buffer.address_flags(),
+            count: index_buffer.len() as u32,
+            instances,
+        };
+        Self::with(bindings.erase(), command, [index_access], state, accesses)
+    }
+
+    pub fn indirect<IND: IsIndirect>(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let command = DrawCommand::Indirect {
+            draws: buffer.strided_range(),
+            flags: buffer.address_flags(),
+            count: buffer.len() as u32,
+        };
+        Self::with(
+            bindings.erase(),
+            command,
+            [indirect_access(buffer)],
+            state,
+            accesses,
+        )
+    }
+
+    /// Launches the task (or, without a task shader, mesh) workgroup counts in `buffer`.
+    pub fn launch_indirect<IND: IsIndirect>(
+        bindings: &'a BindingOutput<'a, kind::RasterMesh>,
+        buffer: BufferSlice<'a, DispatchIndirectCommand, IND>,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let command = DrawCommand::LaunchIndirect {
+            draws: buffer.strided_range(),
+            flags: buffer.address_flags(),
+            count: buffer.len() as u32,
+        };
+        Self::with(
+            bindings.erase(),
+            command,
+            [indirect_access(buffer)],
+            state,
+            accesses,
+        )
+    }
+}
+
+impl<'a, const N: usize> Draw<'a, N, 2> {
+    pub fn indirect_count<IND: IsIndirect, CNT: IsIndirect>(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
+        count_buffer: BufferSlice<'a, u32, CNT>,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let extra = [indirect_access(buffer), indirect_access(count_buffer)];
+        let command = DrawCommand::IndirectCount {
+            draws: buffer.strided_range(),
+            flags: buffer.address_flags(),
+            count: count_buffer.address_range(),
+            count_flags: count_buffer.address_flags(),
+            max_count: buffer.len() as u32,
+        };
+        Self::with(bindings.erase(), command, extra, state, accesses)
+    }
 }
 
 #[derive(Debug)]
@@ -323,11 +570,10 @@ fn rect(offset: IVec2, extent: UVec2) -> vk::Rect2D {
     }
 }
 
-/// `draws`, emptied, for draws of another lifetime, keeping its allocation (an in-place
-/// collect of nothing).
-fn recycle<'b>(mut draws: Vec<Draw<'_>>) -> Vec<Draw<'b>> {
-    draws.clear();
-    draws.into_iter().map(|_| unreachable!()).collect()
+fn iter_draws<'a>(
+    draws: &SmallVec<[NonNull<DrawOutput<'static>>; INLINE_DRAWS]>,
+) -> impl Iterator<Item = &'a DrawOutput<'a>> + Clone {
+    (draws.iter()).map(|draw| unsafe { &*(draw.as_ptr() as *const DrawOutput<'a>) })
 }
 
 impl<'a, const N: usize> RasterBuilder<'a, N> {
@@ -371,153 +617,39 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         self
     }
 
-    pub fn draw(
-        &mut self,
-        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        vertices: u32,
-        instances: u32,
-        state: RasterState<N>,
-    ) -> &mut Self {
-        let command = DrawCommand::Draw {
-            vertices,
-            instances,
-        };
-        self.push(bindings.erase(), SmallVec::new(), command, state)
-    }
-
-    pub fn draw_indexed<IDX: IsIndex>(
-        &mut self,
-        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        index_buffer: BufferSlice<'a, u32, IDX>,
-        instances: u32,
-        state: RasterState<N>,
-    ) -> &mut Self {
-        index_buffer.usage_check(vk::BufferUsageFlags::INDEX_BUFFER);
-        let index_access = index_buffer.access(
-            vk::PipelineStageFlags2::INDEX_INPUT,
-            vk::AccessFlags2::INDEX_READ,
-        );
-        let command = DrawCommand::Indexed {
-            indices: index_buffer.address_range(),
-            flags: index_buffer.address_flags(),
-            count: index_buffer.len() as u32,
-            instances,
-        };
-        self.push(bindings.erase(), smallvec![index_access], command, state)
-    }
-
-    pub fn draw_indirect<IND: IsIndirect>(
-        &mut self,
-        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
-        state: RasterState<N>,
-    ) -> &mut Self {
-        let command = DrawCommand::Indirect {
-            draws: buffer.strided_range(),
-            flags: buffer.address_flags(),
-            count: buffer.len() as u32,
-        };
-        self.push(
-            bindings.erase(),
-            smallvec![indirect_access(buffer)],
-            command,
-            state,
-        )
-    }
-
-    pub fn draw_indirect_count<IND: IsIndirect, CNT: IsIndirect>(
-        &mut self,
-        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
-        count_buffer: BufferSlice<'a, u32, CNT>,
-        state: RasterState<N>,
-    ) -> &mut Self {
-        let extra = smallvec![indirect_access(buffer), indirect_access(count_buffer)];
-        let command = DrawCommand::IndirectCount {
-            draws: buffer.strided_range(),
-            flags: buffer.address_flags(),
-            count: count_buffer.address_range(),
-            count_flags: count_buffer.address_flags(),
-            max_count: buffer.len() as u32,
-        };
-        self.push(bindings.erase(), extra, command, state)
-    }
-
-    pub fn launch(
-        &mut self,
-        bindings: &'a BindingOutput<'a, kind::RasterMesh>,
-        groups: [u32; 3],
-        state: RasterState<N>,
-    ) -> &mut Self {
-        self.push(
-            bindings.erase(),
-            SmallVec::new(),
-            DrawCommand::Launch(groups),
-            state,
-        )
-    }
-
-    /// Launches the task (or, without a task shader, mesh) workgroup counts in `buffer`.
-    pub fn launch_indirect<IND: IsIndirect>(
-        &mut self,
-        bindings: &'a BindingOutput<'a, kind::RasterMesh>,
-        buffer: BufferSlice<'a, DispatchIndirectCommand, IND>,
-        state: RasterState<N>,
-    ) -> &mut Self {
-        let command = DrawCommand::LaunchIndirect {
-            draws: buffer.strided_range(),
-            flags: buffer.address_flags(),
-            count: buffer.len() as u32,
-        };
-        self.push(
-            bindings.erase(),
-            smallvec![indirect_access(buffer)],
-            command,
-            state,
-        )
-    }
-
-    fn push(
-        &mut self,
-        bindings: &'a BindingOutput<'a, ()>,
-        extra: SmallVec<[BufferAccess; 2]>,
-        command: DrawCommand,
-        state: RasterState<N>,
-    ) -> &mut Self {
-        self.draws.push(Draw {
-            bindings,
-            extra,
-            command,
-            state: state.widen(),
-            samples: None,
-        });
-        self
-    }
-
-    /// Counts the samples of the draw added last that pass the depth and stencil tests into
-    /// query `index` of `pool`.
-    pub fn count_samples(&mut self, pool: &'a QueryPool<Occlusion>, index: u32) -> &mut Self {
-        assert!(
-            index < pool.count(),
-            "query {index} of a pool of {}",
-            pool.count()
-        );
-        let draw = self
-            .draws
-            .last_mut()
-            .expect("`count_samples` follows a draw");
-        draw.samples = Some((pool, index));
+    /// Adds `draw`, after the draws added before.
+    pub fn draw<const E: usize>(&mut self, draw: &'a Draw<'a, N, E>) -> &mut Self {
+        let draw = (draw.deref()) as *const DrawOutput<'a> as *mut DrawOutput<'static>;
+        self.draws.push(unsafe { NonNull::new_unchecked(draw) });
         self
     }
 
     /// The depth attachment's access: also a write when it is cleared or a draw writes depth.
     fn depth_access(&self) -> Option<ImageUse<'a>> {
         let mut depth = self.depth_access.clone()?;
-        let writes = |d: &Draw| d.state.writes_depth() || d.state.stencil.is_some();
-        if self.clear_depth.is_some() || self.draws.iter().any(writes) {
+        let writes = |d: &DrawOutput| d.state.writes_depth() || d.state.stencil.is_some();
+        if self.clear_depth.is_some() || iter_draws(&self.draws).any(writes) {
             depth.access.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
         }
         Some(depth)
+    }
+
+    /// The accesses of the color and depth attachments. An attachment a draw also reads (a
+    /// depth buffer sampled while it is tested) is rendered in `GENERAL`, the layout the draw's
+    /// descriptor has: one image can't be in two layouts in one rendering.
+    fn attachment_accesses(&self) -> ([ImageUse<'a>; N], Option<ImageUse<'a>>) {
+        let read_by_draws = |image: vk::Image| {
+            iter_draws(&self.draws)
+                .any(|draw| draw.image_accesses().any(|i| i.access.image == image))
+        };
+        let in_layout = |mut access: ImageUse<'a>| {
+            if read_by_draws(access.access.image) {
+                access.access.layout = vk::ImageLayout::GENERAL;
+            }
+            access
+        };
+        let color = self.color.each_ref().map(|c| in_layout(c.access.clone()));
+        (color, self.depth_access().map(in_layout))
     }
 
     /// The pipeline key of a draw of `sections` in this rendering.
@@ -542,22 +674,21 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
     #[validation_trace]
     pub fn record(&mut self, name: &'static str) {
         let _span = tracing::info_span!("draw", pass = name).entered();
-        let depth_access = self.depth_access();
-        let draws = &self.draws;
+        let (color_accesses, depth_access) = self.attachment_accesses();
+        let draws = iter_draws(&self.draws);
         self.cmd_buf.flush_pending(
             draws
-                .iter()
-                .flat_map(|draw| draw.bindings.sections().images())
-                .chain(self.color.iter().map(|c| c.access.clone()))
+                .clone()
+                .flat_map(|draw| draw.image_accesses())
+                .chain(color_accesses.iter().cloned())
                 .chain(depth_access.clone()),
-            draws.iter().flat_map(|draw| {
-                (draw.bindings.sections().buffers()).chain(draw.extra.iter().cloned())
-            }),
+            draws.flat_map(|draw| draw.buffer_accesses()),
         );
 
+        let mut color_layouts = color_accesses.iter().map(|access| access.access.layout);
         let color_attachments = self.color.each_ref().map(|color| {
             let ret = vk::RenderingAttachmentInfo::default()
-                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                .image_layout(color_layouts.next().expect("a layout per attachment"))
                 .image_view(color.view)
                 .store_op(vk::AttachmentStoreOp::STORE);
             if let Some(clear_value) = color.clear {
@@ -580,7 +711,7 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
                 .access
                 .contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE);
             depth_info = vk::RenderingAttachmentInfo::default()
-                .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                .image_layout(depth.access.layout)
                 .image_view(self.depth_attachment)
                 .store_op(if written {
                     vk::AttachmentStoreOp::STORE
@@ -625,10 +756,10 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         };
         // What the previous draws set: the state, the input assembly, the pipeline of a pass
         // with its constants.
-        let mut state: Option<&RasterState<MAX_COLOR_ATTACHMENTS>> = None;
+        let mut state: Option<DrawState> = None;
         let mut assembly: Assembly = None;
         let mut bound: Option<(usize, &[u8])> = None;
-        for draw in &self.draws {
+        for draw in iter_draws(&self.draws) {
             if let Some((pool, query)) = draw.samples {
                 self.cmd_buf.begin_query(pool, query);
             }
@@ -654,9 +785,9 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
                     draw.command,
                     DrawCommand::Launch(_) | DrawCommand::LaunchIndirect { .. }
                 );
-                draw.state
-                    .record(state, rendering, vertex, &mut assembly, handle);
-                state = Some(&draw.state);
+                let draw_state = draw.draw_state();
+                draw_state.record(state.as_ref(), rendering, vertex, &mut assembly, handle);
+                state = Some(draw_state);
                 record_draw(handle, &draw.command);
             }
             if let Some((pool, query)) = draw.samples {
@@ -665,8 +796,7 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         }
         unsafe { device.cmd_end_rendering(handle) };
         self.cmd_buf.exit(name, true);
-        // The next rendering reuses the list (one dropped without being recorded loses it).
-        self.cmd_buf.draws = recycle(std::mem::take(&mut self.draws));
+        self.draws.clear();
     }
 }
 
@@ -767,8 +897,7 @@ impl CommandBuffer {
         extent: UVec2,
         color: [Attachment<'a>; N],
     ) -> RasterBuilder<'a, N> {
-        const { assert!(N <= MAX_COLOR_ATTACHMENTS) };
-        let draws = recycle(std::mem::take(&mut self.draws));
+        self.caps.require(vk::QueueFlags::GRAPHICS, "a rendering");
         RasterBuilder {
             cmd_buf: self,
             extent,
@@ -783,57 +912,15 @@ impl CommandBuffer {
             depth_attachment: vk::ImageView::null(),
             depth_access: None,
             clear_depth: None,
-            draws,
+            draws: SmallVec::new(),
+            marker: PhantomData,
         }
     }
 
-    /// Declares that the next command reaches `access` without naming it, at `stage`: through
-    /// a bindless handle or a pointer the pass reads from a buffer. The access is tracked like
-    /// the command's own: its barrier joins the next command's (or the end of the recording),
-    /// and later commands wait for it. Declare a rendering's accesses before it. An image
-    /// declared in another layout than the next command uses it in gets two transitions in one
-    /// barrier, which is invalid.
-    pub fn record_access(&mut self, access: Access<'_>, stage: Stage) {
-        use vk::PipelineStageFlags2 as S;
-        let stage = match stage {
-            Stage::All => S::ALL_COMMANDS,
-            Stage::Compute => S::COMPUTE_SHADER,
-            Stage::RayTracing => S::RAY_TRACING_SHADER_KHR,
-            Stage::Raster => S::PRE_RASTERIZATION_SHADERS | S::FRAGMENT_SHADER,
-            Stage::Transfer => {
-                panic!("`record_access` declares shader accesses; transfers name what they touch")
-            }
-        };
-        let (image, buffers) = match access.0 {
-            AccessKind::Image(mut image) => {
-                image.access.stage = stage;
-                (Some(image), SmallVec::new())
-            }
-            AccessKind::Buffers(mut buffers) => {
-                buffers.iter_mut().for_each(|buffer| buffer.stage = stage);
-                (None, buffers)
-            }
-        };
-        let barriers = compute_barriers(
-            &self.pending_accesses,
-            image.iter().cloned(),
-            buffers.iter().cloned(),
-        );
-        if let Some(barriers) = barriers {
-            self.pending_accesses.made_visible(&barriers);
-            match &mut self.deferred {
-                Some(deferred) => deferred.merge(barriers),
-                None => self.deferred = Some(barriers),
-            }
-        }
-        self.pending_accesses
-            .record(image.map(|image| image.access).into_iter(), buffers.into_iter());
-    }
-
-    /// Records the barriers of [`Self::record_access`]es no command took.
-    pub(crate) fn flush_deferred(&mut self) {
-        if let Some(barriers) = self.deferred.take() {
-            self.pipeline_barrier(&barriers);
+    /// Records every barrier computed so far, each on its own, in order (see `barrier_log`).
+    pub(crate) fn replay_barriers(&self) {
+        for barriers in &self.barrier_log {
+            self.pipeline_barrier(barriers);
         }
     }
 
@@ -849,21 +936,23 @@ impl CommandBuffer {
         unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
     }
 
-
     fn compute_private<IND: IsIndirect>(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
         dispatch: [u32; 3],
         indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand, IND>>,
+        accesses: Option<Accesses<'_>>,
     ) {
+        self.caps.require(vk::QueueFlags::COMPUTE, "a dispatch");
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("compute", pass = pass.name).entered();
+        let (images, buffers) = declared(accesses, vk::PipelineStageFlags2::COMPUTE_SHADER);
         self.flush_pending(
-            sections.images(),
-            sections
-                .buffers()
-                .chain(indirect_buffer.map(indirect_access)),
+            sections.images().chain(images),
+            (sections.buffers())
+                .chain(indirect_buffer.map(indirect_access))
+                .chain(buffers),
         );
         self.push_constants(sections.push_constants);
 
@@ -886,18 +975,27 @@ impl CommandBuffer {
         self.exit(pass.name, true);
     }
 
+    /// Like [`Self::compute`], with the workgroup counts read from `buffer` on the GPU.
     #[validation_trace]
     pub fn compute_indirect<IND: IsIndirect>(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
         buffer: BufferSlice<'_, DispatchIndirectCommand, IND>,
+        accesses: Option<Accesses<'_>>,
     ) {
-        self.compute_private(bindings, [0, 0, 0], Some(buffer));
+        self.compute_private(bindings, [0, 0, 0], Some(buffer), accesses);
     }
 
+    /// Dispatches `dispatch` workgroups of a compute pass. `accesses` are the resources it
+    /// reaches without naming them in its bindings (through a handle or pointer in a buffer).
     #[validation_trace]
-    pub fn compute(&mut self, bindings: &BindingOutput<'_, kind::Compute>, dispatch: [u32; 3]) {
-        self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None);
+    pub fn compute(
+        &mut self,
+        bindings: &BindingOutput<'_, kind::Compute>,
+        dispatch: [u32; 3],
+        accesses: Option<Accesses<'_>>,
+    ) {
+        self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None, accesses);
     }
 
     fn raytrace_private<IND: IsIndirect>(
@@ -905,15 +1003,19 @@ impl CommandBuffer {
         bindings: &BindingOutput<'_, kind::RayTracing>,
         rays: [u32; 3],
         indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand, IND>>,
+        accesses: Option<Accesses<'_>>,
     ) {
+        self.caps.require(vk::QueueFlags::COMPUTE, "a trace");
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
+        let stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
+        let (images, buffers) = declared(accesses, stage);
         self.flush_pending(
-            sections.images(),
-            sections
-                .buffers()
-                .chain(indirect_buffer.map(indirect_access)),
+            sections.images().chain(images),
+            (sections.buffers())
+                .chain(indirect_buffer.map(indirect_access))
+                .chain(buffers),
         );
         self.push_constants(sections.push_constants);
 
@@ -951,10 +1053,16 @@ impl CommandBuffer {
         self.exit(pass.name, true);
     }
 
-    /// Traces `rays` (width, height, depth) raygen invocations of a ray tracing pass.
+    /// Traces `rays` (width, height, depth) raygen invocations of a ray tracing pass, which
+    /// also reaches `accesses` (see [`Self::compute`]).
     #[validation_trace]
-    pub fn raytrace(&mut self, bindings: &BindingOutput<'_, kind::RayTracing>, rays: [u32; 3]) {
-        self.raytrace_private::<buffer::usage::Indirect>(bindings, rays, None);
+    pub fn raytrace(
+        &mut self,
+        bindings: &BindingOutput<'_, kind::RayTracing>,
+        rays: [u32; 3],
+        accesses: Option<Accesses<'_>>,
+    ) {
+        self.raytrace_private::<buffer::usage::Indirect>(bindings, rays, None, accesses);
     }
 
     /// Like [`Self::raytrace`], with the ray counts read from `buffer` on the GPU.
@@ -963,8 +1071,9 @@ impl CommandBuffer {
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
         buffer: BufferSlice<'_, TraceRaysIndirectCommand, IND>,
+        accesses: Option<Accesses<'_>>,
     ) {
-        self.raytrace_private(bindings, [0, 0, 0], Some(buffer));
+        self.raytrace_private(bindings, [0, 0, 0], Some(buffer), accesses);
     }
 
     /// Pushes a pass's push constants from offset 0; the bytes past them keep what earlier
@@ -989,6 +1098,9 @@ impl CommandBuffer {
         image_acceses: impl Iterator<Item = ImageUse<'a>> + Clone,
         buffer_acceses: impl Iterator<Item = BufferAccess> + Clone,
     ) {
+        if !self.caps.images && image_acceses.clone().next().is_some() {
+            self.caps.require_images();
+        }
         let barriers = compute_barriers(
             &self.pending_accesses,
             image_acceses.clone(),
@@ -996,15 +1108,7 @@ impl CommandBuffer {
         );
         if let Some(barriers) = &barriers {
             self.pending_accesses.made_visible(barriers);
-        }
-        let barriers = match (self.deferred.take(), barriers) {
-            (Some(mut deferred), Some(barriers)) => {
-                deferred.merge(barriers);
-                Some(deferred)
-            }
-            (deferred, barriers) => deferred.or(barriers),
-        };
-        if let Some(barriers) = &barriers {
+            self.barrier_log.push(barriers.clone());
             self.pipeline_barrier(barriers);
         }
 
@@ -1094,7 +1198,7 @@ impl CommandBuffer {
 
     /// Writes the device's clock into query `index` of `pool` once the commands recorded before
     /// reached `stage`: `NONE` for when they started, `ALL_COMMANDS` for when they finished.
-    pub fn write_timestamp(
+    pub(crate) fn write_timestamp(
         &mut self,
         pool: &QueryPool<Timestamp>,
         index: u32,
@@ -1150,18 +1254,25 @@ impl CommandBuffer {
 
     pub(crate) fn end_query<K: QueryKind>(&mut self, pool: &QueryPool<K>, index: u32) {
         let bit = query_bit(K::TYPE);
-        assert!(self.active_queries & bit != 0, "no query of this kind is active");
+        assert!(
+            self.active_queries & bit != 0,
+            "no query of this kind is active"
+        );
         unsafe { Ctx::device().cmd_end_query(self.handle, pool.handle, index) };
         self.active_queries &= !bit;
     }
 
-    /// A command buffer recording into `handle` for the frame of `epoch` on queue `family`.
+    /// A command buffer recording into `handle` for the frame of `epoch` on queue `family`,
+    /// logging its barriers into `barrier_log` (empty, lent by the frame slot).
     pub(crate) fn new(
         handle: vk::CommandBuffer,
-        pending_accesses: PendingAccesses,
+        mut pending_accesses: PendingAccesses,
         epoch: u64,
         family: u32,
+        caps: QueueCaps,
+        barrier_log: Vec<Barriers>,
     ) -> Self {
+        pending_accesses.epoch = epoch;
         Self {
             handle,
             pending_accesses,
@@ -1170,18 +1281,15 @@ impl CommandBuffer {
             observer: None,
             depth: 0,
             active_queries: 0,
-            deferred: None,
-            draws: Vec::new(),
+            caps,
+            barrier_log,
         }
     }
 
     pub(crate) fn begin(&mut self) -> Result<()> {
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info)? };
-        Bindless::bind(&self.handle);
-        // Passes push only their own push constants; this sets the rest of the range once, so
-        // no byte of it is ever undefined.
-        self.push_constants(&[0; MAX_PUSH_CONSTANTS_SIZE]);
+        Bindless::bind(&self.handle, self.caps.flags);
         Ok(())
     }
 
@@ -1192,6 +1300,7 @@ impl CommandBuffer {
 }
 
 /// Barriers one command needs before it may run, given what is still pending.
+#[derive(Clone, Debug)]
 pub(crate) struct Barriers {
     /// The dependency on the pending accesses the command conflicts with; `None` without a
     /// hazard, when only a layout transition is needed, since that carries its own stages.
@@ -1200,92 +1309,110 @@ pub(crate) struct Barriers {
     pub(crate) images: SmallVec<[vk::ImageMemoryBarrier2<'static>; 1]>,
 }
 
-impl Barriers {
-    /// Adds `other`'s dependencies: one memory barrier from both sources to both destinations,
-    /// and both lists of transitions.
-    fn merge(&mut self, other: Barriers) {
-        self.memory = match (self.memory, other.memory) {
-            (Some(a), Some(b)) => Some(
-                a.src_stage_mask(a.src_stage_mask | b.src_stage_mask)
-                    .src_access_mask(a.src_access_mask | b.src_access_mask)
-                    .dst_stage_mask(a.dst_stage_mask | b.dst_stage_mask)
-                    .dst_access_mask(a.dst_access_mask | b.dst_access_mask),
-            ),
-            (a, b) => a.or(b),
-        };
-        self.images.extend(other.images);
+/// The resources a command's pass reaches without naming them in its bindings: through a
+/// bindless handle or a pointer it reads from a buffer. Commands take them besides their
+/// bindings (`cmd.compute(&bindings, groups, Some(Accesses::images(&[ImageUse::sampled_read(view)])))`)
+/// and track them like the bindings' accesses, at the command's shader stages.
+#[derive(Clone, Copy, Default)]
+pub struct Accesses<'a> {
+    pub images: &'a [ImageUse<'a>],
+    pub buffers: &'a [BufferAccess],
+}
+
+impl<'a> Accesses<'a> {
+    pub fn new(images: &'a [ImageUse<'a>], buffers: &'a [BufferAccess]) -> Self {
+        Self { images, buffers }
+    }
+
+    pub fn images(images: &'a [ImageUse<'a>]) -> Self {
+        Self {
+            images,
+            buffers: &[],
+        }
+    }
+
+    pub fn buffers(buffers: &'a [BufferAccess]) -> Self {
+        Self {
+            images: &[],
+            buffers,
+        }
     }
 }
 
-/// A resource a pass reaches without naming it in its push constants, through a bindless
-/// handle or a pointer it reads from a buffer, which [`CommandBuffer::record_access`] declares.
-pub struct Access<'a>(AccessKind<'a>);
-
-enum AccessKind<'a> {
-    Image(ImageUse<'a>),
-    Buffers(SmallVec<[BufferAccess; 2]>),
+/// A command's `accesses` at its shader stages `stage`.
+fn declared<'a>(
+    accesses: Option<Accesses<'a>>,
+    stage: vk::PipelineStageFlags2,
+) -> (
+    impl Iterator<Item = ImageUse<'a>> + Clone,
+    impl Iterator<Item = BufferAccess> + Clone,
+) {
+    let Accesses { images, buffers } = accesses.unwrap_or_default();
+    let images = images.iter().cloned().map(move |mut image| {
+        image.access.stage = stage;
+        image
+    });
+    let buffers = buffers.iter().cloned().map(move |mut buffer| {
+        buffer.stage = stage;
+        buffer
+    });
+    (images, buffers)
 }
 
-impl<'a> Access<'a> {
-    fn image<F: Format, U: crate::image::usage::ImageUsage, D: Dim>(
-        image: ImageView<'a, F, U, D>,
-        access: vk::AccessFlags2,
-    ) -> Self {
-        // `record_access` sets the stage.
-        let stage = vk::PipelineStageFlags2::NONE;
-        Self(AccessKind::Image(image.access(stage, access, vk::ImageLayout::GENERAL)))
-    }
-
+/// The image accesses of [`Accesses`]; the command sets the stage.
+impl<'a> ImageUse<'a> {
     /// The pass samples `image` (`Tex2D`, or a `DynImg` with a sampled index).
     pub fn sampled_read<F: Format, U: IsSampled, D: Dim>(image: ImageView<'a, F, U, D>) -> Self {
         image.usage_check(vk::ImageUsageFlags::SAMPLED);
-        Self::image(image, vk::AccessFlags2::SHADER_SAMPLED_READ)
+        image.access(
+            S2::NONE,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::GENERAL,
+        )
     }
 
     /// The pass loads from `image` as a storage image (`Image2D`, or a `DynImg` without a
     /// sampled index).
     pub fn storage_read<F: Format, U: IsStorage, D: Dim>(image: ImageView<'a, F, U, D>) -> Self {
         image.usage_check(vk::ImageUsageFlags::STORAGE);
-        Self::image(image, vk::AccessFlags2::SHADER_STORAGE_READ)
+        image.access(
+            S2::NONE,
+            vk::AccessFlags2::SHADER_STORAGE_READ,
+            vk::ImageLayout::GENERAL,
+        )
     }
 
     /// The pass loads from and stores to `image` (`MutImage2D`).
     pub fn storage_write<F: Format, U: IsStorage, D: Dim>(image: ImageView<'a, F, U, D>) -> Self {
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         let access = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
-        Self::image(image, access)
+        image.access(S2::NONE, access, vk::ImageLayout::GENERAL)
     }
+}
 
+/// The buffer accesses of [`Accesses`]; the command sets the stage.
+impl BufferAccess {
     /// The pass reads `buffer` through a pointer (`Buf`).
-    pub fn buffer_read<V: Copy + Pod, U: buffer::usage::IsStorage>(
-        buffer: BufferSlice<'_, V, U>,
-    ) -> Self {
+    pub fn read<V: Copy + Pod, U: buffer::usage::IsStorage>(buffer: BufferSlice<'_, V, U>) -> Self {
         buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
-        let stage = vk::PipelineStageFlags2::NONE;
-        let access = buffer.access(stage, vk::AccessFlags2::SHADER_STORAGE_READ);
-        Self(AccessKind::Buffers(smallvec![access]))
+        buffer.access(S2::NONE, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
     /// The pass reads and writes `buffer` through a pointer (`MutBuf`).
-    pub fn buffer_write<V: Copy + Pod, U: buffer::usage::IsStorage>(
+    pub fn write<V: Copy + Pod, U: buffer::usage::IsStorage>(
         buffer: BufferSlice<'_, V, U>,
     ) -> Self {
         buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
-        let access = buffer.access(
-            vk::PipelineStageFlags2::NONE,
-            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        );
-        Self(AccessKind::Buffers(smallvec![access]))
+        let access = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
+        buffer.access(S2::NONE, access)
     }
 
     /// The pass traces `tlas` through an address it reads from a buffer (an `Accel` inside a
     /// struct): its memory and the BLASes it names.
-    pub fn trace(tlas: &Tlas) -> Self {
-        let accesses = tlas.trace_accesses(vk::PipelineStageFlags2::NONE);
-        Self(AccessKind::Buffers(SmallVec::from_buf(accesses)))
+    pub fn trace(tlas: &Tlas) -> [Self; 2] {
+        tlas.trace_accesses(S2::NONE)
     }
 }
-
 
 /// Works out the barriers needed to run a command with the given accesses after `pending`.
 ///
@@ -1478,8 +1605,7 @@ impl PendingAccesses {
         if let Some((src_stage, src_access, dst_stage, dst_access)) = memory {
             for w in &mut self.buffer_writes {
                 if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
-                    w.visible_stages |= dst_stage;
-                    w.visible_access |= dst_access;
+                    w.make_visible(dst_stage, dst_access);
                 }
             }
         }
@@ -1501,9 +1627,46 @@ impl PendingAccesses {
                 memory.into_iter().chain(transitions)
             {
                 if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
-                    w.visible_stages |= dst_stage;
-                    w.visible_access |= dst_access;
+                    w.make_visible(dst_stage, dst_access);
                 }
+            }
+        }
+    }
+
+    /// Drops what the GPU finished, every epoch up to `completed`: the buffer reads, which no
+    /// later write has to wait for any more, and, once there are many, the buffer writes, which
+    /// later accesses still have to be made visible to: they fold into one write of every
+    /// address (`EVERY_BUFFER`). Image accesses stay; there is one of each kind per image.
+    pub(crate) fn retire(&mut self, completed: u64) {
+        self.buffer_reads.retain(|read| read.epoch > completed);
+        if self.buffer_writes.len() <= MAX_PENDING_BUFFER_WRITES {
+            return;
+        }
+        let (mut stage, mut access) = (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE);
+        self.buffer_writes.retain(|w| {
+            let fold = w.epoch <= completed && w.write.range != EVERY_BUFFER;
+            if fold {
+                stage |= w.write.stage;
+                access |= w.write.access;
+            }
+            !fold
+        });
+        if stage.is_empty() && access.is_empty() {
+            return;
+        }
+        match (self.buffer_writes.iter_mut()).find(|w| w.write.range == EVERY_BUFFER) {
+            Some(every) => {
+                every.write.stage |= stage;
+                every.write.access |= access;
+                every.visible.clear();
+            }
+            None => {
+                let write = BufferAccess {
+                    stage,
+                    access,
+                    range: EVERY_BUFFER,
+                };
+                self.buffer_writes.push(PendingWrite::new(write, 0));
             }
         }
     }
@@ -1517,7 +1680,7 @@ impl PendingAccesses {
     /// Forgets the accesses within the addresses of a buffer that is being destroyed.
     pub(crate) fn forget_buffer(&mut self, range: std::ops::Range<u64>) {
         let outside = |access: &BufferAccess| !range.contains(&access.range.start);
-        self.buffer_reads.retain(|read| outside(read));
+        self.buffer_reads.retain(|read| outside(&read.read));
         self.buffer_writes.retain(|write| outside(&write.write));
     }
 
@@ -1551,7 +1714,8 @@ impl PendingAccesses {
 
             if writes {
                 self.buffer_writes.retain(|a| !covers(&a.write));
-                self.buffer_writes.push(PendingWrite::new(access.clone()));
+                self.buffer_writes
+                    .push(PendingWrite::new(access.clone(), self.epoch));
                 // An acceleration structure write waited for every read of every structure,
                 // and every later one runs at the same build stage, after that barrier.
                 let structure_write = access
@@ -1571,7 +1735,10 @@ impl PendingAccesses {
                     }
                     !covered
                 });
-                self.buffer_reads.push(read);
+                self.buffer_reads.push(PendingRead {
+                    read,
+                    epoch: self.epoch,
+                });
             }
         }
 
@@ -1582,7 +1749,8 @@ impl PendingAccesses {
 
             if writes {
                 self.image_writes.retain(|a| !same_image(&a.write));
-                self.image_writes.push(PendingWrite::new(access.clone()));
+                self.image_writes
+                    .push(PendingWrite::new(access.clone(), self.epoch));
                 self.image_reads.retain(|a| !same_image(a));
             }
             if reads {
@@ -1653,12 +1821,12 @@ fn all_read_access() -> vk::AccessFlags2 {
 mod tests {
     use super::*;
     use crate::image::usage::ImageUsage;
-    use std::iter;
     use crate::image::{
         format::{self, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
         usage::{self, ColorAttachment, DepthAttachment, StaticUsage},
     };
     use crate::vk::Handle;
+    use std::iter;
     use std::marker::PhantomData;
     use std::sync::atomic::AtomicU32;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
@@ -1735,7 +1903,14 @@ mod tests {
 
     /// A command buffer that is never handed to Vulkan: enough for state-only code paths.
     fn offline_cmd() -> CommandBuffer {
-        CommandBuffer::new(vk::CommandBuffer::null(), PendingAccesses::default(), 0, 0)
+        CommandBuffer::new(
+            vk::CommandBuffer::null(),
+            PendingAccesses::default(),
+            0,
+            0,
+            QueueCaps::ALL,
+            Vec::new(),
+        )
     }
 
     fn view<F: StaticFormat, U: StaticUsage>(layout: &AtomicU32) -> ImageView<'_, F, U> {
@@ -1750,6 +1925,7 @@ mod tests {
         ImageView {
             image: vk::Image::from_raw(1),
             view: vk::ImageView::from_raw(2),
+            shader_view: vk::ImageView::from_raw(2),
             mip_range: (0..1).into(),
             extent: EXTENT,
             handle: crate::bindless::BindlessHandle::none(),
@@ -2333,6 +2509,93 @@ mod tests {
         assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
     }
 
+    /// A ring read at a moving range each frame: once a frame completed, its reads are gone.
+    #[test]
+    fn reads_of_completed_frames_are_dropped() {
+        let mut pending = PendingAccesses::default();
+        for frame in 1..=10u64 {
+            pending.epoch = frame;
+            let range = frame * 100..frame * 100 + 10;
+            pending.record(iter::empty(), [read(range)].into_iter());
+            pending.retire(frame - 1);
+            assert!(pending.buffer_reads.len() <= 2, "frame {frame}");
+        }
+        // A write over a completed read needs no barrier for it.
+        pending.retire(10);
+        assert!(buffer_barrier(&pending, &write(1000..1010)).is_none());
+    }
+
+    #[test]
+    fn many_completed_writes_fold_into_one_of_every_buffer() {
+        let mut pending = PendingAccesses::default();
+        for i in 0..=MAX_PENDING_BUFFER_WRITES as u64 {
+            pending.epoch = 1;
+            pending.record(iter::empty(), [write(i * 16..i * 16 + 8)].into_iter());
+        }
+        pending.epoch = 2;
+        pending.record(iter::empty(), [write(1 << 20..(1 << 20) + 8)].into_iter());
+        pending.retire(0);
+        assert_eq!(
+            pending.buffer_writes.len(),
+            MAX_PENDING_BUFFER_WRITES + 2,
+            "none done"
+        );
+        pending.retire(1);
+        assert_eq!(
+            pending.buffer_writes.len(),
+            2,
+            "frame 2's write and the folded ones"
+        );
+        let every = &pending
+            .buffer_writes
+            .iter()
+            .find(|w| w.write.range == EVERY_BUFFER);
+        assert_eq!(every.unwrap().write.stage, S::COMPUTE_SHADER);
+        // A read anywhere still has to see the folded writes, once.
+        let mut pending = pending;
+        assert!(flush(&mut pending, &[], &[read(5000..5004)]).is_some());
+        assert!(flush(&mut pending, &[], &[read(9000..9004)]).is_none());
+        // Destroying a buffer doesn't forget them.
+        pending.forget_buffer(1..100_000);
+        assert_eq!(pending.buffer_writes.len(), 2);
+    }
+
+    /// A compute write, sampled in a fragment shader, storage-read in compute: neither barrier
+    /// made it visible to sampled reads in compute shaders.
+    #[test]
+    fn visibility_is_per_barrier_not_the_union_of_stages_and_accesses() {
+        let mut pending = pending(&[], &[image_write(1)]);
+        let at = |stage, access| image(1, stage, access, L::GENERAL, L::GENERAL);
+        let fragment_sampled = at(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ);
+        let compute_storage = at(S::COMPUTE_SHADER, A::SHADER_STORAGE_READ);
+        let compute_sampled = at(S::COMPUTE_SHADER, A::SHADER_SAMPLED_READ);
+        assert!(flush(&mut pending, &[fragment_sampled.clone()], &[]).is_some());
+        assert!(flush(&mut pending, &[compute_storage.clone()], &[]).is_some());
+        let barriers = flush(&mut pending, &[compute_sampled.clone()], &[])
+            .expect("the write isn't visible to sampled reads in compute shaders yet");
+        assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
+        // Now it is, and the earlier ones still are.
+        for access in [compute_sampled, fragment_sampled, compute_storage] {
+            assert!(flush(&mut pending, &[access], &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn visible_scopes_merge_only_where_that_is_exact() {
+        let mut write = PendingWrite::new((), 0);
+        write.make_visible(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ);
+        write.make_visible(S::COMPUTE_SHADER, A::SHADER_SAMPLED_READ);
+        assert_eq!(write.visible.len(), 1, "same accesses: one scope");
+        write.make_visible(S::COMPUTE_SHADER, A::SHADER_STORAGE_READ);
+        assert_eq!(write.visible.len(), 2);
+        assert!(!write.visible_to(S::FRAGMENT_SHADER, A::SHADER_STORAGE_READ));
+        // A scope containing another replaces it.
+        let wide_stages = S::VERTEX_SHADER | S::FRAGMENT_SHADER | S::COMPUTE_SHADER;
+        write.make_visible(wide_stages, A::SHADER_SAMPLED_READ | A::SHADER_STORAGE_READ);
+        assert_eq!(write.visible.len(), 1);
+        assert!(write.visible_to(S::VERTEX_SHADER, A::SHADER_STORAGE_READ));
+    }
+
     #[test]
     fn a_new_write_is_not_visible_to_anything() {
         let mut pending = pending(&[write(0..100)], &[]);
@@ -2521,16 +2784,20 @@ mod tests {
         assert!(key.constants.is_empty());
     }
 
-    /// Widening keeps a draw's blends and masks for its attachments in front.
+    /// A draw keeps its state's blends and masks as sections, one per attachment.
     #[test]
-    fn widened_state_keeps_the_attachments_blends_in_front() {
+    fn a_draw_keeps_a_blend_and_mask_per_attachment() {
         let state = RasterState::<2>::default()
             .blends([Blend::Alpha, Blend::Skip])
-            .write_masks([ColorComponentFlags::R, ColorComponentFlags::RGBA]);
-        let wide = state.clone().widen();
-        assert_eq!(wide.blends[..2], [Blend::Alpha, Blend::Skip]);
-        assert_eq!(wide.write_masks[..2], state.write_masks);
-        assert_eq!(wide.cull_mode, state.cull_mode);
+            .write_masks([ColorComponentFlags::R, ColorComponentFlags::RGBA])
+            .cull_mode(CullModeFlags::NONE);
+        let none = no_bindings();
+        let draw = Draw::new(&none, 3, 1, state.clone(), None);
+        let draw_state = draw.draw_state();
+        assert_eq!(draw_state.blends, [Blend::Alpha, Blend::Skip]);
+        assert_eq!(draw_state.write_masks, state.write_masks);
+        assert_eq!(draw_state.cull_mode, CullModeFlags::NONE);
+        assert_eq!(size_of_val(&*draw), size_of_val(&draw));
     }
 
     #[test]
@@ -2609,10 +2876,11 @@ mod tests {
         let mut cmd = offline_cmd();
         let read_only = RasterState::default().depth_write(false);
         let none = no_bindings();
+        let draw = Draw::new(&none, 3, 1, read_only.clone(), None);
         let mut builder = cmd.raster(EXTENT, []);
         builder
             .depth_attachment(view::<D32Sfloat, DepthAttachment>(&state), None)
-            .draw(&none, 3, 1, read_only.clone());
+            .draw(&draw);
 
         assert_eq!(builder.depth_format, vk::Format::D32_SFLOAT);
         assert_eq!(builder.stencil_format, vk::Format::UNDEFINED);
@@ -2625,16 +2893,52 @@ mod tests {
         );
     }
 
+    /// Soft particles: the depth buffer is tested and sampled in one rendering, so it is in the
+    /// layout the sampler's descriptor has.
+    #[test]
+    fn an_attachment_a_draw_also_reads_is_rendered_in_general() {
+        let (depth_state, color_state) = (layout(L::GENERAL), layout(L::UNDEFINED));
+        let depth = view::<D32Sfloat, usage::DepthAttachmentSampled>(&depth_state);
+        let sampled = depth.access(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL);
+        let particles: Bindings<'_, kind::RasterVertex, 4, 1, 0, 0> =
+            Bindings::new(0, &0u32, [sampled], []);
+        let draw = Draw::new(
+            &particles,
+            3,
+            1,
+            RasterState::default().depth_write(false),
+            None,
+        );
+        let mut cmd = offline_cmd();
+        let mut color = view::<R8G8B8A8Unorm, ColorAttachment>(&color_state);
+        color.image = vk::Image::from_raw(9);
+        let mut builder = cmd.raster(EXTENT, [Attachment::color(color, None)]);
+        builder.depth_attachment(depth, None);
+        let ([color], depth) = builder.attachment_accesses();
+        assert_eq!(
+            depth.unwrap().access.layout,
+            L::ATTACHMENT_OPTIMAL,
+            "no draw reads it yet"
+        );
+        assert_eq!(color.access.layout, L::ATTACHMENT_OPTIMAL);
+
+        builder.draw(&draw);
+        let ([color], depth) = builder.attachment_accesses();
+        assert_eq!(depth.unwrap().access.layout, L::GENERAL);
+        assert_eq!(color.access.layout, L::ATTACHMENT_OPTIMAL, "another image");
+    }
+
     /// Clearing modifies the attachment even if every draw only tests against it.
     #[test]
     fn cleared_read_only_depth_attachment_is_still_a_write_access() {
         let state = layout(L::UNDEFINED);
         let mut cmd = offline_cmd();
         let none = no_bindings();
+        let draw = Draw::new(&none, 3, 1, RasterState::default().depth_write(false), None);
         let mut builder = cmd.raster(EXTENT, []);
         builder
             .depth_attachment(view::<D32Sfloat, DepthAttachment>(&state), Some([0.25]))
-            .draw(&none, 3, 1, RasterState::default().depth_write(false));
+            .draw(&draw);
         assert_eq!(
             unsafe { builder.clear_depth.unwrap().depth_stencil.depth },
             0.25
@@ -2707,11 +3011,13 @@ mod tests {
         let state = layout(L::UNDEFINED);
         let mut cmd = offline_cmd();
         let none = no_bindings();
+        let writing = Draw::new(&none, 3, 1, RasterState::default(), None);
+        let testing = Draw::new(&none, 3, 1, RasterState::default().depth_write(false), None);
         let mut builder = cmd.raster(EXTENT, []);
         builder
             .depth_attachment(view::<D32Sfloat, DepthAttachment>(&state), None)
-            .draw(&none, 3, 1, RasterState::default())
-            .draw(&none, 3, 1, RasterState::default().depth_write(false));
+            .draw(&writing)
+            .draw(&testing);
         assert_eq!(
             builder.depth_access().unwrap().access.access,
             A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE
@@ -2733,100 +3039,47 @@ mod tests {
         assert_eq!(builder.stencil_format, vk::Format::D32_SFLOAT_S8_UINT);
     }
 
-    /// A declared access is tracked at once; its barrier waits for the next command's.
+    /// The accesses a command takes besides its bindings get the command's shader stages.
     #[test]
-    fn declared_accesses_are_tracked_and_their_barriers_held_back() {
+    fn extra_accesses_take_the_commands_stage() {
         use crate::buffer::usage::Storage;
-        let mut cmd = offline_cmd();
-        let buffer = slice::<u32, Storage>(0x1000, 4);
-        cmd.record_access(Access::buffer_write(buffer), Stage::Compute);
-        assert!(cmd.deferred.is_none(), "a first access needs no barrier");
-        assert_eq!(cmd.pending_accesses.buffer_writes.len(), 1);
-
-        cmd.record_access(Access::buffer_read(buffer), Stage::Raster);
-        let memory = cmd.deferred.take().unwrap().memory.unwrap();
-        assert_eq!(memory.src_stage_mask, S::COMPUTE_SHADER);
-        assert_eq!(
-            memory.dst_stage_mask,
-            S::PRE_RASTERIZATION_SHADERS | S::FRAGMENT_SHADER
-        );
-        assert_eq!(memory.dst_access_mask, A::SHADER_STORAGE_READ);
+        let state = layout(L::GENERAL);
+        let image = view::<R8G8B8A8Unorm, usage::Sampled>(&state);
+        let images = [ImageUse::sampled_read(image)];
+        let buffers = [BufferAccess::write(slice::<u32, Storage>(0x1000, 4))];
+        let (images, buffers) = declared(Some(Accesses::new(&images, &buffers)), S::COMPUTE_SHADER);
+        let [ref image] = images.collect::<Vec<_>>()[..] else {
+            panic!("one image")
+        };
+        assert_eq!(image.access.stage, S::COMPUTE_SHADER);
+        assert_eq!(image.access.access, A::SHADER_SAMPLED_READ);
+        let [ref buffer] = buffers.collect::<Vec<_>>()[..] else {
+            panic!("one buffer")
+        };
+        assert_eq!(buffer.stage, S::COMPUTE_SHADER);
+        assert_eq!(buffer.range, (0x1000u64..0x1010).into());
+        assert_eq!(declared(None, S::COMPUTE_SHADER).0.count(), 0);
     }
 
-    /// The draw list is the command buffer's, lent to each rendering and given back by
-    /// `record`: draws can be added in a loop, and the next rendering starts with none but
-    /// keeps the allocation.
+    /// An attachment a draw samples through a handle is rendered in `GENERAL`, like one its
+    /// bindings read.
     #[test]
-    fn renderings_reuse_the_command_buffers_draw_list() {
-        let mut cmd = offline_cmd();
+    fn an_attachment_a_draw_reaches_through_a_handle_is_rendered_in_general() {
+        let depth_state = layout(L::GENERAL);
+        let depth = view::<D32Sfloat, usage::DepthAttachmentSampled>(&depth_state);
+        let sampled = [ImageUse::sampled_read(depth)];
         let none = no_bindings();
-        let mut builder = cmd.raster(EXTENT, []);
-        for _ in 0..5 {
-            builder.draw(&none, 3, 1, RasterState::default());
-        }
-        assert_eq!(builder.draws.len(), 5);
-        let capacity = builder.draws.capacity();
-        // What `record` does after recording.
-        builder.cmd_buf.draws = recycle(std::mem::take(&mut builder.draws));
-        let builder = cmd.raster(EXTENT, []);
-        assert!(builder.draws.is_empty());
-        assert_eq!(builder.draws.capacity(), capacity);
-    }
-
-    #[test]
-    fn draws_keep_their_order_and_access_their_command_buffers() {
-        use crate::buffer::usage::{Index, Indirect};
+        let state = RasterState::default().depth_write(false);
+        let draw = Draw::new(&none, 3, 1, state, Some(Accesses::images(&sampled)));
         let mut cmd = offline_cmd();
-        let (vertex, mesh) = (no_bindings(), no_bindings());
         let mut builder = cmd.raster(EXTENT, []);
-        builder
-            .draw_indexed(
-                &vertex,
-                slice::<u32, Index>(0x1000, 6),
-                2,
-                RasterState::default(),
-            )
-            .launch_indirect(
-                &mesh,
-                slice::<DispatchIndirectCommand, Indirect>(0x2000, 1),
-                RasterState::default(),
-            );
-        let [indexed, launch] = builder.draws.as_slice() else {
-            panic!("two draws");
+        builder.depth_attachment(depth, None).draw(&draw);
+        let ([], depth) = builder.attachment_accesses();
+        assert_eq!(depth.unwrap().access.layout, L::GENERAL);
+        let [ref image] = draw.image_accesses().collect::<Vec<_>>()[..] else {
+            panic!("one image")
         };
-        let DrawCommand::Indexed {
-            indices,
-            flags,
-            count: 6,
-            instances: 2,
-        } = indexed.command
-        else {
-            panic!("not the indexed draw: {:?}", indexed.command);
-        };
-        assert_eq!((indices.address, indices.size), (0x1000, 24));
-        assert_eq!(
-            flags,
-            vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
-                | vk::AddressCommandFlagsKHR::FULLY_BOUND
-        );
-        assert_eq!(indexed.bindings.sections().buffers().len(), 0);
-        let index = &indexed.extra[0];
-        assert_eq!((index.stage, index.access), (S::INDEX_INPUT, A::INDEX_READ));
-        assert_eq!(index.range, (0x1000u64..0x1018).into());
-
-        let DrawCommand::LaunchIndirect {
-            draws, count: 1, ..
-        } = launch.command
-        else {
-            panic!("not the indirect launch: {:?}", launch.command);
-        };
-        assert_eq!((draws.address, draws.size, draws.stride), (0x2000, 12, 12));
-        let indirect = &launch.extra[0];
-        assert_eq!(
-            (indirect.stage, indirect.access),
-            (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ)
-        );
-        assert_eq!(indirect.range.start, 0x2000);
+        assert_eq!(image.access.stage, RASTER_SHADERS);
     }
 
     // ---- layouts read by the GPU ---------------------------------------------------------

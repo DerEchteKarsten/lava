@@ -60,6 +60,10 @@ features! {
     /// `VK_KHR_calibrated_timestamps`, which puts timestamps on the host's clock
     /// (`QueryPool::instant`).
     calibrated_timestamps,
+    /// `VK_EXT_swapchain_maintenance1` (with a display, and the instance's
+    /// `VK_EXT_surface_maintenance1`): every present signals a fence, so what it uses
+    /// (semaphores, swapchains, surfaces) is destroyed once it is done, not after one more frame.
+    present_fences,
     /// BC1-7 compressed formats.
     bc_compression,
     /// Different `Blend`s for the color attachments of one draw.
@@ -125,6 +129,7 @@ impl Features {
             (self.shader_clock, ash::khr::shader_clock::NAME),
             (self.performance_query, ash::khr::performance_query::NAME),
             (self.calibrated_timestamps, ash::khr::calibrated_timestamps::NAME),
+            (self.present_fences, ash::ext::swapchain_maintenance1::NAME),
             (self.acceleration_structure, ash::khr::deferred_host_operations::NAME),
             (self.acceleration_structure, ash::khr::acceleration_structure::NAME),
             (self.ray_query, ash::khr::ray_query::NAME),
@@ -226,6 +231,7 @@ pub(crate) struct FeatureChain {
     host_image_copy: vk::PhysicalDeviceHostImageCopyFeaturesEXT<'static>,
     clock: vk::PhysicalDeviceShaderClockFeaturesKHR<'static>,
     performance: vk::PhysicalDevicePerformanceQueryFeaturesKHR<'static>,
+    swapchain_maintenance1: vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>,
 }
 
 impl FeatureChain {
@@ -265,6 +271,7 @@ impl FeatureChain {
             host_image_copy,
             clock,
             performance,
+            swapchain_maintenance1,
         } = self;
         // ash 0.38's `push_next` links the pushed struct's whole chain, and a queried chain
         // still points at the structs it was linked to, so every struct starts unlinked.
@@ -292,7 +299,8 @@ impl FeatureChain {
             ray_tracing_pipeline,
             host_image_copy,
             clock,
-            performance
+            performance,
+            swapchain_maintenance1
         );
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(*core)
@@ -323,6 +331,7 @@ impl FeatureChain {
             ash::ext::host_image_copy::NAME => host_image_copy,
             ash::khr::shader_clock::NAME => clock,
             ash::khr::performance_query::NAME => performance,
+            ash::ext::swapchain_maintenance1::NAME => swapchain_maintenance1,
         }
         features
     }
@@ -418,6 +427,8 @@ impl FeatureChain {
             shader_clock: t(self.clock.shader_subgroup_clock),
             performance_query: t(self.performance.performance_counter_query_pools),
             calibrated_timestamps: has(ash::khr::calibrated_timestamps::NAME),
+            // The caller drops it without a display or the instance extension.
+            present_fences: t(self.swapchain_maintenance1.swapchain_maintenance1),
             bc_compression: t(c.texture_compression_bc),
             independent_blend: t(c.independent_blend),
             fill_mode_non_solid: t(c.fill_mode_non_solid),
@@ -548,6 +559,7 @@ impl FeatureChain {
         chain.host_image_copy.host_image_copy = on(f.host_image_copy);
         chain.clock.shader_subgroup_clock = on(f.shader_clock);
         chain.performance.performance_counter_query_pools = on(f.performance_query);
+        chain.swapchain_maintenance1.swapchain_maintenance1 = on(f.present_fences);
         chain
     }
 }

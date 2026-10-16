@@ -1,4 +1,6 @@
 //! The state of a draw (`RasterState`): every rasterization, depth, stencil and blend setting, all of it dynamic state that a rendering sets once and then per draw only where it changed, so raster pipelines are keyed by their attachment formats and constants alone
+use std::ops::Deref;
+
 use crate::vk;
 
 pub use crate::vk::{
@@ -7,7 +9,7 @@ pub use crate::vk::{
     PrimitiveTopology, ProvokingVertexModeEXT, StencilOp,
 };
 
-use super::MAX_COLOR_ATTACHMENTS;
+use smallvec::SmallVec;
 use crate::state::{Ctx, Functions};
 
 /// How a color attachment combines a fragment's output `src` with the stored value `dst`.
@@ -263,14 +265,10 @@ setters! {
 }
 
 impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
-    /// The same state in a list of any rendering's draws: the blends and masks past the first
-    /// `COLOR_ATTACHMENTS` are never read.
-    pub(super) fn widen(self) -> RasterState<MAX_COLOR_ATTACHMENTS> {
-        let mut blends = [Blend::Replace; MAX_COLOR_ATTACHMENTS];
-        blends[..COLOR_ATTACHMENTS].copy_from_slice(&self.blends);
-        let mut write_masks = [ColorComponentFlags::RGBA; MAX_COLOR_ATTACHMENTS];
-        write_masks[..COLOR_ATTACHMENTS].copy_from_slice(&self.write_masks);
-        RasterState {
+    /// The state without the per-attachment parts, and those: a draw keeps them in its own
+    /// sections.
+    pub(super) fn split(self) -> (RasterState<0>, [Blend; COLOR_ATTACHMENTS], [ColorComponentFlags; COLOR_ATTACHMENTS]) {
+        let state = RasterState {
             topology: self.topology,
             primitive_restart: self.primitive_restart,
             rasterizer_discard: self.rasterizer_discard,
@@ -292,9 +290,10 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
             stencil: self.stencil,
             logic_op: self.logic_op,
             blend_constants: self.blend_constants,
-            blends,
-            write_masks,
-        }
+            blends: [],
+            write_masks: [],
+        };
+        (state, self.blends, self.write_masks)
     }
 
     /// Whether the draw writes depth into a depth attachment.
@@ -366,7 +365,24 @@ pub(super) struct Rendering {
 /// The input assembly state last set in a rendering, which only vertex draws set.
 pub(super) type Assembly = Option<(PrimitiveTopology, bool)>;
 
-impl<const MAX: usize> RasterState<MAX> {
+/// A draw's state as the draw keeps it: the [`RasterState`] without the per-attachment parts,
+/// which it derefs to, and a blend and write mask per color attachment.
+#[derive(Clone, Copy)]
+pub(super) struct DrawState<'s> {
+    pub(super) state: &'s RasterState<0>,
+    pub(super) blends: &'s [Blend],
+    pub(super) write_masks: &'s [ColorComponentFlags],
+}
+
+impl Deref for DrawState<'_> {
+    type Target = RasterState<0>;
+
+    fn deref(&self) -> &RasterState<0> {
+        self.state
+    }
+}
+
+impl DrawState<'_> {
     /// Records the state that differs from `last`, the state recorded before in this
     /// rendering (`None`: everything), for a draw of a rendering with `rendering`'s
     /// attachments. Vertex draws also set the input assembly that differs from `assembly`.
@@ -382,6 +398,7 @@ impl<const MAX: usize> RasterState<MAX> {
         let (d2, d3) = (Functions::dynamic_state2(), Functions::dynamic_state3());
         let features = Ctx::features();
         let n = rendering.color_attachments;
+        debug_assert_eq!((self.blends.len(), self.write_masks.len()), (n, n));
         macro_rules! changed {
             ($field:ident) => {
                 last.is_none_or(|last| last.$field != self.$field)
@@ -539,15 +556,14 @@ impl<const MAX: usize> RasterState<MAX> {
                     features.independent_blend || blends.iter().all(|b| *b == blends[0]),
                     "different blends per attachment need `Features::independent_blend`"
                 );
-                let enables: [vk::Bool32; MAX] = std::array::from_fn(|i| {
-                    (i < n && self.blends[i].equation().is_some()) as vk::Bool32
-                });
-                let equations: [vk::ColorBlendEquationEXT; MAX] =
-                    std::array::from_fn(|i| self.blends[i].vk_equation());
-                let writes: [vk::Bool32; MAX] =
-                    std::array::from_fn(|i| (self.blends[i] != Blend::Skip) as vk::Bool32);
-                d3.cmd_set_color_blend_enable(cmd, 0, &enables[..n]);
-                d3.cmd_set_color_blend_equation(cmd, 0, &equations[..n]);
+                let enables: SmallVec<[vk::Bool32; 8]> =
+                    (blends.iter()).map(|b| b.equation().is_some() as vk::Bool32).collect();
+                let equations: SmallVec<[vk::ColorBlendEquationEXT; 8]> =
+                    blends.iter().map(|b| b.vk_equation()).collect();
+                let writes: SmallVec<[vk::Bool32; 8]> =
+                    (blends.iter()).map(|b| (*b != Blend::Skip) as vk::Bool32).collect();
+                d3.cmd_set_color_blend_enable(cmd, 0, &enables);
+                d3.cmd_set_color_blend_equation(cmd, 0, &equations);
                 (Functions::color_write().fp().cmd_set_color_write_enable_ext)(
                     cmd,
                     n as u32,

@@ -195,7 +195,7 @@ pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
             );
             let info = vk::DescriptorImageInfo {
                 image_layout: vk::ImageLayout::GENERAL,
-                image_view: image.view,
+                image_view: image.shader_view,
                 ..Default::default()
             };
             infos.push((set, index, info));
@@ -316,12 +316,12 @@ impl Bindless {
             .push_constant_ranges(&ranges);
         let layout = unsafe { Ctx::device().create_pipeline_layout(&pipline_layout_info, None)? };
 
+        // Exactly what the two sets allocate: the variable counts above, from the
+        // update-after-bind limits (the plain limits, which can be smaller, don't apply to an
+        // update-after-bind pool).
         let pool_sizes = [
             vk::DescriptorPoolSize {
-                descriptor_count: Ctx::device_properties()
-                    .limits
-                    .max_descriptor_set_sampled_images
-                    .min(10000),
+                descriptor_count: desc_counts[0],
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
             },
             vk::DescriptorPoolSize {
@@ -329,10 +329,7 @@ impl Bindless {
                 ty: vk::DescriptorType::SAMPLER,
             },
             vk::DescriptorPoolSize {
-                descriptor_count: Ctx::device_properties()
-                    .limits
-                    .max_descriptor_set_storage_images
-                    .min(10000),
+                descriptor_count: desc_counts[1],
                 ty: vk::DescriptorType::STORAGE_IMAGE,
             },
         ];
@@ -366,8 +363,13 @@ impl Bindless {
         Ok(())
     }
 
-    pub(crate) fn bind(cmd: &vk::CommandBuffer) {
+    /// Binds the sets at the bind points a queue family of `flags` has: none on a
+    /// transfer-only family.
+    pub(crate) fn bind(cmd: &vk::CommandBuffer, flags: vk::QueueFlags) {
         let s = Self::get();
+        if !flags.contains(vk::QueueFlags::COMPUTE) {
+            return;
+        }
         unsafe {
             Ctx::device().cmd_bind_descriptor_sets(
                 *cmd,
@@ -389,6 +391,9 @@ impl Bindless {
                     &[],
                 )
             };
+        }
+        if !flags.contains(vk::QueueFlags::GRAPHICS) {
+            return;
         }
         unsafe {
             Ctx::device().cmd_bind_descriptor_sets(

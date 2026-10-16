@@ -144,6 +144,9 @@ pub struct AccelerationStructure<L: Level> {
     max_primitives: SmallVec<[u32; 4]>,
     build_scratch: u64,
     update_scratch: u64,
+    /// Made by `compacted`: its memory only holds the compacted structure, so it can't be built
+    /// again (a build needs the full size). Updates refit in place.
+    compacted: bool,
     /// Dropped after the structure, so destroyed after it.
     buffer: Buffer<u8, usage::AccelerationStructureStorage>,
     _level: PhantomData<L>,
@@ -184,6 +187,7 @@ impl<L: Level> AccelerationStructure<L> {
             } else {
                 0
             },
+            false,
         )
     }
 
@@ -193,6 +197,7 @@ impl<L: Level> AccelerationStructure<L> {
         max_primitives: SmallVec<[u32; 4]>,
         build_scratch: u64,
         update_scratch: u64,
+        compacted: bool,
     ) -> Result<Self> {
         let functions = functions()?;
         let buffer = Buffer::raw(
@@ -223,6 +228,7 @@ impl<L: Level> AccelerationStructure<L> {
             max_primitives,
             build_scratch,
             update_scratch,
+            compacted,
             buffer,
             _level: PhantomData,
         })
@@ -254,7 +260,8 @@ impl<L: Level> AccelerationStructure<L> {
     }
 
     /// An unbuilt structure of `size` bytes (read from a `QueryPool<CompactedSize>`) with this
-    /// one's flags, for [`CommandBuffer::compact`].
+    /// one's flags, for [`CommandBuffer::compact`]. It can be updated but never built: a build
+    /// needs more memory than the compacted size.
     pub fn compacted(&self, size: u64) -> Result<Self> {
         Self::create(
             size,
@@ -262,7 +269,13 @@ impl<L: Level> AccelerationStructure<L> {
             self.max_primitives.clone(),
             self.build_scratch,
             self.update_scratch,
+            true,
         )
+    }
+
+    /// Whether it was made by `compacted`, so only `compact` and `update` write it.
+    pub fn is_compacted(&self) -> bool {
+        self.compacted
     }
 
     /// An access of its memory by an acceleration structure command or a shader.
@@ -713,6 +726,11 @@ impl CommandBuffer {
                 !update || structure.flags.allow_update,
                 "only a structure with `allow_update` can be updated"
             );
+            assert!(
+                update || !structure.compacted,
+                "a compacted structure can't be built again: its memory only holds the \
+                 compacted structure (build the one it was compacted from, or a new one)"
+            );
             let size = if update {
                 structure.update_scratch
             } else {
@@ -852,6 +870,10 @@ impl CommandBuffer {
         assert!(
             src.flags.allow_compaction,
             "only a structure with `allow_compaction` can be compacted"
+        );
+        assert!(
+            dst.compacted,
+            "`compact` copies into a structure made by `compacted`"
         );
         let accesses = [src.access(BUILD, READ), dst.access(BUILD, WRITE)];
         self.flush_pending(std::iter::empty(), accesses.iter().cloned());

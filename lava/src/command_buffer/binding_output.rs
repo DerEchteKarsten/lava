@@ -1,16 +1,10 @@
-//! Pass bindings as generated code builds them (`Bindings`, sized by the pass) and as commands borrow them (`BindingOutput`, unsized bytes): the push constants, accesses and specialization constants of one pass
-use std::{
-    marker::PhantomData,
-    mem::{MaybeUninit, transmute},
-    ops::Deref,
-    ptr,
-    sync::atomic::AtomicU32,
-};
+//! Pass bindings as generated code builds them (`Bindings`, sized by the pass) and as commands borrow them (`BindingOutput`, unsized, an `unsized_struct!`): the push constants, accesses and specialization constants of one pass
 
 use bytemuck::{Pod, bytes_of};
 
 use super::{BufferAccess, ImageUse};
 use crate::pipeline::MAX_PUSH_CONSTANTS_SIZE;
+use crate::unsized_struct::unsized_struct;
 
 /// Marker types for the kind of pass a [`BindingOutput`] was made for, so that it can only be
 /// recorded the way its shaders run.
@@ -21,110 +15,68 @@ pub mod kind {
     pub struct RasterMesh;
 }
 
-/// The header of a [`BindingOutput`]: the pass index, then the push-constant bytes, image
-/// accesses, buffer accesses and specialization-constant bytes that follow it.
-type Header = [u32; 5];
-const HEADER_SIZE: usize = size_of::<Header>();
-const IMAGE_USE_SIZE: usize = size_of::<ImageUse<'static>>();
-const BUFFER_ACCESS_SIZE: usize = size_of::<BufferAccess>();
-
-fn header(
-    pass: usize,
-    push_constants: usize,
-    images: usize,
-    buffers: usize,
-    constants: usize,
-) -> Header {
-    [pass, push_constants, images, buffers, constants].map(|n| n as u32)
+unsized_struct! {
+    /// A pass's bindings as the generated functions build them: the [`BindingOutput`] it derefs
+    /// to, sized by what the pass has: `P` bytes of push constants, `I` image and `B` buffer
+    /// accesses, `C` bytes of specialization constants. Binding generators make it with
+    /// [`Self::new`] and [`Self::with_constants`]. Resources a pass reaches without naming them
+    /// (through a handle or pointer in a buffer) are passed to the command as its `Accesses`.
+    pub struct Bindings<'a, K>[P, I, B, C];
+    /// A pass's push constants, specialization constants and the resources it accesses, as
+    /// commands take them: borrowed and unsized, so a binding is as big as its pass needs and
+    /// commands don't depend on that size. The generated `Pass::push_bindings` (and
+    /// `constant_bindings` for a pass with specialization constants) returns it as a sized
+    /// [`Bindings`], which derefs to this, so `cmd.compute(&Pass::push_bindings(..), ..)` records
+    /// it. It borrows its images' tracked layouts until it is recorded, and can be recorded more
+    /// than once.
+    pub struct BindingOutput {
+        /// The pass's index in the pass map.
+        pass: u32,
+    } sections {
+        push_constants: [u8; P],
+        images: [ImageUse<'a>; I],
+        buffers: [BufferAccess; B],
+        constants: [u8; C],
+    }
 }
 
-/// A pass's push constants, specialization constants and the resources it accesses, as
-/// commands take them: borrowed and unsized, so a binding is as big as its pass needs and
-/// commands don't depend on that size. The generated `Pass::push_bindings` (and
-/// `constant_bindings` for a pass with specialization constants) returns it as a sized
-/// [`Bindings`], which derefs to this, so `cmd.compute(&Pass::push_bindings(..), ..)` records
-/// it. It borrows its images' tracked layouts until it is recorded, and can be recorded more
-/// than once.
-///
-/// It is one run of bytes: a header (pass index and the size of each section), the push
-/// constants at their size, the image accesses ([`ImageUse`]s), the buffer accesses
-/// ([`BufferAccess`]es) and the specialization constants.
-#[repr(C)]
-pub struct BindingOutput<'a, K> {
-    marker: PhantomData<(&'a [AtomicU32], K)>,
-    /// Bytes, but also the pointers of the accesses' borrows, so `MaybeUninit` keeps their
-    /// provenance.
-    bytes: [MaybeUninit<u8>],
-}
-
-/// The sections of a [`BindingOutput`], read from its header once.
+/// The sections of a [`BindingOutput`].
 #[derive(Clone, Copy)]
 pub struct Sections<'s, 'a> {
     pub pass: usize,
     pub push_constants: &'s [u8],
-    images: &'s [[MaybeUninit<u8>; IMAGE_USE_SIZE]],
-    buffers: &'s [[MaybeUninit<u8>; BUFFER_ACCESS_SIZE]],
+    images: &'s [ImageUse<'a>],
+    buffers: &'s [BufferAccess],
     pub constants: &'s [u8],
-    marker: PhantomData<&'a [AtomicU32]>,
 }
 
 impl<'s, 'a> Sections<'s, 'a> {
     pub fn images(self) -> impl ExactSizeIterator<Item = ImageUse<'a>> + Clone {
-        // SAFETY: `Bindings` wrote an `ImageUse<'a>` there.
-        self.images
-            .iter()
-            .map(|&bytes| unsafe { transmute::<_, ImageUse<'a>>(bytes) })
+        self.images.iter().cloned()
     }
 
     pub fn buffers(self) -> impl ExactSizeIterator<Item = BufferAccess> + Clone {
-        // SAFETY: `Bindings` wrote a `BufferAccess` there.
-        self.buffers
-            .iter()
-            .map(|&bytes| unsafe { transmute::<_, BufferAccess>(bytes) })
+        self.buffers.iter().cloned()
     }
 }
 
 impl<'a, K> BindingOutput<'a, K> {
+    #[inline]
     pub fn sections(&self) -> Sections<'_, 'a> {
-        let (&header, rest) = self.bytes.split_first_chunk::<HEADER_SIZE>().unwrap();
-        // SAFETY: `Bindings` wrote a `Header` there.
-        let [pass, push_len, images_len, buffers_len, constants_len] =
-            unsafe { transmute::<_, Header>(header) }.map(|n| n as usize);
-        let (push_constants, rest) = rest.split_at(push_len);
-        let (images, rest) = rest.split_at(images_len * IMAGE_USE_SIZE);
-        let (buffers, rest) = rest.split_at(buffers_len * BUFFER_ACCESS_SIZE);
-        // SAFETY: `Bindings` wrote the push and specialization constants from `Pod` values.
-        let init = |bytes: &[MaybeUninit<u8>]| unsafe { transmute::<_, &[u8]>(bytes) };
         Sections {
-            pass,
-            push_constants: init(push_constants),
-            images: images.as_chunks().0,
-            buffers: buffers.as_chunks().0,
-            constants: init(&rest[..constants_len]),
-            marker: PhantomData,
+            pass: self.pass as usize,
+            push_constants: self.push_constants(),
+            images: self.images(),
+            buffers: self.buffers(),
+            constants: self.constants(),
         }
     }
 
     /// The same bindings without their kind, so draws of both raster kinds share a list.
     pub(super) fn erase(&self) -> &BindingOutput<'a, ()> {
-        // SAFETY: `K` is a zero-sized marker; the layout and the slice length stay the same.
+        // SAFETY: `K` is a zero-sized marker; the layout and the tail length stay the same.
         unsafe { &*(self as *const Self as *const BindingOutput<'a, ()>) }
     }
-}
-
-/// A pass's bindings as the generated functions build them: the [`BindingOutput`] it derefs
-/// to, sized by what the pass has: `P` bytes of push constants, `I` image and `B` buffer
-/// accesses, `C` bytes of specialization constants. Binding generators make it with
-/// [`Self::new`] and [`Self::with_constants`]. Resources a pass reaches without naming them
-/// (through a handle or pointer in a buffer) are declared with `CommandBuffer::record_access`.
-#[repr(C, packed)]
-pub struct Bindings<'a, K, const P: usize, const I: usize, const B: usize, const C: usize> {
-    header: Header,
-    push_constants: [u8; P],
-    images: [ImageUse<'a>; I],
-    buffers: [BufferAccess; B],
-    constants: [u8; C],
-    marker: PhantomData<(&'a [AtomicU32], K)>,
 }
 
 impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I, B, 0> {
@@ -137,16 +89,10 @@ impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I
         buffers: [BufferAccess; B],
     ) -> Self {
         assert!(P <= MAX_PUSH_CONSTANTS_SIZE);
-        Self {
-            header: header(pass, P, I, B, 0),
-            push_constants: bytes_of(bindings)
-                .try_into()
-                .expect("`P` is the size of the push constants"),
-            images,
-            buffers,
-            constants: [],
-            marker: PhantomData,
-        }
+        let push_constants = bytes_of(bindings)
+            .try_into()
+            .expect("`P` is the size of the push constants");
+        Self::from_parts(pass as u32, push_constants, images, buffers, [])
     }
 
     /// Sets the specialization constants (`C` bytes), laid out as the pass's
@@ -166,40 +112,22 @@ impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I
         buffers: [BufferAccess; B2],
     ) -> Bindings<'a, K, P, IO, BO, C> {
         const { assert!(IO == I + I2 && BO == B + B2) };
-        let pass = self.header[0] as usize;
         let Self {
+            pass,
             push_constants,
             images: own_images,
             buffers: own_buffers,
             ..
         } = self;
-        Bindings {
-            header: header(pass, P, IO, BO, C),
+        Bindings::from_parts(
+            pass,
             push_constants,
-            images: concat(own_images, images),
-            buffers: concat(own_buffers, buffers),
-            constants: bytes_of(constants)
+            concat(own_images, images),
+            concat(own_buffers, buffers),
+            bytes_of(constants)
                 .try_into()
                 .expect("`C` is the size of the specialization constants"),
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<'a, K, const P: usize, const I: usize, const B: usize, const C: usize> Deref
-    for Bindings<'a, K, P, I, B, C>
-{
-    type Target = BindingOutput<'a, K>;
-
-    fn deref(&self) -> &BindingOutput<'a, K> {
-        let bytes = ptr::slice_from_raw_parts(
-            (self as *const Self).cast::<MaybeUninit<u8>>(),
-            size_of::<Self>(),
-        );
-        // SAFETY: `Bindings` is packed, so it is `size_of::<Self>()` bytes laid out as
-        // `BindingOutput` reads them; `BindingOutput` is those bytes behind a zero-sized
-        // marker.
-        unsafe { &*(bytes as *const BindingOutput<'a, K>) }
+        )
     }
 }
 
@@ -214,6 +142,7 @@ fn concat<T, const N: usize, const M: usize, const O: usize>(a: [T; N], b: [T; M
 mod tests {
     use super::*;
     use crate::command_buffer::ImageAccess;
+    use std::sync::atomic::AtomicU32;
     use crate::vk::{self, Handle};
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
@@ -252,7 +181,8 @@ mod tests {
             );
         let output: &BindingOutput<'_, kind::Compute> = &bindings;
 
-        assert_eq!(size_of_val(output), 20 + 12 + 2 * 56 + 32 + 8);
+        // The pass and the lengths, then the sections, each aligned to its type.
+        assert_eq!(size_of_val(output), 24 + 16 + 2 * 56 + 32 + 8);
         assert_eq!(output.sections().pass, 5);
         assert_eq!(
             output.sections().push_constants,

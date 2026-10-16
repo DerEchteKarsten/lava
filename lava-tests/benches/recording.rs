@@ -14,7 +14,7 @@ use lava::{
         Buffer,
         usage::{Index, Storage},
     },
-    command_buffer::{Access, Attachment, CommandBuffer, RasterState},
+    command_buffer::{Accesses, Attachment, CommandBuffer, Draw, ImageUse, RasterState},
     epoch,
     image::{
         Image,
@@ -22,7 +22,7 @@ use lava::{
         usage::{ColorAttachmentStorageTransferSrcTransferDst, SampledTransferDst},
     },
     state::Ctx,
-    vkobjects::queue::{FrameSlot, Gfx, Queue, Stage},
+    vkobjects::queue::{FrameSlot, Gfx, Queue},
 };
 use lava_tests::bindings::{
     PASS_MAP, TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster,
@@ -83,6 +83,7 @@ fn compute(cmd: &mut CommandBuffer, r: &Resources) {
                 i as u32,
             ),
             [1, 1, 1],
+            None,
         );
     }
     for i in 0..16 {
@@ -94,6 +95,7 @@ fn compute(cmd: &mut CommandBuffer, r: &Resources) {
                 1.0,
             ),
             [1, 1, 1],
+            None,
         );
     }
     for i in 0..16 {
@@ -105,6 +107,7 @@ fn compute(cmd: &mut CommandBuffer, r: &Resources) {
                 UVec2::splat(8),
             ),
             [1, 1, 1],
+            None,
         );
     }
 }
@@ -115,24 +118,24 @@ fn many_draws(cmd: &mut CommandBuffer, r: &Resources) {
     let draw = |i: usize| {
         TestRasterTextured::push_bindings(r.textured[i].range(..), r.textures[i].whole_view(), 0)
     };
+    // Two textures each draw reaches through a handle.
+    let textures = |d: usize| {
+        [(d + 1) % TEXTURES, (d + 32) % TEXTURES]
+            .map(|t| ImageUse::sampled_read(r.textures[t].whole_view()))
+    };
     let state = RasterState::default;
     for j in 0..8 {
         let i = j * 8;
         let indices = r.indices.range(..);
-        for d in i..i + 8 {
-            for t in [(d + 1) % TEXTURES, (d + 32) % TEXTURES] {
-                cmd.record_access(Access::sampled_read(r.textures[t].whole_view()), Stage::Raster);
-            }
-        }
         cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
-            .draw_indexed(&draw(i), indices, 1, state())
-            .draw_indexed(&draw(i + 1), indices, 1, state())
-            .draw_indexed(&draw(i + 2), indices, 1, state())
-            .draw_indexed(&draw(i + 3), indices, 1, state())
-            .draw_indexed(&draw(i + 4), indices, 1, state())
-            .draw_indexed(&draw(i + 5), indices, 1, state())
-            .draw_indexed(&draw(i + 6), indices, 1, state())
-            .draw_indexed(&draw(i + 7), indices, 1, state())
+            .draw(&Draw::indexed(&draw(i), indices, 1, state(), Some(Accesses::images(&textures(i)))))
+            .draw(&Draw::indexed(&draw(i + 1), indices, 1, state(), Some(Accesses::images(&textures(i + 1)))))
+            .draw(&Draw::indexed(&draw(i + 2), indices, 1, state(), Some(Accesses::images(&textures(i + 2)))))
+            .draw(&Draw::indexed(&draw(i + 3), indices, 1, state(), Some(Accesses::images(&textures(i + 3)))))
+            .draw(&Draw::indexed(&draw(i + 4), indices, 1, state(), Some(Accesses::images(&textures(i + 4)))))
+            .draw(&Draw::indexed(&draw(i + 5), indices, 1, state(), Some(Accesses::images(&textures(i + 5)))))
+            .draw(&Draw::indexed(&draw(i + 6), indices, 1, state(), Some(Accesses::images(&textures(i + 6)))))
+            .draw(&Draw::indexed(&draw(i + 7), indices, 1, state(), Some(Accesses::images(&textures(i + 7)))))
             .record("many_draws");
     }
 }
@@ -140,16 +143,16 @@ fn many_draws(cmd: &mut CommandBuffer, r: &Resources) {
 /// 4 renderings of one draw that reaches 16 declared textures.
 fn declared(cmd: &mut CommandBuffer, r: &Resources) {
     for j in 0..4 {
-        for texture in &r.textures[j * 16..j * 16 + 16] {
-            cmd.record_access(Access::sampled_read(texture.whole_view()), Stage::Raster);
-        }
+        let textures: [ImageUse; 16] =
+            std::array::from_fn(|k| ImageUse::sampled_read(r.textures[j * 16 + k].whole_view()));
         cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
-            .draw(
+            .draw(&Draw::new(
                 &TestRaster::push_bindings(r.vertices.range(..), Vec2::ZERO),
                 3,
                 1,
                 RasterState::default(),
-            )
+                Some(Accesses::images(&textures)),
+            ))
             .record("declared");
     }
 }
@@ -160,10 +163,10 @@ fn mesh(cmd: &mut CommandBuffer, r: &Resources) {
     let state = RasterState::default;
     for _ in 0..8 {
         cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
-            .launch(&launch(0), [1, 1, 1], state())
-            .launch(&launch(1), [1, 1, 1], state())
-            .launch(&launch(2), [1, 1, 1], state())
-            .launch(&launch(3), [1, 1, 1], state())
+            .draw(&Draw::launch(&launch(0), [1, 1, 1], state(), None))
+            .draw(&Draw::launch(&launch(1), [1, 1, 1], state(), None))
+            .draw(&Draw::launch(&launch(2), [1, 1, 1], state(), None))
+            .draw(&Draw::launch(&launch(3), [1, 1, 1], state(), None))
             .record("mesh");
     }
 }
