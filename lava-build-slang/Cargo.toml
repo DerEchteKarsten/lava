@@ -10,7 +10,7 @@ description = "lava's Slang frontend: compiles an application's Slang passes in 
 readme = "README.md"
 keywords = ["vulkan", "slang", "shader", "codegen", "lava"]
 categories = ["development-tools::build-utils", "graphics", "rendering::graphics-api"]
-include = ["src/**", "slang/**", "README.md", "LICENSE-*"]
+include = ["build.rs", "src/**", "slang/**", "README.md", "LICENSE-*"]
 
 [dependencies]
 shader-slang.workspace = true

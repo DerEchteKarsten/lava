@@ -25,15 +25,20 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    `profile.slang` and `ray_tracing.slang` in its `slang/`, searched by every session, and
    lava's GPU tests moved to the `lava-tests` crate, an ordinary consumer, so `test-passes` is
    gone.
-3. ~~**Git dependencies.**~~ **Done (2026-10-16):** ash, ash-window, gpu-allocator and slang-rs are
-   lava's own forks (`github.com/DerEchteKarsten/{ash,gpu-allocator,slang-rs}`, branch `lava`),
-   to be published as `lava-ash`, `lava-ash-window`, `lava-gpu-allocator`, `lava-slang-sys`
-   and `lava-slang` with their upstream lib names. No `[patch]` is left. They are published
-   first; until then `lava` and `lava-build-slang` can't run `cargo package` with verification.
-4. ~~**Slang is needed by every user.**~~ **Done (2026-10-16):** lava-slang-sys loads Slang at
-   runtime from the path its build script finds (`SLANG_LIB_DIR`, `SLANG_DIR`, `VULKAN_SDK`,
-   else the system's loader), with pregenerated bindings, so no rpath, `LD_LIBRARY_PATH` or
-   clang is needed and docs.rs can build it. Only lava-build-slang reaches Slang.
+3. **Git dependencies.** ash's crates.io release (0.38, April 2024) predates
+   `VK_KHR_device_address_commands`, and gpu-allocator 0.28 builds against it. lava names both
+   by version, and its workspace patches ash and ash-window to ash's master and gpu-allocator to
+   its `ash-next` branch. Every application needs the same `[patch.crates-io]` (the README shows
+   it), and `lava` can't pass `cargo package` verification until ash releases. lava-build-slang
+   depends on slang-rs by git, which crates.io refuses. *Tried and reverted (2026-10-16):*
+   publishing lava's own forks (`lava-ash`, `lava-gpu-allocator`, `lava-slang`, ...); the user
+   chose upstream instead. Fix: wait for ash's next release and gpu-allocator's on it, and for a
+   slang-rs release (or ask its maintainers for one).
+4. **Slang is needed by every user.** lava-build-slang links `slang-compiler` through slang-rs,
+   whose build script runs bindgen (clang) on `slang.h` from `SLANG_DIR`/`VULKAN_SDK`. Build
+   scripts and hot-reload binaries find the library through an absolute rpath (or
+   `LD_LIBRARY_PATH`) the application sets up; lava-build-slang's README documents it. The
+   user accepted this (2026-10-16). docs.rs can't build lava-build-slang this way.
 5. ~~**The default `hot-reload` feature makes binaries non-relocatable.**~~ **Done
    (2026-10-15):** `PassEntry.spirv` is always `include_bytes!`'d and hot reload compiles from
    the absolute source path (lava-build-slang's `BuiltPass.source`), so a moved binary runs

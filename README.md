@@ -23,7 +23,8 @@ lava is young (0.x) and is developed alongside a game engine. Expect breaking ch
 - Rust 1.96 or newer.
 - A Vulkan 1.4 driver with `VK_KHR_device_address_commands`, the extended dynamic state 2 and 3 extensions (including the logic op and the extended dynamic state 3 bits lava sets), `VK_EXT_color_write_enable`, `VK_KHR_line_rasterization`, `VK_EXT_provoking_vertex`, `VK_EXT_conservative_rasterization`, `VK_EXT_depth_clip_enable`, `VK_EXT_depth_clip_control`, `VK_EXT_depth_clamp_control` and `VK_EXT_sample_locations`. `lava::init` names whatever a GPU lacks.
 - Everything else is optional (`lava::Features`: mesh shaders, ray tracing, BC textures, …). lava enables what the device has, `Config::required` makes features mandatory, and a pass whose SPIR-V needs a missing feature panics when it is recorded.
-- The Slang compiler at build time (see [`lava-build-slang`](lava-build-slang/README.md)).
+- ash from its git master, because lava uses `VK_KHR_device_address_commands`, which ash's 0.38 release predates. Your workspace patches ash, ash-window and gpu-allocator, as in the example below. Cargo applies patches only in the workspace being built, so lava can't do it for you.
+- The Slang SDK at build time, found through `SLANG_DIR`, and an rpath to it for build scripts and hot-reload binaries. [`lava-build-slang`](lava-build-slang/README.md#setting-up-slang) shows the setup.
 
 lava is tested on Linux with Mesa's ANV driver (Intel Arc).
 
@@ -39,6 +40,22 @@ bytemuck = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 lava-build-slang = "0.1"
+
+# Until ash releases VK_KHR_device_address_commands (the revisions lava is built with):
+[patch.crates-io]
+ash = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
+ash-window = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
+gpu-allocator = { git = "https://github.com/Traverse-Research/gpu-allocator", rev = "6a68a5b4c233361c07dfa8865043a16ade7512db" }
+```
+
+`.cargo/config.toml`, pointing at your Slang SDK:
+
+```toml
+[env]
+SLANG_DIR = { value = "slang-sdk", relative = true }
+
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/absolute/path/to/slang-sdk/lib"]
 ```
 
 `shaders/double.slang`, one pass per file:

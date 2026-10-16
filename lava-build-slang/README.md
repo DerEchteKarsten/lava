@@ -17,15 +17,28 @@ Every compilation can include `bindless.slang` (lava's bindless images, buffer p
 
 With the `hot-reload` feature, `lava_build_slang::watch!()` (called after `lava::init`) recompiles changed passes while the application runs and swaps their pipelines in.
 
-## The Slang compiler
+## Setting up Slang
 
-lava-build-slang loads Slang at runtime, so nothing needs an rpath or `LD_LIBRARY_PATH`. At build time it looks for the library in, in order:
+lava-build-slang links the Slang compiler through [slang-rs](https://github.com/FloatyMonkey/slang-rs), so every application needs a Slang SDK at build time, and every binary that links it needs to find the library when it starts. You set this up once per checkout:
 
-1. `SLANG_LIB_DIR`;
-2. `SLANG_DIR` (a [Slang release](https://github.com/shader-slang/slang/releases), unpacked);
-3. `VULKAN_SDK` (LunarG's Vulkan SDK ships Slang).
+1. Get Slang: unpack a [Slang release](https://github.com/shader-slang/slang/releases), or install LunarG's Vulkan SDK, which ships it. slang-rs generates its bindings from `slang.h` with bindgen, so clang has to be installed too.
+2. Tell the build where it is. slang-rs reads `SLANG_DIR` (the unpacked release, with `include/` and `lib/`), else `VULKAN_SDK`. `SLANG_INCLUDE_DIR` and `SLANG_LIB_DIR` override either half. The simplest place is your project's `.cargo/config.toml`:
 
-Without any of them the system's loader looks for `libslang-compiler` at runtime. A binary that compiles shaders at runtime (hot reload) and runs on another machine needs Slang there too.
+   ```toml
+   [env]
+   SLANG_DIR = { value = "slang-sdk", relative = true }
+   ```
+
+3. Let binaries find the library. Your build script runs lava-build-slang, so it links `libslang-compiler`, and so does an application built with the `hot-reload` feature. Cargo doesn't put the SDK on the library path, so add an rpath to it, again in `.cargo/config.toml`. It has to be an absolute path:
+
+   ```toml
+   [build]
+   rustflags = ["-C", "link-arg=-Wl,-rpath,/absolute/path/to/slang-sdk/lib"]
+   ```
+
+   Setting `LD_LIBRARY_PATH` to the SDK's `lib/` works as well. On Windows, put the SDK's `bin/` on `PATH`.
+
+A binary built with `hot-reload` needs Slang on every machine it runs on. Without the feature, only the build needs it.
 
 ## License
 

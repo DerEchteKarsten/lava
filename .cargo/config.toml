@@ -2,3 +2,7 @@
 # The Slang SDK lava-build-slang compiles with (gitignored; any Slang release or Vulkan SDK works).
 SLANG_DIR = { value = "slang-sdk", relative = true }
 
+[build]
+# Build scripts (lava-tests') and hot-reload binaries link `slang-compiler` and find it here.
+# Absolute, so adjust it to your checkout (see lava-build-slang's README).
+rustflags = ["-C", "link-arg=-Wl,-rpath,/home/karsten/code/lava/slang-sdk/lib"]
