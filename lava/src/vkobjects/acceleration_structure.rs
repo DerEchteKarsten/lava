@@ -15,7 +15,8 @@ use crate::{
     },
     command_buffer::{BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE},
     epoch,
-    error::{Error, Result},
+    error::Result,
+    features::{Feature, gate},
     query::{CompactedSize, QueryPool},
     state::{Ctx, Functions},
 };
@@ -34,16 +35,15 @@ const TRACE_READ: vk::AccessFlags2 =
 /// What `vkCreateAccelerationStructure2KHR` requires of a structure's address and size.
 const STRUCTURE_ALIGNMENT: u64 = 256;
 
+/// The acceleration structure functions, or `MissingFeature` (only where lava checks it).
 pub(crate) fn functions() -> Result<&'static ash::khr::acceleration_structure::Device> {
-    Functions::acceleration_structure().ok_or_else(|| {
-        Error::message(
-            "acceleration structures aren't supported by this device (`Ctx::features().acceleration_structure`)",
-        )
-    })
+    gate::AccelerationStructure::check()?;
+    Ok(Functions::acceleration_structure())
 }
 
+/// The functions of commands on a structure, which only exists where the device has them.
 fn command_functions() -> &'static ash::khr::acceleration_structure::Device {
-    functions().unwrap_or_else(|err| panic!("{err}"))
+    Functions::acceleration_structure()
 }
 
 /// The alignment of a scratch buffer's address (`minAccelerationStructureScratchOffsetAlignment`).

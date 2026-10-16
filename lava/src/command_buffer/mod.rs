@@ -24,16 +24,15 @@ use crate::{
         slice::ImageView,
         usage::{IsColorAttachment, IsDepthAttachment, IsSampled, IsStorage},
     },
-    pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterKeyRef, pass_map, pipelines},
+    pipeline::{RasterKeyRef, pass_map, pipelines},
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
     state::{Ctx, Functions},
-    vkobjects::{
-        acceleration_structure::Tlas,
-        queue::{PendingAccesses, PendingRead, PendingWrite},
-    },
+    vkobjects::queue::{PendingAccesses, PendingRead, PendingWrite},
 };
+#[cfg(feature = "acceleration-structure")]
+use crate::vkobjects::acceleration_structure::Tlas;
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec2, UVec2};
 use lava_macros::validation_trace;
@@ -387,6 +386,8 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         Self::with(bindings.erase(), command, [], state, accesses)
     }
 
+    /// Launches `groups` task (or, without a task shader, mesh) workgroups.
+    #[cfg(feature = "mesh-shader")]
     pub fn launch(
         bindings: &'a BindingOutput<'a, kind::RasterMesh>,
         groups: [u32; 3],
@@ -446,6 +447,7 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
     }
 
     /// Launches the task (or, without a task shader, mesh) workgroup counts in `buffer`.
+    #[cfg(feature = "mesh-shader")]
     pub fn launch_indirect<IND: IsIndirect>(
         bindings: &'a BindingOutput<'a, kind::RasterMesh>,
         buffer: BufferSlice<'a, DispatchIndirectCommand, IND>,
@@ -511,12 +513,25 @@ pub(crate) enum DrawCommand {
         count_flags: vk::AddressCommandFlagsKHR,
         max_count: u32,
     },
+    #[cfg(feature = "mesh-shader")]
     Launch([u32; 3]),
+    #[cfg(feature = "mesh-shader")]
     LaunchIndirect {
         draws: vk::StridedDeviceAddressRangeKHR,
         flags: vk::AddressCommandFlagsKHR,
         count: u32,
     },
+}
+
+impl DrawCommand {
+    /// Whether it launches mesh shaders, which have no input assembly.
+    fn is_mesh(&self) -> bool {
+        match self {
+            #[cfg(feature = "mesh-shader")]
+            DrawCommand::Launch(_) | DrawCommand::LaunchIndirect { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -537,6 +552,7 @@ pub struct DispatchIndirectCommand {
 }
 
 /// The rays of an indirect trace (`VkTraceRaysIndirectCommandKHR`).
+#[cfg(feature = "ray-tracing-pipeline")]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct TraceRaysIndirectCommand {
@@ -652,17 +668,30 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
         (color, self.depth_access().map(in_layout))
     }
 
-    /// The pipeline key of a draw of `sections` in this rendering.
+    /// The pipeline key of a draw with `sections` and `state` in this rendering, on a device
+    /// with `dynamic` state: what the device can't set dynamically is part of it.
     fn pipeline_key<'k>(
         &self,
         color_formats: &'k [vk::Format],
         sections: &Sections<'k, '_>,
+        state: DrawState<'k>,
+        dynamic: &Dynamic,
     ) -> RasterKeyRef<'k> {
+        #[cfg(bake_blend)]
+        let (blends, write_masks) = match dynamic.blend {
+            true => (&[][..], &[][..]),
+            false => (state.blends, state.write_masks),
+        };
         RasterKeyRef {
             color_formats,
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
             constants: sections.constants,
+            baked: Baked::of(state.state, dynamic),
+            #[cfg(bake_blend)]
+            blends,
+            #[cfg(bake_blend)]
+            write_masks,
         }
     }
 
@@ -755,10 +784,11 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
             stencil: self.stencil_format != vk::Format::UNDEFINED,
         };
         // What the previous draws set: the state, the input assembly, the pipeline of a pass
-        // with its constants.
+        // with its key.
+        let dynamic = Dynamic::of(Ctx::features_ref());
         let mut state: Option<DrawState> = None;
         let mut assembly: Assembly = None;
-        let mut bound: Option<(usize, &[u8])> = None;
+        let mut bound: Option<(usize, RasterKeyRef)> = None;
         for draw in iter_draws(&self.draws) {
             if let Some((pool, query)) = draw.samples {
                 self.cmd_buf.begin_query(pool, query);
@@ -772,21 +802,18 @@ impl<'a, const N: usize> RasterBuilder<'a, N> {
                     | DrawCommand::Indexed { count: 0, .. }
             ) {
                 let sections = draw.bindings.sections();
-                if bound != Some((sections.pass, sections.constants)) {
-                    let key = self.pipeline_key(&color_formats, &sections);
+                let draw_state = draw.draw_state();
+                let key = self.pipeline_key(&color_formats, &sections, draw_state, &dynamic);
+                if bound != Some((sections.pass, key)) {
                     let pipeline = pipelines().raster(&key, sections.pass);
                     unsafe {
                         device.cmd_bind_pipeline(handle, vk::PipelineBindPoint::GRAPHICS, pipeline)
                     };
-                    bound = Some((sections.pass, sections.constants));
+                    bound = Some((sections.pass, key));
                 }
                 self.cmd_buf.push_constants(sections.push_constants);
-                let vertex = !matches!(
-                    draw.command,
-                    DrawCommand::Launch(_) | DrawCommand::LaunchIndirect { .. }
-                );
-                let draw_state = draw.draw_state();
-                draw_state.record(state.as_ref(), rendering, vertex, &mut assembly, handle);
+                let vertex = !draw.command.is_mesh();
+                draw_state.record(state.as_ref(), rendering, vertex, &mut assembly, &dynamic, handle);
                 state = Some(draw_state);
                 record_draw(handle, &draw.command);
             }
@@ -851,9 +878,11 @@ fn record_draw(handle: vk::CommandBuffer, command: &DrawCommand) {
                         .count_address_flags(count_flags)
                         .max_draw_count(max_count),
                 ),
+                #[cfg(feature = "mesh-shader")]
                 DrawCommand::Launch([x, y, z]) => {
                     mesh_functions().cmd_draw_mesh_tasks(handle, x, y, z)
                 }
+                #[cfg(feature = "mesh-shader")]
                 DrawCommand::LaunchIndirect {
                     draws,
                     flags,
@@ -874,10 +903,10 @@ fn address_commands() -> &'static crate::vk::device_address_commands::Device {
     Functions::device_address_commands()
 }
 
+/// Past the check of a mesh pass's bindings.
+#[cfg(feature = "mesh-shader")]
 fn mesh_functions() -> &'static ash::ext::mesh_shader::Device {
-    Functions::mesh().expect(
-        "mesh shaders aren't supported by this device (`Ctx::features().mesh`), so a mesh pass can't be launched",
-    )
+    Functions::mesh()
 }
 
 /// The access of an indirect command read from `buffer`, which has to be `IsIndirect`.
@@ -998,6 +1027,7 @@ impl CommandBuffer {
         self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None, accesses);
     }
 
+    #[cfg(feature = "ray-tracing-pipeline")]
     fn raytrace_private<IND: IsIndirect>(
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
@@ -1020,9 +1050,9 @@ impl CommandBuffer {
         self.push_constants(sections.push_constants);
 
         self.enter(pass.name, true);
-        let functions = Functions::raytracing_pipeline()
-            .expect("a pass that can be recorded has its pipeline functions");
         pipelines().ray_tracing(sections.pass, sections.constants, |pipeline| unsafe {
+            // Past the pass's check (`ray_tracing` panics for hand-made bindings without it).
+            let functions = Functions::raytracing_pipeline();
             Ctx::device().cmd_bind_pipeline(
                 self.handle,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1055,6 +1085,7 @@ impl CommandBuffer {
 
     /// Traces `rays` (width, height, depth) raygen invocations of a ray tracing pass, which
     /// also reaches `accesses` (see [`Self::compute`]).
+    #[cfg(feature = "ray-tracing-pipeline")]
     #[validation_trace]
     pub fn raytrace(
         &mut self,
@@ -1066,6 +1097,7 @@ impl CommandBuffer {
     }
 
     /// Like [`Self::raytrace`], with the ray counts read from `buffer` on the GPU.
+    #[cfg(feature = "ray-tracing-pipeline")]
     #[validation_trace]
     pub fn raytrace_indirect<IND: IsIndirect>(
         &mut self,
@@ -1409,6 +1441,7 @@ impl BufferAccess {
 
     /// The pass traces `tlas` through an address it reads from a buffer (an `Accel` inside a
     /// struct): its memory and the BLASes it names.
+    #[cfg(feature = "acceleration-structure")]
     pub fn trace(tlas: &Tlas) -> [Self; 2] {
         tlas.trace_accesses(S2::NONE)
     }
@@ -1820,6 +1853,7 @@ fn all_read_access() -> vk::AccessFlags2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::image::usage::ImageUsage;
     use crate::image::{
         format::{self, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
@@ -2768,36 +2802,84 @@ mod tests {
         assert_eq!(state.write_masks, [ColorComponentFlags::RGBA; 2]);
     }
 
-    /// Draw state is dynamic: a pipeline is keyed by the rendering's attachment formats and
-    /// the pass's constants alone.
+    /// Where the device has the dynamic state, a pipeline is keyed by the rendering's
+    /// attachment formats and the pass's constants alone; elsewhere also by the draw's state.
     #[test]
-    fn pipelines_are_keyed_by_attachment_formats_and_constants() {
+    fn pipelines_are_keyed_by_attachment_formats_constants_and_baked_state() {
         let state = layout(L::UNDEFINED);
         let mut cmd = offline_cmd();
         let target = view::<R8G8B8A8Unorm, ColorAttachment>(&state);
         let builder = cmd.raster(EXTENT, [Attachment::color(target, None)]);
         let bindings = no_bindings::<kind::RasterVertex>();
+        let none = no_bindings();
+        let alpha = Draw::new(&none, 3, 1, RasterState::<1>::default().blend(Blend::Alpha), None);
         let formats = [vk::Format::R8G8B8A8_UNORM];
-        let key = builder.pipeline_key(&formats, &bindings.sections());
+        // Every state the device can't set dynamically is baked (`Features::DEFAULT`).
+        let baked = Dynamic::of(&Features::DEFAULT);
+        let key = builder.pipeline_key(&formats, &bindings.sections(), alpha.draw_state(), &baked);
         assert_eq!(key.color_formats, formats);
         assert_eq!(key.depth_format, vk::Format::UNDEFINED);
         assert!(key.constants.is_empty());
+        #[cfg(bake_blend)]
+        assert_eq!(key.blends, [Blend::Alpha]);
+        // Where it has every dynamic state, nothing is.
+        let dynamic = Dynamic {
+            blend: true,
+            polygon_mode: true,
+            depth_clamp: true,
+            depth_clamp_range: true,
+            depth_clip: true,
+            depth_clip_negative_one_to_one: true,
+            logic_op: true,
+            conservative: true,
+            line_mode: true,
+            line_stipple_enable: true,
+            line_stipple: true,
+            provoking_vertex: true,
+        };
+        let key = builder.pipeline_key(&formats, &bindings.sections(), alpha.draw_state(), &dynamic);
+        assert_eq!(key.baked, Baked::default());
+        #[cfg(bake_blend)]
+        assert!(key.blends.is_empty());
     }
 
     /// A draw keeps its state's blends and masks as sections, one per attachment.
     #[test]
     fn a_draw_keeps_a_blend_and_mask_per_attachment() {
         let state = RasterState::<2>::default()
-            .blends([Blend::Alpha, Blend::Skip])
+            .blend(Blend::Alpha)
             .write_masks([ColorComponentFlags::R, ColorComponentFlags::RGBA])
             .cull_mode(CullModeFlags::NONE);
         let none = no_bindings();
         let draw = Draw::new(&none, 3, 1, state.clone(), None);
         let draw_state = draw.draw_state();
-        assert_eq!(draw_state.blends, [Blend::Alpha, Blend::Skip]);
+        assert_eq!(draw_state.blends, [Blend::Alpha, Blend::Alpha]);
         assert_eq!(draw_state.write_masks, state.write_masks);
         assert_eq!(draw_state.cull_mode, CullModeFlags::NONE);
         assert_eq!(size_of_val(&*draw), size_of_val(&draw));
+    }
+
+    /// Without dynamic state, a draw's state is in its pipeline key; skipped attachments write
+    /// nothing either way.
+    #[test]
+    fn baked_state_holds_the_draw_values_only_without_the_dynamic_state() {
+        let mut state = RasterState::<0>::default();
+        state.polygon_mode = PolygonMode::LINE;
+        state.logic_op = Some(LogicOp::XOR);
+        let baked = Baked::of(&state, &Dynamic::of(&Features::DEFAULT));
+        #[cfg(bake_polygon_mode)]
+        assert_eq!(baked.polygon_mode(), PolygonMode::LINE);
+        #[cfg(bake_logic_op)]
+        assert_eq!(baked.logic_op(), Some(LogicOp::XOR));
+        let _ = baked;
+        assert_eq!(
+            effective_write_mask(Blend::Skip, ColorComponentFlags::RGBA),
+            ColorComponentFlags::empty()
+        );
+        assert_eq!(
+            effective_write_mask(Blend::Add, ColorComponentFlags::R),
+            ColorComponentFlags::R
+        );
     }
 
     #[test]

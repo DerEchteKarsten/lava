@@ -16,9 +16,14 @@ include = ["build.rs", "src/**", "slang/**", "README.md", "LICENSE-*"]
 shader-slang.workspace = true
 # Only for `src/reflect.rs`, which checks the reflection results 0.1.0 doesn't.
 shader-slang-sys.workspace = true
-lava = { version = "0.1.0", path = "../lava", optional = true }
+# Without its defaults: the application picks lava's features (cargo would add every default).
+lava = { version = "0.1.0", path = "../lava", optional = true, default-features = false }
 notify = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+# For the test that compares the SPIR-V capability tables (`src/features.rs`).
+lava = { path = "../lava" }
 
 [features]
 # Recompiles changed passes while the application runs (a debugging aid, `src/hot_reload.rs`),

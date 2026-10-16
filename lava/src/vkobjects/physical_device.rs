@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::vk;
 use lava_macros::validation_trace;
 
-use crate::features::{FeatureChain, Features};
+use crate::features::{DeviceFacts, FeatureChain, Features};
 
 impl PartialEq for QueueFamily {
     fn eq(&self, other: &Self) -> bool {
@@ -57,8 +57,10 @@ pub struct PhysicalDevice {
     pub supported_features: Features,
     /// What lava needs that it lacks, by name; empty on a device lava can use.
     pub lava_missing: Vec<String>,
+    #[cfg(feature = "ray-tracing-pipeline")]
     pub ray_tracing_pipeline_properties:
         Option<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>>,
+    #[cfg(feature = "acceleration-structure")]
     pub acceleration_structure_properties:
         Option<vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>>,
 }
@@ -121,11 +123,16 @@ impl PhysicalDevice {
         vk12_properties.p_next = std::ptr::null_mut();
         rt_pipeline_properties.p_next = std::ptr::null_mut();
         acc_properties.p_next = std::ptr::null_mut();
+        let _ = (&rt_pipeline_properties, &acc_properties);
 
         let mem_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let rebar = has_rebar(&mem_properties);
-        let supported_features = features.optional(&has, rebar);
+        let facts = DeviceFacts {
+            rebar,
+            strict_lines: properties.limits.strict_lines == vk::TRUE,
+        };
+        let supported_features = features.optional(&has, facts);
         let lava_missing = features.lava_missing(&has);
 
         Ok(Self {
@@ -138,9 +145,11 @@ impl PhysicalDevice {
             queue_families,
             supported_extensions,
 
+            #[cfg(feature = "acceleration-structure")]
             acceleration_structure_properties: supported_features
                 .acceleration_structure
                 .then_some(acc_properties),
+            #[cfg(feature = "ray-tracing-pipeline")]
             ray_tracing_pipeline_properties: supported_features
                 .ray_tracing_pipeline
                 .then_some(rt_pipeline_properties),
@@ -188,7 +197,7 @@ impl PhysicalDevice {
     }
 
     /// Returns the first GPU (discrete before integrated) with everything lava needs, the
-    /// `required` features and a usable graphics family, plus its graphics and transfer
+    /// `required` (asserted) features and a usable graphics family, plus its graphics and transfer
     /// families. Presentation goes through the graphics family (checked per surface). The
     /// error names what each GPU lacks.
     #[validation_trace]
@@ -206,7 +215,7 @@ impl PhysicalDevice {
                 required
                     .missing_from(&device.supported_features)
                     .into_iter()
-                    .map(|name| format!("Features::{name}")),
+                    .map(|name| format!("`{name}` (lava asserts it)")),
             );
             let families = device.pick_queue_families();
             if families.is_none() {
@@ -286,7 +295,9 @@ mod tests {
             supported_extensions: Vec::new(),
             supported_features: Features::default(),
             lava_missing: Vec::new(),
+            #[cfg(feature = "ray-tracing-pipeline")]
             ray_tracing_pipeline_properties: None,
+            #[cfg(feature = "acceleration-structure")]
             acceleration_structure_properties: None,
         }
     }
@@ -427,10 +438,10 @@ mod tests {
         plain.name = "plain".into();
         let mut meshy = device(INTEGRATED, vec![gfx_family(0, 1)]);
         meshy.name = "meshy".into();
-        meshy.supported_features.mesh = true;
+        meshy.supported_features.rebar = true;
 
         let mesh = Features {
-            mesh: true,
+            rebar: true,
             ..Default::default()
         };
         let devices = [old.clone(), plain.clone(), meshy];
@@ -444,10 +455,10 @@ mod tests {
         let Err(Error::Message(message)) =
             PhysicalDevice::select_suitable_physical_device(&[old, plain], &mesh)
         else {
-            panic!("no GPU has mesh shaders");
+            panic!("no GPU has ReBAR");
         };
-        assert!(message.contains("old lacks VK_EXT_extended_dynamic_state3, Features::mesh"));
-        assert!(message.contains("plain lacks Features::mesh"));
+        assert!(message.contains("old lacks VK_EXT_extended_dynamic_state3, `rebar` (lava asserts it)"));
+        assert!(message.contains("plain lacks `rebar` (lava asserts it)"));
     }
 
     fn memory(

@@ -1,109 +1,393 @@
-//! Device features: what lava itself needs of every device, the optional `Features` it enables wherever the device has them, the features a pass's SPIR-V declares, and the chain of Vulkan feature structs all of them are queried and enabled through
+//! Device features: what lava needs of every device, the optional `Features` behind its cargo features (`X` checked at runtime, `assert-X` required at init and assumed, neither compiled out), the `Gated` values that check them, the features a pass's SPIR-V declares, and the chain of Vulkan feature structs all of them are queried and enabled through
 use std::ffi::CStr;
 
-use crate::vk;
+#[allow(unused_imports)]
+use crate::{sealed::Sealed, state::Ctx, vk};
+
+/// What a function returns when the device lacks an optional feature lava checks at runtime
+/// (its cargo feature is on without its `assert-` form): the cargo feature's name, which is also
+/// the [`Features`] field with `_` for `-`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MissingFeature {
+    pub feature: &'static str,
+}
+
+impl std::fmt::Display for MissingFeature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the device lacks `{}` (lava's cargo feature of that name; see `Ctx::features()`)",
+            self.feature
+        )
+    }
+}
+
+impl std::error::Error for MissingFeature {}
+
+/// How lava compiled a cargo feature: [`Asserted`] (`assert-X`, required at init) or
+/// [`Checked`] (`X` alone, checked where it is used).
+pub trait Mode: Sealed {
+    /// What a function that needs the feature returns for `T`: `T` when asserted,
+    /// `Result<T, MissingFeature>` when checked.
+    type Out<T>;
+    #[doc(hidden)]
+    type Store<T>;
+    #[doc(hidden)]
+    fn wrap<T>(result: Result<T, MissingFeature>) -> Self::Out<T>;
+    #[doc(hidden)]
+    fn store<T>(on: bool, load: impl FnOnce() -> T) -> Self::Store<T>;
+    #[doc(hidden)]
+    fn get<T>(stored: &Self::Store<T>) -> &T;
+}
+
+/// The mode of an `assert-X` feature: `init` refused devices without it, so nothing checks it.
+pub enum Asserted {}
+/// The mode of an `X` feature without `assert-X`: functions that need it check the device.
+pub enum Checked {}
+
+impl Sealed for Asserted {}
+impl Sealed for Checked {}
+
+impl Mode for Asserted {
+    type Out<T> = T;
+    type Store<T> = T;
+    fn wrap<T>(result: Result<T, MissingFeature>) -> T {
+        result.unwrap_or_else(|missing| {
+            unreachable!("`{}` is asserted, so `init` checked it", missing.feature)
+        })
+    }
+    fn store<T>(_: bool, load: impl FnOnce() -> T) -> T {
+        load()
+    }
+    fn get<T>(stored: &T) -> &T {
+        stored
+    }
+}
+
+impl Mode for Checked {
+    type Out<T> = Result<T, MissingFeature>;
+    type Store<T> = Option<T>;
+    fn wrap<T>(result: Result<T, MissingFeature>) -> Result<T, MissingFeature> {
+        result
+    }
+    fn store<T>(on: bool, load: impl FnOnce() -> T) -> Option<T> {
+        on.then(load)
+    }
+    fn get<T>(stored: &Option<T>) -> &T {
+        stored
+            .as_ref()
+            .expect("only code past the feature's check reaches its functions")
+    }
+}
+
+/// The mode of two features together: checked if either is.
+pub trait Join<B: Mode>: Mode {
+    type Joined: Mode;
+}
+impl Join<Asserted> for Asserted {
+    type Joined = Asserted;
+}
+impl Join<Checked> for Asserted {
+    type Joined = Checked;
+}
+impl<B: Mode> Join<B> for Checked {
+    type Joined = Checked;
+}
+
+/// A cargo feature lava was compiled with ([`gate`] has one type per feature), or a pair of
+/// them, or `()` for none.
+#[diagnostic::on_unimplemented(
+    message = "lava was compiled without the cargo feature of `{Self}`",
+    note = "each type in `lava::features::gate` names its cargo feature: enable it (or its `assert-` form) on the `lava` dependency"
+)]
+pub trait Feature: Sealed {
+    type Mode: Mode;
+    /// `Ok` if the device has the feature (always, when asserted).
+    fn check() -> Result<(), MissingFeature>;
+}
+
+impl Sealed for () {}
+impl Feature for () {
+    type Mode = Asserted;
+    fn check() -> Result<(), MissingFeature> {
+        Ok(())
+    }
+}
+
+impl<A: Feature, B: Feature> Sealed for (A, B) {}
+impl<A: Feature, B: Feature> Feature for (A, B)
+where
+    A::Mode: Join<B::Mode>,
+{
+    type Mode = <A::Mode as Join<B::Mode>>::Joined;
+    fn check() -> Result<(), MissingFeature> {
+        A::check()?;
+        B::check()
+    }
+}
+
+/// A `T` that needs feature (or features) `F`: `T` itself when `F` is asserted,
+/// `Result<T, MissingFeature>` when lava checks it.
+pub type Gated<F, T> = <<F as Feature>::Mode as Mode>::Out<T>;
+
+/// `value()` as a [`Gated`] value: called only if the device has `F`.
+pub fn gate<F: Feature, T>(value: impl FnOnce() -> T) -> Gated<F, T> {
+    <F::Mode as Mode>::wrap(F::check().map(|()| value()))
+}
+
+/// A Vulkan loader that exists only where the device has `F`: the loader itself when `F` is
+/// asserted, an `Option` of it when checked. [`loaded`] reads it.
+#[allow(dead_code)]
+pub(crate) type Loader<F, T> = <<F as Feature>::Mode as Mode>::Store<T>;
+
+/// The loader of `F`, built only if the device has `F` (`on`, its bit in the features lava
+/// enables).
+#[allow(dead_code)]
+pub(crate) fn load<F: Feature, T>(on: bool, load: impl FnOnce() -> T) -> Loader<F, T> {
+    <F::Mode as Mode>::store(on, load)
+}
+
+/// The loader of `F`, which code past `F`'s check reaches.
+#[allow(dead_code)]
+pub(crate) fn loaded<F: Feature, T>(stored: &Loader<F, T>) -> &T {
+    <F::Mode as Mode>::get(stored)
+}
+
+/// Whether the device has a feature: `true` when asserted, the device's bit when checked,
+/// `false` when compiled out. Every [`gate`] type has it, so code that runs either way can ask.
+pub(crate) trait On {
+    fn on() -> bool;
+}
 
 macro_rules! features {
-    ($($(#[doc = $doc:literal])* $name:ident,)*) => {
-        /// Optional device features. lava enables each one the device has
-        /// (`Ctx::features()`); `Config::required` makes a missing one an init error, and a pass
-        /// whose SPIR-V needs a missing one gets no pipeline and panics when recorded.
+    ($($(#[doc = $doc:literal])* $name:ident: $cargo:literal / $assert:literal => $marker:ident,)*) => {
+        /// The optional device features lava was compiled with, one per cargo feature (`_` for
+        /// `-`), plus `rebar`. `Ctx::features()` says which the device has and lava enabled:
+        /// those of `assert-` features are always `true`. Fields of features lava was compiled
+        /// without don't exist.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct Features {
-            $($(#[doc = $doc])* pub $name: bool,)*
+            /// A large device-local heap the host can write (resizable BAR or an integrated
+            /// GPU); not a Vulkan feature, and always checked. Buffers live there, mapped.
+            pub rebar: bool,
+            $($(#[doc = $doc])* #[cfg(feature = $cargo)] pub $name: bool,)*
         }
 
         impl Features {
             /// No feature, for `..Features::DEFAULT` in constants.
-            pub const DEFAULT: Features = Features { $($name: false,)* };
+            pub const DEFAULT: Features = Features {
+                rebar: false,
+                $(#[cfg(feature = $cargo)] $name: false,)*
+            };
 
-            const NAMES: &[&str] = &[$(stringify!($name)),*];
+            /// The cargo name of each feature, in field order.
+            const NAMES: &[&str] = &["rebar", $(#[cfg(feature = $cargo)] $cargo,)*];
 
             fn bits(&self) -> impl Iterator<Item = bool> {
-                [$(self.$name),*].into_iter()
+                [self.rebar, $(#[cfg(feature = $cargo)] self.$name,)*].into_iter()
             }
 
             fn from_bits(mut bits: impl Iterator<Item = bool>) -> Self {
-                Self { $($name: bits.next().unwrap(),)* }
+                Self {
+                    rebar: bits.next().unwrap(),
+                    $(#[cfg(feature = $cargo)] $name: bits.next().unwrap(),)*
+                }
             }
+
+            /// The features lava was compiled to assert: every device must have them.
+            pub fn asserted() -> Features {
+                Features {
+                    rebar: false,
+                    $(#[cfg(feature = $cargo)] $name: cfg!(feature = $assert),)*
+                }
+            }
+
+            /// Sets the feature of cargo name `cargo`; `false` if lava was compiled without it.
+            fn set_named(&mut self, cargo: &str) -> bool {
+                match cargo {
+                    $(#[cfg(feature = $cargo)] $cargo => {
+                        self.$name = true;
+                        true
+                    })*
+                    _ => false,
+                }
+            }
+        }
+
+        /// One type per optional feature, named after it, for [`Gated`] values and the
+        /// generated bindings of passes that need it. It implements [`Feature`] only when lava
+        /// was compiled with the feature.
+        pub mod gate {
+            use super::*;
+            $(
+                #[doc = concat!("lava's `", $cargo, "` cargo feature (`assert-", $cargo, "` asserts it).")]
+                pub enum $marker {}
+                impl Sealed for $marker {}
+                impl On for $marker {
+                    #[allow(unreachable_code)]
+                    fn on() -> bool {
+                        #[cfg(feature = $assert)]
+                        return true;
+                        #[cfg(all(feature = $cargo, not(feature = $assert)))]
+                        return Ctx::features_ref().$name;
+                        false
+                    }
+                }
+                #[cfg(feature = $assert)]
+                impl Feature for $marker {
+                    type Mode = Asserted;
+                    fn check() -> Result<(), MissingFeature> {
+                        Ok(())
+                    }
+                }
+                #[cfg(all(feature = $cargo, not(feature = $assert)))]
+                impl Feature for $marker {
+                    type Mode = Checked;
+                    fn check() -> Result<(), MissingFeature> {
+                        match Ctx::features_ref().$name {
+                            true => Ok(()),
+                            false => Err(MissingFeature { feature: $cargo }),
+                        }
+                    }
+                }
+            )*
         }
     };
 }
 
 features! {
-    /// A large device-local heap the host can write (resizable BAR or an integrated GPU); not
-    /// a Vulkan feature. Buffers live there, mapped.
-    rebar,
-    /// `VK_EXT_host_image_copy` on `rebar` memory: `Image::copy_from`.
-    host_image_copy,
+    /// `VK_EXT_host_image_copy` on `rebar` memory: `Image::copy_from` and the `*HostCopy` usages.
+    host_image_copy: "host-image-copy" / "assert-host-image-copy" => HostImageCopy,
     /// `VK_EXT_mesh_shader` with task shaders: mesh passes.
-    mesh,
+    mesh_shader: "mesh-shader" / "assert-mesh-shader" => MeshShader,
     /// Task and mesh shader invocations in pipeline statistics.
-    mesh_queries,
-    /// `VK_KHR_acceleration_structure`: `Blas`/`Tlas` and their builds. `ray_query` and
-    /// `ray_tracing_pipeline` need it.
-    acceleration_structure,
+    mesh_shader_queries: "mesh-shader-queries" / "assert-mesh-shader-queries" => MeshShaderQueries,
+    /// `VK_KHR_acceleration_structure`: `Blas`/`Tlas` and their builds.
+    acceleration_structure: "acceleration-structure" / "assert-acceleration-structure" => AccelerationStructure,
     /// `VK_KHR_ray_query`: tracing from compute, mesh and fragment passes.
-    ray_query,
+    ray_query: "ray-query" / "assert-ray-query" => RayQuery,
     /// `VK_KHR_ray_tracing_pipeline` with indirect tracing: ray tracing passes.
-    ray_tracing_pipeline,
+    ray_tracing_pipeline: "ray-tracing-pipeline" / "assert-ray-tracing-pipeline" => RayTracingPipeline,
     /// Pipeline statistics queries (invocation counts per pass).
-    pipeline_statistics,
-    /// Occlusion queries that count samples exactly (`QueryPool::occlusion`).
-    precise_occlusion,
+    pipeline_statistics: "pipeline-statistics" / "assert-pipeline-statistics" => PipelineStatistics,
+    /// Occlusion queries that count samples exactly (`QueryPool::precise_occlusion`).
+    precise_occlusion: "precise-occlusion" / "assert-precise-occlusion" => PreciseOcclusion,
     /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
-    memory_budget,
+    memory_budget: "memory-budget" / "assert-memory-budget" => MemoryBudget,
     /// `VK_KHR_shader_clock` with subgroup clocks (`OpReadClockKHR Subgroup`).
-    shader_clock,
-    /// `VK_KHR_performance_query` with query pools: `QueryPool::performance`.
-    performance_query,
+    shader_clock: "shader-clock" / "assert-shader-clock" => ShaderClock,
+    /// `VK_KHR_performance_query` with query pools: `query::counters`, `QueryPool::performance`.
+    performance_query: "performance-query" / "assert-performance-query" => PerformanceQuery,
     /// `VK_KHR_calibrated_timestamps`, which puts timestamps on the host's clock
     /// (`QueryPool::instant`).
-    calibrated_timestamps,
+    calibrated_timestamps: "calibrated-timestamps" / "assert-calibrated-timestamps" => CalibratedTimestamps,
     /// `VK_EXT_swapchain_maintenance1` (with a display, and the instance's
     /// `VK_EXT_surface_maintenance1`): every present signals a fence, so what it uses
     /// (semaphores, swapchains, surfaces) is destroyed once it is done, not after one more frame.
-    present_fences,
+    /// Asserting it requires it only with a display.
+    present_fences: "present-fences" / "assert-present-fences" => PresentFences,
     /// BC1-7 compressed formats.
-    bc_compression,
-    /// Different `Blend`s for the color attachments of one draw.
-    independent_blend,
-    /// Line and point `PolygonMode`s.
-    fill_mode_non_solid,
-    /// `RasterState::line_width` other than 1.
-    wide_lines,
+    bc_compression: "bc-compression" / "assert-bc-compression" => BcCompression,
+    /// Different blends for the color attachments of one draw (`RasterState::blends`).
+    independent_blend: "independent-blend" / "assert-independent-blend" => IndependentBlend,
+    /// Line and point polygons (`RasterState::polygon_mode`).
+    fill_mode_non_solid: "fill-mode-non-solid" / "assert-fill-mode-non-solid" => FillModeNonSolid,
+    /// `RasterState::line_width`.
+    wide_lines: "wide-lines" / "assert-wide-lines" => WideLines,
     /// `RasterState::depth_bounds`.
-    depth_bounds,
+    depth_bounds: "depth-bounds" / "assert-depth-bounds" => DepthBounds,
     /// `RasterState::depth_clamp`.
-    depth_clamp,
+    depth_clamp: "depth-clamp" / "assert-depth-clamp" => DepthClamp,
+    /// `VK_EXT_depth_clamp_control`: `RasterState::depth_clamp_range`.
+    depth_clamp_control: "depth-clamp-control" / "assert-depth-clamp-control" => DepthClampControl,
+    /// `VK_EXT_depth_clip_enable`: `RasterState::depth_clip`.
+    depth_clip_enable: "depth-clip-enable" / "assert-depth-clip-enable" => DepthClipEnable,
+    /// `VK_EXT_depth_clip_control`: `RasterState::depth_clip_negative_one_to_one`.
+    depth_clip_control: "depth-clip-control" / "assert-depth-clip-control" => DepthClipControl,
     /// `RasterState::logic_op`.
-    logic_op,
+    logic_op: "logic-op" / "assert-logic-op" => LogicOp,
     /// `SamplerDesc::max_anisotropy`.
-    sampler_anisotropy,
-    /// The line rasterization modes of `RasterState::line`, and their stippled forms.
-    rectangular_lines,
-    bresenham_lines,
-    smooth_lines,
-    stippled_rectangular_lines,
-    stippled_bresenham_lines,
-    stippled_smooth_lines,
-    /// Shader capabilities: 8-, 16- and 64-bit types, 64-bit atomics, and 8- and 16-bit
-    /// values in storage buffers and push constants.
-    int8,
-    int16,
-    float16,
-    float64,
-    int64_atomics,
-    storage_8bit,
-    storage_16bit,
-    push_constant_8bit,
-    push_constant_16bit,
+    sampler_anisotropy: "sampler-anisotropy" / "assert-sampler-anisotropy" => SamplerAnisotropy,
+    /// `VK_EXT_conservative_rasterization`: `RasterState::conservative`.
+    conservative_rasterization: "conservative-rasterization" / "assert-conservative-rasterization" => ConservativeRasterization,
+    /// `VK_EXT_provoking_vertex` with last-vertex provoking: `RasterState::provoking_vertex`.
+    provoking_vertex: "provoking-vertex" / "assert-provoking-vertex" => ProvokingVertex,
+    /// `VK_KHR_line_rasterization`'s line modes: `RasterState::rectangular_lines`,
+    /// `bresenham_lines` and `smooth_lines`.
+    rectangular_lines: "rectangular-lines" / "assert-rectangular-lines" => RectangularLines,
+    bresenham_lines: "bresenham-lines" / "assert-bresenham-lines" => BresenhamLines,
+    smooth_lines: "smooth-lines" / "assert-smooth-lines" => SmoothLines,
+    /// Stippled lines (`RasterState::line_stipple`) in every line mode the device has, default
+    /// lines included (which need strict lines).
+    line_stipple: "line-stipple" / "assert-line-stipple" => LineStipple,
+    /// Shader capabilities: 8-, 16- and 64-bit types and 64-bit atomics.
+    shader_int8: "shader-int8" / "assert-shader-int8" => ShaderInt8,
+    shader_int16: "shader-int16" / "assert-shader-int16" => ShaderInt16,
+    shader_float16: "shader-float16" / "assert-shader-float16" => ShaderFloat16,
+    shader_float64: "shader-float64" / "assert-shader-float64" => ShaderFloat64,
+    shader_int64_atomics: "shader-int64-atomics" / "assert-shader-int64-atomics" => ShaderInt64Atomics,
+    /// 8- and 16-bit values in storage and uniform buffers and push constants.
+    storage_8bit: "storage-8bit" / "assert-storage-8bit" => Storage8Bit,
+    storage_16bit: "storage-16bit" / "assert-storage-16bit" => Storage16Bit,
+    /// Dynamic state (extended dynamic state 2 and 3): where the device has it, draws that
+    /// differ in that state share a pipeline; where it doesn't, the state is part of the
+    /// pipeline's key. Asserting one keeps it out of the key. These have no API of their own.
+    dynamic_blend: "dynamic-blend" / "assert-dynamic-blend" => DynamicBlend,
+    dynamic_polygon_mode: "dynamic-polygon-mode" / "assert-dynamic-polygon-mode" => DynamicPolygonMode,
+    dynamic_depth_clamp: "dynamic-depth-clamp" / "assert-dynamic-depth-clamp" => DynamicDepthClamp,
+    dynamic_depth_clip: "dynamic-depth-clip" / "assert-dynamic-depth-clip" => DynamicDepthClip,
+    dynamic_depth_clip_negative_one_to_one: "dynamic-depth-clip-negative-one-to-one" / "assert-dynamic-depth-clip-negative-one-to-one" => DynamicDepthClipNegativeOneToOne,
+    dynamic_logic_op: "dynamic-logic-op" / "assert-dynamic-logic-op" => DynamicLogicOp,
+    dynamic_conservative_rasterization: "dynamic-conservative-rasterization" / "assert-dynamic-conservative-rasterization" => DynamicConservativeRasterization,
+    dynamic_line_mode: "dynamic-line-mode" / "assert-dynamic-line-mode" => DynamicLineMode,
+    dynamic_line_stipple: "dynamic-line-stipple" / "assert-dynamic-line-stipple" => DynamicLineStipple,
+    dynamic_provoking_vertex: "dynamic-provoking-vertex" / "assert-dynamic-provoking-vertex" => DynamicProvokingVertex,
 }
 
 impl Default for Features {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// Sets field `$field` of `$features` to `$value` if lava was compiled with cargo feature
+/// `$cargo`.
+macro_rules! set {
+    ($features:ident: $($cargo:literal => $($field:ident).+ = $value:expr),* $(,)?) => {
+        $(#[cfg(feature = $cargo)]
+        {
+            $features.$($field).+ = $value;
+        })*
+    };
+}
+
+/// The SPIR-V capabilities lava knows, by the cargo feature they need. lava-build-slang has the
+/// same table to gate the generated bindings (its test compares them).
+#[doc(hidden)]
+pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
+    (9, "shader-float16"),
+    (10, "shader-float64"),
+    (12, "shader-int64-atomics"),
+    (22, "shader-int16"),
+    (39, "shader-int8"),
+    (4433, "storage-16bit"),
+    (4434, "storage-16bit"),
+    (4435, "storage-16bit"),
+    (4448, "storage-8bit"),
+    (4449, "storage-8bit"),
+    (4450, "storage-8bit"),
+    (4472, "ray-query"),
+    (4479, "ray-tracing-pipeline"),
+    (5055, "shader-clock"),
+    (5283, "mesh-shader"),
+];
+
+/// What a pass's SPIR-V needs: the optional features it declares, and the cargo features lava
+/// was compiled without that it would need.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Needs {
+    pub(crate) features: Features,
+    pub(crate) compiled_out: Vec<&'static str>,
 }
 
 impl Features {
@@ -120,49 +404,130 @@ impl Features {
         Self::from_bits(self.bits().zip(other.bits()).map(|(a, b)| a || b))
     }
 
-    /// The device extensions these features need.
-    pub(crate) fn extensions(&self) -> Vec<&'static CStr> {
-        [
-            (self.host_image_copy, ash::ext::host_image_copy::NAME),
-            (self.mesh, ash::ext::mesh_shader::NAME),
-            (self.memory_budget, ash::ext::memory_budget::NAME),
-            (self.shader_clock, ash::khr::shader_clock::NAME),
-            (self.performance_query, ash::khr::performance_query::NAME),
-            (self.calibrated_timestamps, ash::khr::calibrated_timestamps::NAME),
-            (self.present_fences, ash::ext::swapchain_maintenance1::NAME),
-            (self.acceleration_structure, ash::khr::deferred_host_operations::NAME),
-            (self.acceleration_structure, ash::khr::acceleration_structure::NAME),
-            (self.ray_query, ash::khr::ray_query::NAME),
-            (self.ray_tracing_pipeline, ash::khr::ray_tracing_pipeline::NAME),
-        ]
-        .into_iter()
-        .filter_map(|(on, name)| on.then_some(name))
-        .collect()
+    /// The features `self` has and `other` doesn't.
+    pub fn without(self, other: Features) -> Features {
+        Self::from_bits(self.bits().zip(other.bits()).map(|(a, b)| a && !b))
     }
 
-    /// The features a SPIR-V module's `OpCapability`s need. Capabilities lava doesn't know
-    /// are left to the driver.
-    pub(crate) fn of_spirv(spirv: &[u8]) -> Features {
-        let mut features = Features::default();
+    /// `self` without the features whose prerequisites it lacks (after some were disabled).
+    #[allow(unused_mut)]
+    pub(crate) fn consistent(mut self) -> Features {
+        let rebar = self.rebar;
+        let _ = rebar;
+        set! { self:
+            "host-image-copy" => host_image_copy = self.host_image_copy && rebar,
+            "ray-query" => ray_query = self.ray_query && self.acceleration_structure,
+            "ray-tracing-pipeline" => ray_tracing_pipeline =
+                self.ray_tracing_pipeline && self.acceleration_structure,
+            "mesh-shader-queries" => mesh_shader_queries =
+                self.mesh_shader_queries && self.mesh_shader && self.pipeline_statistics,
+            "depth-clamp-control" => depth_clamp_control =
+                self.depth_clamp_control && self.depth_clamp,
+            "dynamic-depth-clip" => dynamic_depth_clip =
+                self.dynamic_depth_clip && self.depth_clip_enable,
+            "dynamic-depth-clip-negative-one-to-one" => dynamic_depth_clip_negative_one_to_one =
+                self.dynamic_depth_clip_negative_one_to_one && self.depth_clip_control,
+            "dynamic-conservative-rasterization" => dynamic_conservative_rasterization =
+                self.dynamic_conservative_rasterization && self.conservative_rasterization,
+            "dynamic-provoking-vertex" => dynamic_provoking_vertex =
+                self.dynamic_provoking_vertex && self.provoking_vertex,
+        }
+        self
+    }
+
+    /// Whether any line mode or stipple is on: they need `VK_KHR_line_rasterization`.
+    pub(crate) fn lines(&self) -> bool {
+        let lines: &[bool] = &[
+            #[cfg(feature = "rectangular-lines")]
+            self.rectangular_lines,
+            #[cfg(feature = "bresenham-lines")]
+            self.bresenham_lines,
+            #[cfg(feature = "smooth-lines")]
+            self.smooth_lines,
+            #[cfg(feature = "line-stipple")]
+            self.line_stipple,
+            #[cfg(feature = "dynamic-line-mode")]
+            self.dynamic_line_mode,
+            #[cfg(feature = "dynamic-line-stipple")]
+            self.dynamic_line_stipple,
+        ];
+        lines.iter().any(|on| *on)
+    }
+
+    /// The device extensions these features need.
+    #[allow(unused_mut)]
+    pub(crate) fn extensions(&self) -> Vec<&'static CStr> {
+        let mut extensions: Vec<&'static CStr> = Vec::new();
+        let mut on = |on: bool, names: &[&'static CStr]| {
+            for name in names {
+                if on && !extensions.contains(name) {
+                    extensions.push(name);
+                }
+            }
+        };
+        let eds3 = ash::ext::extended_dynamic_state3::NAME;
+        macro_rules! needs {
+            ($($cargo:literal => $field:ident: [$($name:expr),*],)*) => {
+                $(#[cfg(feature = $cargo)]
+                on(self.$field, &[$($name),*]);)*
+            };
+        }
+        needs! {
+            "host-image-copy" => host_image_copy: [ash::ext::host_image_copy::NAME],
+            "mesh-shader" => mesh_shader: [ash::ext::mesh_shader::NAME],
+            "memory-budget" => memory_budget: [ash::ext::memory_budget::NAME],
+            "shader-clock" => shader_clock: [ash::khr::shader_clock::NAME],
+            "performance-query" => performance_query: [ash::khr::performance_query::NAME],
+            "calibrated-timestamps" => calibrated_timestamps: [ash::khr::calibrated_timestamps::NAME],
+            "present-fences" => present_fences: [ash::ext::swapchain_maintenance1::NAME],
+            "acceleration-structure" => acceleration_structure: [
+                ash::khr::deferred_host_operations::NAME,
+                ash::khr::acceleration_structure::NAME
+            ],
+            "ray-query" => ray_query: [ash::khr::ray_query::NAME],
+            "ray-tracing-pipeline" => ray_tracing_pipeline: [ash::khr::ray_tracing_pipeline::NAME],
+            "depth-clamp-control" => depth_clamp_control: [crate::vk::depth_clamp_control::NAME],
+            "depth-clip-enable" => depth_clip_enable: [ash::ext::depth_clip_enable::NAME],
+            "depth-clip-control" => depth_clip_control: [ash::ext::depth_clip_control::NAME],
+            "conservative-rasterization" => conservative_rasterization: [
+                ash::ext::conservative_rasterization::NAME
+            ],
+            "provoking-vertex" => provoking_vertex: [ash::ext::provoking_vertex::NAME],
+            "dynamic-blend" => dynamic_blend: [eds3],
+            "dynamic-polygon-mode" => dynamic_polygon_mode: [eds3],
+            "dynamic-depth-clamp" => dynamic_depth_clamp: [eds3],
+            "dynamic-depth-clip" => dynamic_depth_clip: [eds3],
+            "dynamic-depth-clip-negative-one-to-one" => dynamic_depth_clip_negative_one_to_one: [eds3],
+            "dynamic-logic-op" => dynamic_logic_op: [
+                ash::ext::extended_dynamic_state2::NAME, eds3
+            ],
+            "dynamic-conservative-rasterization" => dynamic_conservative_rasterization: [eds3],
+            "dynamic-line-mode" => dynamic_line_mode: [eds3],
+            "dynamic-line-stipple" => dynamic_line_stipple: [eds3],
+            "dynamic-provoking-vertex" => dynamic_provoking_vertex: [eds3],
+        }
+        on(self.lines(), &[ash::khr::line_rasterization::NAME]);
+        let _ = eds3;
+        extensions
+    }
+
+    /// What a SPIR-V module's `OpCapability`s need. Capabilities lava doesn't know are left to
+    /// the driver.
+    pub(crate) fn of_spirv(spirv: &[u8]) -> Needs {
+        let mut needs = Needs {
+            features: Features::default(),
+            compiled_out: Vec::new(),
+        };
         for capability in capabilities(spirv) {
-            match capability {
-                9 => features.float16 = true,
-                10 => features.float64 = true,
-                12 => features.int64_atomics = true,
-                22 => features.int16 = true,
-                39 => features.int8 = true,
-                4433 | 4434 => features.storage_16bit = true,
-                4435 => features.push_constant_16bit = true,
-                4448 | 4449 => features.storage_8bit = true,
-                4450 => features.push_constant_8bit = true,
-                4472 => features.ray_query = true,
-                4479 => features.ray_tracing_pipeline = true,
-                5055 => features.shader_clock = true,
-                5283 => features.mesh = true,
-                _ => {}
+            let known = SPIRV_CAPABILITIES.iter().find(|(id, _)| *id == capability);
+            if let Some(&(_, cargo)) = known
+                && !needs.features.set_named(cargo)
+                && !needs.compiled_out.contains(&cargo)
+            {
+                needs.compiled_out.push(cargo);
             }
         }
-        features
+        needs
     }
 }
 
@@ -191,21 +556,17 @@ fn capabilities(spirv: &[u8]) -> impl Iterator<Item = u32> {
     found.into_iter()
 }
 
-/// The device extensions lava needs on every device: buffer address commands and the dynamic
-/// state of renderings.
-pub(crate) const LAVA_EXTENSIONS: [&CStr; 11] = [
-    crate::vk::device_address_commands::NAME,
-    ash::ext::extended_dynamic_state2::NAME,
-    ash::ext::extended_dynamic_state3::NAME,
-    ash::ext::color_write_enable::NAME,
-    ash::khr::line_rasterization::NAME,
-    ash::ext::provoking_vertex::NAME,
-    ash::ext::conservative_rasterization::NAME,
-    ash::ext::depth_clip_enable::NAME,
-    ash::ext::depth_clip_control::NAME,
-    crate::vk::depth_clamp_control::NAME,
-    ash::ext::sample_locations::NAME,
-];
+/// The device extensions lava needs on every device: buffer address commands.
+pub(crate) const LAVA_EXTENSIONS: [&CStr; 1] = [crate::vk::device_address_commands::NAME];
+
+/// What [`FeatureChain::optional`] needs to know of the device besides its feature structs.
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceFacts {
+    pub(crate) rebar: bool,
+    /// `VkPhysicalDeviceLimits::strictLines`, which stippled default lines need.
+    #[allow(dead_code)]
+    pub(crate) strict_lines: bool,
+}
 
 /// Every Vulkan feature struct lava queries or enables. [`Self::chain`] links the ones whose
 /// extension is in use.
@@ -218,7 +579,6 @@ pub(crate) struct FeatureChain {
     address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
     dynamic_state2: vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT<'static>,
     dynamic_state3: vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static>,
-    color_write: vk::PhysicalDeviceColorWriteEnableFeaturesEXT<'static>,
     lines: vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static>,
     provoking_vertex: vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>,
     depth_clip_enable: vk::PhysicalDeviceDepthClipEnableFeaturesEXT<'static>,
@@ -258,7 +618,6 @@ impl FeatureChain {
             address_commands,
             dynamic_state2,
             dynamic_state3,
-            color_write,
             lines,
             provoking_vertex,
             depth_clip_enable,
@@ -287,7 +646,6 @@ impl FeatureChain {
             address_commands,
             dynamic_state2,
             dynamic_state3,
-            color_write,
             lines,
             provoking_vertex,
             depth_clip_enable,
@@ -318,7 +676,6 @@ impl FeatureChain {
             crate::vk::device_address_commands::NAME => address_commands,
             ash::ext::extended_dynamic_state2::NAME => dynamic_state2,
             ash::ext::extended_dynamic_state3::NAME => dynamic_state3,
-            ash::ext::color_write_enable::NAME => color_write,
             ash::khr::line_rasterization::NAME => lines,
             ash::ext::provoking_vertex::NAME => provoking_vertex,
             ash::ext::depth_clip_enable::NAME => depth_clip_enable,
@@ -338,10 +695,9 @@ impl FeatureChain {
 
     /// What lava needs of every device, by name: the bindless descriptor indexing set, buffer
     /// addresses and address commands, timeline semaphores, host query resets, the memory
-    /// model, sync2, dynamic rendering and the dynamic state of renderings.
-    fn lava_bits(&self) -> [(&'static str, vk::Bool32); 49] {
+    /// model, sync2 and dynamic rendering.
+    fn lava_bits(&self) -> [(&'static str, vk::Bool32); 25] {
         let (c, v11, v12, v13) = (&self.core, &self.vk11, &self.vk12, &self.vk13);
-        let (d2, d3) = (&self.dynamic_state2, &self.dynamic_state3);
         [
             ("shaderInt64", c.shader_int64),
             ("fragmentStoresAndAtomics", c.fragment_stores_and_atomics),
@@ -368,31 +724,6 @@ impl FeatureChain {
             ("maintenance4", v13.maintenance4),
             ("shaderDemoteToHelperInvocation", v13.shader_demote_to_helper_invocation),
             ("deviceAddressCommands", self.address_commands.device_address_commands),
-            ("extendedDynamicState2LogicOp", d2.extended_dynamic_state2_logic_op),
-            ("extendedDynamicState3PolygonMode", d3.extended_dynamic_state3_polygon_mode),
-            ("extendedDynamicState3DepthClampEnable", d3.extended_dynamic_state3_depth_clamp_enable),
-            ("extendedDynamicState3DepthClipEnable", d3.extended_dynamic_state3_depth_clip_enable),
-            ("extendedDynamicState3DepthClipNegativeOneToOne", d3.extended_dynamic_state3_depth_clip_negative_one_to_one),
-            ("extendedDynamicState3RasterizationSamples", d3.extended_dynamic_state3_rasterization_samples),
-            ("extendedDynamicState3SampleMask", d3.extended_dynamic_state3_sample_mask),
-            ("extendedDynamicState3AlphaToCoverageEnable", d3.extended_dynamic_state3_alpha_to_coverage_enable),
-            ("extendedDynamicState3AlphaToOneEnable", d3.extended_dynamic_state3_alpha_to_one_enable),
-            ("extendedDynamicState3LogicOpEnable", d3.extended_dynamic_state3_logic_op_enable),
-            ("extendedDynamicState3ColorBlendEnable", d3.extended_dynamic_state3_color_blend_enable),
-            ("extendedDynamicState3ColorBlendEquation", d3.extended_dynamic_state3_color_blend_equation),
-            ("extendedDynamicState3ColorWriteMask", d3.extended_dynamic_state3_color_write_mask),
-            ("extendedDynamicState3ConservativeRasterizationMode", d3.extended_dynamic_state3_conservative_rasterization_mode),
-            ("extendedDynamicState3LineRasterizationMode", d3.extended_dynamic_state3_line_rasterization_mode),
-            ("extendedDynamicState3LineStippleEnable", d3.extended_dynamic_state3_line_stipple_enable),
-            ("extendedDynamicState3ProvokingVertexMode", d3.extended_dynamic_state3_provoking_vertex_mode),
-            ("extendedDynamicState3SampleLocationsEnable", d3.extended_dynamic_state3_sample_locations_enable),
-            ("colorWriteEnable", self.color_write.color_write_enable),
-            ("provokingVertexLast", self.provoking_vertex.provoking_vertex_last),
-            ("depthClipEnable", self.depth_clip_enable.depth_clip_enable),
-            ("depthClipControl", self.depth_clip_control.depth_clip_control),
-            ("depthClampControl", self.depth_clamp_control.depth_clamp_control),
-            // The one line mode every line rasterization device has.
-            ("rectangularLines", self.lines.rectangular_lines),
         ]
     }
 
@@ -404,60 +735,110 @@ impl FeatureChain {
         extensions.chain(bits.map(|(name, _)| name.to_owned())).collect()
     }
 
-    /// The optional features the device has (`rebar` is the caller's).
-    pub(crate) fn optional(&self, has: &dyn Fn(&CStr) -> bool, rebar: bool) -> Features {
+    /// The optional features the device has.
+    #[allow(unused_variables)]
+    pub(crate) fn optional(&self, has: &dyn Fn(&CStr) -> bool, device: DeviceFacts) -> Features {
         let t = |bit: vk::Bool32| bit == vk::TRUE;
         let (c, v11, v12) = (&self.core, &self.vk11, &self.vk12);
+        let (d2, d3, lines) = (&self.dynamic_state2, &self.dynamic_state3, &self.lines);
+        let line_ext = has(ash::khr::line_rasterization::NAME);
         let acceleration_structure = has(ash::khr::acceleration_structure::NAME)
             && has(ash::khr::deferred_host_operations::NAME)
             && t(self.acceleration_structure.acceleration_structure);
-        Features {
-            rebar,
-            host_image_copy: rebar && t(self.host_image_copy.host_image_copy),
-            mesh: t(self.mesh.mesh_shader) && t(self.mesh.task_shader),
-            mesh_queries: t(self.mesh.mesh_shader_queries),
-            acceleration_structure,
-            ray_query: acceleration_structure && t(self.ray_query.ray_query),
-            ray_tracing_pipeline: acceleration_structure
-                && t(self.ray_tracing_pipeline.ray_tracing_pipeline)
-                && t(self.ray_tracing_pipeline.ray_tracing_pipeline_trace_rays_indirect),
-            pipeline_statistics: t(c.pipeline_statistics_query),
-            precise_occlusion: t(c.occlusion_query_precise),
-            memory_budget: has(ash::ext::memory_budget::NAME),
-            shader_clock: t(self.clock.shader_subgroup_clock),
-            performance_query: t(self.performance.performance_counter_query_pools),
-            calibrated_timestamps: has(ash::khr::calibrated_timestamps::NAME),
+        let eds3 = |bit| has(ash::ext::extended_dynamic_state3::NAME) && t(bit);
+        #[allow(unused_mut)]
+        let mut f = Features {
+            rebar: device.rebar,
+            ..Features::DEFAULT
+        };
+        set! { f:
+            "host-image-copy" => host_image_copy = t(self.host_image_copy.host_image_copy),
+            "mesh-shader" => mesh_shader = t(self.mesh.mesh_shader) && t(self.mesh.task_shader),
+            "mesh-shader-queries" => mesh_shader_queries = t(self.mesh.mesh_shader_queries),
+            "acceleration-structure" => acceleration_structure = acceleration_structure,
+            "ray-query" => ray_query = t(self.ray_query.ray_query),
+            "ray-tracing-pipeline" => ray_tracing_pipeline =
+                t(self.ray_tracing_pipeline.ray_tracing_pipeline)
+                    && t(self.ray_tracing_pipeline.ray_tracing_pipeline_trace_rays_indirect),
+            "pipeline-statistics" => pipeline_statistics = t(c.pipeline_statistics_query),
+            "precise-occlusion" => precise_occlusion = t(c.occlusion_query_precise),
+            "memory-budget" => memory_budget = has(ash::ext::memory_budget::NAME),
+            "shader-clock" => shader_clock = t(self.clock.shader_subgroup_clock),
+            "performance-query" => performance_query =
+                t(self.performance.performance_counter_query_pools),
+            "calibrated-timestamps" => calibrated_timestamps =
+                has(ash::khr::calibrated_timestamps::NAME),
             // The caller drops it without a display or the instance extension.
-            present_fences: t(self.swapchain_maintenance1.swapchain_maintenance1),
-            bc_compression: t(c.texture_compression_bc),
-            independent_blend: t(c.independent_blend),
-            fill_mode_non_solid: t(c.fill_mode_non_solid),
-            wide_lines: t(c.wide_lines),
-            depth_bounds: t(c.depth_bounds),
-            depth_clamp: t(c.depth_clamp),
-            logic_op: t(c.logic_op),
-            sampler_anisotropy: t(c.sampler_anisotropy),
-            rectangular_lines: t(self.lines.rectangular_lines),
-            bresenham_lines: t(self.lines.bresenham_lines),
-            smooth_lines: t(self.lines.smooth_lines),
-            stippled_rectangular_lines: t(self.lines.stippled_rectangular_lines),
-            stippled_bresenham_lines: t(self.lines.stippled_bresenham_lines),
-            stippled_smooth_lines: t(self.lines.stippled_smooth_lines),
-            int8: t(v12.shader_int8),
-            int16: t(c.shader_int16),
-            float16: t(v12.shader_float16),
-            float64: t(c.shader_float64),
-            int64_atomics: t(v12.shader_buffer_int64_atomics),
-            storage_8bit: t(v12.storage_buffer8_bit_access)
-                && t(v12.uniform_and_storage_buffer8_bit_access),
-            storage_16bit: t(v11.storage_buffer16_bit_access)
-                && t(v11.uniform_and_storage_buffer16_bit_access),
-            push_constant_8bit: t(v12.storage_push_constant8),
-            push_constant_16bit: t(v11.storage_push_constant16),
+            "present-fences" => present_fences =
+                t(self.swapchain_maintenance1.swapchain_maintenance1),
+            "bc-compression" => bc_compression = t(c.texture_compression_bc),
+            "independent-blend" => independent_blend = t(c.independent_blend),
+            "fill-mode-non-solid" => fill_mode_non_solid = t(c.fill_mode_non_solid),
+            "wide-lines" => wide_lines = t(c.wide_lines),
+            "depth-bounds" => depth_bounds = t(c.depth_bounds),
+            "depth-clamp" => depth_clamp = t(c.depth_clamp),
+            "depth-clamp-control" => depth_clamp_control =
+                t(self.depth_clamp_control.depth_clamp_control),
+            "depth-clip-enable" => depth_clip_enable = t(self.depth_clip_enable.depth_clip_enable),
+            "depth-clip-control" => depth_clip_control =
+                t(self.depth_clip_control.depth_clip_control),
+            "logic-op" => logic_op = t(c.logic_op),
+            "sampler-anisotropy" => sampler_anisotropy = t(c.sampler_anisotropy),
+            "conservative-rasterization" => conservative_rasterization =
+                has(ash::ext::conservative_rasterization::NAME),
+            "provoking-vertex" => provoking_vertex = t(self.provoking_vertex.provoking_vertex_last),
+            "rectangular-lines" => rectangular_lines = line_ext && t(lines.rectangular_lines),
+            "bresenham-lines" => bresenham_lines = line_ext && t(lines.bresenham_lines),
+            "smooth-lines" => smooth_lines = line_ext && t(lines.smooth_lines),
+            "shader-int8" => shader_int8 = t(v12.shader_int8),
+            "shader-int16" => shader_int16 = t(c.shader_int16),
+            "shader-float16" => shader_float16 = t(v12.shader_float16),
+            "shader-float64" => shader_float64 = t(c.shader_float64),
+            "shader-int64-atomics" => shader_int64_atomics = t(v12.shader_buffer_int64_atomics),
+            "storage-8bit" => storage_8bit = t(v12.storage_buffer8_bit_access)
+                && t(v12.uniform_and_storage_buffer8_bit_access)
+                && t(v12.storage_push_constant8),
+            "storage-16bit" => storage_16bit = t(v11.storage_buffer16_bit_access)
+                && t(v11.uniform_and_storage_buffer16_bit_access)
+                && t(v11.storage_push_constant16),
+            "dynamic-blend" => dynamic_blend = eds3(d3.extended_dynamic_state3_color_blend_enable)
+                && t(d3.extended_dynamic_state3_color_blend_equation)
+                && t(d3.extended_dynamic_state3_color_write_mask),
+            "dynamic-polygon-mode" => dynamic_polygon_mode =
+                eds3(d3.extended_dynamic_state3_polygon_mode),
+            "dynamic-depth-clamp" => dynamic_depth_clamp =
+                eds3(d3.extended_dynamic_state3_depth_clamp_enable),
+            "dynamic-depth-clip" => dynamic_depth_clip =
+                eds3(d3.extended_dynamic_state3_depth_clip_enable),
+            "dynamic-depth-clip-negative-one-to-one" => dynamic_depth_clip_negative_one_to_one =
+                eds3(d3.extended_dynamic_state3_depth_clip_negative_one_to_one),
+            "dynamic-logic-op" => dynamic_logic_op =
+                eds3(d3.extended_dynamic_state3_logic_op_enable)
+                    && has(ash::ext::extended_dynamic_state2::NAME)
+                    && t(d2.extended_dynamic_state2_logic_op),
+            "dynamic-conservative-rasterization" => dynamic_conservative_rasterization =
+                eds3(d3.extended_dynamic_state3_conservative_rasterization_mode),
+            "dynamic-line-mode" => dynamic_line_mode =
+                line_ext && eds3(d3.extended_dynamic_state3_line_rasterization_mode),
+            "dynamic-line-stipple" => dynamic_line_stipple =
+                line_ext && eds3(d3.extended_dynamic_state3_line_stipple_enable),
+            "dynamic-provoking-vertex" => dynamic_provoking_vertex =
+                eds3(d3.extended_dynamic_state3_provoking_vertex_mode),
         }
+        // Stippling has to work in every line mode the device has, default lines included.
+        let stippled = |mode: vk::Bool32, stippled: vk::Bool32| !t(mode) || t(stippled);
+        set! { f:
+            "line-stipple" => line_stipple = line_ext
+                && device.strict_lines
+                && t(lines.stippled_rectangular_lines)
+                && stippled(lines.bresenham_lines, lines.stippled_bresenham_lines)
+                && stippled(lines.smooth_lines, lines.stippled_smooth_lines),
+        }
+        f.consistent()
     }
 
     /// The chain that enables lava's needs and `features`.
+    #[allow(unused_variables)]
     pub(crate) fn enabling(features: &Features) -> Self {
         let on = |b: bool| b as vk::Bool32;
         let f = features;
@@ -465,24 +846,8 @@ impl FeatureChain {
         chain.core = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
             .fragment_stores_and_atomics(true)
-            .vertex_pipeline_stores_and_atomics(true)
-            .texture_compression_bc(f.bc_compression)
-            .independent_blend(f.independent_blend)
-            .fill_mode_non_solid(f.fill_mode_non_solid)
-            .wide_lines(f.wide_lines)
-            .depth_bounds(f.depth_bounds)
-            .depth_clamp(f.depth_clamp)
-            .logic_op(f.logic_op)
-            .sampler_anisotropy(f.sampler_anisotropy)
-            .shader_int16(f.int16)
-            .shader_float64(f.float64)
-            .pipeline_statistics_query(f.pipeline_statistics)
-            .occlusion_query_precise(f.precise_occlusion);
-        chain.vk11 = vk::PhysicalDeviceVulkan11Features::default()
-            .shader_draw_parameters(true)
-            .storage_buffer16_bit_access(f.storage_16bit)
-            .uniform_and_storage_buffer16_bit_access(f.storage_16bit)
-            .storage_push_constant16(f.push_constant_16bit);
+            .vertex_pipeline_stores_and_atomics(true);
+        chain.vk11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
         chain.vk12 = vk::PhysicalDeviceVulkan12Features::default()
             .descriptor_indexing(true)
             .runtime_descriptor_array(true)
@@ -499,13 +864,7 @@ impl FeatureChain {
             .scalar_block_layout(true)
             .vulkan_memory_model(true)
             .vulkan_memory_model_device_scope(true)
-            .host_query_reset(true)
-            .shader_int8(f.int8)
-            .shader_float16(f.float16)
-            .shader_buffer_int64_atomics(f.int64_atomics)
-            .storage_buffer8_bit_access(f.storage_8bit)
-            .uniform_and_storage_buffer8_bit_access(f.storage_8bit)
-            .storage_push_constant8(f.push_constant_8bit);
+            .host_query_reset(true);
         chain.vk13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true)
@@ -513,53 +872,107 @@ impl FeatureChain {
             // What `discard` compiles to.
             .shader_demote_to_helper_invocation(true);
         chain.address_commands.device_address_commands = vk::TRUE;
-        chain.dynamic_state2.extended_dynamic_state2_logic_op = vk::TRUE;
-        let d3 = &mut chain.dynamic_state3;
-        for bit in [
-            &mut d3.extended_dynamic_state3_polygon_mode,
-            &mut d3.extended_dynamic_state3_depth_clamp_enable,
-            &mut d3.extended_dynamic_state3_depth_clip_enable,
-            &mut d3.extended_dynamic_state3_depth_clip_negative_one_to_one,
-            &mut d3.extended_dynamic_state3_rasterization_samples,
-            &mut d3.extended_dynamic_state3_sample_mask,
-            &mut d3.extended_dynamic_state3_alpha_to_coverage_enable,
-            &mut d3.extended_dynamic_state3_alpha_to_one_enable,
-            &mut d3.extended_dynamic_state3_logic_op_enable,
-            &mut d3.extended_dynamic_state3_color_blend_enable,
-            &mut d3.extended_dynamic_state3_color_blend_equation,
-            &mut d3.extended_dynamic_state3_color_write_mask,
-            &mut d3.extended_dynamic_state3_conservative_rasterization_mode,
-            &mut d3.extended_dynamic_state3_line_rasterization_mode,
-            &mut d3.extended_dynamic_state3_line_stipple_enable,
-            &mut d3.extended_dynamic_state3_provoking_vertex_mode,
-            &mut d3.extended_dynamic_state3_sample_locations_enable,
-        ] {
-            *bit = vk::TRUE;
+        let FeatureChain {
+            core: c,
+            vk11: v11,
+            vk12: v12,
+            dynamic_state2: d2,
+            dynamic_state3: d3,
+            lines,
+            ..
+        } = &mut chain;
+        set! { c:
+            "bc-compression" => texture_compression_bc = on(f.bc_compression),
+            "independent-blend" => independent_blend = on(f.independent_blend),
+            "fill-mode-non-solid" => fill_mode_non_solid = on(f.fill_mode_non_solid),
+            "wide-lines" => wide_lines = on(f.wide_lines),
+            "depth-bounds" => depth_bounds = on(f.depth_bounds),
+            "depth-clamp" => depth_clamp = on(f.depth_clamp),
+            "logic-op" => logic_op = on(f.logic_op),
+            "sampler-anisotropy" => sampler_anisotropy = on(f.sampler_anisotropy),
+            "shader-int16" => shader_int16 = on(f.shader_int16),
+            "shader-float64" => shader_float64 = on(f.shader_float64),
+            "pipeline-statistics" => pipeline_statistics_query = on(f.pipeline_statistics),
+            "precise-occlusion" => occlusion_query_precise = on(f.precise_occlusion),
         }
-        chain.color_write.color_write_enable = vk::TRUE;
-        chain.provoking_vertex.provoking_vertex_last = vk::TRUE;
-        chain.depth_clip_enable.depth_clip_enable = vk::TRUE;
-        chain.depth_clip_control.depth_clip_control = vk::TRUE;
-        chain.depth_clamp_control.depth_clamp_control = vk::TRUE;
-        let lines = &mut chain.lines;
-        lines.rectangular_lines = vk::TRUE;
-        lines.bresenham_lines = on(f.bresenham_lines);
-        lines.smooth_lines = on(f.smooth_lines);
-        lines.stippled_rectangular_lines = on(f.stippled_rectangular_lines);
-        lines.stippled_bresenham_lines = on(f.stippled_bresenham_lines);
-        lines.stippled_smooth_lines = on(f.stippled_smooth_lines);
-        chain.mesh.task_shader = on(f.mesh);
-        chain.mesh.mesh_shader = on(f.mesh);
-        chain.mesh.mesh_shader_queries = on(f.mesh_queries);
-        chain.acceleration_structure.acceleration_structure = on(f.acceleration_structure);
-        chain.ray_query.ray_query = on(f.ray_query);
-        chain.ray_tracing_pipeline.ray_tracing_pipeline = on(f.ray_tracing_pipeline);
-        chain.ray_tracing_pipeline.ray_tracing_pipeline_trace_rays_indirect =
-            on(f.ray_tracing_pipeline);
-        chain.host_image_copy.host_image_copy = on(f.host_image_copy);
-        chain.clock.shader_subgroup_clock = on(f.shader_clock);
-        chain.performance.performance_counter_query_pools = on(f.performance_query);
-        chain.swapchain_maintenance1.swapchain_maintenance1 = on(f.present_fences);
+        set! { v11:
+            "storage-16bit" => storage_buffer16_bit_access = on(f.storage_16bit),
+            "storage-16bit" => uniform_and_storage_buffer16_bit_access = on(f.storage_16bit),
+            "storage-16bit" => storage_push_constant16 = on(f.storage_16bit),
+        }
+        set! { v12:
+            "shader-int8" => shader_int8 = on(f.shader_int8),
+            "shader-float16" => shader_float16 = on(f.shader_float16),
+            "shader-int64-atomics" => shader_buffer_int64_atomics = on(f.shader_int64_atomics),
+            "storage-8bit" => storage_buffer8_bit_access = on(f.storage_8bit),
+            "storage-8bit" => uniform_and_storage_buffer8_bit_access = on(f.storage_8bit),
+            "storage-8bit" => storage_push_constant8 = on(f.storage_8bit),
+        }
+        set! { d3:
+            "dynamic-blend" => extended_dynamic_state3_color_blend_enable = on(f.dynamic_blend),
+            "dynamic-blend" => extended_dynamic_state3_color_blend_equation = on(f.dynamic_blend),
+            "dynamic-blend" => extended_dynamic_state3_color_write_mask = on(f.dynamic_blend),
+            "dynamic-polygon-mode" => extended_dynamic_state3_polygon_mode =
+                on(f.dynamic_polygon_mode),
+            "dynamic-depth-clamp" => extended_dynamic_state3_depth_clamp_enable =
+                on(f.dynamic_depth_clamp),
+            "dynamic-depth-clip" => extended_dynamic_state3_depth_clip_enable =
+                on(f.dynamic_depth_clip),
+            "dynamic-depth-clip-negative-one-to-one" =>
+                extended_dynamic_state3_depth_clip_negative_one_to_one =
+                    on(f.dynamic_depth_clip_negative_one_to_one),
+            "dynamic-logic-op" => extended_dynamic_state3_logic_op_enable = on(f.dynamic_logic_op),
+            "dynamic-conservative-rasterization" =>
+                extended_dynamic_state3_conservative_rasterization_mode =
+                    on(f.dynamic_conservative_rasterization),
+            "dynamic-line-mode" => extended_dynamic_state3_line_rasterization_mode =
+                on(f.dynamic_line_mode),
+            "dynamic-line-stipple" => extended_dynamic_state3_line_stipple_enable =
+                on(f.dynamic_line_stipple),
+            "dynamic-provoking-vertex" => extended_dynamic_state3_provoking_vertex_mode =
+                on(f.dynamic_provoking_vertex),
+        }
+        set! { d2:
+            "dynamic-logic-op" => extended_dynamic_state2_logic_op = on(f.dynamic_logic_op),
+        }
+        set! { lines:
+            "rectangular-lines" => rectangular_lines = on(f.rectangular_lines),
+            "bresenham-lines" => bresenham_lines = on(f.bresenham_lines),
+            "smooth-lines" => smooth_lines = on(f.smooth_lines),
+            "line-stipple" => stippled_rectangular_lines = on(f.line_stipple),
+        }
+        // The stippled form of every line mode that is on.
+        #[cfg(feature = "line-stipple")]
+        {
+            lines.stippled_bresenham_lines = on(f.line_stipple && lines.bresenham_lines == vk::TRUE);
+            lines.stippled_smooth_lines = on(f.line_stipple && lines.smooth_lines == vk::TRUE);
+        }
+        let _ = (c, v11, v12, d2, d3, lines);
+        set! { chain:
+            "provoking-vertex" => provoking_vertex.provoking_vertex_last = on(f.provoking_vertex),
+            "depth-clip-enable" => depth_clip_enable.depth_clip_enable = on(f.depth_clip_enable),
+            "depth-clip-control" => depth_clip_control.depth_clip_control =
+                on(f.depth_clip_control),
+            "depth-clamp-control" => depth_clamp_control.depth_clamp_control =
+                on(f.depth_clamp_control),
+            "mesh-shader" => mesh.task_shader = on(f.mesh_shader),
+            "mesh-shader" => mesh.mesh_shader = on(f.mesh_shader),
+            "mesh-shader-queries" => mesh.mesh_shader_queries = on(f.mesh_shader_queries),
+            "acceleration-structure" => acceleration_structure.acceleration_structure =
+                on(f.acceleration_structure),
+            "ray-query" => ray_query.ray_query = on(f.ray_query),
+            "ray-tracing-pipeline" => ray_tracing_pipeline.ray_tracing_pipeline =
+                on(f.ray_tracing_pipeline),
+            "ray-tracing-pipeline" =>
+                ray_tracing_pipeline.ray_tracing_pipeline_trace_rays_indirect =
+                    on(f.ray_tracing_pipeline),
+            "host-image-copy" => host_image_copy.host_image_copy = on(f.host_image_copy),
+            "shader-clock" => clock.shader_subgroup_clock = on(f.shader_clock),
+            "performance-query" => performance.performance_counter_query_pools =
+                on(f.performance_query),
+            "present-fences" => swapchain_maintenance1.swapchain_maintenance1 =
+                on(f.present_fences),
+        }
         chain
     }
 }
@@ -578,14 +991,24 @@ mod tests {
         [2 << 16 | 17, id]
     }
 
+    /// Every capability a pass declares maps to its feature, or to the cargo feature lava was
+    /// compiled without.
     #[test]
     fn capabilities_map_to_the_features_they_need() {
         let spirv = module(&[&capability(1), &capability(39), &capability(4472), &capability(5283)]);
-        let features = Features::of_spirv(&spirv);
-        assert!(features.int8 && features.ray_query && features.mesh);
-        assert!(!features.float16 && !features.shader_clock);
+        let needs = Features::of_spirv(&spirv);
+        let mut expected = Features::default();
+        let mut compiled_out = Vec::new();
+        for cargo in ["shader-int8", "ray-query", "mesh-shader"] {
+            if !expected.set_named(cargo) {
+                compiled_out.push(cargo);
+            }
+        }
+        assert_eq!(needs, Needs { features: expected, compiled_out });
         // `Shader` (1) needs nothing optional.
-        assert_eq!(Features::of_spirv(&module(&[&capability(1)])), Features::default());
+        let shader = Features::of_spirv(&module(&[&capability(1)]));
+        assert_eq!(shader.features, Features::default());
+        assert!(shader.compiled_out.is_empty());
     }
 
     #[test]
@@ -593,24 +1016,24 @@ mod tests {
         // `OpExtension "SPV_KHR_ray_query"` (opcode 10) holds the text, not a capability.
         let extension = [5 << 16 | 10, 0x5f565053, 0x5f52484b, 0x5f796172, 0x72657571];
         let spirv = module(&[&extension, &capability(1)]);
-        assert_eq!(Features::of_spirv(&spirv), Features::default());
+        assert_eq!(Features::of_spirv(&spirv).features, Features::default());
     }
 
     #[test]
-    fn missing_features_are_named() {
+    fn missing_features_are_named_by_their_cargo_feature() {
         let wanted = Features {
-            mesh: true,
-            bc_compression: true,
-            int8: true,
+            rebar: true,
             ..Default::default()
         };
-        let available = Features {
-            mesh: true,
-            ..Default::default()
-        };
-        assert_eq!(wanted.missing_from(&available), ["bc_compression", "int8"]);
+        assert_eq!(wanted.missing_from(&Features::default()), ["rebar"]);
         assert!(wanted.missing_from(&wanted).is_empty());
         assert_eq!(wanted.union(Features::default()), wanted);
+        assert_eq!(wanted.without(wanted), Features::default());
+        for name in &Features::NAMES[1..] {
+            let mut one = Features::default();
+            assert!(one.set_named(name), "{name}");
+            assert_eq!(one.missing_from(&Features::default()), [*name]);
+        }
     }
 
     /// Every bit lava checks on a device it also enables, without any optional feature.
@@ -622,6 +1045,7 @@ mod tests {
         }
         assert_eq!(chain.mesh.mesh_shader, vk::FALSE);
         assert_eq!(chain.core.texture_compression_bc, vk::FALSE);
+        assert_eq!(chain.dynamic_state3.extended_dynamic_state3_color_blend_enable, vk::FALSE);
     }
 
     /// What enabling a feature sets is what detecting it reads.
@@ -629,16 +1053,34 @@ mod tests {
     fn enabled_optional_features_read_back_as_supported() {
         let all = Features::from_bits(std::iter::repeat(true));
         let chain = FeatureChain::enabling(&all);
-        assert_eq!(chain.optional(&|_| true, true), all);
+        let facts = DeviceFacts {
+            rebar: true,
+            strict_lines: true,
+        };
+        assert_eq!(chain.optional(&|_| true, facts), all);
+    }
+
+    /// Features whose prerequisites were disabled are off too.
+    #[test]
+    fn disabled_prerequisites_turn_dependent_features_off() {
+        let all = Features::from_bits(std::iter::repeat(true));
+        let no_rebar = Features { rebar: false, ..all }.consistent();
+        #[cfg(feature = "host-image-copy")]
+        assert!(!no_rebar.host_image_copy);
+        let _ = no_rebar;
+        assert_eq!(all.consistent(), all);
     }
 
     #[test]
     fn extensions_follow_the_features() {
         assert!(Features::default().extensions().is_empty());
-        let mesh = Features {
-            mesh: true,
-            ..Default::default()
-        };
-        assert_eq!(mesh.extensions(), [ash::ext::mesh_shader::NAME]);
+        let mut mesh = Features::default();
+        if mesh.set_named("mesh-shader") {
+            assert_eq!(mesh.extensions(), [ash::ext::mesh_shader::NAME]);
+        }
+        let mut lines = Features::default();
+        if lines.set_named("bresenham-lines") {
+            assert_eq!(lines.extensions(), [ash::khr::line_rasterization::NAME]);
+        }
     }
 }

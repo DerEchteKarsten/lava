@@ -1,10 +1,11 @@
-//! Hardware performance counters (`VK_KHR_performance_query`): the graphics family's counters, how many passes a selection needs, and the profiling lock counter pools hold
+//! Hardware performance counters (`VK_KHR_performance_query`, the `performance-query` feature): the graphics family's counters, how many passes a selection needs, and the profiling lock counter pools hold
 use std::sync::{Mutex, OnceLock};
 
 use crate::vk;
 
 use crate::{
     error::Result,
+    features::{Gated, On, gate},
     state::{Ctx, Functions},
 };
 
@@ -102,9 +103,10 @@ fn to_string(chars: &[std::ffi::c_char]) -> String {
 
 /// Lists the counters of the graphics queue family, if the device has performance queries.
 pub(crate) fn init() -> Result<()> {
-    let Some((instance, _)) = Functions::performance_query() else {
+    if !gate::PerformanceQuery::on() {
         return Ok(());
-    };
+    }
+    let (instance, _) = Functions::performance_query();
     let (device, family) = (Ctx::physical_device().handel, Ctx::gfx_queue_index());
     let len = unsafe {
         instance
@@ -137,18 +139,19 @@ pub(crate) fn init() -> Result<()> {
     Ok(())
 }
 
-/// Every counter the graphics queue family offers; empty before `lava::init` and without
-/// `VK_KHR_performance_query`.
-pub fn counters() -> &'static [Counter] {
-    COUNTERS.get().map_or(&[], Vec::as_slice)
+/// Every counter the graphics queue family offers.
+pub fn counters() -> Gated<gate::PerformanceQuery, &'static [Counter]> {
+    gate::<gate::PerformanceQuery, _>(|| COUNTERS.get().map_or(&[][..], Vec::as_slice))
 }
 
-/// How many submissions of a frame it takes to read `selection`. Only selections of one pass
-/// can be recorded.
+/// How many submissions of a frame it takes to read `selection`, counters of
+/// [`counters()`] (0 without performance queries, which have no counters). Only selections of
+/// one pass can be recorded.
 pub fn passes(selection: &[&Counter]) -> u32 {
-    let Some((instance, _)) = Functions::performance_query() else {
+    if !gate::PerformanceQuery::on() {
         return 0;
-    };
+    }
+    let (instance, _) = Functions::performance_query();
     let indices: Vec<u32> = selection.iter().map(|counter| counter.index).collect();
     let info = vk::QueryPoolPerformanceCreateInfoKHR::default()
         .queue_family_index(Ctx::gfx_queue_index())
@@ -165,7 +168,7 @@ pub fn passes(selection: &[&Counter]) -> u32 {
 pub(crate) fn acquire_lock() -> bool {
     let mut users = LOCK_USERS.lock().unwrap();
     if *users == 0 {
-        let (_, device) = Functions::performance_query().expect("performance queries are enabled");
+        let (_, device) = Functions::performance_query();
         let info = vk::AcquireProfilingLockInfoKHR::default().timeout(0);
         if let Err(err) = unsafe { device.acquire_profiling_lock(&info) } {
             tracing::warn!("no performance counters: the profiling lock is taken ({err})");
@@ -181,7 +184,7 @@ pub(crate) fn release_lock() {
     let mut users = LOCK_USERS.lock().unwrap();
     *users -= 1;
     if *users == 0 {
-        let (_, device) = Functions::performance_query().expect("performance queries are enabled");
+        let (_, device) = Functions::performance_query();
         unsafe { device.release_profiling_lock() };
     }
 }

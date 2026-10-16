@@ -365,10 +365,10 @@ fn record_profiled(cmd: &mut CommandBuffer, target: &Target) {
             );
         }
     });
-    if Ctx::features().mesh {
+    if Ctx::features().mesh_shader {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::launch(
-                &TestMesh::push_bindings(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4),
+                &TestMesh::push_bindings(Vec4::ONE, Vec2::new(1.0, 0.0), 0.4).unwrap(),
                 [2, 1, 1],
                 RasterState::default().cull_mode(CullModeFlags::NONE),
                 None,
@@ -489,7 +489,7 @@ fn observers_see_every_scope_and_pass_once_in_nesting_order() {
         ("TestComputeImage", 2, true, false),
         ("group", 1, false, false),
     ];
-    if Ctx::features().mesh {
+    if Ctx::features().mesh_shader {
         expected.extend([("TestMesh", 1, true, true), ("TestMesh", 1, true, false)]);
     }
     expected.push(("frame", 0, false, false));
@@ -517,10 +517,10 @@ fn observers_count_passes_and_renderings_with_queries() {
     let gpu = gpu();
     let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(0);
     let features = Ctx::features();
-    let mesh = features.mesh;
+    let mesh = features.mesh_shader;
     // One counter, which always fits a single pass. A time counter, if the device has one,
     // can't be 0 for a pass.
-    let all = counters::counters();
+    let all = counters::counters().unwrap_or_default();
     let counter = (all.iter())
         .find(|c| c.unit == counters::CounterUnit::Nanoseconds)
         .or(all.first());
@@ -530,7 +530,7 @@ fn observers_count_passes_and_renderings_with_queries() {
         statistics =
             Statistics::FRAGMENT_SHADER_INVOCATIONS | Statistics::COMPUTE_SHADER_INVOCATIONS;
     }
-    if features.pipeline_statistics && features.mesh_queries {
+    if features.pipeline_statistics && features.mesh_shader_queries {
         statistics |= Statistics::MESH_SHADER_INVOCATIONS_EXT;
     }
     let mut observer = TestObserver::new(statistics, &selection);
@@ -558,7 +558,7 @@ fn observers_count_passes_and_renderings_with_queries() {
         if mesh {
             assert!(count(2, Statistics::FRAGMENT_SHADER_INVOCATIONS).unwrap() > 0);
             assert_eq!(count(2, Statistics::COMPUTE_SHADER_INVOCATIONS), Some(0));
-            if features.mesh_queries {
+            if features.mesh_shader_queries {
                 assert!(count(2, Statistics::MESH_SHADER_INVOCATIONS_EXT).unwrap() > 0);
             }
         }
@@ -641,7 +641,12 @@ fn occlusion_queries_count_the_samples_of_a_draw() {
     let gpu = gpu();
     let vertices = overlapping_triangles();
     let depth = Image::<D32Sfloat, DepthAttachment>::new(UVec2::new(SIZE, SIZE)).unwrap();
-    let pool = QueryPool::occlusion(3, true).unwrap();
+    let precise = Ctx::features().precise_occlusion;
+    let pool = match precise {
+        true => QueryPool::precise_occlusion(3),
+        false => QueryPool::occlusion(3),
+    }
+    .unwrap();
     render(&gpu, |cmd, target| {
         let near = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
         let far = TestRaster::push_bindings(vertices.range(3..), Vec2::ZERO);
@@ -655,7 +660,7 @@ fn occlusion_queries_count_the_samples_of_a_draw() {
     let mut samples = [0; 3];
     assert!(pool.read(0, &mut samples).unwrap());
     assert!(samples[0] > 0, "the near triangle is visible");
-    if Ctx::features().precise_occlusion {
+    if precise {
         assert!(samples[0] < (SIZE * SIZE) as u64, "{}", samples[0]);
     }
     assert_eq!(samples[1], 0, "the far triangle is hidden behind it");
@@ -1195,7 +1200,7 @@ fn clock_regions_count_every_subgroup_once() {
     let out = zeroed_buffer::<u32, Storage>(INVOCATIONS);
     gpu.submit(|cmd| {
         cmd.compute(
-            &TestClock::push_bindings(clocks.address(), out.range(..)),
+            &TestClock::push_bindings(clocks.address(), out.range(..)).unwrap(),
             [INVOCATIONS as u32 / 64, 1, 1],
             None,
         )
@@ -1343,6 +1348,10 @@ fn disabling_backface_culling_draws_both_windings() {
 #[test]
 fn wireframe_draws_only_the_edges() {
     let gpu = gpu();
+    if !Ctx::features().fill_mode_non_solid {
+        eprintln!("SKIPPED wireframe_draws_only_the_edges: the device lacks `fill-mode-non-solid`");
+        return;
+    }
     let vertices = two_triangles();
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -1350,7 +1359,9 @@ fn wireframe_draws_only_the_edges() {
                 &bindings(&vertices),
                 6,
                 1,
-                unculled().polygon_mode(PolygonMode::LINE),
+                unculled()
+                    .polygon_mode(PolygonMode::LINE)
+                    .expect("the device has `fill-mode-non-solid`"),
                 None,
             ))
             .record("wireframe")
@@ -1580,7 +1591,7 @@ fn blend_modes_combine_overlapping_fragments() {
                 &bindings(&vertices),
                 6,
                 1,
-                RasterState::default().blends([blend]),
+                RasterState::default().blend(blend),
                 None,
             ))
             .record("blended")
@@ -1598,6 +1609,10 @@ fn blend_modes_combine_overlapping_fragments() {
 #[test]
 fn skipped_attachment_keeps_its_content() {
     let gpu = gpu();
+    if !Ctx::features().independent_blend {
+        eprintln!("SKIPPED skipped_attachment_keeps_its_content: the device lacks `independent-blend`");
+        return;
+    }
     let vertices = overlapping_triangles();
     let second = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage(1);
     let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);
@@ -1613,7 +1628,9 @@ fn skipped_attachment_keeps_its_content() {
             &bindings(&vertices),
             6,
             1,
-            RasterState::default().blends([Blend::Replace, Blend::Skip]),
+            RasterState::default()
+                .blends([Blend::Replace, Blend::Skip])
+                .expect("the device has `independent-blend`"),
             None,
         ))
         .record("skip");
@@ -1682,7 +1699,7 @@ fn blend_equations_take_any_factors_and_ops() {
     };
     let pixels = render(&gpu, |cmd, target| {
         let white = Attachment::color(target.whole_view(), Some([1.0; 4]));
-        let state = RasterState::default().blends([Blend::Equation(min)]);
+        let state = RasterState::default().blend(Blend::Equation(min));
         cmd.raster(EXTENT, [white])
             .draw(&Draw::new(&bindings(&vertices), 6, 1, state, None))
             .record("min");
@@ -1696,13 +1713,13 @@ fn blend_equations_take_any_factors_and_ops() {
 fn logic_ops_replace_blending() {
     let gpu = gpu();
     if !Ctx::features().logic_op {
-        eprintln!("SKIPPED logic_ops_replace_blending: the device lacks `Features::logic_op`");
+        eprintln!("SKIPPED logic_ops_replace_blending: the device lacks `logic-op`");
         return;
     }
     let vertices = overlapping_triangles();
     let pixels = render(&gpu, |cmd, target| {
         let white = Attachment::color(target.whole_view(), Some([1.0; 4]));
-        let state = RasterState::default().logic_op(Some(LogicOp::XOR));
+        let state = RasterState::default().logic_op(Some(LogicOp::XOR)).unwrap();
         cmd.raster(EXTENT, [white])
             .draw(&Draw::new(&bindings(&vertices), 6, 1, state, None))
             .record("xor");
@@ -2265,14 +2282,14 @@ fn host_copy_uploads_block_compressed_mips() {
 #[test]
 fn mesh_pass_emits_triangles_per_workgroup() {
     let gpu = gpu();
-    if !Ctx::features().mesh {
+    if !Ctx::features().mesh_shader {
         eprintln!("SKIPPED mesh_pass_emits_triangles_per_workgroup: no mesh shader support");
         return;
     }
     let pixels = render(&gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::launch(
-                &TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4),
+                &TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4).unwrap(),
                 [2, 1, 1],
                 unculled(),
                 None,
@@ -2289,12 +2306,12 @@ fn mesh_pass_emits_triangles_per_workgroup() {
 #[test]
 fn indirect_mesh_launch_matches_the_direct_one() {
     let gpu = gpu();
-    if !Ctx::features().mesh {
+    if !Ctx::features().mesh_shader {
         eprintln!("SKIPPED indirect_mesh_launch_matches_the_direct_one: no mesh shader support");
         return;
     }
     let bindings =
-        || TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4);
+        || TestMesh::push_bindings(Vec4::new(0.8, 0.8, 0.8, 1.0), Vec2::new(1.0, 0.0), 0.4).unwrap();
     let direct = render(&gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::launch(&bindings(), [2, 1, 1], unculled(), None))

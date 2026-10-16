@@ -10,7 +10,7 @@ description = "Vulkan for Rust with bindless resources, automatic barriers and t
 readme = "../README.md"
 keywords = ["vulkan", "graphics", "gpu", "bindless", "rendering"]
 categories = ["graphics", "rendering::graphics-api", "game-development"]
-include = ["src/**", "LICENSE-*"]
+include = ["src/**", "build.rs", "LICENSE-*"]
 
 [dependencies]
 glam = {workspace = true}
@@ -28,4 +28,151 @@ hashbrown.workspace = true
 tracing-subscriber = { workspace = true }
 
 [features]
-default = []
+# Every optional device feature is two cargo features: `X` compiles it and checks the device at
+# runtime (functions that need it return `lava::features::Gated` values), `assert-X` makes `init`
+# refuse devices without it and drops the checks. Without either, its API isn't compiled.
+# `dynamic-*` decide whether a draw's state is dynamic state or part of the pipeline key.
+# See `lava::features`.
+default = [
+    "host-image-copy",
+    "mesh-shader",
+    "mesh-shader-queries",
+    "acceleration-structure",
+    "ray-query",
+    "ray-tracing-pipeline",
+    "pipeline-statistics",
+    "precise-occlusion",
+    "memory-budget",
+    "shader-clock",
+    "performance-query",
+    "calibrated-timestamps",
+    "present-fences",
+    "bc-compression",
+    "independent-blend",
+    "fill-mode-non-solid",
+    "wide-lines",
+    "depth-bounds",
+    "depth-clamp",
+    "depth-clamp-control",
+    "depth-clip-enable",
+    "depth-clip-control",
+    "logic-op",
+    "sampler-anisotropy",
+    "conservative-rasterization",
+    "provoking-vertex",
+    "rectangular-lines",
+    "bresenham-lines",
+    "smooth-lines",
+    "line-stipple",
+    "shader-int8",
+    "shader-int16",
+    "shader-float16",
+    "shader-float64",
+    "shader-int64-atomics",
+    "storage-8bit",
+    "storage-16bit",
+    "dynamic-blend",
+    "dynamic-polygon-mode",
+    "dynamic-depth-clamp",
+    "dynamic-depth-clip",
+    "dynamic-depth-clip-negative-one-to-one",
+    "dynamic-logic-op",
+    "dynamic-conservative-rasterization",
+    "dynamic-line-mode",
+    "dynamic-line-stipple",
+    "dynamic-provoking-vertex",
+]
+host-image-copy = []
+assert-host-image-copy = ["host-image-copy"]
+mesh-shader = []
+assert-mesh-shader = ["mesh-shader"]
+mesh-shader-queries = ["mesh-shader", "pipeline-statistics"]
+assert-mesh-shader-queries = ["mesh-shader-queries", "assert-mesh-shader", "assert-pipeline-statistics"]
+acceleration-structure = []
+assert-acceleration-structure = ["acceleration-structure"]
+ray-query = ["acceleration-structure"]
+assert-ray-query = ["ray-query", "assert-acceleration-structure"]
+ray-tracing-pipeline = ["acceleration-structure"]
+assert-ray-tracing-pipeline = ["ray-tracing-pipeline", "assert-acceleration-structure"]
+pipeline-statistics = []
+assert-pipeline-statistics = ["pipeline-statistics"]
+precise-occlusion = []
+assert-precise-occlusion = ["precise-occlusion"]
+memory-budget = []
+assert-memory-budget = ["memory-budget"]
+shader-clock = []
+assert-shader-clock = ["shader-clock"]
+performance-query = []
+assert-performance-query = ["performance-query"]
+calibrated-timestamps = []
+assert-calibrated-timestamps = ["calibrated-timestamps"]
+present-fences = []
+assert-present-fences = ["present-fences"]
+bc-compression = []
+assert-bc-compression = ["bc-compression"]
+independent-blend = []
+assert-independent-blend = ["independent-blend"]
+fill-mode-non-solid = []
+assert-fill-mode-non-solid = ["fill-mode-non-solid"]
+wide-lines = []
+assert-wide-lines = ["wide-lines"]
+depth-bounds = []
+assert-depth-bounds = ["depth-bounds"]
+depth-clamp = []
+assert-depth-clamp = ["depth-clamp"]
+depth-clamp-control = ["depth-clamp"]
+assert-depth-clamp-control = ["depth-clamp-control", "assert-depth-clamp"]
+depth-clip-enable = []
+assert-depth-clip-enable = ["depth-clip-enable"]
+depth-clip-control = []
+assert-depth-clip-control = ["depth-clip-control"]
+logic-op = []
+assert-logic-op = ["logic-op"]
+sampler-anisotropy = []
+assert-sampler-anisotropy = ["sampler-anisotropy"]
+conservative-rasterization = []
+assert-conservative-rasterization = ["conservative-rasterization"]
+provoking-vertex = []
+assert-provoking-vertex = ["provoking-vertex"]
+rectangular-lines = []
+assert-rectangular-lines = ["rectangular-lines"]
+bresenham-lines = []
+assert-bresenham-lines = ["bresenham-lines"]
+smooth-lines = []
+assert-smooth-lines = ["smooth-lines"]
+line-stipple = []
+assert-line-stipple = ["line-stipple"]
+shader-int8 = []
+assert-shader-int8 = ["shader-int8"]
+shader-int16 = []
+assert-shader-int16 = ["shader-int16"]
+shader-float16 = []
+assert-shader-float16 = ["shader-float16"]
+shader-float64 = []
+assert-shader-float64 = ["shader-float64"]
+shader-int64-atomics = []
+assert-shader-int64-atomics = ["shader-int64-atomics"]
+storage-8bit = []
+assert-storage-8bit = ["storage-8bit"]
+storage-16bit = []
+assert-storage-16bit = ["storage-16bit"]
+dynamic-blend = []
+assert-dynamic-blend = ["dynamic-blend"]
+dynamic-polygon-mode = ["fill-mode-non-solid"]
+assert-dynamic-polygon-mode = ["dynamic-polygon-mode"]
+dynamic-depth-clamp = ["depth-clamp"]
+assert-dynamic-depth-clamp = ["dynamic-depth-clamp"]
+dynamic-depth-clip = ["depth-clip-enable"]
+assert-dynamic-depth-clip = ["dynamic-depth-clip", "assert-depth-clip-enable"]
+dynamic-depth-clip-negative-one-to-one = ["depth-clip-control"]
+assert-dynamic-depth-clip-negative-one-to-one = ["dynamic-depth-clip-negative-one-to-one", "assert-depth-clip-control"]
+dynamic-logic-op = ["logic-op"]
+assert-dynamic-logic-op = ["dynamic-logic-op"]
+dynamic-conservative-rasterization = ["conservative-rasterization"]
+assert-dynamic-conservative-rasterization = ["dynamic-conservative-rasterization", "assert-conservative-rasterization"]
+dynamic-line-mode = []
+assert-dynamic-line-mode = ["dynamic-line-mode"]
+dynamic-line-stipple = ["line-stipple"]
+assert-dynamic-line-stipple = ["dynamic-line-stipple"]
+dynamic-provoking-vertex = ["provoking-vertex"]
+assert-dynamic-provoking-vertex = ["dynamic-provoking-vertex", "assert-provoking-vertex"]

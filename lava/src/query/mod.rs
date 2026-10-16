@@ -1,33 +1,38 @@
-//! GPU queries: user-owned pools of one kind each (timestamps, pipeline statistics, occlusion, hardware counters, compacted sizes), reset on the host when a recording first touches them, read without waiting, and destroyed once no frame can reach them
+//! GPU queries: user-owned pools of one kind each (timestamps, and with their features pipeline statistics, occlusion, hardware counters, compacted sizes), reset on the host when a recording first touches them, read without waiting, and destroyed once no frame can reach them
 //!
 //! A pool holds the results of one recording. The first command of a recording that touches a
 //! pool resets it on the host, which needs the frames that recorded into it before to be done:
 //! keep one pool per frame in flight. Its results are readable once that recording finished
 //! ([`QueryPool::read`] never waits). A [`ScopeObserver`] that `CommandBuffer::measure` attaches
 //! can record queries at the edges of every scope and pass of a recording.
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "calibrated-timestamps")]
+use std::time::{Duration, Instant};
 
 use crate::vk;
 
+#[allow(unused_imports)]
 use crate::{
     epoch,
     error::{Error, Result},
+    features::{Feature, Gated, gate},
     sealed::Sealed,
     state::{Ctx, Functions},
 };
 
+#[cfg(feature = "performance-query")]
 pub mod counters;
 pub mod observer;
 
 pub use crate::vk::QueryPipelineStatisticFlags;
+#[cfg(feature = "performance-query")]
 pub use counters::{Counter, CounterUnit, MAX_COUNTERS};
 pub use observer::{QueryRecorder, ScopeInfo, ScopeObserver};
 
 pub(crate) fn init() -> Result<()> {
-    counters::init()
+    #[cfg(feature = "performance-query")]
+    counters::init()?;
+    Ok(())
 }
 
 /// What a pool's queries measure, and what the pool needs to know about them. Only lava
@@ -56,6 +61,7 @@ pub struct Timestamp {
 }
 
 /// Invocation and primitive counts of the commands in a query.
+#[cfg(feature = "pipeline-statistics")]
 pub struct PipelineStatistics {
     /// What each query counts.
     flags: vk::QueryPipelineStatisticFlags,
@@ -68,12 +74,14 @@ pub struct Occlusion {
 }
 
 /// Hardware counters (`VK_KHR_performance_query`) of the commands in a query.
+#[cfg(feature = "performance-query")]
 pub struct Performance {
     /// The counters of each query, in result order.
     counters: Box<[&'static Counter]>,
 }
 
 /// The compacted size of an acceleration structure (`CommandBuffer::query_compacted_sizes`).
+#[cfg(feature = "acceleration-structure")]
 pub struct CompactedSize;
 
 macro_rules! kinds {
@@ -88,9 +96,18 @@ macro_rules! kinds {
 
 kinds! {
     Timestamp: TIMESTAMP + SingleValue;
-    PipelineStatistics: PIPELINE_STATISTICS + Scoped;
     Occlusion: OCCLUSION + SingleValue;
+}
+#[cfg(feature = "pipeline-statistics")]
+kinds! {
+    PipelineStatistics: PIPELINE_STATISTICS + Scoped;
+}
+#[cfg(feature = "performance-query")]
+kinds! {
     Performance: PERFORMANCE_QUERY_KHR + Scoped;
+}
+#[cfg(feature = "acceleration-structure")]
+kinds! {
     CompactedSize: ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR + SingleValue;
 }
 
@@ -224,9 +241,14 @@ impl QueryPool<Timestamp> {
     }
 
     /// When the device's clock read `tick`, on the host's clock: from
-    /// `VK_KHR_calibrated_timestamps` (`Features::calibrated_timestamps`), `None` without it.
-    /// Calibrates once per call.
-    pub fn instant(&self, tick: u64) -> Option<Instant> {
+    /// `VK_KHR_calibrated_timestamps`, `None` if calibrating failed. Calibrates once per call.
+    #[cfg(feature = "calibrated-timestamps")]
+    pub fn instant(&self, tick: u64) -> Gated<gate::CalibratedTimestamps, Option<Instant>> {
+        gate::<gate::CalibratedTimestamps, _>(|| self.instant_of(tick))
+    }
+
+    #[cfg(feature = "calibrated-timestamps")]
+    fn instant_of(&self, tick: u64) -> Option<Instant> {
         let (now_ticks, now) = calibrate()?;
         let valid_bits = self.kind.valid_bits.load(Ordering::Relaxed);
         let period = Ctx::device_properties().limits.timestamp_period as f64;
@@ -243,9 +265,10 @@ impl QueryPool<Timestamp> {
 }
 
 /// The device's clock (its raw timestamp) and the host's at the same moment, from
-/// `VK_KHR_calibrated_timestamps`: the host time is the middle of the call.
+/// `VK_KHR_calibrated_timestamps` (past its check): the host time is the middle of the call.
+#[cfg(feature = "calibrated-timestamps")]
 fn calibrate() -> Option<(u64, Instant)> {
-    let functions = Functions::calibrated_timestamps()?;
+    let functions = Functions::calibrated_timestamps();
     let info = [vk::CalibratedTimestampInfoKHR::default().time_domain(vk::TimeDomainKHR::DEVICE)];
     let before = Instant::now();
     let (timestamps, _max_deviation) = unsafe { functions.get_calibrated_timestamps(&info) }
@@ -257,12 +280,14 @@ fn calibrate() -> Option<(u64, Instant)> {
 
 /// The most statistics one query can count: every flag up to mesh shader invocations, plus
 /// one spare.
+#[cfg(feature = "pipeline-statistics")]
 const STATISTICS: usize = 14;
 
 /// What one pipeline statistics query counted, for the flags of its pool.
 ///
 /// Also the layout a query's results are read into: they come in the order of their flag bits,
 /// one `u64` each, from offset 0, and the pool is read straight into a slice of these.
+#[cfg(feature = "pipeline-statistics")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct PipelineStats {
@@ -270,6 +295,7 @@ pub struct PipelineStats {
     flags: vk::QueryPipelineStatisticFlags,
 }
 
+#[cfg(feature = "pipeline-statistics")]
 impl PipelineStats {
     /// The count of one statistic, `None` if the pool doesn't count it.
     pub fn get(&self, statistic: vk::QueryPipelineStatisticFlags) -> Option<u64> {
@@ -289,22 +315,21 @@ impl PipelineStats {
     }
 }
 
+#[cfg(feature = "pipeline-statistics")]
 impl QueryPool<PipelineStatistics> {
     /// Queries that count `statistics`. Task and mesh shader invocations need
-    /// `Features::mesh_queries`; queries that are active while mesh shaders draw may not count
+    /// `mesh-shader-queries`; queries that are active while mesh shaders draw may not count
     /// input assembly, vertex, geometry, tessellation or clipping statistics.
     pub fn statistics(count: u32, statistics: vk::QueryPipelineStatisticFlags) -> Result<Self> {
-        let features = Ctx::features();
-        if !features.pipeline_statistics {
-            return Err(Error::message(
-                "the device has no pipeline statistics queries",
-            ));
-        }
+        gate::PipelineStatistics::check()?;
         let mesh = vk::QueryPipelineStatisticFlags::TASK_SHADER_INVOCATIONS_EXT
             | vk::QueryPipelineStatisticFlags::MESH_SHADER_INVOCATIONS_EXT;
-        if statistics.intersects(mesh) && !features.mesh_queries {
+        if statistics.intersects(mesh) {
+            #[cfg(feature = "mesh-shader-queries")]
+            gate::MeshShaderQueries::check()?;
+            #[cfg(not(feature = "mesh-shader-queries"))]
             return Err(Error::message(
-                "the device can't count task and mesh shader invocations",
+                "task and mesh shader invocations need lava's `mesh-shader-queries` feature",
             ));
         }
         assert!(statistics.as_raw().count_ones() as usize <= STATISTICS);
@@ -325,24 +350,29 @@ impl QueryPool<PipelineStatistics> {
 }
 
 impl QueryPool<Occlusion> {
-    /// Queries that count the samples of their draws. Without `precise` (or without
-    /// `Features::precise_occlusion`), a query that saw samples may report any non-zero count.
-    pub fn occlusion(count: u32, precise: bool) -> Result<Self> {
-        let kind = Occlusion {
-            precise: precise && Ctx::features().precise_occlusion,
-        };
+    /// Queries that count the samples of their draws. A query that saw samples may report any
+    /// non-zero count ([`Self::precise_occlusion`] counts them exactly).
+    pub fn occlusion(count: u32) -> Result<Self> {
+        let kind = Occlusion { precise: false };
+        Self::create(count, vk::QueryPoolCreateInfo::default(), kind)
+    }
+
+    /// Queries that count the samples of their draws exactly.
+    #[cfg(feature = "precise-occlusion")]
+    pub fn precise_occlusion(count: u32) -> Result<Self> {
+        gate::PreciseOcclusion::check()?;
+        let kind = Occlusion { precise: true };
         Self::create(count, vk::QueryPoolCreateInfo::default(), kind)
     }
 }
 
+#[cfg(feature = "performance-query")]
 impl QueryPool<Performance> {
     /// Queries of the hardware counters `counters` (at most [`MAX_COUNTERS`], read in one
     /// submission: [`counters::passes`] is 1), recorded on the graphics family. Holds the
     /// profiling lock until it is destroyed, and fails if another process holds it.
     pub fn performance(count: u32, counters: &[&'static Counter]) -> Result<Self> {
-        if Functions::performance_query().is_none() {
-            return Err(Error::message("the device has no performance queries"));
-        }
+        gate::PerformanceQuery::check()?;
         if counters.is_empty() || counters.len() > MAX_COUNTERS {
             return Err(Error::message(format!(
                 "{} counters selected, 1 to {MAX_COUNTERS} fit",
@@ -401,6 +431,7 @@ impl QueryPool<Performance> {
     }
 }
 
+#[cfg(feature = "acceleration-structure")]
 impl QueryPool<CompactedSize> {
     /// Room for the compacted sizes of `count` acceleration structures.
     pub fn compacted_sizes(count: u32) -> Result<Self> {
@@ -414,14 +445,16 @@ impl<K: QueryKind> Drop for QueryPool<K> {
         let (pool, locked) = (self.handle, K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR);
         epoch::retire(move || {
             unsafe { Ctx::device().destroy_query_pool(pool, None) };
+            #[cfg(feature = "performance-query")]
             if locked {
                 counters::release_lock();
             }
+            let _ = locked;
         });
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "pipeline-statistics"))]
 mod tests {
     use super::*;
     use vk::QueryPipelineStatisticFlags as S;

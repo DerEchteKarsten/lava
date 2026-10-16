@@ -1,4 +1,4 @@
-//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip, host uploads, type erasure, and their destruction once no frame can reach them
+//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip, host uploads (`host-image-copy`), type erasure, and their destruction once no frame can reach them
 use std::{
     mem::{self, ManuallyDrop},
     range::Range,
@@ -12,14 +12,13 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindless::{self, BindlessHandle},
-    command_buffer::{ImageAccess, ImageUse},
     epoch,
     image::{
         format::{Format, StaticFormat, bc_block},
         slice::ImageView,
-        usage::{ImageUsage, IsHostCopy, IsSampled, IsStorage, StaticUsage},
+        usage::{ImageUsage, IsSampled, IsStorage, StaticUsage},
     },
-    state::{Ctx, Functions},
+    state::Ctx,
     vkobjects::queue::forget_image,
 };
 
@@ -44,6 +43,7 @@ pub struct RawImage<F: Format, U: ImageUsage, D: Dim> {
 
 impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
     fn new(format: F, usage: U, extent: D::Extent, mip_levels: u32) -> Result<Self> {
+        check_features(format.vk_format(), usage.flags())?;
         let create_info = vk::ImageCreateInfo {
             array_layers: 1,
             extent: D::extent_3d(extent),
@@ -53,12 +53,7 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
-            // Without the extension `copy_from` fails, and the flag isn't allowed.
-            usage: if Ctx::features().host_image_copy {
-                usage.flags()
-            } else {
-                usage.flags() & !vk::ImageUsageFlags::HOST_TRANSFER_EXT
-            },
+            usage: usage.flags(),
             initial_layout: vk::ImageLayout::UNDEFINED,
             ..Default::default()
         };
@@ -520,6 +515,42 @@ impl<F: Format, U: IsStorage, D: Dim> MipChain<F, U, D> {
     }
 }
 
+/// `MissingFeature` for an image the device can't have: a BC format without `bc-compression`,
+/// host copies without `host-image-copy` (an error message where lava was compiled without
+/// them, which only a dynamic format or usage can ask for).
+fn check_features(format: vk::Format, usage: vk::ImageUsageFlags) -> Result<()> {
+    if bc_block(format).is_some() {
+        #[cfg(feature = "bc-compression")]
+        gate::BcCompression::check()?;
+        #[cfg(not(feature = "bc-compression"))]
+        return Err(Error::message(format!(
+            "{format:?} needs lava's `bc-compression` feature"
+        )));
+    }
+    if usage.contains(vk::ImageUsageFlags::HOST_TRANSFER_EXT) {
+        #[cfg(feature = "host-image-copy")]
+        gate::HostImageCopy::check()?;
+        #[cfg(not(feature = "host-image-copy"))]
+        return Err(Error::message(
+            "host copy usage needs lava's `host-image-copy` feature",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "host-image-copy")]
+use crate::{
+    command_buffer::{ImageAccess, ImageUse},
+    features::Feature,
+    image::usage::IsHostCopy,
+    state::Functions,
+};
+#[cfg(all(feature = "bc-compression", not(feature = "host-image-copy")))]
+use crate::features::Feature;
+#[cfg(any(feature = "bc-compression", feature = "host-image-copy"))]
+use crate::features::gate;
+
+#[cfg(feature = "host-image-copy")]
 impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
     /// Writes a whole mip level from the host, right away. Like anything a command buffer
     /// doesn't record, it isn't synchronised with the GPU: frames in flight that read the image
@@ -554,12 +585,8 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
     }
 
     fn check_host_copy(&self, data: &[u8], mip_level: u32) -> Result<()> {
+        // The image exists, so the device has host copies (`check_features`).
         self.usage_check(vk::ImageUsageFlags::HOST_TRANSFER_EXT);
-        if !Ctx::features().host_image_copy {
-            return Err(Error::message(
-                "host image copies need VK_EXT_host_image_copy on host-visible device memory, which this device lacks",
-            ));
-        }
         if mip_level >= self.raw.mip_levels {
             return Err(Error::message(format!(
                 "mip level {mip_level} is out of range for an image with {} levels",

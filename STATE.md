@@ -2,6 +2,17 @@
 
 The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` entries get fixed right away; `--- intended ---` entries stay so they aren't forgotten; `--- find solutions ---` entries get proposals without code changes; `--- future work ---` entries are agreed directions waiting for their time. `## Ideas` holds design proposals we don't want to lose.
 
+## lava: optional features (cargo features `X` / `assert-X`, 2026-10-17)
+----find solutions----
+- `vkCmdDispatch(): ... 144 bytes were never set with vkCmdPushConstants` (a validation warning) on the engine's headless `render` of sponza, at `core/src/render/render.rs:802`, before and after the feature change; `CommandBuffer::begin` is meant to zero the whole range once, so a recording path seems to skip it.
+----intended----
+- `PassKind` and the `kind::*` markers stay compiled whatever the features: they describe the pass map. A pass map whose SPIR-V needs a compiled-out feature fails at `init`, and its generated bindings don't compile.
+- `line-stipple` is one feature for every line mode the device has (default lines need `strictLines` and stippled rectangular lines), so a device with stippled Bresenham but not stippled smooth lines has no stippling at all.
+- The ETC2 and EAC format markers have no feature: lava never enables `textureCompressionETC2`, so images of them fail in the driver.
+- With `assert-present-fences` but no display, `Ctx::features().present_fences` is false while the code assumes fences; nothing presents headless, so nothing reads it.
+- The engine-facing `Gated` setters of `RasterState` check the capability whatever the value (`polygon_mode(FILL)` needs `fill-mode-non-solid` too).
+- Baked draw state can make many pipelines per pass on devices without the dynamic state (the 16-pipeline warning then names the pass); `dynamic-*` without `assert-` keeps that possible.
+
 ## lava: ray tracing (tested by `gpu_ray_tracing`, not used by core yet)
 ----intended----
 - Binding table records hold only shader group handles: no shader record data, since shaders read everything through push constants and addresses.

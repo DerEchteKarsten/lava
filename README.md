@@ -21,8 +21,13 @@ lava is young (0.x) and is developed alongside a game engine. Expect breaking ch
 ## Requirements
 
 - Rust 1.96 or newer.
-- A Vulkan 1.4 driver with `VK_KHR_device_address_commands`, the extended dynamic state 2 and 3 extensions (including the logic op and the extended dynamic state 3 bits lava sets), `VK_EXT_color_write_enable`, `VK_KHR_line_rasterization`, `VK_EXT_provoking_vertex`, `VK_EXT_conservative_rasterization`, `VK_EXT_depth_clip_enable`, `VK_EXT_depth_clip_control`, `VK_EXT_depth_clamp_control` and `VK_EXT_sample_locations`. `lava::init` names whatever a GPU lacks.
-- Everything else is optional (`lava::Features`: mesh shaders, ray tracing, BC textures, …). lava enables what the device has, `Config::required` makes features mandatory, and a pass whose SPIR-V needs a missing feature panics when it is recorded.
+- A Vulkan 1.4 driver with `VK_KHR_device_address_commands`. `lava::init` names whatever a GPU lacks.
+- Everything else is optional (`lava::Features`: mesh shaders, ray tracing, BC textures, extended dynamic state, …), and each optional feature is two cargo features:
+  - `X` (all of them are default) compiles it, and lava checks the device where it is used. Functions that need it return `lava::features::Gated` values: `Result`s with `MissingFeature`. That includes the generated bindings of a pass whose SPIR-V needs it.
+  - `assert-X` makes `lava::init` refuse a device without it. The checks go, and those functions return their value directly.
+  - Without either, its API isn't compiled.
+- The `dynamic-*` features are extended dynamic state. Where the device has a state, draws that differ in it share a pipeline. Elsewhere the state is part of the pipeline's key. Asserting one keeps it out of the key.
+- An application that turns off lava's defaults (`default-features = false`) must do so in every crate that depends on lava, since cargo enables the union of all of them.
 - The Slang SDK at build time, found through `SLANG_DIR`, and an rpath to it for build scripts and hot-reload binaries. [`lava-build-slang`](lava-build-slang/README.md#setting-up-slang) shows the setup.
 
 lava is tested on Linux with Mesa's ANV driver (Intel Arc).

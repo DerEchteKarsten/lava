@@ -1,9 +1,9 @@
-//! Shared harness for lava's GPU tests: one headless context, serialised, validation-checked
+//! Shared harness for lava's GPU tests: one headless context per process (with the features a test binary disables), serialised, validation-checked
 #![allow(dead_code)]
 
 pub mod golden;
 
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use bytemuck::Pod;
 use lava::{
@@ -57,10 +57,24 @@ pub fn take_validation_errors() -> Vec<String> {
     std::mem::take(&mut *VALIDATION_ERRORS.lock().unwrap())
 }
 
+/// The features the context leaves off (`Config::disabled`), set by a test binary before its
+/// first `gpu()`.
+static DISABLED: OnceLock<lava::Features> = OnceLock::new();
+
+/// Makes the process's context leave `features` off; call before the first `gpu()`.
+pub fn disable(features: lava::Features) {
+    assert_eq!(
+        *DISABLED.get_or_init(|| features),
+        features,
+        "one set of disabled features per process"
+    );
+}
+
 static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
     capture_validation_errors();
     let config = lava::Config {
         validation: true,
+        disabled: DISABLED.get().copied().unwrap_or_default(),
         ..lava::Config::new(&lava_tests::bindings::PASS_MAP)
     };
     lava::init(&config).expect(
@@ -121,11 +135,7 @@ impl Gpu {
         let mut slot = FrameSlot::new(&self.queue).unwrap();
         slot.begin(epoch::reserve())
             .unwrap()
-            .execute(
-                &self.queue, wait_on,
-                signal,
-                record,
-            )
+            .execute(&self.queue, wait_on, signal, record)
             .unwrap();
         // Dropping a submitted slot waits for its fence.
     }

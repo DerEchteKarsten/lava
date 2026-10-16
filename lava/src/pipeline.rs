@@ -1,4 +1,4 @@
-//! Pass pipelines: the pass map a frontend generates and `init` takes, its entries (ray tracing passes with their shader groups), the cache of every pass's pipelines per specialization and raster state, their creation (none for passes the device lacks the features of), and `reload_pass`, which replaces a pass's pipelines and retires the old ones
+//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups), the cache of every pass's pipelines per specialization and raster key (attachment formats and the draw state the device can't set dynamically), their creation (none for passes the device lacks the features of), and `reload_pass`, which replaces a pass's pipelines and retires the old ones
 use std::{
     ffi::CStr,
     hash::Hash,
@@ -11,12 +11,13 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::{
     bindless::Bindless,
-    command_buffer::dynamic_states,
+    command_buffer::{Baked, Blend, ColorComponentFlags, Dynamic, dynamic_states, effective_write_mask},
     error::{Error, Result},
     features::Features,
     state::{Ctx, Functions},
-    vkobjects::rt_pipeline::RaytracingPipeline,
 };
+#[cfg(feature = "ray-tracing-pipeline")]
+use crate::vkobjects::rt_pipeline::RaytracingPipeline;
 
 /// The most bytes of push constants a pass can have, the range of the shared pipeline layout;
 /// Vulkan 1.4 guarantees 256 bytes.
@@ -106,33 +107,63 @@ pub struct PassEntry {
     pub constants_size: usize,
 }
 
-/// What a raster pipeline is made for: its rendering's attachment formats and its
-/// specialization constants (every other state is dynamic), as the cache keeps it.
+/// What a raster pipeline is made for: its rendering's attachment formats, its specialization
+/// constants, and the draw state the device can't set dynamically (`Baked`, and with
+/// `bake_blend` the blends and write masks; both default and empty where the device has the
+/// dynamic state), as the cache keeps it.
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub(crate) struct RasterKey {
     color_formats: SmallVec<[vk::Format; 4]>,
     depth_format: vk::Format,
     stencil_format: vk::Format,
     constants: Box<[u8]>,
+    baked: Baked,
+    #[cfg(bake_blend)]
+    blends: SmallVec<[Blend; 4]>,
+    #[cfg(bake_blend)]
+    write_masks: SmallVec<[ColorComponentFlags; 4]>,
 }
 
 /// A [`RasterKey`] as a draw has it, borrowed, which looks the pipeline up without copying.
 /// It hashes like the key it stands for: the same fields in the same order, and slices,
 /// `SmallVec`s and boxed slices all hash as slices.
-#[derive(Hash, Clone, Copy, Debug)]
+#[derive(Hash, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RasterKeyRef<'a> {
     pub(crate) color_formats: &'a [vk::Format],
     pub(crate) depth_format: vk::Format,
     pub(crate) stencil_format: vk::Format,
     pub(crate) constants: &'a [u8],
+    pub(crate) baked: Baked,
+    #[cfg(bake_blend)]
+    pub(crate) blends: &'a [Blend],
+    #[cfg(bake_blend)]
+    pub(crate) write_masks: &'a [ColorComponentFlags],
+}
+
+impl RasterKeyRef<'_> {
+    /// The blend and write mask the pipeline bakes in for attachment `i`, if it bakes them.
+    fn blend(&self, i: usize) -> Option<(Blend, ColorComponentFlags)> {
+        #[cfg(bake_blend)]
+        if !self.blends.is_empty() {
+            return Some((self.blends[i], self.write_masks[i]));
+        }
+        let _ = i;
+        None
+    }
 }
 
 impl Equivalent<RasterKey> for RasterKeyRef<'_> {
     fn equivalent(&self, key: &RasterKey) -> bool {
+        #[cfg(bake_blend)]
+        if self.blends != key.blends.as_slice() || self.write_masks != key.write_masks.as_slice()
+        {
+            return false;
+        }
         self.color_formats == key.color_formats.as_slice()
             && self.depth_format == key.depth_format
             && self.stencil_format == key.stencil_format
             && self.constants == &*key.constants
+            && self.baked == key.baked
     }
 }
 
@@ -143,6 +174,11 @@ impl RasterKeyRef<'_> {
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
             constants: self.constants.into(),
+            baked: self.baked,
+            #[cfg(bake_blend)]
+            blends: SmallVec::from_slice(self.blends),
+            #[cfg(bake_blend)]
+            write_masks: SmallVec::from_slice(self.write_masks),
         }
     }
 }
@@ -154,6 +190,11 @@ impl RasterKey {
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
             constants: &self.constants,
+            baked: self.baked,
+            #[cfg(bake_blend)]
+            blends: &self.blends,
+            #[cfg(bake_blend)]
+            write_masks: &self.write_masks,
         }
     }
 }
@@ -172,9 +213,23 @@ pub(crate) fn pipelines() -> &'static PipelineManager {
 }
 
 /// Creates every pass's shader module and its pipelines without specialization constants.
-/// Needs the pass map.
-pub(crate) fn init() {
+/// Needs the pass map. Fails for a pass that needs a cargo feature lava was compiled without.
+pub(crate) fn init() -> Result<()> {
+    let compiled_out: Vec<String> = (pass_map().passes.iter())
+        .filter_map(|pass| {
+            let needs = Features::of_spirv(pass.spirv);
+            (!needs.compiled_out.is_empty())
+                .then(|| format!("`{}` needs `{}`", pass.name, needs.compiled_out.join("`, `")))
+        })
+        .collect();
+    if !compiled_out.is_empty() {
+        return Err(Error::message(format!(
+            "lava was compiled without cargo features passes need: {}",
+            compiled_out.join("; ")
+        )));
+    }
     PIPELINES.get_or_init(PipelineManager::new);
+    Ok(())
 }
 
 /// Replaces the SPIR-V of pass `pass_index` (its index in the pass map) and every pipeline made
@@ -188,7 +243,8 @@ pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
 /// Every pass's pipelines: compute and ray tracing passes without specialization constants
 /// have one, made at start; the others one per specialization (and raster state), made at
 /// first use. A pass whose SPIR-V needs features the device lacks (`missing`) has no module
-/// and no pipeline, and panics when it is recorded. [`Self::reload_pass`] replaces a pass's module and
+/// and no pipeline: its generated bindings return `MissingFeature`, and recording hand-made
+/// ones panics. [`Self::reload_pass`] replaces a pass's module and
 /// pipelines, and the replaced pipelines are destroyed once no frame can use them (`epoch`).
 pub(crate) struct PipelineManager {
     /// The features each pass's SPIR-V declares that the device lacks.
@@ -196,7 +252,9 @@ pub(crate) struct PipelineManager {
     shader_modules: RwLock<Box<[vk::ShaderModule]>>,
     compute_pipelines: RwLock<Box<[vk::Pipeline]>>,
     specialized_compute_pipelines: RwLock<Box<[Specialized<Box<[u8]>, vk::Pipeline>]>>,
+    #[cfg(feature = "ray-tracing-pipeline")]
     raytracing_pipelines: RwLock<Box<[Option<RaytracingPipeline>]>>,
+    #[cfg(feature = "ray-tracing-pipeline")]
     specialized_raytracing_pipelines: RwLock<Box<[Specialized<Box<[u8]>, RaytracingPipeline>]>>,
     raster_pipelines: RwLock<Box<[Specialized<RasterKey, vk::Pipeline>]>>,
 }
@@ -211,7 +269,7 @@ impl PipelineManager {
         }
         let missing: Box<[_]> = passes
             .iter()
-            .map(|pass| Features::of_spirv(pass.spirv).missing_from(&Ctx::features()))
+            .map(|pass| Features::of_spirv(pass.spirv).features.missing_from(&Ctx::features()))
             .collect();
         let modules: Box<[_]> = (passes.iter().zip(&missing))
             .map(|(pass, missing)| match missing.is_empty() {
@@ -233,6 +291,7 @@ impl PipelineManager {
             specialized_compute_pipelines: maps(count(|p| {
                 matches!(p.kind, PassKind::Compute { .. }) && !p.constants.is_empty()
             })),
+            #[cfg(feature = "ray-tracing-pipeline")]
             raytracing_pipelines: RwLock::new(create_unspecialized(true, |pass_index, pass| {
                 missing[pass_index].is_empty().then(|| {
                     must(
@@ -241,6 +300,7 @@ impl PipelineManager {
                     )
                 })
             })),
+            #[cfg(feature = "ray-tracing-pipeline")]
             specialized_raytracing_pipelines: maps(count(|p| {
                 matches!(p.kind, PassKind::RayTracing { .. }) && !p.constants.is_empty()
             })),
@@ -255,14 +315,15 @@ impl PipelineManager {
         }
     }
 
-    /// Panics if the device lacks a feature pass `pass_index` needs.
+    /// Panics if the device lacks a feature pass `pass_index` needs: generated bindings of
+    /// such a pass can't be made, so only hand-made ones get here.
     fn assert_supported(&self, pass_index: usize) {
         let missing = &self.missing[pass_index];
         if !missing.is_empty() {
             panic!(
-                "pass `{}` needs `Features::{}`, which this device lacks",
+                "pass `{}` needs `{}`, which this device lacks",
                 pass_map().passes[pass_index].name,
-                missing.join("`, `Features::")
+                missing.join("`, `")
             );
         }
     }
@@ -289,6 +350,7 @@ impl PipelineManager {
 
     /// Calls `record` with the ray tracing pipeline of `pass_index` with `constants`, while
     /// the cache stays locked.
+    #[cfg(feature = "ray-tracing-pipeline")]
     pub(crate) fn ray_tracing<R>(
         &self,
         pass_index: usize,
@@ -339,12 +401,14 @@ impl PipelineManager {
         if !self.missing[pass_index].is_empty() {
             return Ok(());
         }
-        let missing = Features::of_spirv(spirv).missing_from(&Ctx::features());
+        let needs = Features::of_spirv(spirv);
+        let mut missing = needs.features.missing_from(&Ctx::features());
+        missing.extend(needs.compiled_out);
         if !missing.is_empty() {
             return Err(Error::message(&format!(
-                "the new `{}` needs `Features::{}`, which this device lacks",
+                "the new `{}` needs `{}`, which this device lacks or lava was compiled without",
                 pass.name,
-                missing.join("`, `Features::")
+                missing.join("`, `")
             )));
         }
         let module = create_module(spirv)?;
@@ -366,11 +430,13 @@ impl PipelineManager {
                         |constants| create_compute_pipeline(module, pass, constants),
                     )?);
                 }
+                #[cfg(feature = "ray-tracing-pipeline")]
                 PassKind::RayTracing { .. } if unspecialized => {
                     let pipeline = create_raytracing_pipeline(module, pass, &[])?;
                     let pipelines = &mut self.raytracing_pipelines.write().unwrap()[pass.index];
                     retire(pipelines.replace(pipeline));
                 }
+                #[cfg(feature = "ray-tracing-pipeline")]
                 PassKind::RayTracing { .. } => {
                     let maps = &self.specialized_raytracing_pipelines;
                     retire(rebuild(maps, pass, |constants| {
@@ -382,6 +448,9 @@ impl PipelineManager {
                         create_raster_pipeline(module, &key.as_ref(), pass_index)
                     })?);
                 }
+                // `init` refused the pass map.
+                #[cfg(not(feature = "ray-tracing-pipeline"))]
+                PassKind::RayTracing { .. } => unreachable!("a ray tracing pass without its feature"),
             }
             Ok(())
         })();
@@ -399,6 +468,7 @@ impl PipelineManager {
     }
 }
 
+#[cfg(feature = "ray-tracing-pipeline")]
 impl Into<vk::Pipeline> for RaytracingPipeline {
     fn into(self) -> vk::Pipeline {
         self.pipeline
@@ -536,6 +606,7 @@ fn create_compute_pipeline(
     Ok(pipeline)
 }
 
+#[cfg(feature = "ray-tracing-pipeline")]
 fn create_raytracing_pipeline(
     module: vk::ShaderModule,
     pass: &PassEntry,
@@ -684,21 +755,74 @@ fn create_raster_pipeline(
         .depth_attachment_format(key.depth_format)
         .stencil_attachment_format(key.stencil_format)
         .view_mask(0);
-    // Every other state is dynamic (`dynamic_states`); what these structs hold is ignored.
-    let dynamic_states = dynamic_states(matches!(pass.kind, PassKind::RasterMesh { .. }));
+    // The state the device sets dynamically is ignored here; the rest is the key's (`Baked`).
+    let features = Ctx::features();
+    let dynamic = Dynamic::of(&features);
+    let mesh = matches!(pass.kind, PassKind::RasterMesh { .. });
+    let dynamic_states = dynamic_states(mesh, &dynamic);
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let color_blend_attachments =
-        vec![vk::PipelineColorBlendAttachmentState::default(); key.color_formats.len()];
-    let color_blend_state =
-        vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-    let viewport_state = vk::PipelineViewportStateCreateInfo::default();
-    // The mode is dynamic; the overestimation size, which needs its own feature, isn't.
-    let mut conservative = vk::PipelineRasterizationConservativeStateCreateInfoEXT::default();
-    let rasterization_state =
-        vk::PipelineRasterizationStateCreateInfo::default().push_next(&mut conservative);
+    let color_blend_attachments: SmallVec<[vk::PipelineColorBlendAttachmentState; 8]> = (0
+        ..key.color_formats.len())
+        .map(|i| match key.blend(i) {
+            Some((blend, mask)) => {
+                let equation = blend.vk_equation();
+                vk::PipelineColorBlendAttachmentState {
+                    blend_enable: blend.equation().is_some() as vk::Bool32,
+                    src_color_blend_factor: equation.src_color_blend_factor,
+                    dst_color_blend_factor: equation.dst_color_blend_factor,
+                    color_blend_op: equation.color_blend_op,
+                    src_alpha_blend_factor: equation.src_alpha_blend_factor,
+                    dst_alpha_blend_factor: equation.dst_alpha_blend_factor,
+                    alpha_blend_op: equation.alpha_blend_op,
+                    color_write_mask: effective_write_mask(blend, mask),
+                }
+            }
+            None => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(ColorComponentFlags::RGBA),
+        })
+        .collect();
+    let baked = key.baked;
+    let logic_op = baked.logic_op();
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(&color_blend_attachments)
+        .logic_op_enable(logic_op.is_some())
+        .logic_op(logic_op.unwrap_or(vk::LogicOp::COPY));
+    let mut viewport_state = vk::PipelineViewportStateCreateInfo::default();
+    let mut clip_control = vk::PipelineViewportDepthClipControlCreateInfoEXT::default()
+        .negative_one_to_one(baked.depth_clip_negative_one_to_one());
+    if crate::command_buffer::on!(&features, "depth-clip-control", depth_clip_control) {
+        viewport_state = viewport_state.push_next(&mut clip_control);
+    }
+    let mut rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(baked.polygon_mode())
+        .depth_clamp_enable(baked.depth_clamp())
+        .line_width(1.0);
+    let mut conservative = vk::PipelineRasterizationConservativeStateCreateInfoEXT::default()
+        .conservative_rasterization_mode(baked.conservative());
+    if crate::command_buffer::on!(&features, "conservative-rasterization", conservative_rasterization) {
+        rasterization_state = rasterization_state.push_next(&mut conservative);
+    }
+    let mut provoking = vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT::default()
+        .provoking_vertex_mode(baked.provoking_vertex());
+    if crate::command_buffer::on!(&features, "provoking-vertex", provoking_vertex) {
+        rasterization_state = rasterization_state.push_next(&mut provoking);
+    }
+    let mut depth_clip = vk::PipelineRasterizationDepthClipStateCreateInfoEXT::default()
+        .depth_clip_enable(baked.depth_clip());
+    if crate::command_buffer::on!(&features, "depth-clip-enable", depth_clip_enable) {
+        rasterization_state = rasterization_state.push_next(&mut depth_clip);
+    }
+    let mut line = vk::PipelineRasterizationLineStateCreateInfoKHR::default()
+        .line_rasterization_mode(baked.line_mode())
+        .stippled_line_enable(baked.line_stipple())
+        .line_stipple_factor(1)
+        .line_stipple_pattern(!0);
+    if features.lines() {
+        rasterization_state = rasterization_state.push_next(&mut line);
+    }
     let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default();
 
     create_info = create_info
@@ -751,6 +875,11 @@ mod tests {
             depth_format: vk::Format::D32_SFLOAT,
             stencil_format: vk::Format::UNDEFINED,
             constants: &[1, 2, 3, 4],
+            baked: Baked::default(),
+            #[cfg(bake_blend)]
+            blends: &[Blend::Alpha, Blend::Skip],
+            #[cfg(bake_blend)]
+            write_masks: &[ColorComponentFlags::RGBA, ColorComponentFlags::R],
         };
         let owned = key.to_key();
         let hasher = hashbrown::DefaultHashBuilder::default();

@@ -83,7 +83,7 @@ fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 3]) {
 /// The ray query pass's image of `tlas`.
 fn trace_query(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
     cmd.compute(
-        &TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT),
+        &TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT).unwrap(),
         [SIZE / 8, SIZE / 8, 1],
         None,
     );
@@ -91,7 +91,7 @@ fn trace_query(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
 
 fn trace_pipeline(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
     cmd.raytrace(
-        &TestRayTracing::push_bindings(target.whole_view(), tlas, EXTENT),
+        &TestRayTracing::push_bindings(target.whole_view(), tlas, EXTENT).unwrap(),
         [SIZE, SIZE, 1],
         None,
     );
@@ -269,7 +269,7 @@ fn indirect_traces_read_their_size_on_the_gpu() {
             },
         );
         cmd.raytrace_indirect(
-            &TestRayTracing::push_bindings(target.whole_view(), &scene.tlas, EXTENT),
+            &TestRayTracing::push_bindings(target.whole_view(), &scene.tlas, EXTENT).unwrap(),
             command.range(..),
             None,
         );

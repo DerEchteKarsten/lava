@@ -1,7 +1,7 @@
-//! Crate-wide error type and Result alias wrapping Vulkan, allocator, and IO failures
+//! Crate-wide error type and Result alias wrapping Vulkan, allocator and IO failures, and optional features the device lacks
 use std::fmt;
 
-use crate::vk;
+use crate::{features::MissingFeature, vk};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -13,6 +13,8 @@ pub enum Error {
     Io(std::io::Error),
     Message(String),
     Lock,
+    /// The device lacks an optional feature lava checks at runtime.
+    MissingFeature(MissingFeature),
 }
 
 impl Error {
@@ -31,6 +33,7 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::Message(msg) => f.write_str(msg),
             Error::Lock => write!(f, "lock error"),
+            Error::MissingFeature(missing) => missing.fmt(f),
         }
     }
 }
@@ -45,6 +48,7 @@ impl std::error::Error for Error {
             Error::Io(err) => Some(err),
             Error::Message(_) => None,
             Error::Lock => None,
+            Error::MissingFeature(missing) => Some(missing),
         }
     }
 }
@@ -76,6 +80,12 @@ impl From<std::str::Utf8Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
+    }
+}
+
+impl From<MissingFeature> for Error {
+    fn from(missing: MissingFeature) -> Self {
+        Error::MissingFeature(missing)
     }
 }
 
@@ -158,6 +168,9 @@ mod tests {
             Error::from(std::io::Error::other("x")),
             Error::Io(_)
         ));
+        let missing = MissingFeature { feature: "mesh-shader" };
+        assert!(matches!(Error::from(missing), Error::MissingFeature(m) if m == missing));
+        assert!(Error::from(missing).to_string().contains("`mesh-shader`"));
     }
 
     #[test]

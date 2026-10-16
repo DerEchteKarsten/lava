@@ -20,6 +20,8 @@ use gpu_allocator::{
 use lava_macros::validation_trace;
 use std::ffi::{CStr, CString};
 
+#[allow(unused_imports)]
+use crate::features::{Loader, gate, load, loaded};
 use crate::{
     Config,
     features::{FeatureChain, Features, LAVA_EXTENSIONS},
@@ -80,8 +82,14 @@ impl Ctx {
     pub fn device_properties() -> &'static vk::PhysicalDeviceProperties {
         &Ctx::get().physical_device.properties
     }
-    pub fn mesh_shader_properties() -> &'static vk::PhysicalDeviceMeshShaderPropertiesEXT<'static> {
-        &Ctx::get().physical_device.mesh_shader_properties
+    /// The device's mesh shader limits.
+    #[cfg(feature = "mesh-shader")]
+    pub fn mesh_shader_properties()
+    -> crate::features::Gated<gate::MeshShader, &'static vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>>
+    {
+        crate::features::gate::<gate::MeshShader, _>(|| {
+            &Ctx::get().physical_device.mesh_shader_properties
+        })
     }
     pub fn gfx_queue_index() -> u32 {
         Ctx::get().gfx_queues.family
@@ -101,9 +109,13 @@ impl Ctx {
             .expect("allocator mutex was poisoned")
     }
 
-    /// The optional features lava enabled: every one the device has.
+    /// The optional features lava enabled: every one the device has that lava was compiled with
+    /// and `Config::disabled` doesn't name. Those of `assert-` features are always on.
     pub fn features() -> Features {
         Ctx::get().features
+    }
+    pub(crate) fn features_ref() -> &'static Features {
+        &Ctx::get().features
     }
 
     /// Creates the instance, device, and allocator. With a display, the instance gets the
@@ -140,7 +152,7 @@ impl Ctx {
             ash::khr::get_surface_capabilities2::NAME,
             ash::ext::surface_maintenance1::NAME,
         ];
-        let present_fences = display.is_some() && {
+        let present_fences = cfg!(feature = "present-fences") && display.is_some() && {
             let available = unsafe { entry.enumerate_instance_extension_properties(None)? };
             surface_maintenance.iter().all(|name| {
                 (available.iter()).any(|e| e.extension_name_as_c_str() == Ok(*name))
@@ -217,19 +229,36 @@ impl Ctx {
 
         let surface_fn = display.map(|_| ash::khr::surface::Instance::new(&entry, &instance));
 
+        // Every device must have the asserted features; present fences only with a display.
+        #[allow(unused_mut)]
+        let mut required = Features::asserted();
+        #[cfg(feature = "assert-present-fences")]
+        {
+            required.present_fences = display.is_some();
+        }
+        let asserted = Features::asserted();
+        let asserted_and_disabled = asserted.missing_from(&asserted.without(config.disabled));
+        if !asserted_and_disabled.is_empty() {
+            return Err(Error::message(format!(
+                "`Config::disabled` names asserted features: {}",
+                asserted_and_disabled.join(", ")
+            )));
+        }
         let physical_devices = PhysicalDevice::enumerate_physical_devices(&instance)?;
         let (physical_device, graphics_queue_family, transfer_queue_familie) =
-            PhysicalDevice::select_suitable_physical_device(
-                physical_devices.as_slice(),
-                &config.required,
-            )?;
+            PhysicalDevice::select_suitable_physical_device(physical_devices.as_slice(), &required)?;
+        #[allow(unused_mut)]
         let mut features = physical_device.supported_features;
-        features.present_fences &= present_fences;
-        if config.required.present_fences && !features.present_fences {
-            return Err(Error::message(
-                "`present_fences` needs a display and the instance extensions VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1",
-            ));
+        #[cfg(feature = "present-fences")]
+        {
+            features.present_fences &= present_fences;
+            if required.present_fences && !features.present_fences {
+                return Err(Error::message(
+                    "`assert-present-fences` needs the instance extensions VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1",
+                ));
+            }
         }
+        let features = features.without(config.disabled).consistent();
         let mut extensions: Vec<&CStr> = LAVA_EXTENSIONS.to_vec();
         extensions.extend(features.extensions());
         if display.is_some() {
@@ -272,30 +301,35 @@ impl Ctx {
 
         FUNCTIONS
             .set(Functions {
-                mesh: if features.mesh {
-                    Some(ash::ext::mesh_shader::Device::new(&instance, &device))
-                } else {
-                    None
-                },
-                performance_query: features.performance_query.then(|| {
+                #[cfg(feature = "mesh-shader")]
+                mesh: load::<gate::MeshShader, _>(features.mesh_shader, || {
+                    ash::ext::mesh_shader::Device::new(&instance, &device)
+                }),
+                #[cfg(feature = "performance-query")]
+                performance_query: load::<gate::PerformanceQuery, _>(features.performance_query, || {
                     (
                         ash::khr::performance_query::Instance::new(&entry, &instance),
                         ash::khr::performance_query::Device::new(&instance, &device),
                     )
                 }),
-                raytracing_pipeline: features.ray_tracing_pipeline.then(|| {
+                #[cfg(feature = "ray-tracing-pipeline")]
+                raytracing_pipeline: load::<gate::RayTracingPipeline, _>(features.ray_tracing_pipeline, || {
                     ash::khr::ray_tracing_pipeline::Device::new(&instance, &device)
                 }),
-                acceleration_structure: features.acceleration_structure.then(|| {
+                #[cfg(feature = "acceleration-structure")]
+                acceleration_structure: load::<gate::AccelerationStructure, _>(features.acceleration_structure, || {
                     ash::khr::acceleration_structure::Device::new(&instance, &device)
                 }),
-                calibrated_timestamps: features.calibrated_timestamps.then(|| {
+                #[cfg(feature = "calibrated-timestamps")]
+                calibrated_timestamps: load::<gate::CalibratedTimestamps, _>(features.calibrated_timestamps, || {
                     ash::khr::calibrated_timestamps::Device::new(&instance, &device)
                 }),
-                host_image_copy: ash::ext::host_image_copy::Device::new(&instance, &device),
+                #[cfg(feature = "host-image-copy")]
+                host_image_copy: load::<gate::HostImageCopy, _>(features.host_image_copy, || {
+                    ash::ext::host_image_copy::Device::new(&instance, &device)
+                }),
                 dynamic_state2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
                 dynamic_state3: ash::ext::extended_dynamic_state3::Device::new(&instance, &device),
-                color_write: ash::ext::color_write_enable::Device::new(&instance, &device),
                 line_rasterization: ash::khr::line_rasterization::Device::new(&instance, &device),
                 depth_clamp_control: crate::vk::depth_clamp_control::Device::new(
                     &instance, &device,
@@ -418,10 +452,11 @@ unsafe extern "system" fn vulkan_debug_callback(
 
 pub struct Functions {
     instance: ash::Instance,
-    host_image_copy: ash::ext::host_image_copy::Device,
+    #[cfg(feature = "host-image-copy")]
+    host_image_copy: Loader<gate::HostImageCopy, ash::ext::host_image_copy::Device>,
+    // Loaded whatever the device has: lava calls them only for dynamic state it enabled.
     dynamic_state2: ash::ext::extended_dynamic_state2::Device,
     dynamic_state3: ash::ext::extended_dynamic_state3::Device,
-    color_write: ash::ext::color_write_enable::Device,
     line_rasterization: ash::khr::line_rasterization::Device,
     depth_clamp_control: crate::vk::depth_clamp_control::Device,
     device_address_commands: crate::vk::device_address_commands::Device,
@@ -430,14 +465,24 @@ pub struct Functions {
     surface: Option<ash::khr::surface::Instance>,
     debug_utils: Option<ash::ext::debug_utils::Instance>,
     device_debug_utils: Option<ash::ext::debug_utils::Device>,
-    mesh: Option<ash::ext::mesh_shader::Device>,
-    performance_query: Option<(
-        ash::khr::performance_query::Instance,
-        ash::khr::performance_query::Device,
-    )>,
-    raytracing_pipeline: Option<ash::khr::ray_tracing_pipeline::Device>,
-    acceleration_structure: Option<ash::khr::acceleration_structure::Device>,
-    calibrated_timestamps: Option<ash::khr::calibrated_timestamps::Device>,
+    #[cfg(feature = "mesh-shader")]
+    mesh: Loader<gate::MeshShader, ash::ext::mesh_shader::Device>,
+    #[cfg(feature = "performance-query")]
+    performance_query: Loader<
+        gate::PerformanceQuery,
+        (
+            ash::khr::performance_query::Instance,
+            ash::khr::performance_query::Device,
+        ),
+    >,
+    #[cfg(feature = "ray-tracing-pipeline")]
+    raytracing_pipeline: Loader<gate::RayTracingPipeline, ash::khr::ray_tracing_pipeline::Device>,
+    #[cfg(feature = "acceleration-structure")]
+    acceleration_structure:
+        Loader<gate::AccelerationStructure, ash::khr::acceleration_structure::Device>,
+    #[cfg(feature = "calibrated-timestamps")]
+    calibrated_timestamps:
+        Loader<gate::CalibratedTimestamps, ash::khr::calibrated_timestamps::Device>,
 }
 
 impl Debug for Functions {
@@ -452,8 +497,10 @@ impl Functions {
     pub(crate) fn surface() -> Option<&'static ash::khr::surface::Instance> {
         get().surface.as_ref()
     }
+    /// Past a `HostImageCopy` check.
+    #[cfg(feature = "host-image-copy")]
     pub(crate) fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
-        &get().host_image_copy
+        loaded::<gate::HostImageCopy, _>(&get().host_image_copy)
     }
     pub(crate) fn device_address_commands() -> &'static crate::vk::device_address_commands::Device {
         &get().device_address_commands
@@ -463,9 +510,6 @@ impl Functions {
     }
     pub(crate) fn dynamic_state3() -> &'static ash::ext::extended_dynamic_state3::Device {
         &get().dynamic_state3
-    }
-    pub(crate) fn color_write() -> &'static ash::ext::color_write_enable::Device {
-        &get().color_write
     }
     pub(crate) fn line_rasterization() -> &'static ash::khr::line_rasterization::Device {
         &get().line_rasterization
@@ -488,25 +532,29 @@ impl Functions {
     pub(crate) fn instance_debug_utils() -> Option<&'static ash::ext::debug_utils::Instance> {
         get().debug_utils.as_ref()
     }
-    pub(crate) fn performance_query() -> Option<&'static (
+    /// The loaders below are reached only past their feature's check.
+    #[cfg(feature = "performance-query")]
+    pub(crate) fn performance_query() -> &'static (
         ash::khr::performance_query::Instance,
         ash::khr::performance_query::Device,
-    )> {
-        get().performance_query.as_ref()
+    ) {
+        loaded::<gate::PerformanceQuery, _>(&get().performance_query)
     }
-    pub(crate) fn mesh() -> Option<&'static ash::ext::mesh_shader::Device> {
-        get().mesh.as_ref()
+    #[cfg(feature = "mesh-shader")]
+    pub(crate) fn mesh() -> &'static ash::ext::mesh_shader::Device {
+        loaded::<gate::MeshShader, _>(&get().mesh)
     }
-    pub(crate) fn calibrated_timestamps()
-    -> Option<&'static ash::khr::calibrated_timestamps::Device> {
-        get().calibrated_timestamps.as_ref()
+    #[cfg(feature = "calibrated-timestamps")]
+    pub(crate) fn calibrated_timestamps() -> &'static ash::khr::calibrated_timestamps::Device {
+        loaded::<gate::CalibratedTimestamps, _>(&get().calibrated_timestamps)
     }
-    pub(crate) fn raytracing_pipeline() -> Option<&'static ash::khr::ray_tracing_pipeline::Device> {
-        get().raytracing_pipeline.as_ref()
+    #[cfg(feature = "ray-tracing-pipeline")]
+    pub(crate) fn raytracing_pipeline() -> &'static ash::khr::ray_tracing_pipeline::Device {
+        loaded::<gate::RayTracingPipeline, _>(&get().raytracing_pipeline)
     }
-    pub(crate) fn acceleration_structure()
-    -> Option<&'static ash::khr::acceleration_structure::Device> {
-        get().acceleration_structure.as_ref()
+    #[cfg(feature = "acceleration-structure")]
+    pub(crate) fn acceleration_structure() -> &'static ash::khr::acceleration_structure::Device {
+        loaded::<gate::AccelerationStructure, _>(&get().acceleration_structure)
     }
 
     pub(crate) fn set_debug_name<T>(name: &str, object: T)

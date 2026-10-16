@@ -17,6 +17,10 @@ tracing-subscriber = { workspace = true }
 png = { workspace = true }
 smallvec = { workspace = true }
 
+[features]
+# Every lava feature checked at runtime, so the tests cover what the device has.
+default = ["lava/default"]
+
 [build-dependencies]
 lava-build-slang = { path = "../lava-build-slang" }
 

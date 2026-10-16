@@ -669,6 +669,7 @@ fn generate_pass(
     pass_map: &mut Vec<String>,
     pipelines: &mut Pipelines,
     spirv: &Path,
+    spirv_code: &[u8],
     source: &str,
 ) -> String {
     let gpu_name = format!("C{pass_name}Bindings");
@@ -834,6 +835,16 @@ fn generate_pass(
             format!("{incomplete}<'a>"),
             format!("{incomplete}({binding_output})"),
         )
+    };
+    // A pass that needs optional features returns its bindings only where the device has them
+    // (`Gated`; it doesn't compile where lava was compiled without them).
+    let gates = crate::features::needed(spirv_code);
+    let (returns, body) = match crate::features::gate_type(&gates) {
+        None => (returns, body),
+        Some(gate) => (
+            format!("lava::features::Gated<{gate}, {returns}>"),
+            format!("lava::features::gate::<{gate}, _>(move || {body})"),
+        ),
     };
 
     let mut out = gpu_struct;
@@ -1059,6 +1070,7 @@ use lava::pipeline::*;
             &mut pass_map,
             &mut pipelines,
             &out,
+            pass_spirv.as_slice(),
             source,
         );
         built_passes.push(format!(

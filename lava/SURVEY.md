@@ -41,7 +41,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 5. ~~**The default `hot-reload` feature makes binaries non-relocatable.**~~ **Done
    (2026-10-15):** `PassEntry.spirv` is always `include_bytes!`'d and hot reload compiles from
    the absolute source path (lava-build-slang's `BuiltPass.source`), so a moved binary runs
-   with the pipelines it was built with. lava has no features now; hot reload is lava-build-slang's.
+   with the pipelines it was built with. lava has no hot-reload feature now (it is lava-build-slang's); since 2026-10-17 its cargo features are the optional device features (`X` checked, `assert-X` required, see `lava::features`).
 6. ~~**Nightly.**~~ **Done (2026-10-16):** lava, its tests and the generated code build on stable
    (rust-version 1.96). Registrations became the commands' `Accesses` parameter (`ImageUse::sampled_read(view)` and the like), `RasterBuilder`
    takes its attachments up front (see 4.1), and the range intersection is written out.
@@ -468,7 +468,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
   - `lava::shutdown()` that waits, drains epochs, destroys everything and allows re-init. Today
     `destroy()` destroys only the bindless objects and leaves lava unusable, and nothing calls
     it.
-  - Feature masking at init, so tests can cover the fallback paths.
+  - ~~Feature masking at init, so tests can cover the fallback paths.~~ **Done (2026-10-17):** `Config::disabled`, used by `gpu_missing_features`.
 
 ---
 

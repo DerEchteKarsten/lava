@@ -4,15 +4,14 @@ use crate::vk;
 use crate::{
     buffer::{Buffer, usage},
     error::{Error, Result},
+    features::{Feature, gate},
     state::{Ctx, Functions},
 };
 
+/// The ray tracing pipeline functions, or `MissingFeature` (only where lava checks it).
 fn functions() -> Result<&'static ash::khr::ray_tracing_pipeline::Device> {
-    Functions::raytracing_pipeline().ok_or_else(|| {
-        Error::message(
-            "ray tracing pipelines aren't supported by this device (`Ctx::features().ray_tracing_pipeline`)",
-        )
-    })
+    gate::RayTracingPipeline::check()?;
+    Ok(Functions::raytracing_pipeline())
 }
 
 pub struct RaytracingPipeline {

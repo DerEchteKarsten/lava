@@ -783,7 +783,7 @@ impl Queue<Gfx> {
             .wait_semaphores(waits.as_slice());
         // Signalled once the present is done with the image and the semaphores, which may be
         // destroyed then (`epoch`).
-        let fence = match Ctx::features().present_fences {
+        let fence = match <crate::features::gate::PresentFences as crate::features::On>::on() {
             true => Some([epoch::present_fence()?]),
             false => None,
         };

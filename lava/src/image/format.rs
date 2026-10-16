@@ -219,7 +219,7 @@ macro_rules! formats {
     };
     (@traits $name:ident $color:ident) => { impl ColorAspect for $name {} };
 
-    ($($name:ident => ($vk:ident, $size:literal, $kind:ident $(, $n:literal)?),)*) => {
+    ($info:ident; $($name:ident => ($vk:ident, $size:literal, $kind:ident $(, $n:literal)?),)*) => {
         $(
             #[derive(Clone, Copy, Debug, Default)]
             pub struct $name;
@@ -247,7 +247,7 @@ macro_rules! formats {
             formats!(@traits $name $kind);
         )*
 
-        fn info(format: vk::Format) -> Option<Info> {
+        fn $info(format: vk::Format) -> Option<Info> {
             type Texels<F> = <F as Format>::Texels;
             match format {
                 $(vk::Format::$vk => Some(Info {
@@ -263,6 +263,7 @@ macro_rules! formats {
 }
 
 formats! {
+    plain_info;
     R4G4UnormPack8 => (R4G4_UNORM_PACK8, 1, float, 2),
     R4G4B4A4UnormPack16 => (R4G4B4A4_UNORM_PACK16, 2, float, 4),
     B4G4R4A4UnormPack16 => (B4G4R4A4_UNORM_PACK16, 2, float, 4),
@@ -344,22 +345,6 @@ formats! {
     R64G64B64A64Sfloat => (R64G64B64A64_SFLOAT, 32, float64, 4),
     B10G11R11UfloatPack32 => (B10G11R11_UFLOAT_PACK32, 4, float, 3),
     E5B9G9R9UfloatPack32 => (E5B9G9R9_UFLOAT_PACK32, 4, float, 4),
-    BC1RgbUnormBlock => (BC1_RGB_UNORM_BLOCK, 0, float, 3),
-    BC1RgbSrgbBlock => (BC1_RGB_SRGB_BLOCK, 0, float, 3),
-    BC1RgbaUnormBlock => (BC1_RGBA_UNORM_BLOCK, 0, float, 4),
-    BC1RgbaSrgbBlock => (BC1_RGBA_SRGB_BLOCK, 0, float, 4),
-    BC2UnormBlock => (BC2_UNORM_BLOCK, 0, float, 4),
-    BC2SrgbBlock => (BC2_SRGB_BLOCK, 0, float, 4),
-    BC3UnormBlock => (BC3_UNORM_BLOCK, 0, float, 4),
-    BC3SrgbBlock => (BC3_SRGB_BLOCK, 0, float, 4),
-    BC4UnormBlock => (BC4_UNORM_BLOCK, 0, float, 1),
-    BC4SnormBlock => (BC4_SNORM_BLOCK, 0, float, 1),
-    BC5UnormBlock => (BC5_UNORM_BLOCK, 0, float, 2),
-    BC5SnormBlock => (BC5_SNORM_BLOCK, 0, float, 2),
-    BC6HUfloatBlock => (BC6H_UFLOAT_BLOCK, 0, float, 3),
-    BC6HSfloatBlock => (BC6H_SFLOAT_BLOCK, 0, float, 3),
-    BC7UnormBlock => (BC7_UNORM_BLOCK, 0, float, 4),
-    BC7SrgbBlock => (BC7_SRGB_BLOCK, 0, float, 4),
     ETC2R8G8B8UnormBlock => (ETC2_R8G8B8_UNORM_BLOCK, 0, float, 3),
     ETC2R8G8B8SrgbBlock => (ETC2_R8G8B8_SRGB_BLOCK, 0, float, 3),
     ETC2R8G8B8A1UnormBlock => (ETC2_R8G8B8A1_UNORM_BLOCK, 0, float, 4),
@@ -449,6 +434,37 @@ formats! {
     D32SfloatS8Uint => (D32_SFLOAT_S8_UINT, 5, depth_stencil),
 }
 
+// The block-compressed formats (`bc-compression`).
+#[cfg(feature = "bc-compression")]
+formats! {
+    bc_info;
+    BC1RgbUnormBlock => (BC1_RGB_UNORM_BLOCK, 0, float, 3),
+    BC1RgbSrgbBlock => (BC1_RGB_SRGB_BLOCK, 0, float, 3),
+    BC1RgbaUnormBlock => (BC1_RGBA_UNORM_BLOCK, 0, float, 4),
+    BC1RgbaSrgbBlock => (BC1_RGBA_SRGB_BLOCK, 0, float, 4),
+    BC2UnormBlock => (BC2_UNORM_BLOCK, 0, float, 4),
+    BC2SrgbBlock => (BC2_SRGB_BLOCK, 0, float, 4),
+    BC3UnormBlock => (BC3_UNORM_BLOCK, 0, float, 4),
+    BC3SrgbBlock => (BC3_SRGB_BLOCK, 0, float, 4),
+    BC4UnormBlock => (BC4_UNORM_BLOCK, 0, float, 1),
+    BC4SnormBlock => (BC4_SNORM_BLOCK, 0, float, 1),
+    BC5UnormBlock => (BC5_UNORM_BLOCK, 0, float, 2),
+    BC5SnormBlock => (BC5_SNORM_BLOCK, 0, float, 2),
+    BC6HUfloatBlock => (BC6H_UFLOAT_BLOCK, 0, float, 3),
+    BC6HSfloatBlock => (BC6H_SFLOAT_BLOCK, 0, float, 3),
+    BC7UnormBlock => (BC7_UNORM_BLOCK, 0, float, 4),
+    BC7SrgbBlock => (BC7_SRGB_BLOCK, 0, float, 4),
+}
+
+/// What lava knows of `format`, `None` for a format it has no marker type for.
+fn info(format: vk::Format) -> Option<Info> {
+    #[cfg(feature = "bc-compression")]
+    if let Some(info) = bc_info(format) {
+        return Some(info);
+    }
+    plain_info(format)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,7 +517,9 @@ mod tests {
 
     #[test]
     fn block_compressed_formats_report_zero() {
+        #[cfg(feature = "bc-compression")]
         assert_eq!(BC1RgbUnormBlock.texel_size(), 0);
+        #[cfg(feature = "bc-compression")]
         assert_eq!(BC7SrgbBlock.texel_size(), 0);
         assert_eq!(ASTC4X4UnormBlock.texel_size(), 0);
     }
@@ -548,7 +566,9 @@ mod tests {
         same(R8G8B8A8Srgb, [0.0; 4]);
         same(R32G32B32A32Uint, [1; 4]);
         same(R16Sint, [-1]);
+        #[cfg(feature = "bc-compression")]
         same(BC7SrgbBlock, [0.0; 4]);
+        #[cfg(feature = "bc-compression")]
         same(BC5UnormBlock, [0.0; 2]);
         same(D32Sfloat, [0.0]);
         same(S8Uint, [1]);

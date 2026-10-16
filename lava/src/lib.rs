@@ -10,7 +10,20 @@
 //!   ([`Config::samplers`], by index), binding 1 the bindless sampled images. Set 1, binding 0:
 //!   the bindless storage images. Passes have no other descriptors.
 //! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) runs
-//!   only where the device has it.
+//!   only where the device has it: its generated bindings are [`features::Gated`] by it.
+//!
+//! # Optional features
+//! Every optional device feature is two cargo features (all of the first kind are default):
+//! - `X` compiles it, and lava checks the device where it is needed: functions that need it
+//!   return [`features::Gated`] values, a `Result` with [`features::MissingFeature`] (also
+//!   [`Error::MissingFeature`] where a function fails otherwise too).
+//! - `assert-X` makes [`init`] refuse devices without it, and the checks go: those functions
+//!   return their value directly.
+//! - Without either, its API isn't compiled.
+//!
+//! The `dynamic-*` features are dynamic state: where the device has it, draws that differ in it
+//! share a pipeline; elsewhere it is part of the pipeline's key. Asserting one keeps it out of
+//! the key.
 //! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes,
 //!   zeroed when a command buffer begins; a pass pushes its own struct from offset 0.
 //!   Specialization constants have no size limit.
@@ -67,7 +80,7 @@ macro_rules! include_passes {
 }
 
 /// What [`init`] sets up: the application's passes and samplers, the window system, validation,
-/// and the optional features the application can't run without.
+/// and the optional features lava leaves off.
 #[derive(Clone, Copy)]
 pub struct Config<'a> {
     /// The `PASS_MAP` of [`include_passes!`].
@@ -82,13 +95,14 @@ pub struct Config<'a> {
     pub gpu_assisted_validation: bool,
     /// The immutable samplers shaders pick by index; at least one.
     pub samplers: &'a [bindless::SamplerDesc],
-    /// Optional features without which `init` fails (lava enables every one the device has).
-    pub required: Features,
+    /// Optional features lava leaves off even where the device has them (with the ones that
+    /// need them), e.g. to test the paths without them. Asserted features can't be disabled.
+    pub disabled: Features,
 }
 
 impl Config<'static> {
-    /// Headless, without validation, with [`bindless::DEFAULT_SAMPLERS`] and no required
-    /// features.
+    /// Headless, without validation, with [`bindless::DEFAULT_SAMPLERS`] and every optional
+    /// feature the device has.
     pub fn new(passes: &'static pipeline::PassMap) -> Self {
         Self {
             passes,
@@ -96,21 +110,23 @@ impl Config<'static> {
             validation: false,
             gpu_assisted_validation: false,
             samplers: &bindless::DEFAULT_SAMPLERS,
-            required: Features::default(),
+            disabled: Features::DEFAULT,
         }
     }
 }
 
-/// Initialises the global Vulkan context: picks a device with everything lava needs and
-/// `config.required`, enables every optional feature it has, and makes the passes' pipelines
-/// (a pass whose SPIR-V needs a missing feature gets none and panics when recorded).
+/// Initialises the global Vulkan context: picks a device with everything lava needs and the
+/// asserted features, enables every optional feature it has (but `config.disabled`), and makes
+/// the passes' pipelines (a pass whose SPIR-V needs a missing feature gets none; its bindings
+/// return [`features::MissingFeature`]). Fails for a pass that needs a cargo feature lava was
+/// compiled without.
 pub fn init(config: &Config) -> Result<()> {
     Ctx::init(config)?;
-    epoch::set_present_fences(Ctx::features().present_fences);
+    epoch::set_present_fences(<features::gate::PresentFences as features::On>::on());
     pipeline::set_pass_map(config.passes);
     Bindless::init(config.samplers)?;
     query::init()?;
-    pipeline::init();
+    pipeline::init()?;
     Ok(())
 }
 

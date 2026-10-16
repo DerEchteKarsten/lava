@@ -1,6 +1,8 @@
-//! GPU memory: what lava's allocator holds, and each heap's usage and budget
+//! GPU memory: what lava's allocator holds, and each heap's size, and with `memory-budget` its usage and budget
 use crate::vk;
 
+#[cfg(feature = "memory-budget")]
+use crate::features::{Gated, On, gate};
 use crate::state::{Ctx, Functions};
 
 /// GPU memory: what lava's allocator holds, and what each heap has in use.
@@ -18,15 +20,20 @@ pub struct MemoryReport {
 pub struct HeapBudget {
     pub size: u64,
     pub device_local: bool,
-    /// Bytes in use by this process; `None` without `VK_EXT_memory_budget`.
-    pub usage: Option<u64>,
-    /// Bytes the process can use without overcommitting; the heap size without the extension.
-    pub budget: u64,
+    /// Bytes in use by this process (`VK_EXT_memory_budget`).
+    #[cfg(feature = "memory-budget")]
+    pub usage: Gated<gate::MemoryBudget, u64>,
+    /// Bytes the process can use without overcommitting (`VK_EXT_memory_budget`).
+    #[cfg(feature = "memory-budget")]
+    pub budget: Gated<gate::MemoryBudget, u64>,
 }
 
 pub fn memory_report() -> MemoryReport {
     let report = Ctx::allocator().generate_report();
-    let has_budget = Ctx::features().memory_budget;
+    #[cfg(feature = "memory-budget")]
+    let has_budget = gate::MemoryBudget::on();
+    #[cfg(not(feature = "memory-budget"))]
+    let has_budget = false;
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut properties = vk::PhysicalDeviceMemoryProperties2::default();
     if has_budget {
@@ -43,12 +50,10 @@ pub fn memory_report() -> MemoryReport {
             device_local: memory.memory_heaps[i]
                 .flags
                 .contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
-            usage: has_budget.then(|| budget.heap_usage[i]),
-            budget: if has_budget {
-                budget.heap_budget[i]
-            } else {
-                memory.memory_heaps[i].size
-            },
+            #[cfg(feature = "memory-budget")]
+            usage: crate::features::gate::<gate::MemoryBudget, _>(|| budget.heap_usage[i]),
+            #[cfg(feature = "memory-budget")]
+            budget: crate::features::gate::<gate::MemoryBudget, _>(|| budget.heap_budget[i]),
         })
         .collect();
     MemoryReport {

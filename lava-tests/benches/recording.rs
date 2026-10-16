@@ -159,7 +159,10 @@ fn declared(cmd: &mut CommandBuffer, r: &Resources) {
 
 /// 8 renderings of 4 mesh-shader launches without accesses: a binding of push constants only.
 fn mesh(cmd: &mut CommandBuffer, r: &Resources) {
-    let launch = |i: u32| TestMesh::push_bindings(Vec4::ONE, Vec2::new(i as f32, 0.0), 0.1);
+    // Only run where the device has mesh shaders.
+    let launch = |i: u32| {
+        TestMesh::push_bindings(Vec4::ONE, Vec2::new(i as f32, 0.0), 0.1).expect("mesh shaders")
+    };
     let state = RasterState::default;
     for _ in 0..8 {
         cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
@@ -188,7 +191,7 @@ fn main() {
         ("many_draws", many_draws),
         ("declared", declared),
     ];
-    if Ctx::features().mesh {
+    if Ctx::features().mesh_shader {
         scenarios.push(("mesh", mesh));
     }
 

@@ -109,7 +109,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-        if Ctx::features().acceleration_structure {
+        if <crate::features::gate::AccelerationStructure as crate::features::On>::on() {
             flags |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
         }
         let mut create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(flags);

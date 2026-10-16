@@ -1,4 +1,4 @@
-//! Global bindless descriptor sets: the application's immutable samplers (`SamplerDesc`), caller-indexed image descriptors, handles
+//! Global bindless descriptor sets: the application's immutable samplers (`SamplerDesc`, anisotropic with `sampler-anisotropy`), caller-indexed image descriptors, handles
 use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
@@ -39,7 +39,9 @@ pub struct SamplerDesc {
     pub address_mode: SamplerAddressMode,
     /// The color outside the image with `CLAMP_TO_BORDER`.
     pub border_color: BorderColor,
-    /// Anisotropic filtering up to this ratio; needs `Features::sampler_anisotropy`.
+    /// Anisotropic filtering up to this ratio (`sampler-anisotropy`; `init` fails with
+    /// `MissingFeature` where lava checks it and the device lacks it).
+    #[cfg(feature = "sampler-anisotropy")]
     pub max_anisotropy: Option<f32>,
 }
 
@@ -53,6 +55,7 @@ pub const DEFAULT_SAMPLERS: [SamplerDesc; 3] = [
         mipmap_mode: SamplerMipmapMode::NEAREST,
         address_mode: SamplerAddressMode::CLAMP_TO_BORDER,
         border_color: BorderColor::FLOAT_OPAQUE_WHITE,
+        #[cfg(feature = "sampler-anisotropy")]
         max_anisotropy: None,
     },
     SamplerDesc {
@@ -61,6 +64,7 @@ pub const DEFAULT_SAMPLERS: [SamplerDesc; 3] = [
         mipmap_mode: SamplerMipmapMode::NEAREST,
         address_mode: SamplerAddressMode::CLAMP_TO_BORDER,
         border_color: BorderColor::FLOAT_OPAQUE_WHITE,
+        #[cfg(feature = "sampler-anisotropy")]
         max_anisotropy: None,
     },
     SamplerDesc {
@@ -69,12 +73,14 @@ pub const DEFAULT_SAMPLERS: [SamplerDesc; 3] = [
         mipmap_mode: SamplerMipmapMode::LINEAR,
         address_mode: SamplerAddressMode::REPEAT,
         border_color: BorderColor::FLOAT_TRANSPARENT_BLACK,
+        #[cfg(feature = "sampler-anisotropy")]
         max_anisotropy: None,
     },
 ];
 
 impl SamplerDesc {
     fn create(&self) -> Result<vk::Sampler> {
+        #[allow(unused_mut)]
         let mut info = vk::SamplerCreateInfo::default()
             .mag_filter(self.mag_filter)
             .min_filter(self.min_filter)
@@ -84,11 +90,10 @@ impl SamplerDesc {
             .address_mode_w(self.address_mode)
             .border_color(self.border_color)
             .max_lod(vk::LOD_CLAMP_NONE);
+        #[cfg(feature = "sampler-anisotropy")]
         if let Some(ratio) = self.max_anisotropy {
-            assert!(
-                Ctx::features().sampler_anisotropy,
-                "anisotropic samplers need `Features::sampler_anisotropy`"
-            );
+            use crate::features::Feature;
+            crate::features::gate::SamplerAnisotropy::check()?;
             info = info.anisotropy_enable(true).max_anisotropy(ratio);
         }
         Ok(unsafe { Ctx::device().create_sampler(&info, None) }?)
@@ -380,7 +385,7 @@ impl Bindless {
                 &[],
             )
         };
-        if Ctx::features().ray_tracing_pipeline {
+        if <crate::features::gate::RayTracingPipeline as crate::features::On>::on() {
             unsafe {
                 Ctx::device().cmd_bind_descriptor_sets(
                     *cmd,
