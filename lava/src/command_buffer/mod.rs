@@ -20,7 +20,7 @@ use crate::{
     error::Result,
     image::{
         format::Format,
-        kind::{ColorTarget, DepthTarget, SampledView, StorageView},
+        kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StorageView},
     },
     pipeline::{RasterKeyRef, pass_map, pipelines},
     query::{
@@ -30,7 +30,7 @@ use crate::{
         self,
         table::{AcquireWait, PresentSignal},
     },
-    queue::{HasCompute, HasGraphics, Kind, QueueKind},
+    queue::{HasCompute, HasGraphics, Kind, QueueKind, device::FamilyInfo},
     state::{Ctx, Functions},
 };
 #[cfg(feature = "acceleration-structure")]
@@ -48,7 +48,7 @@ use crate::unsized_struct::unsized_struct;
 use binding_output::Sections;
 #[cfg(test)]
 use image_state::take_states;
-use image_state::{ImageState, check_states, take_checked_states};
+use image_state::{ImageState, check_states, release_states, take_checked_states};
 use pending::{PendingAccesses, all_read_access, all_write_access};
 pub use binding_output::{BindingOutput, Bindings, kind};
 pub use raster_state::*;
@@ -146,8 +146,8 @@ pub(crate) struct Recording {
     /// remember.
     pub(crate) timeline: usize,
     pub(crate) value: u64,
-    /// Its family's timestamp bits.
-    timestamp_valid_bits: u32,
+    /// Its family, and every kind's family index.
+    pub(crate) family: FamilyInfo,
     /// What `measure` attached, for the duration of its closure (its lifetime erased).
     observer: Option<NonNull<dyn ScopeObserver>>,
     /// How many scopes the observer is inside.
@@ -1142,27 +1142,45 @@ impl<K: QueueKind> CommandBuffer<K> {
     }
 }
 
+impl<K: QueueKind> CommandBuffer<K> {
+    /// Hands `image` (the mips its view covers) to the family of kind `D`: records the release
+    /// half of a queue family ownership transfer, after this recording's earlier accesses of
+    /// it. The next access on a `D` timeline acquires it there; its submission has to wait for
+    /// this one (`Submission::wait_for`), which lava doesn't check. Images are exclusive to one
+    /// family at a time, so an image another family owns has to be released before it is
+    /// accessed (buffers are shared by every family and need nothing). Does nothing for
+    /// `D = K` and for mips no family accessed yet; panics for an image another family owns or
+    /// one released already, and where lava has no family of `D`.
+    #[validation_trace]
+    pub fn release<D: QueueKind>(&mut self, image: impl ImageRef) {
+        if let Err(missing) = D::check() {
+            panic!("`release` to a family lava doesn't have: {missing}");
+        }
+        let image = image.view();
+        let aspect = image.format().aspects();
+        self.rec.release(image.image, aspect, image.mip_range, image.states, D::KIND);
+    }
+}
+
 impl Recording {
-    /// A recording into `handle` for value `value` of `timeline`, on a family of `kind` whose
-    /// timestamps have `timestamp_valid_bits`, logging its barriers into `barrier_log` (empty,
-    /// lent by the frame slot).
+    /// A recording into `handle` for value `value` of `timeline`, on `family`, logging its
+    /// barriers into `barrier_log` (empty, lent by the frame slot).
     pub(crate) fn new(
         handle: vk::CommandBuffer,
-        kind: Kind,
+        family: FamilyInfo,
         mut pending_accesses: PendingAccesses,
         timeline: usize,
         value: u64,
-        timestamp_valid_bits: u32,
         barrier_log: Vec<Barriers>,
     ) -> Self {
         pending_accesses.value = value;
         Self {
             handle,
-            kind,
+            kind: family.kind,
             pending_accesses,
             timeline,
             value,
-            timestamp_valid_bits,
+            family,
             observer: None,
             depth: 0,
             active_queries: 0,
@@ -1237,7 +1255,7 @@ impl Recording {
     ) {
         let barriers = compute_barriers(
             &self.pending_accesses,
-            self.kind,
+            &self.family,
             image_acceses.clone(),
             buffer_acceses.clone(),
         );
@@ -1257,6 +1275,67 @@ impl Recording {
 
         self.pending_accesses
             .record(image_acceses.map(|image| image.access), buffer_acceses);
+    }
+
+    /// The release half of an ownership transfer of `mips` of `image` to the family of `to`
+    /// (see `CommandBuffer::release`).
+    #[track_caller]
+    fn release(
+        &mut self,
+        image: vk::Image,
+        aspect: vk::ImageAspectFlags,
+        mips: Range<u32>,
+        states: &[AtomicU64],
+        to: Kind,
+    ) {
+        if to == self.kind {
+            return;
+        }
+        let (from, to_index) = (self.family.index(self.kind), self.family.index(to));
+        // It waits for this timeline's accesses of the image; the acquire waits for it through
+        // the semaphore its submission signals.
+        let pending = &self.pending_accesses;
+        let tracked = (pending.image_reads.iter())
+            .chain(pending.image_writes.iter().map(|w| &w.write))
+            .filter(|a| a.image == image);
+        let (mut stage, mut access) = (S2::NONE, vk::AccessFlags2::NONE);
+        for a in tracked {
+            stage |= a.stage;
+            access |= a.access;
+        }
+        if stage.is_empty() {
+            stage = S2::ALL_COMMANDS;
+            access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
+        }
+        let mut images = SmallVec::new();
+        release_states(states, mips, self.kind, to, |mips, layout| {
+            images.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(stage)
+                    .src_access_mask(access)
+                    .dst_stage_mask(S2::NONE)
+                    .dst_access_mask(vk::AccessFlags2::NONE)
+                    .old_layout(layout)
+                    .new_layout(layout)
+                    .src_queue_family_index(from)
+                    .dst_queue_family_index(to_index)
+                    .image(image)
+                    .subresource_range(subresource_range(aspect, mips)),
+            )
+        });
+        if images.is_empty() {
+            return;
+        }
+        self.barrier_log.push(Barriers {
+            acquired: SmallVec::new(),
+            acquires: SmallVec::new(),
+            memory: None,
+            images,
+        });
+        let barriers = self.barrier_log.last().expect("just pushed");
+        self.pipeline_barrier(barriers);
+        // The family it goes to waits for this submission as a whole.
+        self.pending_accesses.forget_image(image);
     }
 
     /// Opens a scope: its debug label, and the observer's `on_enter`.
@@ -1299,7 +1378,7 @@ impl Recording {
             "query {index} of a pool of {}",
             pool.count()
         );
-        pool.record_on(self, self.timestamp_valid_bits);
+        pool.record_on(self, self.family.timestamp_valid_bits);
         unsafe { Ctx::device().cmd_write_timestamp2(self.handle, stage, pool.handle, index) };
     }
 
@@ -1466,7 +1545,7 @@ impl BufferAccess {
 /// image must still be recorded one after the other and submitted in that order.
 pub(crate) fn compute_barriers<'a>(
     pending: &PendingAccesses,
-    kind: Kind,
+    family: &FamilyInfo,
     image_acceses: impl Iterator<Item = ImageUse<'a>> + Clone,
     buffer_acceses: impl Iterator<Item = BufferAccess>,
 ) -> Option<Barriers> {
@@ -1534,12 +1613,14 @@ pub(crate) fn compute_barriers<'a>(
         }
     }
 
+    let kind = family.kind;
     // Every image is checked before any state moves: a panic then leaves the tracking as the
     // barriers logged so far describe it.
     for image in image_acceses.clone() {
         image.check_states(kind);
     }
     let mut image_barriers: SmallVec<[vk::ImageMemoryBarrier2; 1]> = SmallVec::new();
+    let mut acquires = SmallVec::new();
     let mut acquired = SmallVec::new();
     for image in image_acceses {
         let access = &image.access;
@@ -1552,6 +1633,13 @@ pub(crate) fn compute_barriers<'a>(
                 acquired.push((image.access.image, stage));
                 stage
             });
+            // Released to this family by its owner: the acquire's half of the transfer.
+            if old.released_to == Some(kind)
+                && let Some(owner) = old.owner
+            {
+                let (from, to) = (family.index(owner), family.index(kind));
+                acquires.push(acquire_barrier(&image.access, mips, old.layout, from, to));
+            }
             if old.layout != image.access.layout {
                 let barrier = transition_barrier(pending, &image.access, mips, old.layout, waited);
                 image_barriers.push(barrier);
@@ -1560,7 +1648,7 @@ pub(crate) fn compute_barriers<'a>(
     }
 
     let hazard = !src_stage.is_empty() || !dst_stage.is_empty();
-    if !hazard && image_barriers.is_empty() && acquired.is_empty() {
+    if !hazard && image_barriers.is_empty() && acquired.is_empty() && acquires.is_empty() {
         return None;
     }
 
@@ -1577,7 +1665,7 @@ pub(crate) fn compute_barriers<'a>(
 
     Some(Barriers {
         acquired,
-        acquires: SmallVec::new(),
+        acquires,
         memory: hazard.then(|| {
             vk::MemoryBarrier2::default()
                 .src_stage_mask(src_stage)
@@ -1587,6 +1675,48 @@ pub(crate) fn compute_barriers<'a>(
         }),
         images: image_barriers,
     })
+}
+
+/// The acquire half of a queue family ownership transfer of `mips` from family `from` to `to`,
+/// in `layout` (the release kept it), before the access `image_access`. Recorded on its own,
+/// before the access's other barriers: barriers of one call are unordered.
+fn acquire_barrier(
+    image_access: &ImageAccess,
+    mips: Range<u32>,
+    layout: vk::ImageLayout,
+    from: u32,
+    to: u32,
+) -> vk::ImageMemoryBarrier2<'static> {
+    let stage = match image_access.stage.is_empty() {
+        true => vk::PipelineStageFlags2::ALL_COMMANDS,
+        false => image_access.stage,
+    };
+    let access = match image_access.access.is_empty() {
+        true => vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        false => image_access.access,
+    };
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(stage)
+        .dst_access_mask(access)
+        .old_layout(layout)
+        .new_layout(layout)
+        .src_queue_family_index(from)
+        .dst_queue_family_index(to)
+        .image(image_access.image)
+        .subresource_range(subresource_range(image_access.aspect, mips))
+}
+
+/// `mips` of every aspect `aspect`.
+fn subresource_range(aspect: vk::ImageAspectFlags, mips: Range<u32>) -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: aspect,
+        base_array_layer: 0,
+        layer_count: 1,
+        base_mip_level: mips.start,
+        level_count: mips.end - mips.start,
+    }
 }
 
 /// The barrier that moves `mips` of the image `image_access` accesses from `old_layout` into
@@ -1672,6 +1802,18 @@ pub(crate) mod tests {
     use std::iter;
     use crate::queue::Graphics;
     use pending::MAX_PENDING_BUFFER_WRITES;
+
+    /// A graphics family that is never handed to Vulkan; the compute family is 1.
+    const GRAPHICS: FamilyInfo = FamilyInfo {
+        kind: Kind::Graphics,
+        timestamp_valid_bits: 64,
+        image_granularity: vk::Extent3D {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        indices: [0, 1, 2],
+    };
     use std::marker::PhantomData;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
@@ -1738,22 +1880,21 @@ pub(crate) mod tests {
     }
 
     fn buffer_barrier(pending: &PendingAccesses, access: &BufferAccess) -> Option<Barriers> {
-        compute_barriers(pending, Kind::Graphics, iter::empty(), iter::once(access.clone()))
+        compute_barriers(pending, &GRAPHICS, iter::empty(), iter::once(access.clone()))
     }
 
     fn image_barrier(pending: &PendingAccesses, access: &ImageUse) -> Option<Barriers> {
-        compute_barriers(pending, Kind::Graphics, iter::once(access.clone()), iter::empty())
+        compute_barriers(pending, &GRAPHICS, iter::once(access.clone()), iter::empty())
     }
 
     /// A command buffer that is never handed to Vulkan: enough for state-only code paths.
     fn offline_cmd() -> CommandBuffer<Graphics> {
         CommandBuffer::new(Recording::new(
             vk::CommandBuffer::null(),
-            Kind::Graphics,
+            GRAPHICS,
             PendingAccesses::default(),
             0,
             0,
-            64,
             Vec::new(),
         ))
     }
@@ -2203,10 +2344,66 @@ pub(crate) mod tests {
         let accesses = [mine.clone(), theirs];
         let nothing = PendingAccesses::default();
         let panic = std::panic::catch_unwind(|| {
-            compute_barriers(&nothing, Kind::Graphics, accesses.iter().cloned(), iter::empty())
+            compute_barriers(&nothing, &GRAPHICS, accesses.iter().cloned(), iter::empty())
         });
         assert!(panic.is_err());
         assert_eq!(ImageState::load(&mine.states[0]).layout, L::UNDEFINED);
+    }
+
+    /// An image its owner released to this family is acquired before the access, in a call of
+    /// its own, and then transitioned like any other.
+    #[test]
+    fn a_released_image_is_acquired_from_its_owner() {
+        let access = image(3, S::COMPUTE_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL, L::ATTACHMENT_OPTIMAL);
+        let released = ImageState {
+            layout: L::GENERAL,
+            owner: Some(Kind::Compute),
+            released_to: Some(Kind::Graphics),
+            acquired: false,
+        };
+        access.states[0].store(released.pack(), std::sync::atomic::Ordering::Relaxed);
+        let barriers = image_barrier(&PendingAccesses::default(), &access).unwrap();
+        let [acquire] = barriers.acquires.as_slice() else {
+            panic!("one acquire")
+        };
+        assert_eq!((acquire.src_queue_family_index, acquire.dst_queue_family_index), (1, 0));
+        assert_eq!((acquire.old_layout, acquire.new_layout), (L::GENERAL, L::GENERAL));
+        assert_eq!(acquire.dst_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(acquire.dst_access_mask, A::SHADER_SAMPLED_READ);
+        let [transition] = barriers.images.as_slice() else {
+            panic!("one transition")
+        };
+        assert_eq!(transition.src_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+        assert_eq!(transition.new_layout, L::ATTACHMENT_OPTIMAL);
+        // Taken: graphics owns it now, and the next access acquires nothing.
+        let state = ImageState::load(&access.states[0]);
+        assert_eq!((state.owner, state.released_to), (Some(Kind::Graphics), None));
+        let again = image(3, S::COMPUTE_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL, L::GENERAL);
+        again.states[0].store(state.pack(), std::sync::atomic::Ordering::Relaxed);
+        assert!(image_barrier(&PendingAccesses::default(), &again).is_some_and(|b| b.acquires.is_empty()));
+    }
+
+    /// The first access of an acquired swapchain image makes the submission wait for the
+    /// acquire at its stage, which the transition starts from.
+    #[test]
+    fn an_acquired_image_waits_at_its_first_access() {
+        let access = image(4, S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE, L::GENERAL, L::GENERAL);
+        let acquired = ImageState {
+            layout: L::PRESENT_SRC_KHR,
+            owner: Some(Kind::Graphics),
+            released_to: None,
+            acquired: true,
+        };
+        access.states[0].store(acquired.pack(), std::sync::atomic::Ordering::Relaxed);
+        let barriers = image_barrier(&PendingAccesses::default(), &access).unwrap();
+        assert_eq!(barriers.acquired.as_slice(), [(vk::Image::from_raw(4), S::COMPUTE_SHADER)]);
+        let [transition] = barriers.images.as_slice() else {
+            panic!("one transition")
+        };
+        assert_eq!(transition.src_stage_mask, S::COMPUTE_SHADER);
+        assert_eq!(transition.src_access_mask, A::NONE);
+        assert_eq!(transition.old_layout, L::PRESENT_SRC_KHR);
+        assert!(!ImageState::load(&access.states[0]).acquired);
     }
 
     #[test]
@@ -2285,7 +2482,7 @@ pub(crate) mod tests {
     ) -> Option<Barriers> {
         let barriers = compute_barriers(
             pending,
-            Kind::Graphics,
+            &GRAPHICS,
             images.iter().cloned(),
             buffers.iter().cloned(),
         );
@@ -2440,7 +2637,7 @@ pub(crate) mod tests {
         ];
         let barriers = compute_barriers(
             &PendingAccesses::default(),
-            Kind::Graphics,
+            &GRAPHICS,
             accesses.into_iter(),
             iter::empty(),
         )
@@ -2466,7 +2663,7 @@ pub(crate) mod tests {
         let nothing = PendingAccesses::default();
         let transition = |access: &ImageUse| {
             let barriers =
-                compute_barriers(&nothing, Kind::Graphics, iter::once(access.clone()), iter::empty()).unwrap();
+                compute_barriers(&nothing, &GRAPHICS, iter::once(access.clone()), iter::empty()).unwrap();
             let [transition] = barriers.images.as_slice() else {
                 panic!("one transition");
             };
@@ -2672,7 +2869,7 @@ pub(crate) mod tests {
             builder.depth_attachment(view::<D32Sfloat, DepthAttachment>(&depth), None);
             let depth = builder.depth_access();
             let accesses = builder.color.iter().map(|c| c.access.clone()).chain(depth);
-            compute_barriers(&nothing, Kind::Graphics, accesses, iter::empty()).map_or(vec![], |barriers| {
+            compute_barriers(&nothing, &GRAPHICS, accesses, iter::empty()).map_or(vec![], |barriers| {
                 let transitions = barriers.images.iter();
                 transitions.map(|t| (t.old_layout, t.new_layout)).collect()
             })

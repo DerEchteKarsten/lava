@@ -21,7 +21,7 @@ use lava::{
     },
     memory::memory_report,
     query::{QueryPipelineStatisticFlags as Statistics, QueryPool, Timestamp, counters},
-    queue::Kind,
+    queue::{Compute, Kind, Timeline, Transfer},
     state::Ctx,
 };
 use lava_tests::bindings::{TestMesh, TestRaster, TestVertex};
@@ -156,9 +156,14 @@ fn disabled_features_are_off() {
     let features = Ctx::features();
     assert_eq!(features.without(disabled()), features);
     assert!(!features.dynamic_blend && !features.mesh_shader);
-    // Without them, lava creates queues of the graphics family alone.
+    // Without them, lava creates queues of the graphics family alone, and no timeline of the
+    // others.
     assert_eq!(Ctx::queue_family(Kind::Compute), None);
     assert_eq!(Ctx::queue_family(Kind::Transfer), None);
+    let compute = Timeline::<Compute>::builder().build();
+    assert!(matches!(compute, Err(Error::MissingFeature(m)) if m == missing("async-compute")));
+    let transfer = Timeline::<Transfer>::builder().build();
+    assert!(matches!(transfer, Err(Error::MissingFeature(m)) if m == missing("async-transfer")));
 }
 
 #[test]

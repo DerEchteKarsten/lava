@@ -61,9 +61,8 @@ pub(crate) fn submit<K: QueueKind>(
     let mut pending = std::mem::take(&mut state.pending);
     pending.retire(completed(i));
     let log = std::mem::take(&mut slot.barrier_log);
-    let valid_bits = inner.family.timestamp_valid_bits;
-    let mut cmd =
-        CommandBuffer::<K>::new(Recording::new(slot.cmd, K::KIND, pending, i, n, valid_bits, log));
+    let family = inner.family.info();
+    let mut cmd = CommandBuffer::<K>::new(Recording::new(slot.cmd, family, pending, i, n, log));
 
     if let Err(err) = cmd.rec.begin() {
         // Nothing was recorded: the accesses describe what earlier submissions do.

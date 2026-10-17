@@ -190,6 +190,59 @@ pub(crate) fn take_checked_states(
     runs(states, mips, new, swap, changed);
 }
 
+/// Releases the mips of `mips` that a family of `kind` owns to the family of `to`: checks them
+/// all first (each owned by `kind` and not released, or owned by nobody, which needs no
+/// transfer), then flags the owned ones released and calls `released(mips, layout)` once per run
+/// of neighbouring owned mips in the same layout.
+#[track_caller]
+pub(crate) fn release_states(
+    states: &[AtomicU64],
+    mips: Range<u32>,
+    kind: Kind,
+    to: Kind,
+    mut released: impl FnMut(Range<u32>, vk::ImageLayout),
+) {
+    for_each(states, mips, |state, _| {
+        let state = ImageState::load(state);
+        let mine = state.owner.is_none_or(|owner| owner == kind);
+        assert!(
+            mine && state.released_to.is_none(),
+            "only the family that owns an image releases it: this one is owned by {:?}{}",
+            state.owner,
+            match state.released_to {
+                Some(to) => format!(" and released to {to:?}"),
+                None => String::new(),
+            }
+        );
+    });
+    let mut run: Option<(Range<u32>, vk::ImageLayout)> = None;
+    for_each(states, mips, |state, mips| {
+        let old = ImageState::load(state);
+        if old.owner.is_none() {
+            if let Some((run_mips, layout)) = run.take() {
+                released(run_mips, layout);
+            }
+            return;
+        }
+        let new = ImageState {
+            released_to: Some(to),
+            ..old
+        };
+        state.store(new.pack(), Ordering::Relaxed);
+        match &mut run {
+            Some((run_mips, layout)) if *layout == old.layout => run_mips.end = mips.end,
+            _ => {
+                if let Some((run_mips, layout)) = run.replace((mips, old.layout)) {
+                    released(run_mips, layout);
+                }
+            }
+        }
+    });
+    if let Some((run_mips, layout)) = run {
+        released(run_mips, layout);
+    }
+}
+
 /// Moves the layouts of `mips` to `layout` without a recording (host image copies), leaving
 /// their owners alone, and calls `changed(mips, old)` per run of mips whose old state had
 /// another layout.
@@ -347,6 +400,34 @@ mod tests {
         let message = *panic.unwrap_err().downcast::<String>().unwrap();
         assert!(message.contains("`cmd.release::<Graphics>(view)`"), "{message}");
         assert_eq!(ImageState::load(&states[0]), g, "nothing moved");
+    }
+
+    #[test]
+    fn releasing_flags_the_owned_mips_and_skips_unowned_ones() {
+        let g = |layout| state(layout, Some(Kind::Graphics));
+        let states = atomics(&[g(L::GENERAL), g(L::GENERAL), ImageState::UNDEFINED, g(L::ATTACHMENT_OPTIMAL)]);
+        let mut runs = Vec::new();
+        release_states(&states, (0..4).into(), Kind::Graphics, Kind::Transfer, |mips, layout| {
+            runs.push((mips.start, mips.end, layout))
+        });
+        assert_eq!(runs, [(0, 2, L::GENERAL), (3, 4, L::ATTACHMENT_OPTIMAL)]);
+        assert_eq!(ImageState::load(&states[1]).released_to, Some(Kind::Transfer));
+        assert_eq!(ImageState::load(&states[2]), ImageState::UNDEFINED);
+        // Released already: only its receiver takes it.
+        let again = std::panic::catch_unwind(|| {
+            release_states(&states, (0..1).into(), Kind::Graphics, Kind::Compute, |_, _| {})
+        });
+        assert!(again.is_err());
+    }
+
+    #[test]
+    fn only_the_owner_releases_and_nothing_moves_before_the_check() {
+        let states = atomics(&[state(L::GENERAL, Some(Kind::Graphics)), state(L::GENERAL, Some(Kind::Compute))]);
+        let released = std::panic::catch_unwind(|| {
+            release_states(&states, (0..2).into(), Kind::Graphics, Kind::Transfer, |_, _| {})
+        });
+        assert!(released.is_err());
+        assert_eq!(ImageState::load(&states[0]).released_to, None);
     }
 
     #[test]

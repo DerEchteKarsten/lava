@@ -39,6 +39,42 @@ pub(crate) struct QueueHandle {
     timelines: AtomicU32,
 }
 
+/// What a recording needs to know of its family: its kind, what its timestamps and image copies
+/// can do, and the index of every kind's family (`QUEUE_FAMILY_IGNORED` where lava has none),
+/// which ownership transfers name.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FamilyInfo {
+    pub(crate) kind: Kind,
+    pub(crate) timestamp_valid_bits: u32,
+    pub(crate) image_granularity: vk::Extent3D,
+    pub(crate) indices: [u32; 3],
+}
+
+impl FamilyInfo {
+    /// A family of `kind` that is never handed to Vulkan, with families 0, 1 and 2.
+    #[cfg(test)]
+    pub(crate) fn offline(kind: Kind) -> Self {
+        Self {
+            kind,
+            timestamp_valid_bits: 64,
+            image_granularity: vk::Extent3D { width: 1, height: 1, depth: 1 },
+            indices: [0, 1, 2],
+        }
+    }
+
+    /// The index of the family of `kind`; panics where lava has none.
+    #[track_caller]
+    pub(crate) fn index(&self, kind: Kind) -> u32 {
+        let index = self.indices[kind.slot()];
+        assert_ne!(
+            index,
+            vk::QUEUE_FAMILY_IGNORED,
+            "lava has no {kind:?} family (`async-compute`, `async-transfer`)"
+        );
+        index
+    }
+}
+
 /// How many queues lava creates of `family`.
 pub(crate) fn queue_count(family: &QueueFamily) -> u32 {
     family.num_queues.min(MAX_TIMELINES as u32)
@@ -60,6 +96,18 @@ impl FamilyQueues {
                     timelines: AtomicU32::new(0),
                 })
                 .collect(),
+        }
+    }
+
+    /// What a recording on this family needs to know of it.
+    pub(crate) fn info(&self) -> FamilyInfo {
+        let queues = &Ctx::get().queues;
+        FamilyInfo {
+            kind: self.kind,
+            timestamp_valid_bits: self.timestamp_valid_bits,
+            image_granularity: self.image_granularity,
+            indices: [Kind::Graphics, Kind::Compute, Kind::Transfer]
+                .map(|kind| queues.family(kind).map_or(vk::QUEUE_FAMILY_IGNORED, |f| f.index)),
         }
     }
 

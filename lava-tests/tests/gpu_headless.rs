@@ -37,7 +37,7 @@ use lava::{
         Performance, PipelineStatistics, PipelineStats, QueryPipelineStatisticFlags as Statistics,
         QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Timestamp, counters,
     },
-    queue::{Graphics, Kind, MAX_TIMELINES, Stage, Timeline},
+    queue::{Compute, Graphics, Kind, MAX_TIMELINES, Stage, Timeline, Transfer},
     state::Ctx,
 };
 use lava_tests::bindings::{
@@ -428,6 +428,126 @@ fn timelines_are_limited_and_reused() {
     assert!(done.is_done());
     let next = reused.reserve();
     next.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
+}
+
+// ---- queue family ownership ------------------------------------------------------------------
+
+/// Whether the device has `feature`'s dedicated family; prints why a test is skipped.
+fn has_family(test: &str, kind: Kind) -> bool {
+    let has = Ctx::queue_family(kind).is_some();
+    if !has {
+        eprintln!("SKIPPED {test}: the device has no dedicated {kind:?} family");
+    }
+    has
+}
+
+type Owned = Image<R8G8B8A8Unorm, StorageTransferSrcTransferDst>;
+
+/// The pixels `TestComputeImage` with a red tint writes into an 8x8 image: red is the
+/// horizontal UV.
+fn expect_red_gradient(pixels: &[u8]) {
+    for (i, texel) in pixels.chunks_exact(4).enumerate() {
+        let x = (i % 8) as f32;
+        let red = ((x + 0.5) / 8.0 * 255.0).round() as u8;
+        assert!(close(texel.try_into().unwrap(), [red, 0, 0, 255]), "texel {i}: {texel:?}");
+    }
+}
+
+/// An image written on the compute family and released to graphics is read there.
+#[test]
+fn a_compute_image_is_released_to_graphics() {
+    let gpu = gpu();
+    if !has_family("a_compute_image_is_released_to_graphics", Kind::Compute) {
+        return;
+    }
+    let compute = Timeline::<Compute>::builder().build().unwrap();
+    let image = Owned::new(UVec2::splat(8)).unwrap().bind_storage().unwrap();
+    let red = Vec4::new(1.0, 0.0, 0.0, 1.0);
+    let written = (compute.reserve().begin().unwrap())
+        .submit(|cmd| {
+            let bindings = TestComputeImage::push_bindings(image.whole_view(), red, UVec2::ZERO, UVec2::splat(8));
+            cmd.compute(&bindings, [1, 1, 1], None);
+            cmd.release::<Graphics>(image.whole_view());
+        })
+        .unwrap();
+    let readback = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
+    gpu.submit_after(&[written], |cmd| {
+        cmd.copy_image_to_buffer(image.whole(), readback.range(..))
+    });
+    expect_red_gradient(readback.host());
+}
+
+/// The copy engine uploads an image for graphics, which hands it back for a readback.
+#[test]
+fn images_go_to_the_transfer_family_and_back() {
+    let gpu = gpu();
+    if !has_family("images_go_to_the_transfer_family_and_back", Kind::Transfer) {
+        return;
+    }
+    let transfer = Timeline::<Transfer>::builder().build().unwrap();
+    let image = Owned::new(UVec2::splat(8)).unwrap();
+    let upload = buffer_with::<u8, Storage>(&pattern(8, 8));
+    let uploaded = (transfer.reserve().begin().unwrap())
+        .submit(|cmd| {
+            cmd.copy_buffer_to_image(upload.range(..), image.whole());
+            cmd.release::<Graphics>(image.whole_view());
+        })
+        .unwrap();
+    let readback = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
+    let drawn = gpu.submit_after(&[uploaded], |cmd| {
+        cmd.copy_image_to_buffer(image.whole(), readback.range(..));
+        cmd.clear_image(image.whole_view(), [0.0, 1.0, 0.0, 1.0]);
+        cmd.release::<Transfer>(image.whole_view());
+    });
+    assert_eq!(readback.host(), pattern(8, 8));
+    let mut back = transfer.reserve().begin().unwrap();
+    back.wait_for(drawn);
+    let back = back.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
+    back.unwrap().block().unwrap();
+    assert!(readback.host().chunks_exact(4).all(|t| t == [0, 255, 0, 255]));
+}
+
+/// An image another family owns can't be accessed before it released it.
+#[test]
+fn an_unreleased_image_panics() {
+    let gpu = gpu();
+    if !has_family("an_unreleased_image_panics", Kind::Compute) {
+        return;
+    }
+    let compute = Timeline::<Compute>::builder().build().unwrap();
+    let image = Owned::new(UVec2::splat(8)).unwrap();
+    let cleared = (compute.reserve().begin().unwrap())
+        .submit(|cmd| cmd.clear_image(image.whole_view(), [1.0; 4]))
+        .unwrap();
+    cleared.block().unwrap();
+    let readback = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)))
+    }));
+    let message = *panicked.unwrap_err().downcast::<String>().unwrap();
+    assert!(message.contains("`cmd.release::<Graphics>(view)`"), "{message}");
+    // A query of graphics statistics can't be recorded on compute either.
+    if Ctx::features().pipeline_statistics {
+        let pool = QueryPool::statistics(1, Statistics::FRAGMENT_SHADER_INVOCATIONS).unwrap();
+        let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (compute.reserve().begin().unwrap()).submit(|cmd| cmd.query(&pool, 0, |_| {}))
+        }));
+        assert!(recorded.is_err());
+    }
+}
+
+/// Releasing to the family that owns the image does nothing.
+#[test]
+fn a_release_to_the_same_family_does_nothing() {
+    let gpu = gpu();
+    let image = Owned::new(UVec2::splat(8)).unwrap();
+    let readback = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
+    gpu.submit(|cmd| {
+        cmd.clear_image(image.whole_view(), [0.0, 0.0, 1.0, 1.0]);
+        cmd.release::<Graphics>(image.whole_view());
+        cmd.copy_image_to_buffer(image.whole(), readback.range(..));
+    });
+    assert!(readback.host().chunks_exact(4).all(|t| t == [0, 0, 255, 255]));
 }
 
 /// A group of two compute passes, then a rendering if the device has mesh shaders.

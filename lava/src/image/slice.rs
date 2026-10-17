@@ -9,7 +9,7 @@ use crate::{
     bindless::BindlessHandle,
     buffer::{slice::BufferSlice, usage::BufferUsage},
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
-    queue::{HasCompute, HasGraphics, QueueKind},
+    queue::{HasCompute, HasGraphics, Kind, QueueKind, device::FamilyInfo},
     image::{
         Image, Views,
         dim::{D2, Dim},
@@ -355,6 +355,7 @@ impl<K: QueueKind> CommandBuffer<K> {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         check_copy_size(&dst, src.size(), "source");
+        check_family(&self.rec.family, &dst, src.address(), true);
         self.rec.flush_pending(
             iter::once(dst.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -410,6 +411,7 @@ impl<K: QueueKind> CommandBuffer<K> {
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         check_copy_size(&src, dst.size(), "destination");
+        check_family(&self.rec.family, &src, dst.address(), false);
         self.rec.flush_pending(
             iter::once(src.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -461,6 +463,62 @@ fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
             format.vk_format()
         );
     }
+}
+
+/// Panics where a copy between `slice` and the buffer at `address` can't be recorded on
+/// `family`: depth or stencil copies into images need graphics, and a transfer family needs
+/// 4-byte aligned buffer addresses and boxes within its image granularity.
+#[track_caller]
+fn check_family<F: Format, U: ImageUsage, D: Dim>(
+    family: &FamilyInfo,
+    slice: &ImageSlice<ImageView<'_, F, U, D>>,
+    address: u64,
+    into_image: bool,
+) {
+    let depth_stencil = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+    assert!(
+        family.kind == Kind::Graphics
+            || !into_image
+            || !slice.view.format.aspects().intersects(depth_stencil),
+        "copies into depth or stencil images are recorded on the graphics family"
+    );
+    if family.kind != Kind::Transfer {
+        return;
+    }
+    assert!(
+        address % 4 == 0,
+        "a transfer family copies from and to 4-byte aligned buffer addresses, not {address:#x}"
+    );
+    let (offset, extent) = (D::offset_3d(slice.offset), D::extent_3d(slice.extend));
+    let mip = D::extent_3d(slice.view.extent);
+    let granularity = family.image_granularity;
+    assert!(
+        fits_granularity(granularity, offset, extent, mip),
+        "a transfer family copies boxes of its image granularity {granularity:?}, not \
+         {extent:?} at {offset:?} of a mip of {mip:?}"
+    );
+}
+
+/// Whether a box of `extent` at `offset` of a mip of `mip` fits a family's image transfer
+/// `granularity`: 0 allows whole mips only; else every offset is a multiple of it, and every
+/// extent is one or reaches the mip's edge.
+pub(crate) fn fits_granularity(
+    granularity: vk::Extent3D,
+    offset: vk::Offset3D,
+    extent: vk::Extent3D,
+    mip: vk::Extent3D,
+) -> bool {
+    let axes = [
+        (granularity.width, offset.x, extent.width, mip.width),
+        (granularity.height, offset.y, extent.height, mip.height),
+        (granularity.depth, offset.z, extent.depth, mip.depth),
+    ];
+    axes.into_iter().all(|(g, offset, extent, mip)| match g {
+        0 => offset == 0 && extent == mip,
+        g => {
+            offset as u32 % g == 0 && (extent % g == 0 || offset as u32 + extent == mip)
+        }
+    })
 }
 
 /// Blit region covering the two slices: from each slice's offset to offset + extent.
@@ -663,6 +721,27 @@ mod tests {
         check_copy_size(&slice, 64, "destination");
         let short = std::panic::catch_unwind(|| check_copy_size(&slice, 31, "destination"));
         assert!(short.is_err());
+    }
+
+    #[test]
+    fn copies_fit_a_familys_granularity() {
+        let extent = |width, height, depth| vk::Extent3D {
+            width,
+            height,
+            depth,
+        };
+        let offset = |x, y, z| vk::Offset3D { x, y, z };
+        let (one, eight, whole) = (extent(1, 1, 1), extent(8, 8, 1), extent(0, 0, 0));
+        let mip = extent(20, 12, 1);
+        assert!(fits_granularity(one, offset(3, 5, 0), extent(7, 2, 1), mip));
+        assert!(fits_granularity(eight, offset(8, 0, 0), extent(8, 8, 1), mip));
+        // An extent that isn't a multiple has to reach the edge.
+        assert!(fits_granularity(eight, offset(16, 8, 0), extent(4, 4, 1), mip));
+        assert!(!fits_granularity(eight, offset(8, 0, 0), extent(4, 8, 1), mip));
+        assert!(!fits_granularity(eight, offset(4, 0, 0), extent(8, 8, 1), mip));
+        // Granularity 0: whole mips only.
+        assert!(fits_granularity(whole, offset(0, 0, 0), mip, mip));
+        assert!(!fits_granularity(whole, offset(0, 0, 0), extent(10, 12, 1), mip));
     }
 
     #[test]
