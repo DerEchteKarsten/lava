@@ -38,8 +38,9 @@ use crate::{bindless::Bindless, state::Ctx};
 
 pub use crate::error::{Error, Result};
 pub use crate::features::Features;
+pub use crate::lifetime::{Stamp, latest_stamp, reclaim};
 pub use crate::vk::Pipeline as VkPipeline;
-/// What `Error::Vulkan` holds, e.g. `ERROR_OUT_OF_DATE_KHR` from `Swapchain::aquire_image`.
+/// What `Error::Vulkan` holds, e.g. `ERROR_DEVICE_LOST`.
 pub use crate::vk::Result as VkResult;
 pub use crate::vk::ShaderModule as VkShaderModule;
 pub use crate::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
@@ -49,12 +50,13 @@ pub use crate::vk::{BufferUsageFlags, Format as VkFormat, ImageUsageFlags};
 pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;
-pub mod epoch;
 pub mod error;
 pub mod features;
 pub mod image;
+pub mod lifetime;
 pub mod memory;
 pub mod pipeline;
+pub mod present;
 pub mod query;
 pub mod queue;
 pub mod state;
@@ -64,7 +66,7 @@ pub mod vkobjects;
 use raw_window_handle::RawDisplayHandle;
 
 /// The supertrait of the traits only lava implements (formats, usages, dimensions, views,
-/// semaphore and queue kinds, acceleration structure levels, index formats): public in a
+/// queue and query kinds, acceleration structure levels, index formats): public in a
 /// private module, so other crates can name and bound by those traits but not implement them.
 mod sealed {
     pub trait Sealed {}
@@ -86,8 +88,7 @@ macro_rules! include_passes {
 pub struct Config<'a> {
     /// The `PASS_MAP` of [`include_passes!`].
     pub passes: &'static pipeline::PassMap,
-    /// The display to create [`vkobjects::surface::Surface`]s and swapchains for; `None` runs
-    /// headless.
+    /// The display to create [`present::PresentSurface`]s for; `None` runs headless.
     pub display: Option<RawDisplayHandle>,
     /// The validation layer with synchronization validation and best practices, in debug
     /// builds.
@@ -123,7 +124,7 @@ impl Config<'static> {
 /// compiled without.
 pub fn init(config: &Config) -> Result<()> {
     Ctx::init(config)?;
-    epoch::set_present_fences(<features::gate::PresentFences as features::On>::on());
+    lifetime::set_present_fences(<features::gate::PresentFences as features::On>::on());
     pipeline::set_pass_map(config.passes);
     Bindless::init(config.samplers)?;
     query::init()?;
@@ -132,27 +133,34 @@ pub fn init(config: &Config) -> Result<()> {
 }
 
 /// Waits until the device finished everything submitted so far, e.g. before exiting. A stall;
-/// a dropped resource is destroyed once the frames that may use it are done anyway (`epoch`).
-/// Destroys what the frames and presents submitted before it kept alive. Every queue is locked
-/// meanwhile (Vulkan wants them externally synchronised), so other threads' submissions and
-/// presents wait; call it outside of `Frame::execute`.
+/// a dropped resource is destroyed once the submissions that may use it are done anyway
+/// (`lifetime`). Destroys what the submissions and presents before it kept alive. Every queue
+/// is locked meanwhile (Vulkan wants them externally synchronised), so other threads'
+/// submissions and presents wait; call it outside of `Submission::submit`.
 pub fn wait_idle() -> Result<()> {
     {
         let _queues = queue::device::lock_all_queues();
         unsafe { Ctx::device().device_wait_idle()? };
         // The presentation engine may still hold what the last presents use.
-        epoch::wait_for_presents(1_000_000_000);
-        // Before the queues are unlocked: what is submitted after it isn't done.
-        epoch::device_idle();
+        lifetime::wait_for_presents(1_000_000_000);
+        queue::timeline::poll_all();
+        // Before the queues are unlocked: what is presented after it isn't done.
+        lifetime::device_idle();
     }
-    // Destructors lock the queues' pending accesses, which a recording holds while it waits
+    // Destructors lock the timelines' pending accesses, which a recording holds while it waits
     // to submit.
-    epoch::reclaim();
+    lifetime::reclaim();
     Ok(())
 }
 
+/// Waits for the device and destroys everything dropped so far, done or not (the timelines
+/// must be dropped first), then the bindless sets.
 #[track_caller]
 pub fn destroy() {
     CALLSITE.set(Some(Location::caller().clone()));
+    if let Err(err) = wait_idle() {
+        tracing::error!(%err, "failed to wait for the device before destroying lava");
+    }
+    lifetime::flush();
     Bindless::destroy();
 }

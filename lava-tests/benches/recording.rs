@@ -2,8 +2,8 @@
 //!
 //! Run with `cargo bench -p lava-tests --bench recording`.
 //!
-//! Every frame records one scenario into a command buffer of one of two frame slots and
-//! submits it; only the recording closure is timed. The GPU work is tiny (one workgroup per
+//! Every frame records one scenario into a command buffer of a timeline with two frame slots
+//! and submits it; only the recording closure is timed. The GPU work is tiny (one workgroup per
 //! dispatch, a 64x64 target), so a slot's previous frame is done by the time it begins again.
 
 use std::{hint::black_box, time::Instant};
@@ -15,14 +15,13 @@ use lava::{
         usage::{Index, Storage},
     },
     command_buffer::{Accesses, Attachment, CommandBuffer, Draw, ImageUse, RasterState},
-    epoch,
     image::{
         Image,
         format::R8G8B8A8Unorm,
         usage::{ColorAttachmentStorageTransferSrcTransferDst, SampledTransferDst},
     },
+    queue::{Graphics, Timeline},
     state::Ctx,
-    vkobjects::queue::{FrameSlot, Gfx, Queue},
 };
 use lava_tests::bindings::{
     PASS_MAP, TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster,
@@ -53,7 +52,7 @@ impl Resources {
         Self {
             target: Target::new(EXTENT).unwrap().bind_storage().unwrap(),
             textures: (0..TEXTURES)
-                .map(|i| {
+                .map(|_| {
                     Texture::new(UVec2::splat(4))
                         .unwrap()
                         .bind_sampled().unwrap()
@@ -73,7 +72,7 @@ impl Resources {
 
 /// 64 compute passes: 32 with two buffers, 16 with specialization constants that name a buffer
 /// and an image, 16 writing an image.
-fn compute(cmd: &mut CommandBuffer, r: &Resources) {
+fn compute(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     for i in 0..32 {
         cmd.compute(
             &TestComputeBuffer::push_bindings(
@@ -114,7 +113,7 @@ fn compute(cmd: &mut CommandBuffer, r: &Resources) {
 
 /// 8 renderings of 8 indexed draws, each with a vertex buffer, a texture and two declared
 /// textures.
-fn many_draws(cmd: &mut CommandBuffer, r: &Resources) {
+fn many_draws(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     let draw = |i: usize| {
         TestRasterTextured::push_bindings(r.textured[i].range(..), r.textures[i].whole_view(), 0)
     };
@@ -141,7 +140,7 @@ fn many_draws(cmd: &mut CommandBuffer, r: &Resources) {
 }
 
 /// 4 renderings of one draw that reaches 16 declared textures.
-fn declared(cmd: &mut CommandBuffer, r: &Resources) {
+fn declared(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     for j in 0..4 {
         let textures: [ImageUse; 16] =
             std::array::from_fn(|k| ImageUse::sampled_read(r.textures[j * 16 + k].whole_view()));
@@ -158,7 +157,7 @@ fn declared(cmd: &mut CommandBuffer, r: &Resources) {
 }
 
 /// 8 renderings of 4 mesh-shader launches without accesses: a binding of push constants only.
-fn mesh(cmd: &mut CommandBuffer, r: &Resources) {
+fn mesh(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     // Only run where the device has mesh shaders.
     let launch = |i: u32| {
         TestMesh::push_bindings(Vec4::ONE, Vec2::new(i as f32, 0.0), 0.1).expect("mesh shaders")
@@ -179,14 +178,10 @@ const FRAMES: usize = 3000;
 
 fn main() {
     lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
-    let queue = Queue::<Gfx>::new();
+    let timeline = Timeline::<Graphics>::builder().in_flight(2).build().unwrap();
     let resources = Resources::new();
-    let mut slots = [
-        FrameSlot::new(&queue).unwrap(),
-        FrameSlot::new(&queue).unwrap(),
-    ];
 
-    let mut scenarios: Vec<(&str, fn(&mut CommandBuffer, &Resources))> = vec![
+    let mut scenarios: Vec<(&str, fn(&mut CommandBuffer<Graphics>, &Resources))> = vec![
         ("compute", compute),
         ("many_draws", many_draws),
         ("declared", declared),
@@ -201,11 +196,9 @@ fn main() {
     for (name, scenario) in scenarios {
         let mut times = Vec::with_capacity(FRAMES);
         for frame in 0..WARMUP + FRAMES {
-            let slot = &mut slots[frame % 2];
             let mut elapsed = 0;
-            slot.begin(epoch::reserve())
-                .unwrap()
-                .execute(&queue, &[], &[], |cmd| {
+            (timeline.reserve().begin().unwrap())
+                .submit(|cmd| {
                     let start = Instant::now();
                     scenario(cmd, black_box(&resources));
                     elapsed = start.elapsed().as_nanos() as u64;
@@ -219,6 +212,6 @@ fn main() {
         let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
         println!("{name:<14} {:>9} {:>9} {:>9}", at(0.5), at(0.1), at(0.9));
     }
-    drop(slots);
+    drop(timeline);
     lava::wait_idle().unwrap();
 }

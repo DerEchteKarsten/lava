@@ -15,6 +15,7 @@ use crate::{
         usage::{BufferUsage, Storage},
     },
     command_buffer::{BufferAccess, CommandBuffer},
+    queue::QueueKind,
     state::Functions,
 };
 
@@ -158,14 +159,14 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
 
 // ---- transfer commands -------------------------------------------------------------------
 
-impl CommandBuffer {
+impl<K: QueueKind> CommandBuffer<K> {
     #[validation_trace]
     pub fn fill_buffer<'a, T: Copy + Pod, U: BufferUsage>(
         &mut self,
         buffer: BufferSlice<'a, T, U>,
         data: u32,
     ) {
-        self.flush_pending(
+        self.rec.flush_pending(
             std::iter::empty(),
             std::iter::once(BufferAccess {
                 access: vk::AccessFlags2::TRANSFER_WRITE,
@@ -175,7 +176,7 @@ impl CommandBuffer {
         );
         unsafe {
             Functions::device_address_commands().cmd_fill_memory(
-                self.handle,
+                self.rec.handle,
                 &buffer.address_range(),
                 buffer.address_flags(),
                 data,
@@ -189,7 +190,7 @@ impl CommandBuffer {
         buffer: BufferSlice<'a, T, U>,
         data: &T,
     ) {
-        self.flush_pending(
+        self.rec.flush_pending(
             iter::empty(),
             iter::once(BufferAccess {
                 stage: vk::PipelineStageFlags2::TRANSFER,
@@ -199,7 +200,7 @@ impl CommandBuffer {
         );
         unsafe {
             Functions::device_address_commands().cmd_update_memory(
-                self.handle,
+                self.rec.handle,
                 &buffer.address_range(),
                 buffer.address_flags(),
                 bytemuck::bytes_of(data),
@@ -242,7 +243,7 @@ impl CommandBuffer {
                 ]
             })
             .collect::<SmallVec<[_; 4]>>();
-        self.flush_pending(iter::empty(), accesses.iter().cloned());
+        self.rec.flush_pending(iter::empty(), accesses.iter().cloned());
         let copies = regions
             .iter()
             .map(|(src, dst)| {
@@ -255,7 +256,7 @@ impl CommandBuffer {
             .collect::<SmallVec<[_; 4]>>();
         unsafe {
             Functions::device_address_commands().cmd_copy_memory(
-                self.handle,
+                self.rec.handle,
                 &vk::CopyDeviceMemoryInfoKHR::default().regions(&copies),
             )
         };

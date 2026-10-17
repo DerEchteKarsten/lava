@@ -1,4 +1,4 @@
-//! Shared harness for lava's GPU tests: one headless context per process (with the features a test binary disables), serialised, validation-checked
+//! Shared harness for lava's GPU tests: one headless context per process (with the features a test binary disables) and its graphics timeline, serialised, validation-checked
 #![allow(dead_code)]
 
 pub mod golden;
@@ -9,8 +9,7 @@ use bytemuck::Pod;
 use lava::{
     buffer::{Buffer, usage::StaticUsage},
     command_buffer::CommandBuffer,
-    epoch,
-    vkobjects::queue::{FrameSlot, Gfx, Queue, SemaphoreInfo},
+    queue::{Graphics, Timeline, Wait},
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
@@ -41,9 +40,12 @@ impl<S: tracing::Subscriber> Layer<S> for ValidationCapture {
     }
 }
 
-/// The process-wide lava context plus the one graphics queue all tests share.
+/// What the tests record into.
+pub type Cmd = CommandBuffer<Graphics>;
+
+/// The process-wide lava context plus the one graphics timeline all tests share.
 pub struct Gpu {
-    pub queue: Queue<Gfx>,
+    pub timeline: Timeline<Graphics>,
 }
 
 /// Starts collecting validation errors; call once, before `lava::init`.
@@ -81,7 +83,7 @@ static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
         "headless lava init failed; the GPU tests need a Vulkan 1.4 GPU and the Khronos validation layer",
     );
     Mutex::new(Gpu {
-        queue: Queue::new(),
+        timeline: Timeline::builder().build().unwrap(),
     })
 });
 
@@ -122,22 +124,19 @@ pub fn gpu() -> GpuGuard {
 
 impl Gpu {
     /// Records one command buffer, submits it, and waits until the GPU has executed it.
-    pub fn submit(&self, record: impl FnOnce(&mut CommandBuffer)) {
-        self.submit_with(&[], &[], record);
+    pub fn submit(&self, record: impl FnOnce(&mut Cmd)) -> Wait {
+        self.submit_after(&[], record)
     }
 
-    pub fn submit_with(
-        &self,
-        wait_on: &[SemaphoreInfo],
-        signal: &[SemaphoreInfo],
-        record: impl FnOnce(&mut CommandBuffer),
-    ) {
-        let mut slot = FrameSlot::new(&self.queue).unwrap();
-        slot.begin(epoch::reserve())
-            .unwrap()
-            .execute(&self.queue, wait_on, signal, record)
-            .unwrap();
-        // Dropping a submitted slot waits for its fence.
+    /// Like [`Self::submit`], after `waits` of other timelines.
+    pub fn submit_after(&self, waits: &[Wait], record: impl FnOnce(&mut Cmd)) -> Wait {
+        let mut submission = self.timeline.reserve().begin().unwrap();
+        for &wait in waits {
+            submission.wait_for(wait);
+        }
+        let done = submission.submit(record).unwrap();
+        done.block().unwrap();
+        done
     }
 }
 

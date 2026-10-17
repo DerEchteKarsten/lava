@@ -90,6 +90,14 @@ impl ImageState {
     }
 }
 
+/// Flags a swapchain image the presentation engine just handed out, or no longer does.
+pub(crate) fn set_acquired(state: &AtomicU64, acquired: bool) {
+    match acquired {
+        true => state.fetch_or(ACQUIRED, Ordering::Relaxed),
+        false => state.fetch_and(!ACQUIRED, Ordering::Relaxed),
+    };
+}
+
 /// Panics unless a recording of `kind` may access an image in state `state`.
 #[track_caller]
 pub(crate) fn check_access(state: ImageState, kind: Kind) {
@@ -156,6 +164,7 @@ pub(crate) fn check_states(states: &[AtomicU64], mips: Range<u32>, kind: Kind) {
 /// checks them all (`check_access`, which panics before any moved, so the barriers logged so far
 /// stay true), then moves each to `layout`, owned by `kind`, and calls `changed(mips, old)` once
 /// per run of neighbouring mips with the same old state that differs from the new one.
+#[cfg(test)]
 #[track_caller]
 pub(crate) fn take_states(
     states: &[AtomicU64],
@@ -165,6 +174,17 @@ pub(crate) fn take_states(
     changed: impl FnMut(Range<u32>, ImageState),
 ) {
     check_states(states, mips, kind);
+    take_checked_states(states, mips, layout, kind, changed);
+}
+
+/// [`take_states`] for states `check_states` checked already.
+pub(crate) fn take_checked_states(
+    states: &[AtomicU64],
+    mips: Range<u32>,
+    layout: vk::ImageLayout,
+    kind: Kind,
+    changed: impl FnMut(Range<u32>, ImageState),
+) {
     let new = ImageState::taken(layout, kind);
     let swap = |state: &AtomicU64| ImageState::unpack(state.swap(new.pack(), Ordering::Relaxed));
     runs(states, mips, new, swap, changed);

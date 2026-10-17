@@ -85,13 +85,13 @@ impl<F: Format + CombinedDepthStencil> ShaderViews<F> for DepthSplitMips {}
 /// ```
 /// # use lava::image::{D2, DepthSplit, Image, format::D32SfloatS8Uint, usage::DepthAttachmentSampled};
 /// fn bind(image: Image<D32SfloatS8Uint, DepthAttachmentSampled, D2, DepthSplit>) {
-///     image.bind_sampled(0);
+///     let _ = image.bind_sampled();
 /// }
 /// ```
 /// ```compile_fail
 /// # use lava::image::{Image, format::D32SfloatS8Uint, usage::DepthAttachmentSampled};
 /// fn bind(image: Image<D32SfloatS8Uint, DepthAttachmentSampled>) {
-///     image.bind_sampled(0);
+///     let _ = image.bind_sampled();
 /// }
 /// ```
 pub trait SampledImage: crate::sealed::Sealed {}

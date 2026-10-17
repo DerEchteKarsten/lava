@@ -1,7 +1,7 @@
 //! Scope observers: what `CommandBuffer::measure` tells when a scope, pass or rendering of a recording is entered and exited, as a tracing subscriber is told about spans, with a recorder that can only record queries there
 use crate::{
     PipelineStageFlags2,
-    command_buffer::{CommandBuffer, query_bit},
+    command_buffer::{Recording, query_bit},
     query::{QueryPool, Scoped, Timestamp},
 };
 
@@ -29,7 +29,7 @@ pub trait ScopeObserver {
 
 /// What a [`ScopeObserver`] can record at the edges of a scope: queries, nothing else.
 pub struct QueryRecorder<'a> {
-    pub(crate) cmd: &'a mut CommandBuffer,
+    pub(crate) cmd: &'a mut Recording,
 }
 
 impl QueryRecorder<'_> {

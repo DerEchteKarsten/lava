@@ -5,14 +5,14 @@
 //! mask skips. Each test skips when the device lacks what it needs.
 mod common;
 
-use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{Affine3A, Quat, UVec2, Vec3};
 use lava::{
     buffer::{
         Buffer,
         usage::{Indirect, Storage},
     },
-    command_buffer::{CommandBuffer, TraceRaysIndirectCommand},
+    command_buffer::TraceRaysIndirectCommand,
     image::{Image, format::R8G8B8A8Unorm, usage::StorageTransferSrcTransferDst},
     query::QueryPool,
     state::Ctx,
@@ -43,7 +43,7 @@ fn target() -> Target {
 /// Lets `record` write `targets` in one submission and reads them back.
 fn render_many<const N: usize>(
     gpu: &common::Gpu,
-    record: impl FnOnce(&mut CommandBuffer, &[Target; N]),
+    record: impl FnOnce(&mut Cmd, &[Target; N]),
 ) -> [Vec<u8>; N] {
     let targets: [Target; N] = std::array::from_fn(|_| target());
     let readbacks: [Buffer<u8>; N] =
@@ -60,7 +60,7 @@ fn render_many<const N: usize>(
     readbacks.map(|readback| readback.host().to_vec())
 }
 
-fn render(gpu: &common::Gpu, record: impl FnOnce(&mut CommandBuffer, &Target)) -> Vec<u8> {
+fn render(gpu: &common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> {
     let [pixels] = render_many(gpu, |cmd, [target]| record(cmd, target));
     pixels
 }
@@ -81,7 +81,7 @@ fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 3]) {
 }
 
 /// The ray query pass's image of `tlas`.
-fn trace_query(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
+fn trace_query(cmd: &mut Cmd, target: &Target, tlas: &Tlas) {
     cmd.compute(
         &TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT).unwrap(),
         [SIZE / 8, SIZE / 8, 1],
@@ -89,7 +89,7 @@ fn trace_query(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
     );
 }
 
-fn trace_pipeline(cmd: &mut CommandBuffer, target: &Target, tlas: &Tlas) {
+fn trace_pipeline(cmd: &mut Cmd, target: &Target, tlas: &Tlas) {
     cmd.raytrace(
         &TestRayTracing::push_bindings(target.whole_view(), tlas, EXTENT).unwrap(),
         [SIZE, SIZE, 1],

@@ -16,16 +16,17 @@ pub(crate) struct PendingAccesses {
     pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
     pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
     pub(crate) image_writes: SmallVec<[PendingWrite<ImageAccess>; 8]>,
-    /// The epoch of the frame being recorded, which the accesses it records are tagged with.
-    pub(crate) epoch: u64,
+    /// The timeline value of the submission being recorded, which the accesses it records are
+    /// tagged with.
+    pub(crate) value: u64,
 }
 
-/// A buffer read later writes may have to wait for, with the epoch of the frame that made it:
-/// once that completed, nothing has to.
+/// A buffer read later writes may have to wait for, with the value of the submission that made
+/// it: once that completed, nothing has to.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingRead {
     pub(crate) read: BufferAccess,
-    pub(crate) epoch: u64,
+    pub(crate) value: u64,
 }
 
 impl std::ops::Deref for PendingRead {
@@ -40,18 +41,18 @@ impl std::ops::Deref for PendingRead {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingWrite<A> {
     pub(crate) write: A,
-    /// The epoch of the frame that made it.
-    pub(crate) epoch: u64,
+    /// The value of the submission that made it.
+    pub(crate) value: u64,
     /// The destination scopes of those barriers: each made the write visible to its accesses
     /// at its stages (every pair of them), but not to its accesses at another barrier's stages.
     pub(crate) visible: SmallVec<[(vk::PipelineStageFlags2, vk::AccessFlags2); 2]>,
 }
 
 impl<A> PendingWrite<A> {
-    pub(crate) fn new(write: A, epoch: u64) -> Self {
+    pub(crate) fn new(write: A, value: u64) -> Self {
         Self {
             write,
-            epoch,
+            value,
             visible: SmallVec::new(),
         }
     }
@@ -137,18 +138,18 @@ impl PendingAccesses {
         }
     }
 
-    /// Drops what the GPU finished, every epoch up to `completed`: the buffer reads, which no
+    /// Drops what the GPU finished, every value of the timeline up to `completed`: the buffer reads, which no
     /// later write has to wait for any more, and, once there are many, the buffer writes, which
     /// later accesses still have to be made visible to: they fold into one write of every
     /// address (`EVERY_BUFFER`). Image accesses stay; there is one of each kind per image.
     pub(crate) fn retire(&mut self, completed: u64) {
-        self.buffer_reads.retain(|read| read.epoch > completed);
+        self.buffer_reads.retain(|read| read.value > completed);
         if self.buffer_writes.len() <= MAX_PENDING_BUFFER_WRITES {
             return;
         }
         let (mut stage, mut access) = (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE);
         self.buffer_writes.retain(|w| {
-            let fold = w.epoch <= completed && w.write.range != EVERY_BUFFER;
+            let fold = w.value <= completed && w.write.range != EVERY_BUFFER;
             if fold {
                 stage |= w.write.stage;
                 access |= w.write.access;
@@ -188,15 +189,6 @@ impl PendingAccesses {
         self.buffer_writes.retain(|write| outside(&write.write));
     }
 
-    /// Adds the accesses of another queue's submissions, which this queue's have to wait for
-    /// too. An access both have is only waited for twice.
-    pub(crate) fn append(&mut self, other: PendingAccesses) {
-        self.buffer_reads.extend(other.buffer_reads);
-        self.image_reads.extend(other.image_reads);
-        self.buffer_writes.extend(other.buffer_writes);
-        self.image_writes.extend(other.image_writes);
-    }
-
     /// Remembers the accesses of a command that was just recorded, so later commands can be
     /// synchronised against them.
     ///
@@ -219,7 +211,7 @@ impl PendingAccesses {
             if writes {
                 self.buffer_writes.retain(|a| !covers(&a.write));
                 self.buffer_writes
-                    .push(PendingWrite::new(access.clone(), self.epoch));
+                    .push(PendingWrite::new(access.clone(), self.value));
                 // An acceleration structure write waited for every read of every structure,
                 // and every later one runs at the same build stage, after that barrier.
                 let structure_write = access
@@ -241,7 +233,7 @@ impl PendingAccesses {
                 });
                 self.buffer_reads.push(PendingRead {
                     read,
-                    epoch: self.epoch,
+                    value: self.value,
                 });
             }
         }
@@ -254,7 +246,7 @@ impl PendingAccesses {
             if writes {
                 self.image_writes.retain(|a| !same_image(&a.write));
                 self.image_writes
-                    .push(PendingWrite::new(access.clone(), self.epoch));
+                    .push(PendingWrite::new(access.clone(), self.value));
                 self.image_reads.retain(|a| !same_image(a));
             }
             if reads {

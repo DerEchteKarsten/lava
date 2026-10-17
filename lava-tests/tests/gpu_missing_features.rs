@@ -4,13 +4,13 @@
 //! but keeps the raster capabilities, so baked polygon modes, blends and logic ops are drawn.
 mod common;
 
-use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     Error, Features,
     buffer::{Buffer, usage::Storage},
     command_buffer::{
-        Attachment, BindingOutput, Blend, CommandBuffer, CullModeFlags, Draw, LogicOp, PolygonMode,
+        Attachment, BindingOutput, Blend, CullModeFlags, Draw, LogicOp, PolygonMode,
         RasterState, kind,
     },
     features::MissingFeature,
@@ -79,7 +79,7 @@ fn missing(feature: &'static str) -> MissingFeature {
 fn render(
     gpu: &common::Gpu,
     clear: [f32; 4],
-    record: impl FnOnce(&mut CommandBuffer, &Target),
+    record: impl FnOnce(&mut Cmd, &Target),
 ) -> Vec<u8> {
     let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
     let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);

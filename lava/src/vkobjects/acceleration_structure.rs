@@ -14,7 +14,8 @@ use crate::{
         usage::{self, BufferUsage, IsStorage},
     },
     command_buffer::{BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE},
-    epoch,
+    lifetime,
+    queue::HasCompute,
     error::Result,
     features::{Feature, gate},
     query::{CompactedSize, QueryPool},
@@ -316,11 +317,11 @@ impl Tlas {
     }
 }
 
-/// Destroyed once no frame can reach it any more (`epoch`).
+/// Destroyed once no submission can reach it any more (`lifetime`).
 impl<L: Level> Drop for AccelerationStructure<L> {
     fn drop(&mut self) {
         let handle = self.handle;
-        epoch::retire(move || {
+        lifetime::retire(move || {
             if let Ok(functions) = functions() {
                 unsafe { functions.destroy_acceleration_structure(handle, None) };
             }
@@ -664,7 +665,7 @@ impl Describe for Instances<'_> {
 
 // ---- commands ---------------------------------------------------------------------------
 
-impl CommandBuffer {
+impl<K: HasCompute> CommandBuffer<K> {
     /// Builds every structure from its geometry in one `vkCmdBuildAccelerationStructuresKHR`,
     /// so the GPU may build them in parallel. Each takes its `build_scratch_size()` of
     /// `scratch` after the previous one's, whose address has to be a multiple of
@@ -768,7 +769,7 @@ impl CommandBuffer {
         if L::TY == vk::AccelerationStructureTypeKHR::TOP_LEVEL {
             accesses.push(every_structure_read(BUILD));
         }
-        self.flush_pending(std::iter::empty(), accesses.iter().cloned());
+        self.rec.flush_pending(std::iter::empty(), accesses.iter().cloned());
 
         let geometries: SmallVec<[SmallVec<[vk::AccelerationStructureGeometryKHR; 1]>; 1]> =
             described
@@ -817,7 +818,7 @@ impl CommandBuffer {
         let ranges: SmallVec<[_; 1]> = ranges.iter().map(|r| r.as_ptr()).collect();
         unsafe {
             (command_functions().fp().cmd_build_acceleration_structures_khr)(
-                self.handle,
+                self.rec.handle,
                 infos.len() as u32,
                 infos.as_ptr(),
                 ranges.as_ptr(),
@@ -845,12 +846,12 @@ impl CommandBuffer {
             "only structures with `allow_compaction` have a compacted size"
         );
         let accesses: SmallVec<[_; 8]> = structures.iter().map(|s| s.access(BUILD, READ)).collect();
-        self.flush_pending(std::iter::empty(), accesses.iter().cloned());
-        sizes.record(self.epoch);
+        self.rec.flush_pending(std::iter::empty(), accesses.iter().cloned());
+        sizes.record(&self.rec);
         let handles: SmallVec<[_; 8]> = structures.iter().map(|s| s.handle).collect();
         unsafe {
             command_functions().cmd_write_acceleration_structures_properties(
-                self.handle,
+                self.rec.handle,
                 &handles,
                 vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
                 sizes.handle,
@@ -876,10 +877,10 @@ impl CommandBuffer {
             "`compact` copies into a structure made by `compacted`"
         );
         let accesses = [src.access(BUILD, READ), dst.access(BUILD, WRITE)];
-        self.flush_pending(std::iter::empty(), accesses.iter().cloned());
+        self.rec.flush_pending(std::iter::empty(), accesses.iter().cloned());
         unsafe {
             command_functions().cmd_copy_acceleration_structure(
-                self.handle,
+                self.rec.handle,
                 &vk::CopyAccelerationStructureInfoKHR::default()
                     .src(src.handle)
                     .dst(dst.handle)

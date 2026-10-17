@@ -20,9 +20,9 @@ use crate::{
         slice::BufferSlice,
         usage::{BufferUsage, StaticUsage, Storage},
     },
-    epoch,
+    lifetime,
+    queue::timeline::forget_buffer,
     state::Ctx,
-    vkobjects::queue::forget_buffer,
 };
 
 pub mod slice;
@@ -57,12 +57,12 @@ impl<T: Copy + Pod, U: BufferUsage> IndexMut<usize> for Buffer<T, U> {
     }
 }
 
-/// Destroyed once no frame can reach it any more (`epoch`).
+/// Destroyed once no submission can reach it any more (`lifetime`).
 impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     fn drop(&mut self) {
         let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
-        let range = self.address..self.address + self.num_bytes;
-        epoch::retire(move || {
+        let range = (self.address..self.address + self.num_bytes).into();
+        lifetime::retire(move || {
             forget_buffer(range);
             unsafe { Ctx::device().destroy_buffer(handle, None) };
             if let Err(err) = Ctx::allocator().free(allocation) {

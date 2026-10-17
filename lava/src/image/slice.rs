@@ -9,6 +9,7 @@ use crate::{
     bindless::BindlessHandle,
     buffer::{slice::BufferSlice, usage::BufferUsage},
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
+    queue::{HasCompute, HasGraphics, QueueKind},
     image::{
         Image, Views,
         dim::{D2, Dim},
@@ -265,7 +266,7 @@ pub enum Filter {
     Liniear = 1,
 }
 
-impl CommandBuffer {
+impl<K: HasCompute> CommandBuffer<K> {
     /// Clears every mip of the view `image` to `clear_color`.
     #[validation_trace]
     pub fn clear_image<T: TransferDstView>(
@@ -276,7 +277,7 @@ impl CommandBuffer {
         let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        self.flush_pending(
+        self.rec.flush_pending(
             std::iter::once(image.access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
@@ -286,7 +287,7 @@ impl CommandBuffer {
         );
         unsafe {
             Ctx::device().cmd_clear_color_image(
-                self.handle,
+                self.rec.handle,
                 image.image,
                 vk::ImageLayout::GENERAL,
                 &vk::ClearValue::from(image.format().clear_value(clear_color)).color,
@@ -294,6 +295,9 @@ impl CommandBuffer {
             )
         };
     }
+}
+
+impl<K: HasGraphics> CommandBuffer<K> {
     /// Blits the box `src` into the box `dst`, scaling it to fit.
     #[validation_trace]
     pub fn blit_image<S: TransferSrcView, T: TransferDstView<Dim = S::Dim>>(
@@ -307,7 +311,7 @@ impl CommandBuffer {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        self.flush_pending(
+        self.rec.flush_pending(
             [
                 src.view.access(
                     vk::PipelineStageFlags2::TRANSFER,
@@ -327,7 +331,7 @@ impl CommandBuffer {
         let regions = [blit_region(&src, &dst)];
         unsafe {
             Ctx::device().cmd_blit_image(
-                self.handle,
+                self.rec.handle,
                 src.view.image,
                 vk::ImageLayout::GENERAL,
                 dst.view.image,
@@ -337,6 +341,9 @@ impl CommandBuffer {
             );
         }
     }
+}
+
+impl<K: QueueKind> CommandBuffer<K> {
     /// Copies the tightly packed texels of `src` into the box `dst`.
     #[validation_trace]
     pub fn copy_buffer_to_image<T: Copy + Pod, BU: BufferUsage, I: TransferDstView>(
@@ -348,7 +355,7 @@ impl CommandBuffer {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         check_copy_size(&dst, src.size(), "source");
-        self.flush_pending(
+        self.rec.flush_pending(
             iter::once(dst.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
@@ -369,7 +376,7 @@ impl CommandBuffer {
             .image_extent(I::Dim::extent_3d(dst.extend))];
         unsafe {
             Functions::device_address_commands().cmd_copy_memory_to_image(
-                self.handle,
+                self.rec.handle,
                 &vk::CopyDeviceMemoryImageInfoKHR::default()
                     .image(dst.view.image)
                     .regions(&regions),
@@ -380,16 +387,16 @@ impl CommandBuffer {
     /// Copies the texels of the box `src` into `dst`, tightly packed row by row (and slice by
     /// slice). It takes a slice, never a view:
     /// ```compile_fail
-    /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer};
+    /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer, queue::Graphics};
     /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::TransferSrc};
-    /// fn copy(cmd: &mut CommandBuffer, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
+    /// fn copy(cmd: &mut CommandBuffer<Graphics>, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
     ///     cmd.copy_image_to_buffer(view, dst);
     /// }
     /// ```
     /// ```
-    /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer};
+    /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer, queue::Graphics};
     /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::TransferSrc};
-    /// fn copy(cmd: &mut CommandBuffer, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
+    /// fn copy(cmd: &mut CommandBuffer<Graphics>, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
     ///     cmd.copy_image_to_buffer(view.whole(), dst);
     /// }
     /// ```
@@ -403,7 +410,7 @@ impl CommandBuffer {
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         check_copy_size(&src, dst.size(), "destination");
-        self.flush_pending(
+        self.rec.flush_pending(
             iter::once(src.view.access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
@@ -424,7 +431,7 @@ impl CommandBuffer {
             .image_extent(I::Dim::extent_3d(src.extend))];
         unsafe {
             Functions::device_address_commands().cmd_copy_image_to_memory(
-                self.handle,
+                self.rec.handle,
                 &vk::CopyDeviceMemoryImageInfoKHR::default()
                     .image(src.view.image)
                     .regions(&regions),

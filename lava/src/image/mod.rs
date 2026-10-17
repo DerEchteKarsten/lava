@@ -14,14 +14,14 @@ use lava_macros::validation_trace;
 use crate::{
     bindless::{self, BindlessHandle, NULL_HANDLE},
     command_buffer::image_state::ImageState,
-    epoch,
     image::{
         format::{Format, StaticFormat, bc_block},
         slice::ImageView,
         usage::{ImageUsage, StaticUsage},
     },
+    lifetime,
+    queue::timeline::forget_image,
     state::Ctx,
-    vkobjects::queue::forget_image,
 };
 
 pub mod dim;
@@ -152,10 +152,10 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
 
 impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
     /// Destroyed after the views: `Image` declares `views` before `raw`, and destructors run
-    /// in drop order (`epoch`).
+    /// in drop order (`lifetime`).
     fn drop(&mut self) {
         let (image, allocation) = (self.image, mem::take(&mut self.allocation));
-        epoch::retire(move || {
+        lifetime::retire(move || {
             forget_image(image);
             unsafe { Ctx::device().destroy_image(image, None) };
             if let Err(err) = Ctx::allocator().free(allocation) {
@@ -395,14 +395,14 @@ fn release(view: vk::ImageView, handle: BindlessHandle) {
 impl Drop for Single {
     fn drop(&mut self) {
         let (view, handle) = (self.view, self.handle);
-        epoch::retire(move || release(view, handle));
+        lifetime::retire(move || release(view, handle));
     }
 }
 
 impl Drop for PerMip {
     fn drop(&mut self) {
         let (view, handle, mips) = (self.view, self.handle, mem::take(&mut self.mips));
-        epoch::retire(move || {
+        lifetime::retire(move || {
             release(view, handle);
             for mip in &mips {
                 release(mip.view, mip.handle);
@@ -421,14 +421,14 @@ fn destroy_views(views: impl IntoIterator<Item = vk::ImageView>) {
 impl Drop for DepthSplit {
     fn drop(&mut self) {
         let shader = self.shader;
-        epoch::retire(move || destroy_views([shader]));
+        lifetime::retire(move || destroy_views([shader]));
     }
 }
 
 impl Drop for DepthSplitMips {
     fn drop(&mut self) {
         let (shader, mips) = (self.shader, mem::take(&mut self.mip_shaders));
-        epoch::retire(move || destroy_views(iter::once(shader).chain(mips)));
+        lifetime::retire(move || destroy_views(iter::once(shader).chain(mips)));
     }
 }
 

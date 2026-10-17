@@ -393,7 +393,7 @@ impl PipelineManager {
     }
 
     /// Replaces the pass's module and every pipeline made from it. A replaced pipeline is
-    /// destroyed once no frame can use it (`epoch`). If the driver rejects the module or one
+    /// destroyed once no submission can use it (`lifetime`). If the driver rejects the module or one
     /// of the pipelines, nothing is replaced: every new pipeline is made before any is swapped
     /// in, and no lock is held while one fails. A pass the device can't run is skipped.
     fn reload_pass(&self, pass_index: usize, spirv: &[u8]) -> Result<()> {
@@ -478,7 +478,7 @@ impl Into<vk::Pipeline> for RaytracingPipeline {
 /// Destroys `pipelines` once no frame can use them any more.
 fn retire<P: Into<vk::Pipeline> + Send + 'static>(pipelines: impl IntoIterator<Item = P>) {
     let pipelines: Vec<P> = pipelines.into_iter().collect();
-    crate::epoch::retire(move || {
+    crate::lifetime::retire(move || {
         pipelines
             .into_iter()
             .for_each(|i| unsafe { Ctx::device().destroy_pipeline(i.into(), None) })

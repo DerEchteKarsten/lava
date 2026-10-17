@@ -1,8 +1,8 @@
-//! GPU queries: user-owned pools of one kind each (timestamps, and with their features pipeline statistics, occlusion, hardware counters, compacted sizes), reset on the host when a recording first touches them, read without waiting, and destroyed once no frame can reach them
+//! GPU queries: user-owned pools of one kind each (timestamps, and with their features pipeline statistics, occlusion, hardware counters, compacted sizes), reset on the host when a recording first touches them, read without waiting, and destroyed once no submission can reach them
 //!
 //! A pool holds the results of one recording. The first command of a recording that touches a
-//! pool resets it on the host, which needs the frames that recorded into it before to be done:
-//! keep one pool per frame in flight. Its results are readable once that recording finished
+//! pool resets it on the host, which needs the recording that touched it before to be done:
+//! keep one pool per frame slot (`Submission::slot`). Its results are readable once that recording finished
 //! ([`QueryPool::read`] never waits). A [`ScopeObserver`] that `CommandBuffer::measure` attaches
 //! can record queries at the edges of every scope and pass of a recording.
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,9 +13,11 @@ use crate::vk;
 
 #[allow(unused_imports)]
 use crate::{
-    epoch,
+    command_buffer::Recording,
     error::{Error, Result},
     features::{Feature, Gated, gate},
+    lifetime,
+    queue::{Kind, timeline::poll},
     sealed::Sealed,
     state::{Ctx, Functions},
 };
@@ -40,6 +42,11 @@ pub(crate) fn init() -> Result<()> {
 pub trait QueryKind: Sealed {
     #[doc(hidden)]
     const TYPE: vk::QueryType;
+    /// Panics unless a recording on a family of `kind` may begin a query of this pool.
+    #[doc(hidden)]
+    fn check_kind(&self, kind: Kind) {
+        let _ = kind;
+    }
 }
 
 /// Kinds whose queries are begun and ended around commands (`CommandBuffer::query`).
@@ -98,14 +105,43 @@ kinds! {
     Timestamp: TIMESTAMP + SingleValue;
     Occlusion: OCCLUSION + SingleValue;
 }
+
+/// The statistics only graphics work counts.
 #[cfg(feature = "pipeline-statistics")]
-kinds! {
-    PipelineStatistics: PIPELINE_STATISTICS + Scoped;
+const GRAPHICS_STATISTICS: vk::QueryPipelineStatisticFlags = vk::QueryPipelineStatisticFlags::from_raw(
+    !vk::QueryPipelineStatisticFlags::COMPUTE_SHADER_INVOCATIONS.as_raw(),
+);
+
+#[cfg(feature = "pipeline-statistics")]
+impl Sealed for PipelineStatistics {}
+#[cfg(feature = "pipeline-statistics")]
+impl QueryKind for PipelineStatistics {
+    const TYPE: vk::QueryType = vk::QueryType::PIPELINE_STATISTICS;
+    fn check_kind(&self, kind: Kind) {
+        assert!(
+            kind == Kind::Graphics || !self.flags.intersects(GRAPHICS_STATISTICS),
+            "pipeline statistics of graphics stages are counted on the graphics family, not {kind:?}"
+        );
+    }
+}
+#[cfg(feature = "pipeline-statistics")]
+impl Scoped for PipelineStatistics {}
+
+#[cfg(feature = "performance-query")]
+impl Sealed for Performance {}
+#[cfg(feature = "performance-query")]
+impl QueryKind for Performance {
+    const TYPE: vk::QueryType = vk::QueryType::PERFORMANCE_QUERY_KHR;
+    fn check_kind(&self, kind: Kind) {
+        assert_eq!(
+            kind,
+            Kind::Graphics,
+            "hardware counters are only recorded on the graphics family"
+        );
+    }
 }
 #[cfg(feature = "performance-query")]
-kinds! {
-    Performance: PERFORMANCE_QUERY_KHR + Scoped;
-}
+impl Scoped for Performance {}
 #[cfg(feature = "acceleration-structure")]
 kinds! {
     CompactedSize: ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR + SingleValue;
@@ -126,8 +162,9 @@ impl Scoped for Occlusion {
 pub struct QueryPool<K: QueryKind> {
     pub(crate) handle: vk::QueryPool,
     count: u32,
-    /// The epoch of the recording that last touched it, 0 for none.
-    epoch: AtomicU64,
+    /// The recording that last touched it: its value shifted past its timeline's 3 bits, 0 for
+    /// none.
+    last: AtomicU64,
     pub(crate) kind: K,
 }
 
@@ -142,7 +179,7 @@ impl<K: QueryKind> QueryPool<K> {
         Ok(Self {
             handle,
             count,
-            epoch: AtomicU64::new(0),
+            last: AtomicU64::new(0),
             kind,
         })
     }
@@ -152,16 +189,19 @@ impl<K: QueryKind> QueryPool<K> {
     }
 
     /// Called by every command that touches the pool: resets it on the host the first time a
-    /// recording does, which needs the recordings before to be done.
-    pub(crate) fn record(&self, epoch: u64) {
-        let last = self.epoch.swap(epoch, Ordering::Relaxed);
-        if last == epoch {
+    /// recording does, which needs the recording before to be done.
+    pub(crate) fn record(&self, rec: &Recording) {
+        const _: () = assert!(crate::queue::MAX_TIMELINES <= 8);
+        let packed = rec.value << 3 | rec.timeline as u64;
+        let last = self.last.swap(packed, Ordering::Relaxed);
+        if last == packed {
             return;
         }
+        let (timeline, value) = ((last & 7) as usize, last >> 3);
         assert!(
-            last <= epoch::completed(),
-            "a query pool is recorded into while an earlier frame that recorded into it still runs: \
-             keep one pool per frame in flight"
+            last == 0 || poll(timeline) >= value,
+            "a query pool is recorded into while an earlier submission that recorded into it \
+             still runs: keep one pool per frame slot"
         );
         unsafe { Ctx::device().reset_query_pool(self.handle, 0, self.count) };
     }
@@ -221,13 +261,11 @@ impl QueryPool<Timestamp> {
         Self::create(count, vk::QueryPoolCreateInfo::default(), kind)
     }
 
-    /// Resets the pool if needed, and remembers the valid bits of `family`, which writes it.
-    pub(crate) fn record_on(&self, epoch: u64, family: u32) {
-        self.record(epoch);
-        let bits = Ctx::physical_device().queue_families[family as usize]
-            .handel
-            .timestamp_valid_bits;
-        assert!(bits > 0, "queue family {family} has no timestamps");
+    /// Resets the pool if needed, and remembers the valid bits of the family `rec` records
+    /// for, `bits`.
+    pub(crate) fn record_on(&self, rec: &Recording, bits: u32) {
+        self.record(rec);
+        assert!(bits > 0, "the {:?} family has no timestamps", rec.kind);
         let mask = if bits >= 64 { !0 } else { (1 << bits) - 1 };
         self.kind.valid_bits.store(mask, Ordering::Relaxed);
     }
@@ -443,7 +481,7 @@ impl QueryPool<CompactedSize> {
 impl<K: QueryKind> Drop for QueryPool<K> {
     fn drop(&mut self) {
         let (pool, locked) = (self.handle, K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR);
-        epoch::retire(move || {
+        lifetime::retire(move || {
             unsafe { Ctx::device().destroy_query_pool(pool, None) };
             #[cfg(feature = "performance-query")]
             if locked {

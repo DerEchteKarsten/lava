@@ -5,7 +5,7 @@
 // Needed to call `RasterBuilder`'s attachment and draw methods, which return it one larger.
 mod common;
 
-use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{IVec2, UVec2, UVec3, Vec2, Vec4};
 use lava::{
     bindless::{BindlessHandle, NULL_HANDLE, max_sampled_images, max_storage_images},
@@ -15,12 +15,11 @@ use lava::{
     },
     command_buffer::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
-        BufferAccess, ColorComponentFlags, CommandBuffer, CompareOp, CullModeFlags,
+        BufferAccess, ColorComponentFlags, CompareOp, CullModeFlags,
         DispatchIndirectCommand, Draw, DrawIndirectCommand, FrontFace, ImageUse, LogicOp,
         PolygonMode, PrimitiveTopology, RasterState, Scissor, Stencil, StencilFace, StencilOp,
         Viewport, kind,
     },
-    epoch,
     image::{
         D2, D3, DepthSplit, Image, MipChain,
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
@@ -38,9 +37,8 @@ use lava::{
         Performance, PipelineStatistics, PipelineStats, QueryPipelineStatisticFlags as Statistics,
         QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Timestamp, counters,
     },
-    queue::{Kind, MAX_TIMELINES},
+    queue::{Graphics, Kind, MAX_TIMELINES, Stage, Timeline},
     state::Ctx,
-    vkobjects::queue::{Binary, FrameSlot, Gfx, Queue, Semaphore, Timeline},
 };
 use lava_tests::bindings::{
     PASS_MAP, TestClock, TestClocks, TestComputeBuffer, TestComputeImage, TestComputeVolume,
@@ -58,7 +56,7 @@ const BLACK: [u8; 4] = [0, 0, 0, 255];
 type Target = Image<R8G8B8A8Unorm, ColorAttachmentStorageTransferSrcTransferDst>;
 
 /// Clears a fresh target to opaque black, lets `record` draw into it, and reads it back.
-fn render(gpu: &common::Gpu, record: impl FnOnce(&mut CommandBuffer, &Target)) -> Vec<u8> {
+fn render(gpu: &common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> {
     let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
     let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);
     gpu.submit(|cmd| {
@@ -202,104 +200,51 @@ fn indexing_past_the_buffer_panics() {
     let _ = buffer[4];
 }
 
-// ---- queues and synchronisation --------------------------------------------------------------
-
-#[test]
-fn timeline_semaphore_reaches_the_signalled_value() {
-    let gpu = gpu();
-    let semaphore = Semaphore::<Timeline>::new().unwrap();
-    let buffer = zeroed_buffer::<u32, Storage>(4);
-    gpu.submit_with(&[], &[semaphore.info(3)], |cmd| {
-        cmd.fill_buffer(buffer.range(..), 1)
-    });
-    semaphore.block_until_value(3).unwrap();
-    // Earlier values count as reached too.
-    semaphore.block_until_value(1).unwrap();
-}
-
-#[test]
-fn binary_semaphore_orders_two_submissions() {
-    let gpu = gpu();
-    let semaphore = Semaphore::<Binary>::new().unwrap();
-    let buffer = zeroed_buffer::<u32, Storage>(4);
-    gpu.submit_with(&[], &[semaphore.info()], |cmd| {
-        cmd.fill_buffer(buffer.range(..), 1)
-    });
-    gpu.submit_with(&[semaphore.info()], &[], |cmd| {
-        cmd.fill_buffer(buffer.range(2..), 2)
-    });
-    assert_eq!(buffer.host(), [1, 1, 2, 2]);
-}
+// ---- timelines and lifetimes -----------------------------------------------------------------
 
 #[test]
 fn more_threads_than_queues_submit_in_parallel() {
     let _gpu = gpu();
-    let threads = Ctx::queue_count(Kind::Graphics) as usize + 1;
+    // One timeline per thread, more than there are queues where the timelines allow it.
+    let threads = (Ctx::queue_count(Kind::Graphics) as usize + 1).min(MAX_TIMELINES - 1);
     let barrier = std::sync::Barrier::new(threads);
     std::thread::scope(|scope| {
         for value in 0..threads as u32 {
             let barrier = &barrier;
             scope.spawn(move || {
                 let buffer = zeroed_buffer::<u32, Storage>(4);
-                let queue = Queue::<Gfx>::new();
-                let mut slot = FrameSlot::new(&queue).unwrap();
+                let timeline = Timeline::<Graphics>::builder().build().unwrap();
                 barrier.wait();
-                slot.begin(epoch::reserve())
-                    .unwrap()
-                    .execute(&queue, &[], &[], |cmd| {
-                        cmd.fill_buffer(buffer.range(..), value)
-                    })
+                let submission = timeline.reserve().begin().unwrap();
+                let done = submission
+                    .submit(|cmd| cmd.fill_buffer(buffer.range(..), value))
                     .unwrap();
-                drop(slot);
+                done.block().unwrap();
                 assert_eq!(buffer.host(), [value; 4]);
             });
         }
     });
 }
 
+/// A timeline's frame slots take turns, and what a submission used lives until the GPU
+/// finished it, also when it is dropped while the submission records or right after it was
+/// submitted. Destroying it earlier is a validation error, which fails the test.
 #[test]
-fn a_reselected_lease_keeps_its_frame_slots_usable() {
-    let _gpu = gpu();
-    let buffer = zeroed_buffer::<u32, Storage>(4);
-    // With every queue leased once more, the last lease shares one.
-    let others: Vec<Queue<Gfx>> = (0..Ctx::queue_count(Kind::Graphics)).map(|_| Queue::new()).collect();
-    let mut queue = Queue::<Gfx>::new();
-    let mut slot = FrameSlot::new(&queue).unwrap();
-    slot.begin(epoch::reserve())
-        .unwrap()
-        .execute(&queue, &[], &[], |cmd| cmd.fill_buffer(buffer.range(..), 1))
-        .unwrap();
-    drop(others);
-    queue.reselect().unwrap();
-    assert!(queue.is_optimal());
-    slot.begin(epoch::reserve())
-        .unwrap()
-        .execute(&queue, &[], &[], |cmd| {
-            cmd.fill_buffer(buffer.range(2..), 2)
-        })
-        .unwrap();
-    drop(slot);
-    assert_eq!(buffer.host(), [1, 1, 2, 2]);
-}
-
-/// What a frame used lives until the GPU finished the frame, also when it is dropped while
-/// the frame records or right after it was submitted. Destroying it earlier is a validation
-/// error, which fails the test.
-#[test]
-fn frame_slot_can_be_reused_and_what_its_frame_used_lives_until_the_frame_is_done() {
+fn frame_slots_cycle_and_what_a_submission_used_lives_until_it_is_done() {
     let gpu = gpu();
     let buffer = zeroed_buffer::<u32, Storage>(4);
-    let mut slot = FrameSlot::new(&gpu.queue).unwrap();
-
-    for value in 1..=3 {
+    let mut slots = Vec::new();
+    let mut last = None;
+    for value in 1..=4 {
         let scratch = zeroed_buffer::<u32, Storage>(1024);
         let image =
             Image::<R8G8B8A8Unorm, StorageTransferSrcTransferDst>::new(UVec2::new(64, 64)).unwrap();
         let recording = zeroed_buffer::<u32, Storage>(4);
         let buffer = &buffer;
-        slot.begin(epoch::reserve())
-            .unwrap()
-            .execute(&gpu.queue, &[], &[], move |cmd| {
+        let submission = gpu.timeline.reserve().begin().unwrap();
+        slots.push(submission.slot());
+        let done = submission
+            .submit(move |cmd| {
                 cmd.fill_buffer(recording.range(..), value);
                 drop(recording);
                 cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.0, 1.0]);
@@ -308,14 +253,18 @@ fn frame_slot_can_be_reused_and_what_its_frame_used_lives_until_the_frame_is_don
                 drop((scratch, image));
             })
             .unwrap();
+        last = Some(done);
     }
-    drop(slot);
-    assert_eq!(buffer.host(), [3; 4]);
+    last.unwrap().block().unwrap();
+    assert_eq!(slots[0], slots[2]);
+    assert_eq!(slots[1], slots[3]);
+    assert_ne!(slots[0], slots[1]);
+    assert_eq!(buffer.host(), [4; 4]);
 }
 
 /// A recording that panics already moved the image's tracked layout to `GENERAL`: its barriers
-/// are submitted instead, so the next frame finds the image in the layout lava tracks (a
-/// mismatch is a validation error), and the queue's pending accesses aren't poisoned.
+/// are submitted instead, so the next submission finds the image in the layout lava tracks (a
+/// mismatch is a validation error), and the timeline's pending accesses aren't poisoned.
 #[test]
 fn a_panicking_recording_still_makes_its_layout_transitions() {
     let gpu = gpu();
@@ -330,41 +279,36 @@ fn a_panicking_recording_still_makes_its_layout_transitions() {
     }));
     assert!(panicked.is_err());
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
-    // Destroying it locks every queue's pending accesses.
+    // Destroying it locks every timeline's pending accesses.
     drop(image);
     gpu.submit(|cmd| cmd.fill_buffer(readback.range(..), 0));
 }
 
-/// A slot that isn't begun again keeps its frame's epoch, which completes once the frame's
-/// fence signalled anyway: one idle slot doesn't hold back every later destruction.
+/// A stamp completes once its submissions are done, without any later submission.
 #[test]
-fn an_idle_frame_slot_completes_its_epoch_once_the_frame_is_done() {
+fn stamps_complete_without_further_submissions() {
     let gpu = gpu();
     let buffer = zeroed_buffer::<u32, Storage>(4);
-    let done = Semaphore::<Timeline>::new().unwrap();
-    let mut idle = FrameSlot::new(&gpu.queue).unwrap();
-    let epoch = epoch::reserve();
-    let value = epoch.value();
-    idle.begin(epoch)
-        .unwrap()
-        .execute(&gpu.queue, &[], &[done.info(1)], |cmd| {
-            cmd.fill_buffer(buffer.range(..), 7)
-        })
+    let submission = gpu.timeline.reserve().begin().unwrap();
+    let stamp = lava::latest_stamp();
+    let done = submission
+        .submit(|cmd| cmd.fill_buffer(buffer.range(..), 7))
         .unwrap();
-    done.block_until_value(1).unwrap();
-    assert!(epoch::completed() >= value);
-    drop(idle);
+    done.block().unwrap();
+    assert!(done.is_done());
+    assert!(stamp.is_done());
 }
 
-/// Dropping an epoch while recording would run destructors there, which lock the pending
-/// accesses the recording holds: they wait for the recording instead of deadlocking.
+/// Dropping a reservation while recording would run destructors there, which lock the
+/// pending accesses the recording holds: they wait for the recording instead of deadlocking.
 #[test]
-fn an_epoch_dropped_while_recording_runs_no_destructors_there() {
+fn a_reservation_dropped_while_recording_runs_no_destructors_there() {
     let gpu = gpu();
-    let earlier = epoch::reserve();
+    let other = Timeline::<Graphics>::builder().build().unwrap();
+    let earlier = other.reserve();
     let image =
         Image::<R8G8B8A8Unorm, StorageTransferSrcTransferDst>::new(UVec2::new(8, 8)).unwrap();
-    // Destroyed once `earlier` completes.
+    // Destroyed once `earlier` is signalled.
     drop(image);
     let buffer = zeroed_buffer::<u32, Storage>(4);
     gpu.submit(|cmd| {
@@ -374,8 +318,120 @@ fn an_epoch_dropped_while_recording_runs_no_destructors_there() {
     assert_eq!(buffer.host(), [1; 4]);
 }
 
+/// One timeline's submission waits on the GPU for another's.
+#[test]
+fn a_submission_waits_for_another_timelines() {
+    let gpu = gpu();
+    let other = Timeline::<Graphics>::builder().build().unwrap();
+    let (src, dst) = (zeroed_buffer::<u32, Storage>(4), zeroed_buffer::<u32, Storage>(4));
+    let own = gpu.submit(|_| {});
+    // Neither submission is waited for on the host before the second is made.
+    let filled = (other.reserve().begin().unwrap())
+        .submit(|cmd| cmd.fill_buffer(src.range(..), 9))
+        .unwrap();
+    let mut copy = gpu.timeline.reserve().begin().unwrap();
+    copy.wait_for(filled.at(Stage::Transfer));
+    // A wait on its own timeline is dropped: its submissions run in order anyway.
+    copy.wait_for(own);
+    let copied = copy
+        .submit(|cmd| cmd.copy_buffer(src.range(..), dst.range(..)))
+        .unwrap();
+    copied.block().unwrap();
+    assert!(filled.is_done());
+    assert_eq!(dst.host(), [9; 4]);
+}
+
+/// Values are submitted in the order they were reserved: a later one first panics, and is
+/// then signalled with the one before it.
+#[test]
+fn submitting_out_of_order_panics() {
+    let _gpu = gpu();
+    let timeline = Timeline::<Graphics>::builder().build().unwrap();
+    let (first, second) = (timeline.reserve(), timeline.reserve());
+    let second = second.begin().unwrap();
+    let value = second.value();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        second.submit(|_| {})
+    }));
+    assert!(panicked.is_err());
+    let done = first.begin().unwrap().submit(|_| {}).unwrap();
+    done.block().unwrap();
+    // The panicking value was dropped, so the first one's submission signalled it too.
+    let next = timeline.reserve();
+    assert_eq!(next.value(), value + 1);
+    next.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
+}
+
+/// A dropped reservation is signalled in order, so the values after it begin and complete.
+#[test]
+fn dropped_reservations_are_signalled() {
+    let _gpu = gpu();
+    let timeline = Timeline::<Graphics>::builder().in_flight(1).build().unwrap();
+    let (dropped, kept) = (timeline.reserve(), timeline.reserve());
+    // With one frame in flight, `kept` begins once `dropped` is done, which isn't submitted.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(timeline.reserve().begin())
+    }));
+    assert!(refused.is_err(), "begin waits for a value nobody submitted");
+    drop(dropped);
+    let done = kept.begin().unwrap().submit(|_| {}).unwrap();
+    done.block().unwrap();
+    // The reservation the refused `begin` dropped is signalled with the next submission.
+    let after = timeline.reserve().begin().unwrap().submit(|_| {}).unwrap();
+    after.block().unwrap();
+}
+
+/// What is dropped while another timeline holds a reservation lives until that one is done
+/// too: its slot isn't free before.
+#[test]
+fn deletions_wait_for_every_timeline() {
+    let gpu = gpu();
+    let other = Timeline::<Graphics>::builder().build().unwrap();
+    lava::wait_idle().unwrap();
+    let bind = || {
+        Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::new(4, 4))
+            .unwrap()
+            .bind_sampled()
+            .unwrap()
+    };
+    let held = other.reserve();
+    let image = bind();
+    let slot = image.handle();
+    drop(image);
+    gpu.submit(|_| {});
+    let unrelated = bind();
+    assert_ne!(unrelated.handle(), slot, "the other timeline may still read it");
+    let done = held.begin().unwrap().submit(|_| {}).unwrap();
+    done.block().unwrap();
+    gpu.submit(|_| {});
+    assert_eq!(bind().handle(), slot);
+}
+
+/// `MAX_TIMELINES` exist at most; a dropped one's semaphore goes to the next, whose values go
+/// on, so a `Wait` of the old one stays done.
+#[test]
+fn timelines_are_limited_and_reused() {
+    let _gpu = gpu();
+    let mut timelines = Vec::new();
+    let error = loop {
+        match Timeline::<Graphics>::builder().in_flight(1).build() {
+            Ok(timeline) => timelines.push(timeline),
+            Err(error) => break error,
+        }
+    };
+    assert!(matches!(error, lava::Error::OutOfTimelines), "{error}");
+    assert!(timelines.len() < MAX_TIMELINES, "the harness holds one");
+    let last = timelines.pop().unwrap();
+    let done = last.reserve().begin().unwrap().submit(|_| {}).unwrap();
+    drop(last);
+    let reused = Timeline::<Graphics>::builder().build().unwrap();
+    assert!(done.is_done());
+    let next = reused.reserve();
+    next.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
+}
+
 /// A group of two compute passes, then a rendering if the device has mesh shaders.
-fn record_profiled(cmd: &mut CommandBuffer, target: &Target) {
+fn record_profiled(cmd: &mut Cmd, target: &Target) {
     cmd.scope("group", |cmd| {
         for color in [Vec4::ONE, Vec4::ZERO] {
             cmd.compute(
@@ -1111,7 +1167,7 @@ fn compute_image_bindings<'a>(
     target: &'a Target,
     offset: UVec2,
     size: UVec2,
-) -> impl FnOnce(&mut CommandBuffer) + 'a {
+) -> impl FnOnce(&mut Cmd) + 'a {
     move |cmd| {
         cmd.compute(
             &TestComputeImage::push_bindings(

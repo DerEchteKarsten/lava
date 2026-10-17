@@ -10,10 +10,10 @@ use bytemuck::{Pod, Zeroable};
 use lava_macros::validation_trace;
 
 use crate::{
-    epoch,
     image::{Dim, format::Format, slice::ImageView, usage::ImageUsage},
+    lifetime,
     pipeline::MAX_PUSH_CONSTANTS_SIZE,
-    queue::lock,
+    queue::{Kind, lock},
     state::Ctx,
 };
 
@@ -155,7 +155,8 @@ pub(crate) fn free_handle(handle: BindlessHandle) {
 
 /// Slots of one set the application writes itself with [`bind`], e.g. one per texture asset:
 /// [`reserve_sampled`] and [`reserve_storage`] make them. Its slots are free again once it is
-/// dropped and no frame reaches them any more (`epoch`); [`bind`] refuses them right away.
+/// dropped and no submission reaches them any more (`lifetime`); [`bind`] refuses them right
+/// away.
 #[derive(Debug)]
 #[must_use]
 pub struct SlotRange {
@@ -196,7 +197,7 @@ impl Drop for SlotRange {
         if let Some(i) = reserved.iter().position(|r| *r == range) {
             reserved.swap_remove(i);
         }
-        epoch::retire(move || free(set, range));
+        lifetime::retire(move || free(set, range));
     }
 }
 
@@ -571,11 +572,10 @@ impl Bindless {
         Ok(())
     }
 
-    /// Binds the sets at the bind points a queue family of `flags` has: none on a
-    /// transfer-only family.
-    pub(crate) fn bind(cmd: &vk::CommandBuffer, flags: vk::QueueFlags) {
+    /// Binds the sets at the bind points a family of `kind` has: none on a transfer family.
+    pub(crate) fn bind(cmd: &vk::CommandBuffer, kind: Kind) {
         let s = Self::get();
-        if !flags.contains(vk::QueueFlags::COMPUTE) {
+        if kind == Kind::Transfer {
             return;
         }
         unsafe {
@@ -600,7 +600,7 @@ impl Bindless {
                 )
             };
         }
-        if !flags.contains(vk::QueueFlags::GRAPHICS) {
+        if kind != Kind::Graphics {
             return;
         }
         unsafe {

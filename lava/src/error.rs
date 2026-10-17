@@ -17,6 +17,8 @@ pub enum Error {
     MissingFeature(MissingFeature),
     /// A bindless set has no `count` contiguous free slots (`set`: "sampled" or "storage").
     OutOfBindlessSlots { set: &'static str, count: u32 },
+    /// `queue::MAX_TIMELINES` timelines exist already.
+    OutOfTimelines,
 }
 
 impl Error {
@@ -39,6 +41,11 @@ impl fmt::Display for Error {
             Error::OutOfBindlessSlots { set, count } => {
                 write!(f, "the bindless {set} set has no {count} contiguous free slots")
             }
+            Error::OutOfTimelines => write!(
+                f,
+                "{} timelines exist already, the most lava has",
+                crate::queue::MAX_TIMELINES
+            ),
         }
     }
 }
@@ -54,7 +61,7 @@ impl std::error::Error for Error {
             Error::Message(_) => None,
             Error::Lock => None,
             Error::MissingFeature(missing) => Some(missing),
-            Error::OutOfBindlessSlots { .. } => None,
+            Error::OutOfBindlessSlots { .. } | Error::OutOfTimelines => None,
         }
     }
 }

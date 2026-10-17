@@ -26,7 +26,11 @@ use crate::{
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
-    queue::Kind,
+    present::{
+        self,
+        table::{AcquireWait, PresentSignal},
+    },
+    queue::{HasCompute, HasGraphics, Kind, QueueKind},
     state::{Ctx, Functions},
 };
 #[cfg(feature = "acceleration-structure")]
@@ -42,7 +46,9 @@ pub(crate) mod pending;
 mod raster_state;
 use crate::unsized_struct::unsized_struct;
 use binding_output::Sections;
-use image_state::{ImageState, check_states, take_states};
+#[cfg(test)]
+use image_state::take_states;
+use image_state::{ImageState, check_states, take_checked_states};
 use pending::{PendingAccesses, all_read_access, all_write_access};
 pub use binding_output::{BindingOutput, Bindings, kind};
 pub use raster_state::*;
@@ -115,6 +121,7 @@ impl ImageUse<'_> {
     /// Takes the tracked states of the access's mips for a recording on a family of `kind`
     /// (`image_state::take_states`): they move to the layout it asks for, owned by `kind`, and
     /// `changed(mips, old)` is called per run of neighbouring mips whose old state differed.
+    #[cfg(test)]
     #[track_caller]
     pub(crate) fn take_states(&self, kind: Kind, changed: impl FnMut(Range<u32>, ImageState)) {
         let access = &self.access;
@@ -128,61 +135,50 @@ impl ImageUse<'_> {
     }
 }
 
-pub struct CommandBuffer {
+/// What a command buffer being recorded keeps, whatever kind of family it is for: the tracking
+/// of its accesses and the scopes and queries it is inside.
+pub(crate) struct Recording {
     pub(crate) handle: vk::CommandBuffer,
     /// The kind of family it records for, which takes the images it accesses.
     pub(crate) kind: Kind,
     pub(crate) pending_accesses: PendingAccesses,
-    /// The epoch of the frame being recorded, which the query pools it touches remember.
-    pub(crate) epoch: u64,
-    pub(crate) family: u32,
+    /// The timeline it is submitted on and its value, which the query pools it touches
+    /// remember.
+    pub(crate) timeline: usize,
+    pub(crate) value: u64,
+    /// Its family's timestamp bits.
+    timestamp_valid_bits: u32,
     /// What `measure` attached, for the duration of its closure (its lifetime erased).
     observer: Option<NonNull<dyn ScopeObserver>>,
     /// How many scopes the observer is inside.
     depth: u16,
     /// The kinds of the active queries (`query_bit`): one of each can be active.
     pub(crate) active_queries: u32,
-    /// What the queue family can do.
-    caps: QueueCaps,
-    /// Every barrier computed so far, in order: the tracking already counts them (layouts
+    /// Every barrier computed so far, in order: the tracking already counts them (states
     /// moved, accesses recorded), so a recording that never reaches the GPU is replaced by one
-    /// of just these (`FrameSlot`), which keeps the tracking true.
+    /// of just these (`queue::submit`), which keeps the tracking true.
     pub(crate) barrier_log: Vec<Barriers>,
+    /// The acquired swapchain images it accessed: the submission waits for their acquires.
+    pub(crate) acquire_waits: SmallVec<[AcquireWait; 1]>,
+    /// The swapchain images it presented: the submission signals their present semaphores.
+    pub(crate) presents: SmallVec<[PresentSignal; 1]>,
 }
 
-/// What a queue family can record, which `CommandBuffer` isn't typed by.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct QueueCaps {
-    pub(crate) flags: vk::QueueFlags,
-    /// Images are `EXCLUSIVE` to the graphics family, and lava records no ownership
-    /// transfers, so only it may access them.
-    pub(crate) images: bool,
+/// A command buffer being recorded for a family of kind `K`, which `Submission::submit` lends
+/// its closure: the commands `K` can run are its methods. Renderings, blits and presents need
+/// `K: HasGraphics`; dispatches, traces, acceleration structure commands and image clears
+/// `K: HasCompute`; copies, fills, updates, timestamps, queries and scopes work on every kind.
+pub struct CommandBuffer<K: QueueKind> {
+    pub(crate) rec: Recording,
+    _kind: PhantomData<fn() -> K>,
 }
 
-impl QueueCaps {
-    /// A graphics family's: everything.
-    #[cfg(test)]
-    pub(crate) const ALL: QueueCaps = QueueCaps {
-        flags: vk::QueueFlags::from_raw(
-            vk::QueueFlags::GRAPHICS.as_raw() | vk::QueueFlags::COMPUTE.as_raw(),
-        ),
-        images: true,
-    };
-
-    fn require(&self, flags: vk::QueueFlags, what: &str) {
-        assert!(
-            self.flags.contains(flags),
-            "{what} can't be recorded on a queue family of {:?}",
-            self.flags
-        );
-    }
-
-    fn require_images(&self) {
-        assert!(
-            self.images,
-            "images are only accessed on the graphics family (`Queue<Gfx>`): they are \
-             exclusive to it, and lava records no ownership transfers"
-        );
+impl<K: QueueKind> CommandBuffer<K> {
+    pub(crate) fn new(rec: Recording) -> Self {
+        Self {
+            rec,
+            _kind: PhantomData,
+        }
     }
 }
 
@@ -208,7 +204,7 @@ const INLINE_DRAWS: usize = 16;
 /// One rendering being built (`CommandBuffer::raster`): its `N` color attachments, an optional
 /// depth attachment and the draws so far, which it borrows and [`Self::record`] records.
 pub struct RasterBuilder<'a, const N: usize> {
-    cmd_buf: &'a mut CommandBuffer,
+    cmd_buf: &'a mut Recording,
     extent: UVec2,
     viewport: Viewport,
     scissors: SmallVec<[vk::Rect2D; 1]>,
@@ -894,7 +890,7 @@ fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<'_, T, U>) 
     )
 }
 
-impl CommandBuffer {
+impl<K: HasGraphics> CommandBuffer<K> {
     /// Starts a rendering of the area `extent` into the `color` attachments, with viewport and
     /// scissor covering it. Every draw has a blend per color attachment.
     pub fn raster<'a, const N: usize>(
@@ -902,9 +898,8 @@ impl CommandBuffer {
         extent: UVec2,
         color: [Attachment<'a>; N],
     ) -> RasterBuilder<'a, N> {
-        self.caps.require(vk::QueueFlags::GRAPHICS, "a rendering");
         RasterBuilder {
-            cmd_buf: self,
+            cmd_buf: &mut self.rec,
             extent,
             viewport: Viewport {
                 offset: IVec2::ZERO,
@@ -921,31 +916,9 @@ impl CommandBuffer {
             marker: PhantomData,
         }
     }
+}
 
-    /// Records every barrier computed so far, each on its own, in order (see `barrier_log`).
-    pub(crate) fn replay_barriers(&self) {
-        for barriers in &self.barrier_log {
-            self.pipeline_barrier(barriers);
-        }
-    }
-
-    fn pipeline_barrier(&self, barriers: &Barriers) {
-        // Barriers of one call are unordered, so acquires go first in their own.
-        if !barriers.acquires.is_empty() {
-            let info = vk::DependencyInfo::default().image_memory_barriers(&barriers.acquires);
-            unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
-        }
-        let mut info = vk::DependencyInfo::default();
-        let memory = barriers.memory.map(|memory| [memory]);
-        if let Some(memory) = &memory {
-            info = info.memory_barriers(memory);
-        }
-        if !barriers.images.is_empty() {
-            info = info.image_memory_barriers(&barriers.images);
-        }
-        unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
-    }
-
+impl<K: HasCompute> CommandBuffer<K> {
     fn compute_private<IND: IsIndirect>(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
@@ -953,36 +926,36 @@ impl CommandBuffer {
         indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand, IND>>,
         accesses: Option<Accesses<'_>>,
     ) {
-        self.caps.require(vk::QueueFlags::COMPUTE, "a dispatch");
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("compute", pass = pass.name).entered();
         let (images, buffers) = declared(accesses, vk::PipelineStageFlags2::COMPUTE_SHADER);
-        self.flush_pending(
+        let rec = &mut self.rec;
+        rec.flush_pending(
             sections.images().chain(images),
             (sections.buffers())
                 .chain(indirect_buffer.map(indirect_access))
                 .chain(buffers),
         );
-        self.push_constants(sections.push_constants);
+        rec.push_constants(sections.push_constants);
 
         let pipeline = pipelines().compute(sections.pass, sections.constants);
 
-        self.enter(pass.name, true);
+        rec.enter(pass.name, true);
         unsafe {
-            Ctx::device().cmd_bind_pipeline(self.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
+            Ctx::device().cmd_bind_pipeline(rec.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
             if let Some(slice) = indirect_buffer {
                 address_commands().cmd_dispatch_indirect2(
-                    self.handle,
+                    rec.handle,
                     &vk::DispatchIndirect2InfoKHR::default()
                         .address_range(slice.address_range())
                         .address_flags(slice.address_flags()),
                 );
             } else {
-                Ctx::device().cmd_dispatch(self.handle, dispatch[0], dispatch[1], dispatch[2]);
+                Ctx::device().cmd_dispatch(rec.handle, dispatch[0], dispatch[1], dispatch[2]);
             }
         }
-        self.exit(pass.name, true);
+        rec.exit(pass.name, true);
     }
 
     /// Like [`Self::compute`], with the workgroup counts read from `buffer` on the GPU.
@@ -1016,33 +989,34 @@ impl CommandBuffer {
         indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand, IND>>,
         accesses: Option<Accesses<'_>>,
     ) {
-        self.caps.require(vk::QueueFlags::COMPUTE, "a trace");
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
         let stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         let (images, buffers) = declared(accesses, stage);
-        self.flush_pending(
+        let rec = &mut self.rec;
+        rec.flush_pending(
             sections.images().chain(images),
             (sections.buffers())
                 .chain(indirect_buffer.map(indirect_access))
                 .chain(buffers),
         );
-        self.push_constants(sections.push_constants);
+        rec.push_constants(sections.push_constants);
 
-        self.enter(pass.name, true);
+        rec.enter(pass.name, true);
+        let handle = rec.handle;
         pipelines().ray_tracing(sections.pass, sections.constants, |pipeline| unsafe {
             // Past the pass's check (`ray_tracing` panics for hand-made bindings without it).
             let functions = Functions::raytracing_pipeline();
             Ctx::device().cmd_bind_pipeline(
-                self.handle,
+                handle,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 pipeline.pipeline,
             );
             let [raygen, miss, hit, callable] = &pipeline.sbt.regions;
             match indirect_buffer {
                 Some(slice) => functions.cmd_trace_rays_indirect(
-                    self.handle,
+                    handle,
                     raygen,
                     miss,
                     hit,
@@ -1050,18 +1024,11 @@ impl CommandBuffer {
                     slice.address(),
                 ),
                 None => functions.cmd_trace_rays(
-                    self.handle,
-                    raygen,
-                    miss,
-                    hit,
-                    callable,
-                    rays[0],
-                    rays[1],
-                    rays[2],
+                    handle, raygen, miss, hit, callable, rays[0], rays[1], rays[2],
                 ),
             }
         });
-        self.exit(pass.name, true);
+        rec.exit(pass.name, true);
     }
 
     /// Traces `rays` (width, height, depth) raygen invocations of a ray tracing pass, which
@@ -1088,6 +1055,161 @@ impl CommandBuffer {
     ) {
         self.raytrace_private(bindings, [0, 0, 0], Some(buffer), accesses);
     }
+}
+
+impl<K: QueueKind> CommandBuffer<K> {
+    /// Debugging aid: a full barrier that makes every command recorded before it finish, and
+    /// its writes visible to every later command, before anything after it starts. Leaves the
+    /// tracked accesses alone, so the automatic barriers stay what they would be without it:
+    /// if a glitch goes away with this call, an automatic barrier before it is missing.
+    pub fn flush_all(&mut self) {
+        let all = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
+        let memory = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(all)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(all)];
+        let info = vk::DependencyInfo::default().memory_barriers(&memory);
+        unsafe { Ctx::device().cmd_pipeline_barrier2(self.rec.handle, &info) };
+    }
+
+    /// Records `f` as a named group: a debug label for RenderDoc/Nsight in debug builds, and a
+    /// scope the observer of [`Self::measure`] sees. Every pass and rendering is such a scope on
+    /// its own.
+    pub fn scope<R>(&mut self, name: &'static str, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.rec.enter(name, false);
+        let result = f(self);
+        self.rec.exit(name, false);
+        result
+    }
+
+    /// Records `f` as the scope `name` with `observer` attached, which sees it and every scope
+    /// and pass inside it (see [`ScopeObserver`]); with `None` just as a scope. Doesn't nest.
+    pub fn measure<R>(
+        &mut self,
+        observer: Option<&mut dyn ScopeObserver>,
+        name: &'static str,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(observer) = observer else {
+            return self.scope(name, f);
+        };
+        assert!(self.rec.observer.is_none(), "`measure` doesn't nest");
+        // SAFETY: only the lifetime is erased. The pointer is cleared before `observer`'s borrow
+        // ends, also when `f` panics, and until then only this command buffer reaches it.
+        let observer = unsafe {
+            std::mem::transmute::<NonNull<dyn ScopeObserver + '_>, NonNull<dyn ScopeObserver>>(
+                NonNull::from(observer),
+            )
+        };
+        self.rec.observer = Some(observer);
+        self.rec.depth = 0;
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| self.scope(name, f)));
+        self.rec.observer = None;
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// Writes the device's clock into query `index` of `pool` once the commands recorded before
+    /// reached `stage`: `NONE` for when they started, `ALL_COMMANDS` for when they finished.
+    pub fn write_timestamp(
+        &mut self,
+        pool: &QueryPool<Timestamp>,
+        index: u32,
+        stage: vk::PipelineStageFlags2,
+    ) {
+        self.rec.write_timestamp(pool, index, stage);
+    }
+
+    /// Records `f` inside query `index` of `pool`, which counts what its commands do. One query
+    /// of a kind can be active at a time, also counting an observer's (`QueryRecorder::is_active`).
+    /// A performance query's pool has to exist before the recording begins, and its queries,
+    /// like pipeline statistics of graphics stages, are recorded on the graphics family.
+    pub fn query<Q: Scoped, R>(
+        &mut self,
+        pool: &QueryPool<Q>,
+        index: u32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        assert!(
+            index < pool.count(),
+            "query {index} of a pool of {}",
+            pool.count()
+        );
+        self.rec.begin_query(pool, index);
+        let result = f(self);
+        self.rec.end_query(pool, index);
+        result
+    }
+}
+
+impl Recording {
+    /// A recording into `handle` for value `value` of `timeline`, on a family of `kind` whose
+    /// timestamps have `timestamp_valid_bits`, logging its barriers into `barrier_log` (empty,
+    /// lent by the frame slot).
+    pub(crate) fn new(
+        handle: vk::CommandBuffer,
+        kind: Kind,
+        mut pending_accesses: PendingAccesses,
+        timeline: usize,
+        value: u64,
+        timestamp_valid_bits: u32,
+        barrier_log: Vec<Barriers>,
+    ) -> Self {
+        pending_accesses.value = value;
+        Self {
+            handle,
+            kind,
+            pending_accesses,
+            timeline,
+            value,
+            timestamp_valid_bits,
+            observer: None,
+            depth: 0,
+            active_queries: 0,
+            barrier_log,
+            acquire_waits: SmallVec::new(),
+            presents: SmallVec::new(),
+        }
+    }
+
+    pub(crate) fn begin(&mut self) -> Result<()> {
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info)? };
+        Bindless::bind(&self.handle, self.kind);
+        Ok(())
+    }
+
+    pub(crate) fn end(&mut self) -> Result<()> {
+        unsafe { Ctx::device().end_command_buffer(self.handle)? };
+        Ok(())
+    }
+
+    /// Records every barrier computed so far, each on its own, in order (see `barrier_log`).
+    pub(crate) fn replay_barriers(&self) {
+        for barriers in &self.barrier_log {
+            self.pipeline_barrier(barriers);
+        }
+    }
+
+    fn pipeline_barrier(&self, barriers: &Barriers) {
+        // Barriers of one call are unordered, so acquires go first in their own.
+        if !barriers.acquires.is_empty() {
+            let info = vk::DependencyInfo::default().image_memory_barriers(&barriers.acquires);
+            unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
+        }
+        let mut info = vk::DependencyInfo::default();
+        let memory = barriers.memory.map(|memory| [memory]);
+        if let Some(memory) = &memory {
+            info = info.memory_barriers(memory);
+        }
+        if !barriers.images.is_empty() {
+            info = info.image_memory_barriers(&barriers.images);
+        }
+        if memory.is_some() || !barriers.images.is_empty() {
+            unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
+        }
+    }
 
     /// Pushes a pass's push constants from offset 0; the bytes past them keep what earlier
     /// passes pushed, which the pass doesn't read.
@@ -1106,79 +1228,35 @@ impl CommandBuffer {
         };
     }
 
+    /// Records the barriers a command with these accesses needs and tracks its accesses. An
+    /// acquired swapchain image's first access makes the submission wait for its acquire.
     pub(crate) fn flush_pending<'a>(
         &mut self,
         image_acceses: impl Iterator<Item = ImageUse<'a>> + Clone,
         buffer_acceses: impl Iterator<Item = BufferAccess> + Clone,
     ) {
-        if !self.caps.images && image_acceses.clone().next().is_some() {
-            self.caps.require_images();
-        }
         let barriers = compute_barriers(
             &self.pending_accesses,
             self.kind,
             image_acceses.clone(),
             buffer_acceses.clone(),
         );
-        if let Some(barriers) = &barriers {
-            self.pending_accesses.made_visible(barriers);
-            self.barrier_log.push(barriers.clone());
+        if let Some(barriers) = barriers {
+            for &(image, stage) in &barriers.acquired {
+                self.acquire_waits.push(AcquireWait {
+                    image,
+                    semaphore: present::table::acquire_semaphore(image),
+                    stage,
+                });
+            }
+            self.pending_accesses.made_visible(&barriers);
+            self.barrier_log.push(barriers);
+            let barriers = self.barrier_log.last().expect("just pushed");
             self.pipeline_barrier(barriers);
         }
 
         self.pending_accesses
             .record(image_acceses.map(|image| image.access), buffer_acceses);
-    }
-
-    /// Debugging aid: a full barrier that makes every command recorded before it finish, and
-    /// its writes visible to every later command, before anything after it starts. Leaves the
-    /// tracked accesses alone, so the automatic barriers stay what they would be without it:
-    /// if a glitch goes away with this call, an automatic barrier before it is missing.
-    pub fn flush_all(&mut self) {
-        let all = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
-        let memory = [vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(all)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(all)];
-        let info = vk::DependencyInfo::default().memory_barriers(&memory);
-        unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
-    }
-
-    /// Records `f` as a named group: a debug label for RenderDoc/Nsight in debug builds, and a
-    /// scope the observer of [`Self::measure`] sees. Every pass and rendering is such a scope on
-    /// its own.
-    pub fn scope<R>(&mut self, name: &'static str, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.enter(name, false);
-        let result = f(self);
-        self.exit(name, false);
-        result
-    }
-
-    /// Records `f` as the scope `name` with `observer` attached, which sees it and every scope
-    /// and pass inside it (see [`ScopeObserver`]); with `None` just as a scope. Doesn't nest.
-    pub fn measure<R>(
-        &mut self,
-        observer: Option<&mut dyn ScopeObserver>,
-        name: &'static str,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let Some(observer) = observer else {
-            return self.scope(name, f);
-        };
-        assert!(self.observer.is_none(), "`measure` doesn't nest");
-        // SAFETY: only the lifetime is erased. The pointer is cleared before `observer`'s borrow
-        // ends, also when `f` panics, and until then only this command buffer reaches it.
-        let observer = unsafe {
-            std::mem::transmute::<NonNull<dyn ScopeObserver + '_>, NonNull<dyn ScopeObserver>>(
-                NonNull::from(observer),
-            )
-        };
-        self.observer = Some(observer);
-        self.depth = 0;
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| self.scope(name, f)));
-        self.observer = None;
-        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     /// Opens a scope: its debug label, and the observer's `on_enter`.
@@ -1191,7 +1269,7 @@ impl CommandBuffer {
                 pass,
             };
             self.depth += 1;
-            // SAFETY: see `measure`.
+            // SAFETY: see `CommandBuffer::measure`.
             unsafe { observer.as_mut() }.on_enter(&mut QueryRecorder { cmd: self }, &scope);
         }
     }
@@ -1204,14 +1282,12 @@ impl CommandBuffer {
                 depth: self.depth,
                 pass,
             };
-            // SAFETY: see `measure`.
+            // SAFETY: see `CommandBuffer::measure`.
             unsafe { observer.as_mut() }.on_exit(&mut QueryRecorder { cmd: self }, &scope);
         }
         Functions::cmd_end_label(&self.handle);
     }
 
-    /// Writes the device's clock into query `index` of `pool` once the commands recorded before
-    /// reached `stage`: `NONE` for when they started, `ALL_COMMANDS` for when they finished.
     pub(crate) fn write_timestamp(
         &mut self,
         pool: &QueryPool<Timestamp>,
@@ -1223,51 +1299,25 @@ impl CommandBuffer {
             "query {index} of a pool of {}",
             pool.count()
         );
-        pool.record_on(self.epoch, self.family);
+        pool.record_on(self, self.timestamp_valid_bits);
         unsafe { Ctx::device().cmd_write_timestamp2(self.handle, stage, pool.handle, index) };
     }
 
-    /// Records `f` inside query `index` of `pool`, which counts what its commands do. One query
-    /// of a kind can be active at a time, also counting an observer's (`QueryRecorder::is_active`).
-    /// A performance query's pool has to exist before the recording begins.
-    pub fn query<K: Scoped, R>(
-        &mut self,
-        pool: &QueryPool<K>,
-        index: u32,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        assert!(
-            index < pool.count(),
-            "query {index} of a pool of {}",
-            pool.count()
-        );
-        self.begin_query(pool, index);
-        let result = f(self);
-        self.end_query(pool, index);
-        result
-    }
-
-    pub(crate) fn begin_query<K: Scoped>(&mut self, pool: &QueryPool<K>, index: u32) {
-        let bit = query_bit(K::TYPE);
+    pub(crate) fn begin_query<Q: Scoped>(&mut self, pool: &QueryPool<Q>, index: u32) {
+        let bit = query_bit(Q::TYPE);
         assert!(
             self.active_queries & bit == 0,
             "a query of this kind is already active, and queries of one kind don't nest"
         );
-        if K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR {
-            assert_eq!(
-                self.family,
-                Ctx::get().queues.graphics().index,
-                "hardware counters are only recorded on the graphics family"
-            );
-        }
-        pool.record(self.epoch);
+        pool.kind.check_kind(self.kind);
+        pool.record(self);
         let flags = pool.kind.control_flags();
         unsafe { Ctx::device().cmd_begin_query(self.handle, pool.handle, index, flags) };
         self.active_queries |= bit;
     }
 
-    pub(crate) fn end_query<K: QueryKind>(&mut self, pool: &QueryPool<K>, index: u32) {
-        let bit = query_bit(K::TYPE);
+    pub(crate) fn end_query<Q: QueryKind>(&mut self, pool: &QueryPool<Q>, index: u32) {
+        let bit = query_bit(Q::TYPE);
         assert!(
             self.active_queries & bit != 0,
             "no query of this kind is active"
@@ -1275,50 +1325,15 @@ impl CommandBuffer {
         unsafe { Ctx::device().cmd_end_query(self.handle, pool.handle, index) };
         self.active_queries &= !bit;
     }
-
-    /// A command buffer recording into `handle` for the frame of `epoch` on queue `family`, of
-    /// `kind`, logging its barriers into `barrier_log` (empty, lent by the frame slot).
-    pub(crate) fn new(
-        handle: vk::CommandBuffer,
-        kind: Kind,
-        mut pending_accesses: PendingAccesses,
-        epoch: u64,
-        family: u32,
-        caps: QueueCaps,
-        barrier_log: Vec<Barriers>,
-    ) -> Self {
-        pending_accesses.epoch = epoch;
-        Self {
-            handle,
-            kind,
-            pending_accesses,
-            epoch,
-            family,
-            observer: None,
-            depth: 0,
-            active_queries: 0,
-            caps,
-            barrier_log,
-        }
-    }
-
-    pub(crate) fn begin(&mut self) -> Result<()> {
-        let begin_info = vk::CommandBufferBeginInfo::default();
-        unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info)? };
-        Bindless::bind(&self.handle, self.caps.flags);
-        Ok(())
-    }
-
-    pub(crate) fn end(&mut self) -> Result<()> {
-        unsafe { Ctx::device().end_command_buffer(self.handle)? };
-        Ok(())
-    }
 }
 
 /// Barriers one command needs before it may run, given what is still pending. Logged whole
-/// (`CommandBuffer::barrier_log`), so a replay records them the same way.
+/// (`Recording::barrier_log`), so a replay records them the same way.
 #[derive(Clone, Debug)]
 pub(crate) struct Barriers {
+    /// Acquired swapchain images this command accesses first, with the stages that wait for
+    /// their acquire.
+    pub(crate) acquired: SmallVec<[(vk::Image, vk::PipelineStageFlags2); 1]>,
     /// Queue family ownership acquires of images another family released to this one,
     /// recorded in a call of their own before the others.
     pub(crate) acquires: SmallVec<[vk::ImageMemoryBarrier2<'static>; 1]>,
@@ -1525,16 +1540,27 @@ pub(crate) fn compute_barriers<'a>(
         image.check_states(kind);
     }
     let mut image_barriers: SmallVec<[vk::ImageMemoryBarrier2; 1]> = SmallVec::new();
+    let mut acquired = SmallVec::new();
     for image in image_acceses {
-        image.take_states(kind, |mips, old| {
+        let access = &image.access;
+        take_checked_states(image.states, access.mip_range, access.layout, kind, |mips, old| {
+            // The first access of an acquired swapchain image waits for the acquire at its
+            // stages, which the transition then starts from.
+            let waited = old.acquired.then(|| {
+                let stage = image.access.stage;
+                let stage = if stage.is_empty() { S2::ALL_COMMANDS } else { stage };
+                acquired.push((image.access.image, stage));
+                stage
+            });
             if old.layout != image.access.layout {
-                image_barriers.push(transition_barrier(pending, &image.access, mips, old.layout))
+                let barrier = transition_barrier(pending, &image.access, mips, old.layout, waited);
+                image_barriers.push(barrier);
             }
         });
     }
 
     let hazard = !src_stage.is_empty() || !dst_stage.is_empty();
-    if !hazard && image_barriers.is_empty() {
+    if !hazard && image_barriers.is_empty() && acquired.is_empty() {
         return None;
     }
 
@@ -1550,6 +1576,7 @@ pub(crate) fn compute_barriers<'a>(
     }
 
     Some(Barriers {
+        acquired,
         acquires: SmallVec::new(),
         memory: hazard.then(|| {
             vk::MemoryBarrier2::default()
@@ -1563,12 +1590,14 @@ pub(crate) fn compute_barriers<'a>(
 }
 
 /// The barrier that moves `mips` of the image `image_access` accesses from `old_layout` into
-/// the layout it asks for.
+/// the layout it asks for. `acquired`: the image comes from the presentation engine, and the
+/// submission waits for its acquire at these stages, which the transition starts from.
 fn transition_barrier(
     pending: &PendingAccesses,
     image_access: &ImageAccess,
     mips: Range<u32>,
     old_layout: vk::ImageLayout,
+    acquired: Option<vk::PipelineStageFlags2>,
 ) -> vk::ImageMemoryBarrier2<'static> {
     // The transition waits for the image's tracked accesses. Without any, the image may
     // still be in use by an earlier submission, or wait for a semaphore when it comes from
@@ -1599,6 +1628,11 @@ fn transition_barrier(
     }
 
     if old_layout == vk::ImageLayout::PRESENT_SRC_KHR {
+        src_access = vk::AccessFlags2::NONE;
+    }
+    // The semaphore wait chains with the transition at the stages it waits at.
+    if let Some(stage) = acquired {
+        src_stage = stage;
         src_access = vk::AccessFlags2::NONE;
     }
     if image_access.layout == vk::ImageLayout::PRESENT_SRC_KHR {
@@ -1636,6 +1670,7 @@ pub(crate) mod tests {
     };
     use crate::vk::Handle;
     use std::iter;
+    use crate::queue::Graphics;
     use pending::MAX_PENDING_BUFFER_WRITES;
     use std::marker::PhantomData;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
@@ -1711,16 +1746,16 @@ pub(crate) mod tests {
     }
 
     /// A command buffer that is never handed to Vulkan: enough for state-only code paths.
-    fn offline_cmd() -> CommandBuffer {
-        CommandBuffer::new(
+    fn offline_cmd() -> CommandBuffer<Graphics> {
+        CommandBuffer::new(Recording::new(
             vk::CommandBuffer::null(),
             Kind::Graphics,
             PendingAccesses::default(),
             0,
             0,
-            QueueCaps::ALL,
+            64,
             Vec::new(),
-        )
+        ))
     }
 
     fn view<F: StaticFormat, U: StaticUsage>(layout: &AtomicU64) -> ImageView<'_, F, U> {
@@ -2279,12 +2314,13 @@ pub(crate) mod tests {
         assert_eq!(barriers.memory.unwrap().src_stage_mask, S::COMPUTE_SHADER);
     }
 
-    /// A ring read at a moving range each frame: once a frame completed, its reads are gone.
+    /// A ring read at a moving range each frame: once a submission completed, its reads are
+    /// gone.
     #[test]
     fn reads_of_completed_frames_are_dropped() {
         let mut pending = PendingAccesses::default();
         for frame in 1..=10u64 {
-            pending.epoch = frame;
+            pending.value = frame;
             let range = frame * 100..frame * 100 + 10;
             pending.record(iter::empty(), [read(range)].into_iter());
             pending.retire(frame - 1);
@@ -2299,10 +2335,10 @@ pub(crate) mod tests {
     fn many_completed_writes_fold_into_one_of_every_buffer() {
         let mut pending = PendingAccesses::default();
         for i in 0..=MAX_PENDING_BUFFER_WRITES as u64 {
-            pending.epoch = 1;
+            pending.value = 1;
             pending.record(iter::empty(), [write(i * 16..i * 16 + 8)].into_iter());
         }
-        pending.epoch = 2;
+        pending.value = 2;
         pending.record(iter::empty(), [write(1 << 20..(1 << 20) + 8)].into_iter());
         pending.retire(0);
         assert_eq!(
@@ -2449,13 +2485,13 @@ pub(crate) mod tests {
     #[test]
     fn flush_without_hazards_only_records_and_needs_no_device() {
         let mut cmd = offline_cmd();
-        cmd.flush_pending(
+        cmd.rec.flush_pending(
             [image_write(1)].into_iter(),
             [write(0..10), read(20..30)].into_iter(),
         );
-        assert_eq!(cmd.pending_accesses.buffer_writes.len(), 1);
-        assert_eq!(cmd.pending_accesses.buffer_reads.len(), 1);
-        assert_eq!(cmd.pending_accesses.image_writes.len(), 1);
+        assert_eq!(cmd.rec.pending_accesses.buffer_writes.len(), 1);
+        assert_eq!(cmd.rec.pending_accesses.buffer_reads.len(), 1);
+        assert_eq!(cmd.rec.pending_accesses.image_writes.len(), 1);
     }
 
     // ---- blits ---------------------------------------------------------------------------
@@ -2630,7 +2666,7 @@ pub(crate) mod tests {
         let depth = layout(L::GENERAL);
         let nothing = PendingAccesses::default();
         // The layout transitions recording the rendering makes, without a device.
-        let draw = |cmd: &mut CommandBuffer| {
+        let draw = |cmd: &mut CommandBuffer<Graphics>| {
             let target = view::<R8G8B8A8Unorm, ColorAttachment>(&color);
             let mut builder = cmd.raster(EXTENT, [Attachment::color(target, None)]);
             builder.depth_attachment(view::<D32Sfloat, DepthAttachment>(&depth), None);
