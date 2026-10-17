@@ -1,4 +1,4 @@
-//! Command recording for generated passes: barriers, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with the swapchain)
+//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with the present table)
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -22,7 +22,7 @@ use crate::{
         format::Format,
         kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StorageView},
     },
-    pipeline::{RasterKeyRef, pass_map, pipelines},
+    pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterKeyRef, pass_map, pipelines},
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
@@ -1195,6 +1195,11 @@ impl Recording {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { Ctx::device().begin_command_buffer(self.handle, &begin_info)? };
         Bindless::bind(&self.handle, self.kind);
+        // Passes push only their own push constants; this sets the rest of the range once, so
+        // no byte of it is ever undefined. A transfer family pushes nothing.
+        if self.kind != Kind::Transfer {
+            self.push_constants(&[0; MAX_PUSH_CONSTANTS_SIZE]);
+        }
         Ok(())
     }
 

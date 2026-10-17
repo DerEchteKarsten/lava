@@ -4,11 +4,29 @@
 //! compiles an application's passes in its build script and generates their bindings and
 //! `PASS_MAP`, and may hot reload them through [`pipeline::reload_pass`].
 //!
+//! # Submission and lifetimes
+//! Work goes to a [`queue::Timeline`] (graphics, and with `async-compute`/`async-transfer` the
+//! device's dedicated compute and transfer families): reserve a value before reading anything
+//! its GPU work reaches, begin it once a frame slot is free, record and submit it, which
+//! returns a [`queue::Wait`] that other timelines and the host can wait for. Barriers within a
+//! timeline are automatic; images move between families with
+//! [`command_buffer::CommandBuffer::release`]. Dropped objects are destroyed once every
+//! timeline finished the values reserved before the drop ([`lifetime`]). Windows present
+//! through a [`present::PresentSurface`], whose acquire and present follow from what the
+//! submission does with the image.
+//!
 //! # Shader contract
 //! What every frontend's shaders and generated code must match:
 //! - Descriptor set 0: binding 0 holds the application's immutable samplers
 //!   ([`Config::samplers`], by index), binding 1 the bindless sampled images. Set 1, binding 0:
 //!   the bindless storage images. Passes have no other descriptors.
+//! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes,
+//!   zeroed when a command buffer begins; a pass pushes its own struct from offset 0.
+//!   Specialization constants have no size limit.
+//! - [`bindless::BindlessHandle`] (two `u32` indices, sampled then storage,
+//!   [`bindless::NULL_HANDLE`] for none) and [`vkobjects::acceleration_structure::Instance`]
+//!   (`VkAccelerationStructureInstanceKHR`) are the layouts shaders see; a TLAS is a `u64`
+//!   device address.
 //! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) runs
 //!   only where the device has it: its generated bindings are [`features::Gated`] by it.
 //!
@@ -24,13 +42,6 @@
 //! The `dynamic-*` features are dynamic state: where the device has it, draws that differ in it
 //! share a pipeline; elsewhere it is part of the pipeline's key. Asserting one keeps it out of
 //! the key.
-//! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes,
-//!   zeroed when a command buffer begins; a pass pushes its own struct from offset 0.
-//!   Specialization constants have no size limit.
-//! - [`bindless::BindlessHandle`] (two `u32` indices, sampled then storage,
-//!   [`bindless::NULL_HANDLE`] for none) and [`vkobjects::acceleration_structure::Instance`]
-//!   (`VkAccelerationStructureInstanceKHR`) are the layouts shaders see; a TLAS is a `u64`
-//!   device address.
 use std::panic::Location;
 
 use crate::state::CALLSITE;

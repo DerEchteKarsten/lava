@@ -93,7 +93,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    - `device_idle()` completes every epoch marked submitted, including one submitted after the
      wait returned. Its destructors then run while the GPU is still using the objects.
    - Core calls it from `Swapchain::drop` while the render thread runs.
-7. ~~**One idle `FrameSlot` stops all destruction, process-wide.**~~ **Done (2026-10-16):** `reserve` and `completed` poll the fences of the oldest submitted epochs (`vkGetFenceStatus`), so a slot that isn't begun again holds nothing back; `reserve` also runs what that frees. A slot completes its epoch before resetting its fence, so nothing polls a reset fence. An epoch completes only at
+7. ~~**One idle `FrameSlot` stops all destruction, process-wide.**~~ **Done (2026-10-17): timelines.** Frame slots and epochs are gone: every timeline is a timeline semaphore, polled when a value is reserved or begun, a `Wait` or `Stamp` is asked, and in `lava::reclaim`, and a dropped object waits for every timeline's latest reserved value (`lifetime.rs`), so an idle timeline holds nothing back. (Before, 2026-10-16:) `reserve` and `completed` poll the fences of the oldest submitted epochs (`vkGetFenceStatus`), so a slot that isn't begun again holds nothing back; `reserve` also runs what that frees. A slot completes its epoch before resetting its fence, so nothing polls a reset fence. An epoch completes only at
    the slot's next `begin` or its drop (`queue.rs:489-523`), and `completed()` stops at the
    oldest open epoch. A slot used once and kept, such as a tool's slot or a closed window's
    loop, leaks every later drop.
@@ -114,7 +114,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     **Done (2026-10-15):** scopes are closures (`cmd.scope(name, f)`), and frame slots no
     longer own or read queries: a user's `ScopeObserver` sees every scope and pass of a
     `cmd.measure` and records its own queries there.
-11. ~~**`Queue<Transfer>` is unusable as built.**~~ **Done (2026-10-16):** *in part:* a transfer-only family binds no descriptors and pushes no constants, dispatches, renderings and image accesses on it panic, and buffers are `CONCURRENT` between the graphics and transfer families. *Open:* images stay exclusive to graphics (no ownership transfers), and `CommandBuffer` still isn't typed by family.
+11. ~~**`Queue<Transfer>` is unusable as built.**~~ **Done (2026-10-17):** `Timeline<Transfer>` (and `Timeline<Compute>`) on the dedicated families of `async-transfer`/`async-compute`; `CommandBuffer<K>` is typed by family kind (dispatches need `HasCompute`, renderings `HasGraphics`); images move between families with `cmd.release::<K>(view)` and an automatic acquire, and buffers are `CONCURRENT` between every family lava created queues of. A transfer family binds no descriptors and pushes no constants.
     - Every command buffer binds descriptor sets at the graphics and compute bind points, which
       is invalid on a transfer-only family.
     - Resources are `EXCLUSIVE` (`image/mod.rs:54`, `buffer/mod.rs:112`), and lava never records
@@ -274,8 +274,9 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 ### Other
 - **The ANV `MEMORY_READ` workaround on trace reads applies to every vendor.** Gate it on
   `DriverId::INTEL_OPEN_SOURCE_MESA` (`acceleration_structure.rs:25-32`).
-- **Every queue of a chosen family is created.** NVIDIA's graphics family has 16
-  (`state.rs:646-662`).
+- ~~**Every queue of a chosen family is created.**~~ **Done (2026-10-17):** at most
+  `MAX_TIMELINES` (8) per family, for the timelines pinned to them. NVIDIA's graphics family
+  has 16 (`state.rs:646-662`).
 - **The debug callback works for every message.** It enables VERBOSE and INFO and formats each
   message before `tracing` filters it.
 - **Descriptor heaps or descriptor buffers** would turn `bind` into a memcpy. They would remove
@@ -305,7 +306,11 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
      layer.
    - **Direction:** `lava::init(Config) -> Result<DeviceInfo>`, with `DeviceInfo` reporting
      supported vs enabled features, limits, subgroup, mesh and ray tracing properties.
-4. **The swapchain leaves the hard parts to the user.**
+4. ~~**The swapchain leaves the hard parts to the user.**~~ **Done (2026-10-17):** `PresentSurface`
+   owns surface, swapchain and semaphores and recreates itself in `acquire(size) ->
+   Option<AcquiredImage>`; the acquire wait and the present signal follow from the
+   submission's accesses (`cmd.present(view)`), and core's swapchain code went from about 250
+   lines to a `Presenter` resource.
    - The user manages acquire semaphores per frame in flight, `render_finished` per image
      (recreated on every resize), the image index, and the `PRESENT_SRC` transition.
    - Out-of-date is an `Err` from acquire but `Ok(true)` from present, suboptimal is dropped,
@@ -318,7 +323,11 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    (`Device`, `Upload`, `Readback`, `DeviceMapped`) where host access exists only on mapped
    locations, plus an uploader (a staging ring recycled by epoch, with host copy as the fast
    path).
-6. **Frames in flight are a convention.** Core builds per-frame rings four ways: instance
+6. **Frames in flight are a convention.** *Partly done (2026-10-17):* a `Timeline` owns its
+   frame slots (`Submission::slot()`), a blocking one-shot submission is
+   `timeline.reserve().begin()?.submit(..)?.block()?`, and several timelines (one submission
+   each per frame) can run side by side. *Open:* `PerFrame<T>`, stream buffers and readbacks.
+   Core builds per-frame rings four ways: instance
    offsets, gizmo `first`, UI buffers per slot, and an unsynchronised readback. `FrameSlot::new`
    and `execute` each take the queue, and can disagree. A blocking one-shot submission needs six
    steps. **Direction:**
@@ -327,7 +336,11 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
    - a growable stream buffer and a typed `Readback<T>`;
    - `queue.submit_and_wait(|cmd| ..)`;
    - several submissions per frame.
-7. **Bindless slots are the user's job.**
+7. ~~**Bindless slots are the user's job.**~~ **Done (2026-10-17) but for the one-`u32`
+   handle:** lava allocates slots (`bind_sampled()`, `bind_storage()`, `bind_mips_*()`) and
+   frees them with the view; `reserve_sampled(n)`/`reserve_storage(n)` give asset-indexed
+   schemes a `SlotRange`, and `lifetime::SlotPool` is the stamp-deferred free list for
+   host-written slot arrays like core's materials. *Open:* the handle keeps two indices.
    - The caller picks every index, and freed slots come back through one global `fn` hook, so
      two libraries can't both use it. Core's 90-line allocator and `material.rs`'s epoch free
      list are the same machinery twice.
@@ -387,12 +400,12 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 18. **Generated types belong to lava,** so users can't implement serde or `Reflect` on them
     (the orphan rule). Generating into the user crate fixes this, with configurable derives.
 19. **The surface is messy.**
-    - Deep paths (`lava::vkobjects::queue::..`, `lava::image::slice::ImageView`).
+    - Deep paths (`lava::image::slice::ImageView`).
     - No prelude, and glam and bytemuck aren't re-exported.
     - Unused re-exports: `VkPipeline`, `VkShaderModule`, `ShaderHash`.
     - Public internals: `PassEntry`, `Functions`, `PhysicalDevice`, `CALLSITE`,
       `RaytracingPipeline`, `ShaderBindingTable`.
-    - Typos: `aquire_image`, `QueueFamilie`, `handel`, `Filter::Liniear`, `extend` for extent,
+    - Typos: `handel`, `Filter::Liniear`, `extend` for extent,
       `enable_gpu_assited_validation`, `unsupports_extensions`.
     - Fix these before 0.1, since renames break users afterwards.
 20. **Codegen errors lack context.** Panics give no file or field (`build.rs:111,118,236`), the
@@ -436,11 +449,10 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     struct name clashes.
 - **Memory:** staging uploads, readback, per-frame transient rings, a budget query outside
   profiling, object and allocation names.
-- **Queues:** an async compute family, transfer with ownership transfers, several submissions
-  and command buffers per frame, parallel recording (per-thread trackers merged by a barrier
-  prologue at submit).
-  - Timeline semaphores lack `value`, `signal`, timeouts and multi-wait.
-  - `Fence` is half-exposed, and `FrameSlot` has no non-blocking `is_done()`.
+- **Queues:** ~~an async compute family, transfer with ownership transfers, several
+  submissions per frame~~ (done 2026-10-17: timelines, `release`); several command buffers per
+  submission, parallel recording (per-thread trackers merged by a barrier prologue at submit).
+  - `Wait` has `block()` and `is_done()`, no timeouts or multi-wait.
 - **Swapchain:** format and colour space choice (HDR10, scRGB, `VK_EXT_hdr_metadata`), extra
   usages, image count, composite alpha, `FIFO_LATEST_READY`, swapchain maintenance1,
   present_id/present_wait for pacing, presenting several swapchains in one call, discard on

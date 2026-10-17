@@ -1,4 +1,4 @@
-//! The accesses later commands may have to wait for: what a queue's submissions read and wrote, each write with what barriers already made it visible to, how recording a command adds to them, and how they shrink once the GPU finished them or a resource is destroyed
+//! The accesses later commands may have to wait for: what a timeline's submissions read and wrote, each write with what barriers already made it visible to, how recording a command adds to them, and how they shrink once the GPU finished them or a resource is destroyed
 
 use crate::vk;
 use smallvec::SmallVec;

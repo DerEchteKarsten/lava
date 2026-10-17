@@ -2,10 +2,11 @@
 
 A Vulkan abstraction for Rust that keeps Vulkan's model but takes its bookkeeping off your hands:
 
-- **Bindless resources.** Every image sits in one of two global descriptor arrays, and shaders reach buffers through device addresses. Passes have no descriptor sets of their own.
+- **Bindless resources.** Every image sits in one of two global descriptor arrays, at slots lava allocates, and shaders reach buffers through device addresses. Passes have no descriptor sets of their own.
 - **Automatic barriers.** Commands know what they read and write, so lava records the barriers and layout transitions between them, per image and buffer range.
 - **Typed passes generated from shaders.** `lava-build-slang` compiles your Slang passes in your build script and generates a Rust function per pass whose arguments are the pass's push constants: buffer slices, image views, plain values. A wrong buffer or image type doesn't compile.
-- **Deferred destruction.** Dropped objects are destroyed once no frame in flight can reach them.
+- **Timelines.** Work is submitted on up to eight timelines (graphics, and async compute and transfer where the device has them), ordered across them with waits, with image ownership transfers recorded on request. Presenting needs no semaphores of your own: the swapchain image's acquire and present follow from what your submission does with it.
+- **Deferred destruction.** Dropped objects are destroyed once no submission in flight can reach them.
 - **Dynamic state.** A draw's raster state (culling, depth, stencil, blending, lines, …) is dynamic state, so pipelines depend only on the shaders, their constants and the attachment formats.
 
 lava is young (0.x) and is developed alongside a game engine. Expect breaking changes.
@@ -90,8 +91,7 @@ fn main() {
 ```rust
 use lava::{
     buffer::{Buffer, usage::Storage},
-    epoch,
-    vkobjects::queue::{FrameSlot, Gfx, Queue},
+    queue::{Graphics, Timeline},
 };
 
 mod bindings {
@@ -105,13 +105,14 @@ fn main() -> lava::Result<()> {
     let mut values = Buffer::<u32, Storage>::new(256, true)?;
     values.host_mut().iter_mut().enumerate().for_each(|(i, v)| *v = i as u32);
 
-    let queue = Queue::<Gfx>::new();
-    let mut slot = FrameSlot::new(&queue)?;
-    slot.begin(epoch::reserve())?.execute(&queue, &[], &[], |cmd| {
-        cmd.compute(&Double::push_bindings(values.range(..), 256), [4, 1, 1]);
+    let timeline = Timeline::<Graphics>::builder().build()?;
+    // Reserve before reading anything the GPU work reaches, begin once a frame slot is free,
+    // then record and submit.
+    let submission = timeline.reserve().begin()?;
+    let done = submission.submit(|cmd| {
+        cmd.compute(&Double::push_bindings(values.range(..), 256), [4, 1, 1], None);
     })?;
-    // Dropping a submitted slot waits for it.
-    drop(slot);
+    done.block()?;
 
     assert_eq!(values.host()[100], 200);
     Ok(())
