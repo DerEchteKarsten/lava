@@ -394,7 +394,7 @@ impl QueryPool<Performance> {
         }
         let indices: Vec<u32> = counters.iter().map(|counter| counter.index).collect();
         let mut performance = vk::QueryPoolPerformanceCreateInfoKHR::default()
-            .queue_family_index(Ctx::gfx_queue_index())
+            .queue_family_index(Ctx::get().queues.graphics().index)
             .counter_indices(&indices);
         let info = vk::QueryPoolCreateInfo::default().push_next(&mut performance);
         let kind = Performance {

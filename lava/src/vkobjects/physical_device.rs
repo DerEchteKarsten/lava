@@ -1,4 +1,4 @@
-//! Physical device selection and queue family capability discovery
+//! Physical device selection and queue family discovery: the graphics family, and the dedicated compute and transfer families of `async-compute` and `async-transfer`
 use std::ffi::CStr;
 
 use crate::error::{Error, Result};
@@ -40,6 +40,36 @@ impl QueueFamily {
     pub fn supports_timestamp_queries(&self) -> bool {
         self.handel.timestamp_valid_bits > 0
     }
+
+    /// Graphics, compute and timestamps: the family every device needs.
+    fn is_graphics(&self) -> bool {
+        self.has_queues()
+            && self.supports_graphics()
+            && self.supports_compute()
+            && self.supports_timestamp_queries()
+    }
+
+    /// Compute without graphics (`async-compute`).
+    fn is_dedicated_compute(&self) -> bool {
+        self.has_queues() && self.supports_compute() && !self.supports_graphics()
+    }
+
+    /// Transfer without graphics or compute, a copy engine (`async-transfer`).
+    fn is_dedicated_transfer(&self) -> bool {
+        self.has_queues()
+            && self.supports_transfer()
+            && !self.supports_graphics()
+            && !self.supports_compute()
+    }
+}
+
+/// The families lava creates queues of: graphics on every device, and the first dedicated
+/// compute and transfer families where the device has them.
+#[derive(Clone, Debug)]
+pub(crate) struct QueueFamilies {
+    pub(crate) graphics: QueueFamily,
+    pub(crate) compute: Option<QueueFamily>,
+    pub(crate) transfer: Option<QueueFamily>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,9 +158,12 @@ impl PhysicalDevice {
         let mem_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let rebar = has_rebar(&mem_properties);
+        let families = pick_queue_families(&queue_families);
         let facts = DeviceFacts {
             rebar,
             strict_lines: properties.limits.strict_lines == vk::TRUE,
+            dedicated_compute: families.as_ref().is_some_and(|f| f.compute.is_some()),
+            dedicated_transfer: families.as_ref().is_some_and(|f| f.transfer.is_some()),
         };
         let supported_features = features.optional(&has, facts);
         let lava_missing = features.lava_missing(&has);
@@ -177,34 +210,15 @@ impl PhysicalDevice {
         Ok(physical_devices)
     }
 
-    /// Picks the graphics family (graphics + compute + timestamps) and, among the remaining
-    /// families, a dedicated transfer family. `None` if the device has no usable graphics family.
-    pub(crate) fn pick_queue_families(&self) -> Option<(QueueFamily, Option<QueueFamily>)> {
-        let mut graphics = None;
-        let mut transfer = None;
-        for family in self.queue_families.iter().filter(|f| f.has_queues()) {
-            if graphics.is_none()
-                && family.supports_graphics()
-                && family.supports_compute()
-                && family.supports_timestamp_queries()
-            {
-                graphics = Some(family.clone());
-            } else if transfer.is_none() && family.supports_transfer() {
-                transfer = Some(family.clone());
-            }
-        }
-        graphics.map(|graphics| (graphics, transfer))
-    }
-
     /// Returns the first GPU (discrete before integrated) with everything lava needs, the
-    /// `required` (asserted) features and a usable graphics family, plus its graphics and transfer
-    /// families. Presentation goes through the graphics family (checked per surface). The
-    /// error names what each GPU lacks.
+    /// `required` (asserted) features and a usable graphics family, plus its queue families.
+    /// Presentation goes through the graphics family (checked per surface). The error names
+    /// what each GPU lacks.
     #[validation_trace]
     pub(crate) fn select_suitable_physical_device(
         devices: &[PhysicalDevice],
         required: &Features,
-    ) -> Result<(PhysicalDevice, QueueFamily, Option<QueueFamily>)> {
+    ) -> Result<(PhysicalDevice, QueueFamilies)> {
         let mut rejected = Vec::new();
         for device in devices.iter().filter(|device| {
             device.properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
@@ -217,13 +231,13 @@ impl PhysicalDevice {
                     .into_iter()
                     .map(|name| format!("`{name}` (lava asserts it)")),
             );
-            let families = device.pick_queue_families();
+            let families = pick_queue_families(&device.queue_families);
             if families.is_none() {
                 missing.push("a queue family with graphics, compute and timestamps".into());
             }
             match families {
-                Some((graphics, transfer)) if missing.is_empty() => {
-                    return Ok((device.clone(), graphics, transfer));
+                Some(families) if missing.is_empty() => {
+                    return Ok((device.clone(), families));
                 }
                 _ => rejected.push(format!("{} lacks {}", device.name, missing.join(", "))),
             }
@@ -234,6 +248,16 @@ impl PhysicalDevice {
             format!("no suitable GPU: {}", rejected.join("; "))
         }))
     }
+}
+
+/// The first family of each kind among `families`; `None` without a graphics family.
+pub(crate) fn pick_queue_families(families: &[QueueFamily]) -> Option<QueueFamilies> {
+    let first = |pick: fn(&QueueFamily) -> bool| families.iter().find(|f| pick(f)).cloned();
+    Some(QueueFamilies {
+        graphics: first(QueueFamily::is_graphics)?,
+        compute: first(QueueFamily::is_dedicated_compute),
+        transfer: first(QueueFamily::is_dedicated_transfer),
+    })
 }
 
 /// Whether the device exposes a large heap that is both device-local and host-visible, i.e.
@@ -344,36 +368,39 @@ mod tests {
                 gfx_family(3, 4),
             ],
         );
-        let (graphics, _) = dev.pick_queue_families().unwrap();
+        let graphics = pick_queue_families(&dev.queue_families).unwrap().graphics;
         assert_eq!(graphics.index, 3);
         assert_eq!(graphics.num_queues, 4);
     }
 
+    /// A discrete GPU's usual families: graphics, async compute, and a copy engine.
     #[test]
-    fn transfer_family_is_a_different_family_than_graphics() {
-        let dev = device(
-            DISCRETE,
-            vec![
-                gfx_family(0, 16),
-                family(1, Q::TRANSFER, 2, false),
-                family(2, Q::COMPUTE | Q::TRANSFER, 8, true),
-            ],
-        );
-        let (graphics, transfer) = dev.pick_queue_families().unwrap();
-        assert_eq!(graphics.index, 0);
-        assert_eq!(transfer.unwrap().index, 1);
+    fn dedicated_families_lack_the_bigger_capabilities() {
+        let families = [
+            family(0, Q::COMPUTE | Q::TRANSFER, 8, true),
+            gfx_family(1, 16),
+            family(2, Q::TRANSFER, 2, false),
+            family(3, Q::TRANSFER | Q::SPARSE_BINDING, 1, false),
+        ];
+        let picked = pick_queue_families(&families).unwrap();
+        assert_eq!(picked.graphics.index, 1);
+        assert_eq!(picked.compute.unwrap().index, 0);
+        assert_eq!(picked.transfer.unwrap().index, 2);
 
-        // Only one family: no dedicated transfer family, callers fall back to graphics.
-        let single = device(INTEGRATED, vec![gfx_family(0, 1)]);
-        let (graphics, transfer) = single.pick_queue_families().unwrap();
-        assert_eq!(graphics.index, 0);
-        assert!(transfer.is_none());
+        // A compute family with transfer is no transfer family, and a graphics family is
+        // neither.
+        let picked = pick_queue_families(&[gfx_family(0, 1), families[0].clone()]).unwrap();
+        assert!(picked.transfer.is_none());
+        let single = pick_queue_families(&[gfx_family(0, 1)]).unwrap();
+        assert!(single.compute.is_none() && single.transfer.is_none());
+        // Families without queues don't count.
+        let empty = pick_queue_families(&[gfx_family(0, 1), family(1, Q::COMPUTE, 0, true)]);
+        assert!(empty.unwrap().compute.is_none());
     }
 
     #[test]
     fn devices_without_a_graphics_family_have_no_pick() {
-        let dev = device(DISCRETE, vec![family(0, Q::TRANSFER, 1, true)]);
-        assert!(dev.pick_queue_families().is_none());
+        assert!(pick_queue_families(&[family(0, Q::TRANSFER, 1, true)]).is_none());
     }
 
     #[test]
@@ -382,13 +409,13 @@ mod tests {
         first.name = "first".into();
         let mut second = device(INTEGRATED, vec![gfx_family(0, 1)]);
         second.name = "second".into();
-        let (dev, graphics, _) = PhysicalDevice::select_suitable_physical_device(
+        let (dev, families) = PhysicalDevice::select_suitable_physical_device(
             &[first, second],
             &Features::default(),
         )
         .unwrap();
         assert_eq!(dev.name, "first");
-        assert_eq!(graphics.num_queues, 16);
+        assert_eq!(families.graphics.num_queues, 16);
     }
 
     #[test]
@@ -418,14 +445,15 @@ mod tests {
         );
         chosen.name = "chosen".into();
 
-        let (dev, graphics, transfer) = PhysicalDevice::select_suitable_physical_device(
+        let (dev, families) = PhysicalDevice::select_suitable_physical_device(
             &[rejected, chosen],
             &Features::default(),
         )
         .unwrap();
         assert_eq!(dev.name, "chosen");
+        let graphics = families.graphics;
         assert_eq!((graphics.index, graphics.num_queues), (1, 4));
-        let transfer = transfer.unwrap();
+        let transfer = families.transfer.unwrap();
         assert_eq!((transfer.index, transfer.num_queues), (0, 2));
     }
 

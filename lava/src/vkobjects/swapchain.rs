@@ -170,9 +170,8 @@ impl<U: StaticUsage> Swapchain<U> {
 
         let image_count = surface.capabilities().min_image_count;
 
-        let families_indices = [Ctx::gfx_queue_index(), Ctx::present_queue_index()];
-
         let create_info = {
+            // Presenting goes through the graphics family, which owns the images.
             let mut builder = vk::SwapchainCreateInfoKHR::default()
                 .surface(surface.handle())
                 .min_image_count(image_count)
@@ -180,15 +179,8 @@ impl<U: StaticUsage> Swapchain<U> {
                 .image_color_space(format.color_space)
                 .image_extent(extent)
                 .image_array_layers(1)
-                .image_usage(usage);
-
-            builder = if Ctx::gfx_queue_index() != Ctx::present_queue_index() {
-                builder
-                    .image_sharing_mode(vk::SharingMode::CONCURRENT)
-                    .queue_family_indices(&families_indices)
-            } else {
-                builder.image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            };
+                .image_usage(usage)
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE);
 
             if let Some(old) = old {
                 builder = builder.old_swapchain(old.handle);

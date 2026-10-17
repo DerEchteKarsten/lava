@@ -286,6 +286,12 @@ features! {
     /// (semaphores, swapchains, surfaces) is destroyed once it is done, not after one more frame.
     /// Asserting it requires it only with a display.
     present_fences: "present-fences" / "assert-present-fences" => PresentFences,
+    /// A queue family with compute but no graphics: `Timeline<Compute>`, work that runs
+    /// beside the graphics queue's.
+    async_compute: "async-compute" / "assert-async-compute" => AsyncCompute,
+    /// A queue family with transfer but neither graphics nor compute (a copy engine):
+    /// `Timeline<Transfer>`.
+    async_transfer: "async-transfer" / "assert-async-transfer" => AsyncTransfer,
     /// BC1-7 compressed formats.
     bc_compression: "bc-compression" / "assert-bc-compression" => BcCompression,
     /// Different blends for the color attachments of one draw (`RasterState::blends`).
@@ -566,6 +572,12 @@ pub(crate) struct DeviceFacts {
     /// `VkPhysicalDeviceLimits::strictLines`, which stippled default lines need.
     #[allow(dead_code)]
     pub(crate) strict_lines: bool,
+    /// A queue family with compute but no graphics (`async-compute`).
+    #[allow(dead_code)]
+    pub(crate) dedicated_compute: bool,
+    /// A queue family with transfer but neither graphics nor compute (`async-transfer`).
+    #[allow(dead_code)]
+    pub(crate) dedicated_transfer: bool,
 }
 
 /// Every Vulkan feature struct lava queries or enables. [`Self::chain`] links the ones whose
@@ -771,6 +783,8 @@ impl FeatureChain {
             // The caller drops it without a display or the instance extension.
             "present-fences" => present_fences =
                 t(self.swapchain_maintenance1.swapchain_maintenance1),
+            "async-compute" => async_compute = device.dedicated_compute,
+            "async-transfer" => async_transfer = device.dedicated_transfer,
             "bc-compression" => bc_compression = t(c.texture_compression_bc),
             "independent-blend" => independent_blend = t(c.independent_blend),
             "fill-mode-non-solid" => fill_mode_non_solid = t(c.fill_mode_non_solid),
@@ -1056,6 +1070,8 @@ mod tests {
         let facts = DeviceFacts {
             rebar: true,
             strict_lines: true,
+            dedicated_compute: true,
+            dedicated_transfer: true,
         };
         assert_eq!(chain.optional(&|_| true, facts), all);
     }

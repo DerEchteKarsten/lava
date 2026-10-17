@@ -1269,7 +1269,7 @@ impl CommandBuffer {
         if K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR {
             assert_eq!(
                 self.family,
-                Ctx::gfx_queue_index(),
+                Ctx::get().queues.graphics().index,
                 "hardware counters are only recorded on the graphics family"
             );
         }

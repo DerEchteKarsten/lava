@@ -25,7 +25,11 @@ use crate::features::{Loader, gate, load, loaded};
 use crate::{
     Config,
     features::{FeatureChain, Features, LAVA_EXTENSIONS},
-    vkobjects::{physical_device::PhysicalDevice, queue::FamilyQueues},
+    queue::{
+        Kind,
+        device::{DeviceQueues, queue_count},
+    },
+    vkobjects::physical_device::PhysicalDevice,
 };
 
 pub use crate::vk as raw_vulkan;
@@ -42,8 +46,7 @@ pub struct Ctx {
     physical_device: PhysicalDevice,
     allocator: Mutex<Allocator>,
 
-    pub(crate) gfx_queues: FamilyQueues,
-    pub(crate) transfer_queues: Option<FamilyQueues>,
+    pub(crate) queues: DeviceQueues,
 }
 
 static STATE: OnceLock<Ctx> = OnceLock::new();
@@ -91,16 +94,16 @@ impl Ctx {
             &Ctx::get().physical_device.mesh_shader_properties
         })
     }
-    pub fn gfx_queue_index() -> u32 {
-        Ctx::get().gfx_queues.family
+    /// The index of the queue family of `kind`, `None` where lava has none (the device lacks a
+    /// dedicated family, or its feature is off). Presenting goes through the graphics family.
+    pub fn queue_family(kind: Kind) -> Option<u32> {
+        Ctx::get().queues.family(kind).map(|family| family.index)
     }
-    pub fn num_gfx_queues() -> u32 {
-        Ctx::get().gfx_queues.len() as u32
-    }
-    /// Presentation always goes through the graphics family; `Surface::new` verifies that the
-    /// family can present to the surface it wraps.
-    pub fn present_queue_index() -> u32 {
-        Ctx::get().gfx_queues.family
+    /// How many queues lava created of the family of `kind` (at most `MAX_TIMELINES`, 0 where
+    /// there is none).
+    pub fn queue_count(kind: Kind) -> u32 {
+        let family = Ctx::get().queues.family(kind);
+        family.map_or(0, |family| family.queues.len() as u32)
     }
     pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
         Ctx::get()
@@ -245,7 +248,7 @@ impl Ctx {
             )));
         }
         let physical_devices = PhysicalDevice::enumerate_physical_devices(&instance)?;
-        let (physical_device, graphics_queue_family, transfer_queue_familie) =
+        let (physical_device, families) =
             PhysicalDevice::select_suitable_physical_device(physical_devices.as_slice(), &required)?;
         #[allow(unused_mut)]
         let mut features = physical_device.supported_features;
@@ -265,13 +268,17 @@ impl Ctx {
             extensions.push(ash::khr::swapchain::NAME);
         }
 
-        let mut queues = vec![(
-            graphics_queue_family.index,
-            graphics_queue_family.num_queues,
-        )];
-        if let Some(tqf) = &transfer_queue_familie {
-            queues.push((tqf.index, tqf.num_queues));
-        }
+        // The dedicated families only where their feature is on.
+        #[cfg(feature = "async-compute")]
+        let compute = families.compute.as_ref().filter(|_| features.async_compute);
+        #[cfg(not(feature = "async-compute"))]
+        let compute = None;
+        #[cfg(feature = "async-transfer")]
+        let transfer = families.transfer.as_ref().filter(|_| features.async_transfer);
+        #[cfg(not(feature = "async-transfer"))]
+        let transfer = None;
+        let used = [Some(&families.graphics), compute, transfer];
+        let queues = used.iter().flatten().map(|f| (f.index, queue_count(f))).collect();
         let device = create_device(queues, &physical_device, &features, &extensions, &instance)?;
         // Destroyed before the messenger and the instance, after the allocator.
         let undo_device = Undo(Some({
@@ -346,23 +353,12 @@ impl Ctx {
             })
             .map_err(|_| Error::message("Vulkan functions were already initialized"))?;
 
-        let gfx_queues = FamilyQueues::new(
-            &device,
-            graphics_queue_family.index,
-            graphics_queue_family.num_queues,
-            graphics_queue_family.handel.queue_flags,
-            true,
-        );
-        let transfer_queues = transfer_queue_familie.map(|family| {
-            let flags = family.handel.queue_flags;
-            FamilyQueues::new(&device, family.index, family.num_queues, flags, false)
-        });
+        let queues = DeviceQueues::new(&device, used);
         STATE
             .set(Ctx {
                 device,
                 allocator: Mutex::new(allocator),
-                gfx_queues,
-                transfer_queues,
+                queues,
 
                 features: features,
                 physical_device: physical_device,
@@ -613,8 +609,8 @@ pub(super) fn create_device(
     extensions: &[&CStr],
     instance: &ash::Instance,
 ) -> Result<ash::Device> {
-    // One priority per queue: every queue of a selected family is created, so that threads
-    // can each get their own (`FamilyQueues`).
+    // One priority per queue: up to `MAX_TIMELINES` queues of each selected family are
+    // created, so that timelines can each get their own (`DeviceQueues`).
     queue_families.sort_unstable();
     queue_families.dedup_by_key(|(index, _)| *index);
     let queue_priorities = queue_families

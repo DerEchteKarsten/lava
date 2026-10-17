@@ -38,6 +38,7 @@ use lava::{
         Performance, PipelineStatistics, PipelineStats, QueryPipelineStatisticFlags as Statistics,
         QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Timestamp, counters,
     },
+    queue::{Kind, MAX_TIMELINES},
     state::Ctx,
     vkobjects::queue::{Binary, FrameSlot, Gfx, Queue, Semaphore, Timeline},
 };
@@ -141,9 +142,26 @@ fn init_twice_is_an_error() {
 #[test]
 fn context_exposes_the_graphics_queue_family() {
     let _gpu = gpu();
-    assert!(Ctx::num_gfx_queues() >= 1);
-    // Presentation shares the graphics family.
-    assert_eq!(Ctx::present_queue_index(), Ctx::gfx_queue_index());
+    assert!((1..=MAX_TIMELINES as u32).contains(&Ctx::queue_count(Kind::Graphics)));
+    let graphics = Ctx::queue_family(Kind::Graphics).expect("every device has one");
+    // The dedicated families are other ones, with queues where they exist.
+    for kind in [Kind::Compute, Kind::Transfer] {
+        match Ctx::queue_family(kind) {
+            Some(family) => {
+                assert_ne!(family, graphics, "{kind:?}");
+                assert!((1..=MAX_TIMELINES as u32).contains(&Ctx::queue_count(kind)));
+            }
+            None => assert_eq!(Ctx::queue_count(kind), 0),
+        }
+    }
+    assert_eq!(
+        Ctx::queue_family(Kind::Compute).is_some(),
+        Ctx::features().async_compute
+    );
+    assert_eq!(
+        Ctx::queue_family(Kind::Transfer).is_some(),
+        Ctx::features().async_transfer
+    );
 }
 
 // ---- buffers ---------------------------------------------------------------------------------
@@ -216,7 +234,7 @@ fn binary_semaphore_orders_two_submissions() {
 #[test]
 fn more_threads_than_queues_submit_in_parallel() {
     let _gpu = gpu();
-    let threads = Ctx::num_gfx_queues() as usize + 1;
+    let threads = Ctx::queue_count(Kind::Graphics) as usize + 1;
     let barrier = std::sync::Barrier::new(threads);
     std::thread::scope(|scope| {
         for value in 0..threads as u32 {
@@ -244,7 +262,7 @@ fn a_reselected_lease_keeps_its_frame_slots_usable() {
     let _gpu = gpu();
     let buffer = zeroed_buffer::<u32, Storage>(4);
     // With every queue leased once more, the last lease shares one.
-    let others: Vec<Queue<Gfx>> = (0..Ctx::num_gfx_queues()).map(|_| Queue::new()).collect();
+    let others: Vec<Queue<Gfx>> = (0..Ctx::queue_count(Kind::Graphics)).map(|_| Queue::new()).collect();
     let mut queue = Queue::<Gfx>::new();
     let mut slot = FrameSlot::new(&queue).unwrap();
     slot.begin(epoch::reserve())

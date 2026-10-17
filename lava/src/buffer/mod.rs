@@ -110,13 +110,11 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             flags |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
         }
         let mut create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(flags);
-        // Shared with the transfer family, which lava records no ownership transfers for.
-        // Buffers have no compression that concurrent sharing could cost, unlike images, which
-        // stay exclusive to the graphics family.
-        let ctx = Ctx::get();
-        let families;
-        if let Some(transfer) = &ctx.transfer_queues {
-            families = [ctx.gfx_queues.family, transfer.family];
+        // Shared between every family lava created queues of, so no queue needs an ownership
+        // transfer for it. Buffers have no compression that concurrent sharing could cost,
+        // unlike images, which are exclusive to one family at a time.
+        let families = Ctx::get().queues.family_indices();
+        if families.len() > 1 {
             create_info = create_info
                 .sharing_mode(vk::SharingMode::CONCURRENT)
                 .queue_family_indices(&families);

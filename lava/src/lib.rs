@@ -56,6 +56,7 @@ pub mod image;
 pub mod memory;
 pub mod pipeline;
 pub mod query;
+pub mod queue;
 pub mod state;
 mod unsized_struct;
 pub mod vk;
@@ -137,7 +138,7 @@ pub fn init(config: &Config) -> Result<()> {
 /// presents wait; call it outside of `Frame::execute`.
 pub fn wait_idle() -> Result<()> {
     {
-        let _queues = vkobjects::queue::lock_all_queues();
+        let _queues = queue::device::lock_all_queues();
         unsafe { Ctx::device().device_wait_idle()? };
         // The presentation engine may still hold what the last presents use.
         epoch::wait_for_presents(1_000_000_000);

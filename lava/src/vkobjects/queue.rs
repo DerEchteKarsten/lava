@@ -4,7 +4,10 @@ use std::{
     marker::PhantomData,
     ops::Range,
     panic::AssertUnwindSafe,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use crate::error::{Error, Result};
@@ -15,6 +18,11 @@ use smallvec::SmallVec;
 use crate::{
     command_buffer::{Barriers, BufferAccess, CommandBuffer, ImageAccess, QueueCaps},
     epoch::{self, Epoch},
+    queue::{
+        Kind,
+        device::FamilyQueues,
+        lock,
+    },
     state::{CALLSITE, Ctx, Functions},
     vkobjects::swapchain::Swapchain,
 };
@@ -224,78 +232,32 @@ pub struct Gfx;
 impl crate::sealed::Sealed for Transfer {}
 impl QueueFamilie for Transfer {
     fn queues() -> &'static FamilyQueues {
-        let ctx = Ctx::get();
-        ctx.transfer_queues.as_ref().unwrap_or(&ctx.gfx_queues)
+        let queues = &Ctx::get().queues;
+        queues.family(Kind::Transfer).unwrap_or(queues.graphics())
     }
 }
 impl crate::sealed::Sealed for Gfx {}
 impl QueueFamilie for Gfx {
     fn queues() -> &'static FamilyQueues {
-        &Ctx::get().gfx_queues
+        Ctx::get().queues.graphics()
     }
 }
 
-/// Every queue of one family, handed out as [`Queue`] leases.
-#[derive(Debug)]
-pub struct FamilyQueues {
-    pub(crate) family: u32,
-    /// Vulkan wants submissions to one queue externally synchronised.
-    handles: Box<[Mutex<vk::Queue>]>,
-    /// The leases of each queue.
-    leases: Mutex<Box<[u32]>>,
-    /// Per queue: the accesses of what was submitted to it that later submissions may have to
-    /// wait for. Locked while a command buffer for the queue is recorded and submitted, so
-    /// leases sharing a queue record one after the other.
-    pending: Box<[Mutex<PendingAccesses>]>,
-    caps: QueueCaps,
-}
-
-/// Locks `mutex`, also after a panic while it was held: what lava keeps in these mutexes stays
-/// usable (pending accesses can only be more than what runs, which costs barriers at most).
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
-impl FamilyQueues {
-    /// The `count` queues of `family`, whose queues can do `flags`; `images`: it is the
-    /// graphics family, the only one that may access images.
-    pub(crate) fn new(
-        device: &ash::Device,
-        family: u32,
-        count: u32,
-        flags: vk::QueueFlags,
-        images: bool,
-    ) -> Self {
-        Self {
-            family,
-            handles: (0..count)
-                .map(|i| Mutex::new(unsafe { device.get_device_queue(family, i) }))
-                .collect(),
-            leases: Mutex::new(vec![0; count as usize].into()),
-            pending: (0..count).map(|_| Mutex::default()).collect(),
-            caps: QueueCaps { flags, images },
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.handles.len()
+/// What a lease of `family` can record.
+fn caps(family: &FamilyQueues) -> QueueCaps {
+    QueueCaps {
+        flags: family.flags,
+        images: family.index == Ctx::get().queues.graphics().index,
     }
 }
 
 /// Calls `f` with the pending accesses of every queue.
 fn for_each_pending(mut f: impl FnMut(&mut PendingAccesses)) {
-    let ctx = Ctx::get();
-    let families = std::iter::once(&ctx.gfx_queues).chain(&ctx.transfer_queues);
-    for pending in families.flat_map(|family| &family.pending) {
-        f(&mut lock(pending));
+    for family in Ctx::get().queues.iter() {
+        for queue in &family.queues {
+            f(&mut lock(&queue.pending));
+        }
     }
-}
-
-/// Every queue, locked: nothing can be submitted or presented while they are held.
-pub(crate) fn lock_all_queues() -> Vec<MutexGuard<'static, vk::Queue>> {
-    let ctx = Ctx::get();
-    let families = std::iter::once(&ctx.gfx_queues).chain(&ctx.transfer_queues);
-    families.flat_map(|family| &family.handles).map(lock).collect()
 }
 
 /// Forgets the pending accesses of an image that is being destroyed, on every queue, so an
@@ -308,6 +270,19 @@ pub(crate) fn forget_image(image: vk::Image) {
 /// Like [`forget_image`], for the addresses of a buffer that is being destroyed.
 pub(crate) fn forget_buffer(range: Range<u64>) {
     for_each_pending(|pending| pending.forget_buffer(range.clone()));
+}
+
+/// Held while leases are counted.
+static LEASES: Mutex<()> = Mutex::new(());
+
+fn leases(family: &FamilyQueues) -> Vec<u32> {
+    (family.queues.iter())
+        .map(|queue| queue.timelines.load(Ordering::Relaxed))
+        .collect()
+}
+
+fn lease_count(family: &FamilyQueues, index: usize) -> &AtomicU32 {
+    &family.queues[index].timelines
 }
 
 /// A lease on one queue of family `Q`: one no other lease holds while there is one, then the
@@ -323,7 +298,12 @@ pub struct Queue<Q: QueueFamilie> {
 impl<Q: QueueFamilie> Queue<Q> {
     pub fn new() -> Self {
         let family = Q::queues();
-        let index = lease(&mut lock(&family.leases));
+        let index = {
+            let _leases = lock(&LEASES);
+            let index = lease(&mut leases(family));
+            lease_count(family, index).fetch_add(1, Ordering::Relaxed);
+            index
+        };
         Self {
             family,
             index,
@@ -335,7 +315,8 @@ impl<Q: QueueFamilie> Queue<Q> {
     /// while every queue was taken keep sharing after the others were dropped; this finds out,
     /// [`Self::reselect`] fixes it.
     pub fn is_optimal(&self) -> bool {
-        is_optimal(&lock(&self.family.leases), self.index)
+        let _leases = lock(&LEASES);
+        is_optimal(&leases(self.family), self.index)
     }
 
     /// Moves the lease to the least used queue of its family. It waits until the old queue is
@@ -350,20 +331,21 @@ impl<Q: QueueFamilie> Queue<Q> {
         self.with(|queue| unsafe { Ctx::device().queue_wait_idle(queue) })?;
         let old = self.index;
         {
-            let mut leases = lock(&self.family.leases);
-            leases[old] -= 1;
-            self.index = lease(&mut leases);
+            let _leases = lock(&LEASES);
+            lease_count(self.family, old).fetch_sub(1, Ordering::Relaxed);
+            self.index = lease(&mut leases(self.family));
+            lease_count(self.family, self.index).fetch_add(1, Ordering::Relaxed);
         }
         if self.index != old {
-            let pending = lock(&self.family.pending[old]).clone();
-            lock(&self.family.pending[self.index]).append(pending);
+            let pending = lock(&self.family.queues[old].pending).clone();
+            lock(&self.family.queues[self.index].pending).append(pending);
         }
         Ok(())
     }
 
     /// Calls `f` with the queue, locked.
     fn with<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
-        f(*lock(&self.family.handles[self.index]))
+        f(*lock(&self.family.queues[self.index].queue))
     }
 }
 
@@ -375,11 +357,12 @@ impl<Q: QueueFamilie> Default for Queue<Q> {
 
 impl<Q: QueueFamilie> Drop for Queue<Q> {
     fn drop(&mut self) {
-        lock(&self.family.leases)[self.index] -= 1;
+        let _leases = lock(&LEASES);
+        lease_count(self.family, self.index).fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// Leases the queue the fewest leases share.
+/// The queue the fewest leases share, whose count goes up.
 fn lease(leases: &mut [u32]) -> usize {
     let (index, _) = leases
         .iter()
@@ -469,7 +452,7 @@ pub struct FrameSlot {
 impl FrameSlot {
     #[validation_trace]
     pub fn new<Q: QueueFamilie>(queue: &Queue<Q>) -> Result<Self> {
-        let pool = CommandPool::new(queue.family.family)?;
+        let pool = CommandPool::new(queue.family.index)?;
         let buffer = pool.create_command_buffer()?;
         Ok(Self {
             epoch: None,
@@ -477,7 +460,7 @@ impl FrameSlot {
             pool,
             fence: Fence::new()?,
             submitted: false,
-            family: queue.family.family,
+            family: queue.family.index,
             barrier_log: Vec::new(),
         })
     }
@@ -636,7 +619,7 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
 ) -> Result<()> {
     // Held until the submission, so the queue gets command buffers in the order their
     // barriers were computed in.
-    let mut pending = lock(&queue.family.pending[queue.index]);
+    let mut pending = lock(&queue.family.queues[queue.index].pending);
     let epoch = slot.epoch.as_ref().map_or(0, Epoch::value);
     let mut taken = std::mem::take(&mut *pending);
     taken.retire(epoch::completed());
@@ -645,7 +628,7 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
         taken,
         epoch,
         slot.family,
-        queue.family.caps,
+        caps(queue.family),
         std::mem::take(&mut slot.barrier_log),
     );
 

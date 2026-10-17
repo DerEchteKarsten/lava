@@ -53,7 +53,7 @@ impl Surface {
         let can_present = unsafe {
             surface_fn.get_physical_device_surface_support(
                 physical_device,
-                Ctx::gfx_queue_index(),
+                Ctx::get().queues.graphics().index,
                 handle,
             )?
         };

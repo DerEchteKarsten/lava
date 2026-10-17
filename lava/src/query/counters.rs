@@ -107,7 +107,7 @@ pub(crate) fn init() -> Result<()> {
         return Ok(());
     }
     let (instance, _) = Functions::performance_query();
-    let (device, family) = (Ctx::physical_device().handel, Ctx::gfx_queue_index());
+    let (device, family) = (Ctx::physical_device().handel, Ctx::get().queues.graphics().index);
     let len = unsafe {
         instance
             .enumerate_physical_device_queue_family_performance_query_counters_len(device, family)?
@@ -154,7 +154,7 @@ pub fn passes(selection: &[&Counter]) -> u32 {
     let (instance, _) = Functions::performance_query();
     let indices: Vec<u32> = selection.iter().map(|counter| counter.index).collect();
     let info = vk::QueryPoolPerformanceCreateInfoKHR::default()
-        .queue_family_index(Ctx::gfx_queue_index())
+        .queue_family_index(Ctx::get().queues.graphics().index)
         .counter_indices(&indices);
     unsafe {
         instance.get_physical_device_queue_family_performance_query_passes(

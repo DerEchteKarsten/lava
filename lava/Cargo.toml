@@ -47,6 +47,8 @@ default = [
     "performance-query",
     "calibrated-timestamps",
     "present-fences",
+    "async-compute",
+    "async-transfer",
     "bc-compression",
     "independent-blend",
     "fill-mode-non-solid",
@@ -108,6 +110,10 @@ calibrated-timestamps = []
 assert-calibrated-timestamps = ["calibrated-timestamps"]
 present-fences = []
 assert-present-fences = ["present-fences"]
+async-compute = []
+assert-async-compute = ["async-compute"]
+async-transfer = []
+assert-async-transfer = ["async-transfer"]
 bc-compression = []
 assert-bc-compression = ["bc-compression"]
 independent-blend = []

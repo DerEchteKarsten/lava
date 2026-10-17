@@ -21,6 +21,7 @@ use lava::{
     },
     memory::memory_report,
     query::{QueryPipelineStatisticFlags as Statistics, QueryPool, Timestamp, counters},
+    queue::Kind,
     state::Ctx,
 };
 use lava_tests::bindings::{TestMesh, TestRaster, TestVertex};
@@ -44,6 +45,8 @@ fn disabled() -> Features {
         shader_clock: true,
         performance_query: true,
         calibrated_timestamps: true,
+        async_compute: true,
+        async_transfer: true,
         host_image_copy: true,
         bc_compression: true,
         wide_lines: true,
@@ -153,6 +156,9 @@ fn disabled_features_are_off() {
     let features = Ctx::features();
     assert_eq!(features.without(disabled()), features);
     assert!(!features.dynamic_blend && !features.mesh_shader);
+    // Without them, lava creates queues of the graphics family alone.
+    assert_eq!(Ctx::queue_family(Kind::Compute), None);
+    assert_eq!(Ctx::queue_family(Kind::Transfer), None);
 }
 
 #[test]
