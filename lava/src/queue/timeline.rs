@@ -419,8 +419,8 @@ impl<K: QueueKind> Submission<K> {
                 unsafe {
                     device.reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())?;
                     device.begin_command_buffer(rec.handle, &Default::default())?;
-                    // An acquired image without its acquire wait keeps its layout; the next
-                    // acquire resets it.
+                    // An acquired image without its acquire wait keeps its layout; the surface
+                    // resets its state when it keeps it current or acquires it again.
                     let presented = |image: vk::Image| rec.presents.iter().any(|p| p.image == image);
                     for barriers in &mut rec.barrier_log {
                         barriers.images.retain(|b| !rec.acquired.iter().any(|&(i, _)| i == b.image && !presented(i)));
@@ -440,8 +440,8 @@ impl<K: QueueKind> Submission<K> {
             }
         }
         for present in &rec.presents {
-            if let Some(outstanding) = &mut *lock(&present.outstanding) {
-                outstanding.presented = Some((i, value));
+            if let Some(current) = &mut *lock(&present.current) {
+                current.presented = Some((i, value));
             }
         }
         let mut log = std::mem::take(&mut rec.barrier_log);

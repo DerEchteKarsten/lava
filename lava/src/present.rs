@@ -1,4 +1,4 @@
-//! Presenting to a window: `PresentSurface` owns a surface, its swapchain and the semaphores between them, recreates the swapchain when needed and destroys replaced ones once their presents are done, and hands out one acquired image at a time, which the submission that presents it waits for and signals
+//! Presenting to a window: `PresentSurface` owns a surface, its swapchain and the semaphores between them, recreates the swapchain when needed and destroys replaced ones once their presents are done, and keeps one current image, which the submission that presents it waits for and signals
 use std::{
     collections::VecDeque,
     fmt,
@@ -42,15 +42,21 @@ pub(crate) struct Present {
     pub(crate) image: vk::Image,
     pub(crate) acquire: vk::Semaphore,
     pub(crate) present: vk::Semaphore,
-    pub(crate) outstanding: Arc<Mutex<Option<Outstanding>>>,
+    pub(crate) current: Arc<Mutex<Option<Current>>>,
 }
 
 impl<K: HasGraphics> CommandBuffer<'_, K> {
-    /// Moves `image` into `PRESENT_SRC_KHR`. The submission waits for its acquire and signals
-    /// what `PresentSurface::present` waits for; it must be the one that first uses the image.
+    /// Moves the surface's current image into `PRESENT_SRC_KHR`. The submission waits for its
+    /// acquire and signals what `PresentSurface::present` waits for; it must be the one that
+    /// first uses the image. Panics if an earlier submission presented it already.
     #[validation_trace]
-    pub fn present<U: StaticUsage>(&mut self, surface: &PresentSurface<U>, image: &AcquiredImage) {
-        let view = surface.image(image);
+    pub fn present<U: StaticUsage>(&mut self, surface: &PresentSurface<U>) {
+        let current = lock(&surface.current).expect("no image is current: `acquire` one first");
+        assert!(
+            current.presented.is_none(),
+            "a submission presented the current image already: `PresentSurface::present` it"
+        );
+        let view = surface.current_image();
         self.rec.flush_pending(
             std::iter::once(view.access(
                 vk::PipelineStageFlags2::empty(),
@@ -63,9 +69,9 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
             let swapchain = surface.swapchain.as_ref().expect("an image was acquired");
             self.rec.presents.push(Present {
                 image: view.image,
-                acquire: image.acquire,
-                present: swapchain.images[image.index as usize].present,
-                outstanding: image.outstanding.clone(),
+                acquire: current.acquire,
+                present: swapchain.images[current.index as usize].present,
+                current: surface.current.clone(),
             });
         }
     }
@@ -109,8 +115,9 @@ impl Swapchain {
 }
 
 /// A window's surface and its swapchain of images of usage `U`, each bound in every bindless
-/// set `U` allows. A frame acquires an image, records into [`Self::image`] in a submission that
-/// ends with `cmd.present(&surface, &image)`, and presents it.
+/// set `U` allows. A frame acquires an image, records into [`Self::current_image`] in a
+/// submission that ends with `cmd.present(&surface)`, and presents it. An image no submission
+/// used stays current for the next frame.
 pub struct PresentSurface<U: StaticUsage = ColorAttachmentTransferDst> {
     surface: vk::SurfaceKHR,
     format: vk::SurfaceFormatKHR,
@@ -127,50 +134,18 @@ pub struct PresentSurface<U: StaticUsage = ColorAttachmentTransferDst> {
     waited: VecDeque<(vk::Semaphore, usize, u64)>,
     /// Signalled present fences.
     fences: Vec<vk::Fence>,
-    outstanding: Arc<Mutex<Option<Outstanding>>>,
+    /// The acquired image, which the submission that presents it writes its value into.
+    current: Arc<Mutex<Option<Current>>>,
     _usage: PhantomData<fn() -> U>,
 }
 
-/// The image a surface handed out.
+/// The image a surface acquired.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Outstanding {
+pub(crate) struct Current {
     index: u32,
     acquire: vk::Semaphore,
     /// The timeline and value of the submission that presented it.
     pub(crate) presented: Option<(usize, u64)>,
-    dropped: bool,
-}
-
-/// An image [`PresentSurface::acquire`] handed out. Dropping it instead of presenting it makes
-/// the next acquire recreate the swapchain.
-#[must_use]
-pub struct AcquiredImage {
-    index: u32,
-    acquire: vk::Semaphore,
-    outstanding: Arc<Mutex<Option<Outstanding>>>,
-    presented: bool,
-}
-
-impl AcquiredImage {
-    pub fn index(&self) -> u32 {
-        self.index
-    }
-}
-
-impl fmt::Debug for AcquiredImage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AcquiredImage").field("index", &self.index).finish()
-    }
-}
-
-impl Drop for AcquiredImage {
-    fn drop(&mut self) {
-        if !self.presented
-            && let Some(outstanding) = &mut *lock(&self.outstanding)
-        {
-            outstanding.dropped = true;
-        }
-    }
 }
 
 impl<U: StaticUsage> fmt::Debug for PresentSurface<U> {
@@ -272,7 +247,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                 free: Vec::new(),
                 waited: VecDeque::new(),
                 fences: Vec::new(),
-                outstanding: Arc::default(),
+                current: Arc::default(),
                 _usage: PhantomData,
             })
         })();
@@ -314,16 +289,24 @@ impl<U: StaticUsage> PresentSurface<U> {
         self.surface
     }
 
-    /// The next image for a window of `size`, `None` while the window has no extent. Panics
-    /// while an acquired image is neither presented nor dropped.
+    /// Makes an image of a window of `size` current, and returns whether one is (`false` while
+    /// the window has no extent). An image a submission presented is presented first; one no
+    /// submission used stays current, at its size, so a resize takes effect a frame later.
     #[validation_trace]
-    pub fn acquire(&mut self, size: UVec2) -> Result<Option<AcquiredImage>> {
+    pub fn acquire(&mut self, size: UVec2) -> Result<bool> {
         let device = Ctx::device();
-        let outstanding = *lock(&self.outstanding);
-        if let Some(outstanding) = outstanding {
-            assert!(outstanding.dropped, "an image acquired before is still outstanding: present or drop it first");
-            self.recover(outstanding)?;
-            *lock(&self.outstanding) = None;
+        let current = *lock(&self.current);
+        match current {
+            Some(current) if current.presented.is_none() => {
+                // Only a failed recording can have used it (one that uses it must present
+                // it), and that one's barriers were dropped: its contents are still undefined.
+                let swapchain = self.swapchain.as_ref().expect("an image is current");
+                let state = ImageState { acquired: true, ..ImageState::UNDEFINED };
+                swapchain.images[current.index as usize].state.store(state.pack(), Ordering::Relaxed);
+                return Ok(size.x > 0 && size.y > 0);
+            }
+            Some(_) => self.present()?,
+            None => {}
         }
         let free = &mut self.free;
         self.waited.retain(|&(semaphore, t, v)| {
@@ -349,7 +332,7 @@ impl<U: StaticUsage> PresentSurface<U> {
             swapchain.destroy();
         }
         if size.x == 0 || size.y == 0 {
-            return Ok(None);
+            return Ok(false);
         }
         for _ in 0..3 {
             let physical_device = Ctx::physical_device().handel;
@@ -358,7 +341,7 @@ impl<U: StaticUsage> PresentSurface<U> {
             };
             let (min, max) = (self.capabilities.min_image_extent, self.capabilities.max_image_extent);
             if max.width == 0 || max.height == 0 {
-                return Ok(None);
+                return Ok(false);
             }
             let extent = vk::Extent2D {
                 width: size.x.clamp(min.width, max.width.max(min.width)),
@@ -474,13 +457,8 @@ impl<U: StaticUsage> PresentSurface<U> {
                     let state = ImageState { acquired: true, ..ImageState::UNDEFINED };
                     swapchain.images[index as usize].state.store(state.pack(), Ordering::Relaxed);
                     let acquire = semaphore;
-                    *lock(&self.outstanding) = Some(Outstanding { index, acquire, presented: None, dropped: false });
-                    return Ok(Some(AcquiredImage {
-                        index,
-                        acquire,
-                        outstanding: self.outstanding.clone(),
-                        presented: false,
-                    }));
+                    *lock(&self.current) = Some(Current { index, acquire, presented: None });
+                    return Ok(true);
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.free.push(semaphore);
@@ -495,10 +473,12 @@ impl<U: StaticUsage> PresentSurface<U> {
         Err(Error::message("the swapchain was still out of date after three recreations"))
     }
 
-    /// The view of `image`, for the submission that draws into it and presents it.
-    pub fn image(&self, image: &AcquiredImage) -> ImageView<'_, format::Dynamic, U> {
-        let swapchain = self.swapchain.as_ref().expect("an image was acquired");
-        let i = &swapchain.images[image.index as usize];
+    /// The view of the current image, for the submission that draws into it and presents it.
+    /// Panics before the first [`Self::acquire`].
+    pub fn current_image(&self) -> ImageView<'_, format::Dynamic, U> {
+        let current = lock(&self.current).expect("no image is current: `acquire` one first");
+        let swapchain = self.swapchain.as_ref().expect("an image is current");
+        let i = &swapchain.images[current.index as usize];
         ImageView {
             image: i.image,
             view: i.view,
@@ -512,18 +492,15 @@ impl<U: StaticUsage> PresentSurface<U> {
         }
     }
 
-    /// Presents `image`. Panics unless a submission recorded `cmd.present` of it.
+    /// Presents the current image once a submission recorded `cmd.present(&surface)` of it;
+    /// until then it stays current.
     #[validation_trace]
-    pub fn present(&mut self, mut image: AcquiredImage) -> Result<()> {
-        let index = image.index;
-        let outstanding = lock(&self.outstanding).expect("an image was acquired");
-        let (t, v) = outstanding.presented.expect(
-            "no submission presented the image: record `cmd.present(&surface, &image)` and submit it first",
-        );
-        image.presented = true;
-        drop(image);
-        *lock(&self.outstanding) = None;
-        self.waited.push_back((outstanding.acquire, t, v));
+    pub fn present(&mut self) -> Result<()> {
+        let Some(Current { index, acquire, presented: Some((t, v)) }) = *lock(&self.current) else {
+            return Ok(());
+        };
+        *lock(&self.current) = None;
+        self.waited.push_back((acquire, t, v));
         let swapchain = self.swapchain.as_ref().expect("an image was acquired");
         let (handle, present) = (swapchain.handle, swapchain.images[index as usize].present);
 
@@ -561,49 +538,40 @@ impl<U: StaticUsage> PresentSurface<U> {
         }
         Ok(())
     }
-
-    /// Takes back an image dropped instead of presented, consuming the semaphore it left
-    /// signalled.
-    fn recover(&mut self, outstanding: Outstanding) -> Result<()> {
-        self.recreate = true;
-        let Some(swapchain) = &self.swapchain else {
-            return Ok(());
-        };
-        let image = &swapchain.images[outstanding.index as usize];
-        let signalled = match outstanding.presented {
-            Some((t, v)) => {
-                self.waited.push_back((outstanding.acquire, t, v));
-                image.present
-            }
-            None => outstanding.acquire,
-        };
-        let device = Ctx::device();
-        let waits = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(signalled)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let fence = unsafe { device.create_fence(&Default::default(), None)? };
-        let submitted = {
-            let queue = lock(&Ctx::get().queues.graphics().queues[0]);
-            let info = vk::SubmitInfo2::default().wait_semaphore_infos(&waits);
-            unsafe { device.queue_submit2(*queue, &[info], fence) }
-        };
-        let waited = submitted.and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
-        unsafe { device.destroy_fence(fence, None) };
-        waited?;
-        if outstanding.presented.is_none() {
-            self.free.push(outstanding.acquire);
-        }
-        Ok(())
-    }
 }
 
 impl<U: StaticUsage> Drop for PresentSurface<U> {
     fn drop(&mut self) {
-        let outstanding = *lock(&self.outstanding);
-        if let Some(outstanding) = outstanding.filter(|o| o.dropped)
-            && let Err(err) = self.recover(outstanding)
+        // A current image left a semaphore signalled (its acquire, or its present once a
+        // submission presented it), which a submission consumes before it is destroyed.
+        let current = *lock(&self.current);
+        if let Some(current) = current
+            && let Some(swapchain) = &self.swapchain
         {
-            tracing::error!(%err, "failed to take back a dropped swapchain image");
+            let signalled = match current.presented {
+                Some(_) => swapchain.images[current.index as usize].present,
+                None => current.acquire,
+            };
+            let device = Ctx::device();
+            let waits = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(signalled)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let consumed = (|| -> Result<()> {
+                let fence = unsafe { device.create_fence(&Default::default(), None)? };
+                let submitted = {
+                    let queue = lock(&Ctx::get().queues.graphics().queues[0]);
+                    let info = vk::SubmitInfo2::default().wait_semaphore_infos(&waits);
+                    unsafe { device.queue_submit2(*queue, &[info], fence) }
+                };
+                let waited =
+                    submitted.and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
+                unsafe { device.destroy_fence(fence, None) };
+                Ok(waited?)
+            })();
+            if let Err(err) = consumed {
+                tracing::error!(%err, "failed to wait for the current swapchain image");
+            }
+            self.free.push(current.acquire);
         }
         let mut swapchains: Vec<Swapchain> = self.old.drain(..).map(|(s, _)| s).collect();
         swapchains.extend(self.swapchain.take());

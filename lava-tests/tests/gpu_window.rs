@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use lava::{
     bindless::{BindlessHandle, NULL_HANDLE},
     image::{format::ClearValue, usage::ColorAttachmentStorageTransferDst},
-    present::{AcquiredImage, PresentSurface},
+    present::PresentSurface,
     queue::{Graphics, Timeline},
     state::raw_vulkan as vk,
 };
@@ -60,29 +60,28 @@ fn present_frame(
     color: [f32; 4],
 ) -> BindlessHandle {
     let submission = timeline.begin().unwrap();
-    let image = surface.acquire(size).unwrap().expect("the window has an extent");
-    let view = surface.image(&image);
-    let handle = view.handle();
+    assert!(surface.acquire(size).unwrap(), "the window has an extent");
+    let handle = surface.current_image().handle();
     submission
         .submit(|cmd| {
-            cmd.clear_image(view, ClearValue::Float(color));
-            cmd.present(surface, &image);
+            cmd.clear_image(surface.current_image(), ClearValue::Float(color));
+            cmd.present(surface);
         })
         .unwrap();
-    surface.present(image).unwrap();
+    surface.present().unwrap();
     handle
 }
 
-/// Acquires an image and records `record` with it in a submission, without presenting it.
-fn acquire_and(
-    timeline: &Timeline<Graphics>,
-    surface: &mut Surface,
-    record: impl FnOnce(&mut lava::command_buffer::CommandBuffer<Graphics>, &Surface, &AcquiredImage),
-) -> AcquiredImage {
+/// Acquires an image and clears and presents it in a submission, without `surface.present()`.
+fn submit_without_presenting(timeline: &Timeline<Graphics>, surface: &mut Surface) {
     let submission = timeline.begin().unwrap();
-    let image = surface.acquire(SIZE).unwrap().unwrap();
-    submission.submit(|cmd| record(cmd, surface, &image)).unwrap();
-    image
+    assert!(surface.acquire(SIZE).unwrap());
+    submission
+        .submit(|cmd| {
+            cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4]));
+            cmd.present(surface);
+        })
+        .unwrap();
 }
 
 fn run(event_loop: &ActiveEventLoop) {
@@ -138,37 +137,38 @@ fn run(event_loop: &ActiveEventLoop) {
     drop(reserved);
     step("a_new_size_recreates_the_swapchain_and_frees_the_old_slots");
 
-    assert!(surface.acquire(glam::UVec2::ZERO).unwrap().is_none());
-    assert!(surface.acquire(glam::UVec2::new(0, 64)).unwrap().is_none());
+    assert!(!surface.acquire(glam::UVec2::ZERO).unwrap());
+    assert!(!surface.acquire(glam::UVec2::new(0, 64)).unwrap());
     step("no_image_without_an_extent");
 
-    // Dropped before any submission waited for its acquire, and after one presented it.
-    drop(surface.acquire(SIZE).unwrap().unwrap());
-    present_frame(&timeline, &mut surface, SIZE, [0.0, 1.0, 1.0, 1.0]);
-    drop(acquire_and(&timeline, &mut surface, |cmd, surface, image| {
-        cmd.clear_image(surface.image(image), ClearValue::Float([0.5; 4]));
-        cmd.present(surface, image);
-    }));
+    // An image no submission used stays current, through `present` too.
+    assert!(surface.acquire(SIZE).unwrap());
+    let unused = surface.current_image().handle();
+    surface.present().unwrap();
+    assert!(surface.acquire(SIZE).unwrap());
+    assert_eq!(surface.current_image().handle(), unused);
+    let drawn = present_frame(&timeline, &mut surface, SIZE, [0.0, 1.0, 1.0, 1.0]);
+    assert_eq!(drawn, unused, "the next frame draws into it");
+    // One a submission presented is presented by the next acquire.
+    submit_without_presenting(&timeline, &mut surface);
     present_frame(&timeline, &mut surface, SIZE, [1.0, 1.0, 1.0, 1.0]);
-    step("dropped_images_are_taken_back");
+    step("unused_images_stay_current");
 
     let submission = timeline.begin().unwrap();
-    let image = surface.acquire(SIZE).unwrap().unwrap();
+    assert!(surface.acquire(SIZE).unwrap());
     let unpresented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        submission.submit(|cmd| cmd.clear_image(surface.image(&image), ClearValue::Float([0.5; 4])))
+        submission.submit(|cmd| cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4])))
     }));
-    assert!(unpresented.is_err(), "the submission that uses an acquired image presents it");
-    let unpresented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        surface.present(image)
-    }));
-    assert!(unpresented.is_err(), "no submission presented it");
+    assert!(unpresented.is_err(), "the submission that uses the current image presents it");
+    submit_without_presenting(&timeline, &mut surface);
+    let submission = timeline.begin().unwrap();
     let twice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _first = surface.acquire(SIZE).unwrap();
-        let _second = surface.acquire(SIZE);
+        submission.submit(|cmd| cmd.present(&surface))
     }));
-    assert!(twice.is_err(), "one image at a time");
+    assert!(twice.is_err(), "an image is presented by one submission");
+    surface.present().unwrap();
     present_frame(&timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
-    step("misuse_panics_and_is_taken_back");
+    step("misuse_panics");
 
     let modes = surface.present_modes().len();
     surface.set_present_mode(modes - 1);

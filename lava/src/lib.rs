@@ -11,8 +11,8 @@
 //! records, submits and returns a [`queue::Wait`] for other timelines and the host. Barriers
 //! within a timeline are automatic; images move between families with
 //! [`command_buffer::CommandBuffer::release`]. Dropped objects are destroyed once every timeline
-//! finished its stamp at the drop ([`lifetime`]). Windows present through a [`present::PresentSurface`], whose acquire and
-//! present follow from what the submission does with the image.
+//! finished its stamp at the drop ([`lifetime`]). Windows present through a [`present::PresentSurface`] and its current
+//! image, whose acquire and present follow from what the submission does with it.
 //!
 //! # Shader contract
 //! What every frontend's shaders and generated code must match:
