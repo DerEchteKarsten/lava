@@ -309,7 +309,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
 4. ~~**The swapchain leaves the hard parts to the user.**~~ **Done (2026-10-17):** `PresentSurface`
    owns surface, swapchain and semaphores and recreates itself in `acquire(size) ->
    Option<AcquiredImage>`; the acquire wait and the present signal follow from the
-   submission's accesses (`cmd.present(view)`), and core's swapchain code went from about 250
+   submission's accesses (`cmd.present(&surface, &image)`), and core's swapchain code went from about 250
    lines to a `Presenter` resource.
    - The user manages acquire semaphores per frame in flight, `render_finished` per image
      (recreated on every resize), the image index, and the `PRESENT_SRC` transition.

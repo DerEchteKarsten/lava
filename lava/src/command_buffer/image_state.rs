@@ -68,13 +68,6 @@ impl ImageState {
     }
 }
 
-pub(crate) fn set_acquired(state: &AtomicU64, acquired: bool) {
-    match acquired {
-        true => state.fetch_or(ACQUIRED, Ordering::Relaxed),
-        false => state.fetch_and(!ACQUIRED, Ordering::Relaxed),
-    };
-}
-
 /// Calls `f` per state and the mips it covers; `states` holds one for all of `mips` or one per mip.
 fn for_each(states: &[AtomicU64], mips: Range<u32>, mut f: impl FnMut(&AtomicU64, Range<u32>)) {
     if let [state] = states {

@@ -17,7 +17,7 @@ use crate::{
     bindless::Bindless,
     command_buffer::{Barriers, CommandBuffer, Recording, pending::PendingAccesses},
     error::{Error, Result},
-    lifetime, present,
+    lifetime,
     queue::{FamilyInfo, FamilyQueues, Kind, MAX_TIMELINES, QueueKind, Stage, Wait, lock},
     state::{CALLSITE, Ctx},
 };
@@ -355,12 +355,21 @@ impl<K: QueueKind> Submission<K> {
         CALLSITE.set(prev);
 
         let rec = &mut cmd.rec;
-        let binary_waits: SmallVec<[_; 1]> =
-            rec.acquire_waits.iter().map(|w| (w.semaphore, w.stage)).collect();
-        let presents: SmallVec<[_; 1]> = rec.presents.iter().map(|p| p.semaphore).collect();
+        let unpresented = (rec.acquired.iter()).any(|(image, _)| !rec.presents.iter().any(|p| p.image == *image));
+        let recorded = recorded.and_then(|()| match unpresented {
+            true => Err(Box::new("a submission that uses an acquired swapchain image must present it") as _),
+            false => Ok(()),
+        });
+        let binary_waits: SmallVec<[_; 1]> = (rec.presents.iter())
+            .map(|p| {
+                let first = rec.acquired.iter().find(|(image, _)| *image == p.image);
+                (p.acquire, first.map_or(vk::PipelineStageFlags2::ALL_COMMANDS, |(_, stage)| *stage))
+            })
+            .collect();
+        let presents: SmallVec<[_; 1]> = rec.presents.iter().map(|p| p.present).collect();
         let family_queues: &'static FamilyQueues = inner.family;
         let queue = &family_queues.queues[inner.queue];
-        let submit = |cmd: vk::CommandBuffer, presents: &[vk::Semaphore]| -> Result<()> {
+        let submit = |cmd: vk::CommandBuffer| -> Result<()> {
             let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let waits: SmallVec<[_; 4]> = (self.waits.iter())
                 .map(|&(t, value, stages)| (semaphore(t), value, stages))
@@ -401,7 +410,7 @@ impl<K: QueueKind> Submission<K> {
                 unsafe { device.cmd_pipeline_barrier2(rec.handle, &info) };
                 unsafe { device.end_command_buffer(rec.handle) }
                     .map_err(Error::from)
-                    .and_then(|()| submit(rec.handle, &presents))
+                    .and_then(|()| submit(rec.handle))
                     .map_err(Err)
             }
         };
@@ -410,12 +419,18 @@ impl<K: QueueKind> Submission<K> {
                 unsafe {
                     device.reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())?;
                     device.begin_command_buffer(rec.handle, &Default::default())?;
+                    // An acquired image without its acquire wait keeps its layout; the next
+                    // acquire resets it.
+                    let presented = |image: vk::Image| rec.presents.iter().any(|p| p.image == image);
+                    for barriers in &mut rec.barrier_log {
+                        barriers.images.retain(|b| !rec.acquired.iter().any(|&(i, _)| i == b.image && !presented(i)));
+                    }
                     for barriers in &rec.barrier_log {
                         rec.pipeline_barrier(barriers);
                     }
                     device.end_command_buffer(rec.handle)?;
                 }
-                submit(rec.handle, &[])
+                submit(rec.handle)
             })();
             if let Err(err) = replayed {
                 tracing::error!(
@@ -424,17 +439,9 @@ impl<K: QueueKind> Submission<K> {
                 );
             }
         }
-        {
-            let mut table = lock(&present::PRESENTS);
-            for wait in &rec.acquire_waits {
-                if let Some(entry) = table.get_mut(&wait.image) {
-                    entry.waited = Some((i, value));
-                }
-            }
-            for presented in rec.presents.iter().filter(|_| result.is_ok()) {
-                if let Some(entry) = table.get_mut(&presented.image) {
-                    entry.presented = Some((queue, i, value));
-                }
+        for present in &rec.presents {
+            if let Some(outstanding) = &mut *lock(&present.outstanding) {
+                outstanding.presented = Some((i, value));
             }
         }
         let mut log = std::mem::take(&mut rec.barrier_log);

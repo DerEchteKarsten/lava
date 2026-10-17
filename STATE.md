@@ -13,7 +13,9 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - A `reserve()` without a following submission holds back every deletion until the timeline's next submission: reserve right before reading.
 - `submit` signals the timeline's stamp, which may cover a `reserve()` made for a later frame (pipelined extract before the previous frame submitted); core's extract runs after the previous render submitted.
 - Swapchain images are owned by graphics: compositing into them on an async compute timeline isn't supported (the present would need an ownership transfer back first).
-- Taking back a dropped `AcquiredImage` waits on the host for an empty submission that consumes its signalled semaphores; it happens only when an image is dropped unpresented.
+- Taking back a dropped `AcquiredImage` waits on the host for an empty submission that consumes its signalled semaphore; it happens only when an image is dropped unpresented.
+- A recording that uses an acquired image and fails before `cmd.present` of it (a panic, or the check that it presents what it uses) is replaced by its barriers without that image's, so its tracked layout is wrong until the next acquire resets it to `UNDEFINED`.
+- The acquire and the present of an image are in one submission: drawing into it on one timeline and presenting from another isn't supported.
 - Without present fences, a replaced swapchain waits for a later value of the timeline that presented it.
 - `VkSwapchainPresentModesCreateInfoEXT` names only the swapchain's own mode, so a present-mode change recreates the swapchain.
 

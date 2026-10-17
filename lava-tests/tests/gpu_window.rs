@@ -66,7 +66,7 @@ fn present_frame(
     submission
         .submit(|cmd| {
             cmd.clear_image(view, ClearValue::Float(color));
-            cmd.present(view);
+            cmd.present(surface, &image);
         })
         .unwrap();
     surface.present(image).unwrap();
@@ -147,14 +147,17 @@ fn run(event_loop: &ActiveEventLoop) {
     present_frame(&timeline, &mut surface, SIZE, [0.0, 1.0, 1.0, 1.0]);
     drop(acquire_and(&timeline, &mut surface, |cmd, surface, image| {
         cmd.clear_image(surface.image(image), ClearValue::Float([0.5; 4]));
-        cmd.present(surface.image(image));
+        cmd.present(surface, image);
     }));
     present_frame(&timeline, &mut surface, SIZE, [1.0, 1.0, 1.0, 1.0]);
     step("dropped_images_are_taken_back");
 
-    let image = acquire_and(&timeline, &mut surface, |cmd, surface, image| {
-        cmd.clear_image(surface.image(image), ClearValue::Float([0.5; 4]))
-    });
+    let submission = timeline.begin().unwrap();
+    let image = surface.acquire(SIZE).unwrap().unwrap();
+    let unpresented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        submission.submit(|cmd| cmd.clear_image(surface.image(&image), ClearValue::Float([0.5; 4])))
+    }));
+    assert!(unpresented.is_err(), "the submission that uses an acquired image presents it");
     let unpresented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         surface.present(image)
     }));

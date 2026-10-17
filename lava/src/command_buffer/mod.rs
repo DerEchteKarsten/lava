@@ -25,7 +25,7 @@ use crate::{
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
-    present::{self, AcquireWait, PresentSignal},
+    present::Present,
     queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
     state::{Ctx, Functions, debug_name},
 };
@@ -118,8 +118,9 @@ pub(crate) struct Recording<'p> {
     /// Every barrier the tracking already counts, so a recording that never reaches the GPU is
     /// replaced by one of just these, which keeps the tracking true.
     pub(crate) barrier_log: Vec<Barriers>,
-    pub(crate) acquire_waits: SmallVec<[AcquireWait; 1]>,
-    pub(crate) presents: SmallVec<[PresentSignal; 1]>,
+    /// Acquired swapchain images with the stages of their first access.
+    pub(crate) acquired: SmallVec<[(vk::Image, vk::PipelineStageFlags2); 1]>,
+    pub(crate) presents: SmallVec<[Present; 1]>,
 }
 
 /// A command buffer being recorded for a family of kind `K`; its methods are the commands `K`
@@ -1104,7 +1105,7 @@ impl<'p> Recording<'p> {
             depth: 0,
             active_queries: 0,
             barrier_log,
-            acquire_waits: SmallVec::new(),
+            acquired: SmallVec::new(),
             presents: SmallVec::new(),
         }
     }
@@ -1156,17 +1157,7 @@ impl<'p> Recording<'p> {
             buffer_acceses.clone(),
         );
         if let Some(barriers) = barriers {
-            for &(image, stage) in &barriers.acquired {
-                let table = present::PRESENTS.lock().unwrap_or_else(|p| p.into_inner());
-                let entry = table.get(&image).expect("an image flagged acquired is in the table");
-                let semaphore = entry.acquire;
-                drop(table);
-                self.acquire_waits.push(AcquireWait {
-                    image,
-                    semaphore,
-                    stage,
-                });
-            }
+            self.acquired.extend_from_slice(&barriers.acquired);
             self.pending_accesses.made_visible(&barriers);
             self.barrier_log.push(barriers);
             let barriers = self.barrier_log.last().expect("just pushed");
