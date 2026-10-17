@@ -479,8 +479,9 @@ struct NewFn {
     gpu_inits: Vec<String>,
     buffer_accesses: Vec<String>,
     image_accesses: Vec<String>,
-    /// `format_check`/`usage_check` calls: what the generics' bounds check at compile time,
-    /// checked at runtime for dynamic formats and usages.
+    /// The image parameters' conversions to views (`let name = name.view();`) and the
+    /// `texel_check`/`usage_check` calls: what the bounds check at compile time, checked at
+    /// runtime for dynamic formats and usages.
     checks: Vec<String>,
 }
 
@@ -502,29 +503,26 @@ fn build_new_fn<'a>(
         let suffix = camel_case(name);
         match field_kind(t) {
             FieldKind::Image { usage } => {
-                let format_bound = match image_texel(t) {
-                    Some((texel, components)) => {
-                        let texels = format!("[{texel}; {components}]");
-                        out.checks
-                            .push(format!("{name}.texel_check::<{texels}>();"));
-                        format!("F{suffix}: HasTexels<{texels}>")
-                    }
-                    None => format!("F{suffix}: Format"),
+                // The view, of the shape's dimension and a format of the shader's texels.
+                let mut bounds = format!("Dim = {}", image_dim(t));
+                out.checks.push(format!("let {name} = {name}.view();"));
+                if let Some((texel, components)) = image_texel(t) {
+                    let texels = format!("[{texel}; {components}]");
+                    out.checks
+                        .push(format!("{name}.texel_check::<{texels}>();"));
+                    bounds.push_str(&format!(", Format: HasTexels<{texels}>"));
+                }
+                let (traits, flags) = match usage {
+                    0 => (format!("image::SampledView<{bounds}>"), "SAMPLED"),
+                    3 => (
+                        format!("image::SampledView<{bounds}> + image::StorageView"),
+                        "SAMPLED | vk::ImageUsageFlags::STORAGE",
+                    ),
+                    _ => (format!("image::StorageView<{bounds}>"), "STORAGE"),
                 };
-                out.generics.push(format_bound);
-                let (usage_bound, flags) = match usage {
-                    0 => ("IsSampled", "SAMPLED"),
-                    3 => ("UnifiedBinding", "SAMPLED | vk::ImageUsageFlags::STORAGE"),
-                    _ => ("IsStorage", "STORAGE"),
-                };
-                out.generics
-                    .push(format!("U{suffix}: image::usage::{usage_bound}"));
                 out.checks
                     .push(format!("{name}.usage_check(vk::ImageUsageFlags::{flags});"));
-                out.params.push(format!(
-                    "{name}: ImageView<'a, F{suffix}, U{suffix}, {}>",
-                    image_dim(t)
-                ));
+                out.params.push(format!("{name}: impl {traits} + 'a"));
                 out.gpu_inits.push(format!("{name}: {name}.handle()"));
                 out.image_accesses.push(format!(
                     "{name}.access({stage}, {access}, vk::ImageLayout::GENERAL)",
@@ -927,9 +925,8 @@ impl<'a> {incomplete}<'a> {{
     out
 }
 
-/// `<'a, F…, U…>` of a generated function, empty without parameters that borrow.
-/// The generics of a generated function; `lifetime` adds the `'a` its views, slices and
-/// result share.
+/// The generics of a generated function (`<'a, U…>`, the buffers' usages); `lifetime` adds
+/// the `'a` its views, slices and result share. Image parameters are `impl` traits.
 fn fn_generics(new: &NewFn, lifetime: bool) -> String {
     let mut generics: Vec<String> = Vec::new();
     if lifetime {

@@ -20,9 +20,10 @@ use crate::{
     epoch,
     image::{
         D2,
-        format::{self, Format},
+        format,
+        kind::ImageRef,
         slice::ImageView,
-        usage::{ColorAttachmentTransferDst, ImageUsage, IsStorage, StaticUsage},
+        usage::{ColorAttachmentTransferDst, IsStorage, StaticUsage},
     },
     state::{Ctx, Functions},
     vkobjects::{
@@ -107,7 +108,6 @@ impl<U: StaticUsage> Swapchain<U> {
         ImageView {
             image: image.image,
             view: image.view,
-            shader_view: image.view,
             mip_range: (0..1).into(),
             extent: self.size,
             handle: image.handle,
@@ -408,10 +408,8 @@ impl CommandBuffer {
     /// Moves `swapchain_image` into `PRESENT_SRC_KHR`, the layout a present needs, once the
     /// frame's earlier accesses of it are done.
     #[validation_trace]
-    pub fn present<'a, F: Format, U: ImageUsage>(
-        &'a mut self,
-        swapchain_image: ImageView<'a, F, U>,
-    ) {
+    pub fn present(&mut self, swapchain_image: impl ImageRef<Dim = D2>) {
+        let swapchain_image = swapchain_image.view();
         self.flush_pending(
             iter::once(swapchain_image.access(
                 vk::PipelineStageFlags2::empty(),

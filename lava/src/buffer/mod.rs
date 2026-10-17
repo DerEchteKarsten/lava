@@ -35,11 +35,8 @@ pub mod usage;
 pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
     pub(crate) handle: vk::Buffer,
     address: u64,
-    allocation: Allocation,
     num_bytes: u64,
-    /// Created `cpu_writable`: the host may access it (`host`, `host_mut`, `host_ptr`). Other
-    /// buffers may be mapped too (all of them on a device with `rebar`), but never accessed.
-    host_access: bool,
+    allocation: Allocation,
     usage: U,
     _type_marker: PhantomData<T>,
 }
@@ -83,7 +80,7 @@ impl<'a, T: Copy + Pod, U: BufferUsage> Into<BufferSlice<'a, T, U>> for &'a Buff
 
 impl<T: Copy + Pod, U: StaticUsage> Buffer<T, U> {
     /// A buffer of `size` elements; `cpu_writable` ones are host-visible, so `host`, `host_mut`
-    /// and `host_ptr` work on them (and only on them, on every device).
+    /// and `host_ptr` work on them on every device (on a device with `rebar` on every buffer).
     #[validation_trace]
     pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
         Self::with_usage(U::default(), size, cpu_writable)
@@ -181,7 +178,6 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             num_bytes,
             allocation: allocation,
             handle: buffer,
-            host_access: cpu_writable,
         })
     }
 
@@ -207,32 +203,29 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         self.usage
     }
 
+    /// Whether the host can access it (`host`, `host_mut`, `host_ptr`): it was created
+    /// `cpu_writable`, or the device has `rebar`, which maps every buffer.
+    pub fn is_mapped(&self) -> bool {
+        self.allocation.mapped_ptr().is_some()
+    }
+
     /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
     pub fn usage_check(&self, required: vk::BufferUsageFlags) {
         self.usage.check(required);
     }
 
-    /// Whether the host can access it: it was created `cpu_writable`.
-    pub fn is_mapped(&self) -> bool {
-        self.host_access
-    }
-
     fn mapped(&self) -> *mut T {
-        assert!(
-            self.host_access,
-            "the host can only access buffers created `cpu_writable`"
-        );
         let ptr = self
             .allocation
             .mapped_ptr()
-            .expect("cpu_writable buffers are host-mapped")
+            .expect("the host can only access mapped buffers (`is_mapped`): create it `cpu_writable`")
             .as_ptr()
             .cast::<T>();
         debug_assert!(ptr.is_aligned());
         ptr
     }
 
-    /// The mapping as a slice. Panics unless the buffer was created `cpu_writable`.
+    /// The mapping as a slice. Panics unless the buffer is mapped (`is_mapped`).
     ///
     /// What the GPU wrote is there once its submission's fence passed: every submission ends
     /// with a barrier that makes its writes host-visible.
@@ -240,7 +233,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         unsafe { std::slice::from_raw_parts(self.mapped(), self.len()) }
     }
 
-    /// The mapping as a mutable slice. Panics unless the buffer was created `cpu_writable`.
+    /// The mapping as a mutable slice. Panics unless the buffer is mapped (`is_mapped`).
     ///
     /// The GPU may still read the buffer for a frame in flight: write only that frame slot's
     /// part of a ring, or a buffer no pending frame uses.
@@ -249,8 +242,8 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
     }
 
     /// The mapping as a pointer, for buffers whose elements are owned one at a time through a
-    /// shared reference (slots handed out by an allocator). Panics unless the buffer was created
-    /// `cpu_writable`.
+    /// shared reference (slots handed out by an allocator). Panics unless the buffer is mapped
+    /// (`is_mapped`).
     ///
     /// Dereferencing it is `unsafe`: the caller must own the element it accesses, and nothing
     /// may call `host`/`host_mut` on the buffer while such elements are live.
@@ -278,7 +271,6 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             address: self.address,
             allocation: mem::take(&mut self.allocation),
             num_bytes: self.num_bytes,
-            host_access: self.host_access,
             usage,
             _type_marker: PhantomData,
         }

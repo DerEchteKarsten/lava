@@ -31,6 +31,7 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 Found in a read-only review; details and directions are in `lava/SURVEY.md` section 2. The rest were fixed on 2026-10-16.
 ----find solutions----
 - `Queue<Transfer>`: images are `EXCLUSIVE` to the graphics family and lava records no queue family ownership transfers, so a transfer-only family may touch no image (it panics); buffers are `CONCURRENT`. `CommandBuffer` isn't typed by family either: dispatches and renderings on a transfer-only family panic when recorded instead of failing to compile.
+- Host access depends on the device (SURVEY bug 16): it works on every mapped buffer (`is_mapped()`), and with `rebar` every buffer is mapped, so `host()` on a buffer not created `cpu_writable` works with ReBAR and panics on a discrete GPU without it. Core's `variables` is `cpu_writable`.
 - `Buffer::host()` hands out `&[T]` over memory a frame in flight may write, which Rust's aliasing rules don't allow (a polling loop over one slice can be hoisted). Needs an API that reads copies or volatile values.
 
 ----intended----

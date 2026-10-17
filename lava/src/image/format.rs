@@ -38,6 +38,12 @@ pub trait HasTexels<T>: Format {}
 pub trait ColorAspect: crate::sealed::Sealed {}
 pub trait DepthAspect: crate::sealed::Sealed {}
 pub trait StencilAspect: crate::sealed::Sealed {}
+/// Formats of one aspect, whose images shaders read through the view of every aspect
+/// (`kind::ShaderViews`).
+pub trait SingleAspect: crate::sealed::Sealed {}
+/// Formats with a depth and a stencil aspect, whose images shaders read through a depth-only
+/// view (`image::DepthSplit`).
+pub trait CombinedDepthStencil: DepthAspect + StencilAspect {}
 
 /// The value an attachment or image is cleared to, padded to 4 components.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,6 +129,10 @@ impl<T> HasTexels<T> for Dynamic {}
 impl ColorAspect for Dynamic {}
 impl DepthAspect for Dynamic {}
 impl StencilAspect for Dynamic {}
+// Checked at runtime: `bindless::bind` refuses a view of two aspects, `DepthSplit::create` a
+// format without them.
+impl SingleAspect for Dynamic {}
+impl CombinedDepthStencil for Dynamic {}
 
 /// What `Dynamic` takes from the static format of its `vk::Format`.
 struct Info {
@@ -211,13 +221,23 @@ macro_rules! formats {
         ClearValue::DepthStencil { depth: $v.0, stencil: $v.1 as u32 }
     };
 
-    (@traits $name:ident depth) => { impl DepthAspect for $name {} };
-    (@traits $name:ident stencil) => { impl StencilAspect for $name {} };
+    (@traits $name:ident depth) => {
+        impl DepthAspect for $name {}
+        impl SingleAspect for $name {}
+    };
+    (@traits $name:ident stencil) => {
+        impl StencilAspect for $name {}
+        impl SingleAspect for $name {}
+    };
     (@traits $name:ident depth_stencil) => {
         impl DepthAspect for $name {}
         impl StencilAspect for $name {}
+        impl CombinedDepthStencil for $name {}
     };
-    (@traits $name:ident $color:ident) => { impl ColorAspect for $name {} };
+    (@traits $name:ident $color:ident) => {
+        impl ColorAspect for $name {}
+        impl SingleAspect for $name {}
+    };
 
     ($info:ident; $($name:ident => ($vk:ident, $size:literal, $kind:ident $(, $n:literal)?),)*) => {
         $(

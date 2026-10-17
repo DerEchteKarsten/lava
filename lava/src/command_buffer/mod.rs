@@ -19,10 +19,8 @@ use crate::{
     },
     error::Result,
     image::{
-        dim::Dim,
-        format::{ColorAspect, DepthAspect, Format},
-        slice::ImageView,
-        usage::{IsColorAttachment, IsDepthAttachment, IsSampled, IsStorage},
+        format::Format,
+        kind::{ColorTarget, DepthTarget, SampledView, StorageView},
     },
     pipeline::{RasterKeyRef, pass_map, pipelines},
     query::{
@@ -254,11 +252,11 @@ pub struct Attachment<'a> {
 }
 
 impl<'a> Attachment<'a> {
-    pub fn color<F: Format, U>(image: ImageView<'a, F, U>, clear: Option<F::Texels>) -> Self
-    where
-        U: IsColorAttachment,
-        F: ColorAspect,
-    {
+    pub fn color<T: ColorTarget + 'a>(
+        image: T,
+        clear: Option<<T::Format as Format>::Texels>,
+    ) -> Self {
+        let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::COLOR_ATTACHMENT);
         let access = image.access(
@@ -594,15 +592,12 @@ fn iter_draws<'a>(
 
 impl<'a, const N: usize> RasterBuilder<'a, N> {
     /// Depth-tests the draws against `image` (nearer = greater). `clear` resets the depth first.
-    pub fn depth_attachment<F: Format, U>(
+    pub fn depth_attachment<T: DepthTarget + 'a>(
         &mut self,
-        image: ImageView<'a, F, U>,
-        clear: Option<F::Texels>,
-    ) -> &mut Self
-    where
-        U: IsDepthAttachment,
-        F: DepthAspect,
-    {
+        image: T,
+        clear: Option<<T::Format as Format>::Texels>,
+    ) -> &mut Self {
+        let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::DEPTH);
         image.usage_check(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT);
         let format = image.format();
@@ -1394,7 +1389,8 @@ fn declared<'a>(
 /// The image accesses of [`Accesses`]; the command sets the stage.
 impl<'a> ImageUse<'a> {
     /// The pass samples `image` (`Tex2D`, or a `DynImg` with a sampled index).
-    pub fn sampled_read<F: Format, U: IsSampled, D: Dim>(image: ImageView<'a, F, U, D>) -> Self {
+    pub fn sampled_read(image: impl SampledView + 'a) -> Self {
+        let image = image.view();
         image.usage_check(vk::ImageUsageFlags::SAMPLED);
         image.access(
             S2::NONE,
@@ -1405,7 +1401,8 @@ impl<'a> ImageUse<'a> {
 
     /// The pass loads from `image` as a storage image (`Image2D`, or a `DynImg` without a
     /// sampled index).
-    pub fn storage_read<F: Format, U: IsStorage, D: Dim>(image: ImageView<'a, F, U, D>) -> Self {
+    pub fn storage_read(image: impl StorageView + 'a) -> Self {
+        let image = image.view();
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         image.access(
             S2::NONE,
@@ -1415,7 +1412,8 @@ impl<'a> ImageUse<'a> {
     }
 
     /// The pass loads from and stores to `image` (`MutImage2D`).
-    pub fn storage_write<F: Format, U: IsStorage, D: Dim>(image: ImageView<'a, F, U, D>) -> Self {
+    pub fn storage_write(image: impl StorageView + 'a) -> Self {
+        let image = image.view();
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         let access = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
         image.access(S2::NONE, access, vk::ImageLayout::GENERAL)
@@ -1854,7 +1852,7 @@ fn all_read_access() -> vk::AccessFlags2 {
 mod tests {
     use super::*;
     use crate::features::Features;
-    use crate::image::usage::ImageUsage;
+    use crate::image::{slice::ImageView, usage::ImageUsage};
     use crate::image::{
         format::{self, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
         usage::{self, ColorAttachment, DepthAttachment, StaticUsage},
@@ -1959,7 +1957,6 @@ mod tests {
         ImageView {
             image: vk::Image::from_raw(1),
             view: vk::ImageView::from_raw(2),
-            shader_view: vk::ImageView::from_raw(2),
             mip_range: (0..1).into(),
             extent: EXTENT,
             handle: crate::bindless::BindlessHandle::none(),

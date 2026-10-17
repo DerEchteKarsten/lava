@@ -173,22 +173,41 @@ pub fn max_storage_images() -> u32 {
 /// `descriptor_index_set0` and the storage set at `descriptor_index_set1`, skipping
 /// `NULL_HANDLE`s, all in one `vkUpdateDescriptorSets`. The caller picks every index; a slot may
 /// only be rewritten while no pending command buffer uses it. Panics if an image lacks the
-/// usage of a set it is written to, or an index is outside its set.
+/// usage of a set it is written to, an index is outside its set, or a view has two aspects (a
+/// combined depth-stencil image binds its depth-only view through `DepthSplit` views'
+/// `bind_sampled`/`bind_storage`).
 #[validation_trace]
 pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
     images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
     handles: impl IntoIterator<Item = BindlessHandle>,
 ) {
+    let views = images.into_iter().map(|image| {
+        let aspects = image.format().aspects();
+        assert!(
+            crate::image::slice::single_aspect(aspects) == aspects,
+            "a view of {:?} has aspects {aspects:?}, but shaders read one: bind a depth-stencil \
+             image through `DepthSplit` views",
+            image.format().vk_format()
+        );
+        (image.view, image.usage().flags())
+    });
+    bind_raw(views, handles);
+}
+
+/// [`bind`] for Vulkan views of the given usages, which the caller vouches show one aspect.
+pub(crate) fn bind_raw(
+    views: impl IntoIterator<Item = (vk::ImageView, vk::ImageUsageFlags)>,
+    handles: impl IntoIterator<Item = BindlessHandle>,
+) {
     let bindless = Bindless::get();
     let mut infos = Vec::new();
-    for (image, handle) in images.into_iter().zip(handles) {
+    for ((view, flags), handle) in views.into_iter().zip(handles) {
         let indices = [handle.descriptor_index_set0, handle.descriptor_index_set1];
         let usages = [vk::ImageUsageFlags::SAMPLED, vk::ImageUsageFlags::STORAGE];
         for (set, (index, usage)) in indices.into_iter().zip(usages).enumerate() {
             if index == NULL_HANDLE {
                 continue;
             }
-            let flags = image.usage().flags();
             assert!(
                 flags.contains(usage),
                 "an image with usage {flags:?} can't be bound in the {usage:?} set"
@@ -200,7 +219,7 @@ pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
             );
             let info = vk::DescriptorImageInfo {
                 image_layout: vk::ImageLayout::GENERAL,
-                image_view: image.shader_view,
+                image_view: view,
                 ..Default::default()
             };
             infos.push((set, index, info));

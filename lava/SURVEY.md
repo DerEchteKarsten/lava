@@ -127,7 +127,7 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     transitions of one subresource go into one barrier, and the descriptor says `GENERAL`
     (`command_buffer.rs:746-755`). Read-only depth that is also sampled (soft particles, decals)
     hits this.
-13. ~~**Depth-stencil formats get views with both aspects**~~ **Done (2026-10-16):** a sampled or storage image of a combined depth-stencil format gets a depth-only view per view, which bindless binds; `subresource_layers` names the depth aspect, and host copies of such formats are refused. (`image/mod.rs:126`). Sampling such a
+13. ~~**Depth-stencil formats get views with both aspects**~~ **Done (2026-10-17): DepthSplit views.** An image of a combined depth-stencil format that shaders read takes `DepthSplit`/`DepthSplitMips` views, which add the depth-only views `bind_sampled`/`bind_storage` bind; `Single`/`PerMip` images of such formats don't compile there (`SampledImage`/`StorageImage`), and `bindless::bind` refuses a view of two aspects. `subresource_layers` names the depth aspect, and host copies of such formats are refused. (The 2026-10-16 fix gave every image a second view.) (`image/mod.rs:126`). Sampling such a
     view is invalid (VUID-VkDescriptorImageInfo-imageView-01976), and host copies and
     `subresource_layers` pass both aspects.
 14. ~~**Pending accesses never retire once the GPU is done.**~~ **Done (2026-10-16):** pending buffer reads are tagged with their frame's epoch and dropped once it completed; past 64 pending buffer writes, the completed ones fold into one write of every address (`EVERY_BUFFER`), which later accesses are made visible to once. Image accesses stay (one of each kind per image). A read is dropped only when a later
@@ -143,10 +143,10 @@ weren't reproduced. Bugs are also listed in `STATE.md`.
     - `Swapchain.size`/`format`/`present_mode` and `Surface.handle`.
 
     Make the fields private with getters.
-16. ~~**Host access depends on the device.**~~ **Done (2026-10-16):** *the first half:* host access works exactly on buffers created `cpu_writable`, on every device (core's `variables` is now `cpu_writable`). *Open:* `host()` still hands out `&[T]` over memory a frame in flight may write. With `rebar`, every buffer is mapped
+16. **Host access depends on the device.** *Open again (2026-10-17):* the `cpu_writable` host-access flag was removed, so host access works on every mapped buffer (`is_mapped()`). Core's `variables` is `cpu_writable`, so it no longer hits this. With `rebar`, every buffer is mapped
     (`buffer/mod.rs:141-145`).
-    - So core's `variables: Buffer::new(1, false)`, read through `Index` (`render.rs:605,638`),
-      panics on a discrete GPU without ReBAR.
+    - So host access to a buffer not created `cpu_writable` works with ReBAR and panics on a
+      discrete GPU without it (core's `variables` used to be such a buffer).
     - `host()` returns `&[T]` over memory the GPU may be writing, which is UB under Rust's
       aliasing rules (a polling loop can be hoisted).
 17. ~~**Required device features are requested but never checked**~~ **Done (2026-10-16):** `features.rs` checks lava's needs and `Config::required` when picking the GPU, and enables only optional features the device has. (`state.rs:418-515`).

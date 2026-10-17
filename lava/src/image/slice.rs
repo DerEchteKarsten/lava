@@ -1,4 +1,4 @@
-//! Borrowed image views of a mip range and their slices, the only image types commands take, with the layouts they track for barriers, and the image transfer commands (clear, blit, copies to and from buffers)
+//! Borrowed image views of a mip range (over every aspect) and their slices, the only image types commands take (bounded by the traits of `kind`), with the layouts they track for barriers, and the image transfer commands (clear, blit, copies to and from buffers)
 use std::{iter, range::Range, sync::atomic::AtomicU32};
 
 use crate::vk;
@@ -13,23 +13,21 @@ use crate::{
         Image, Views,
         dim::{D2, Dim},
         expected_data_len,
-        format::bc_block,
-        format::{ColorAspect, Format},
-        usage::{ImageUsage, IsTransferDst, IsTransferSrc},
+        format::{Format, bc_block},
+        kind::{ImageRef, TransferDstView, TransferSrcView},
+        usage::ImageUsage,
     },
     state::{Ctx, Functions},
 };
 
-/// A borrowed view of `mip_range` of an image. Commands, bindless binds and generated bindings
-/// take these, whichever kind of image they come from (a swapchain's included).
+/// A borrowed view of `mip_range` of an image, over every aspect. Commands, bindless binds and
+/// generated bindings take these (bounded by the traits of [`crate::image::kind`]), whichever
+/// kind of image they come from (a swapchain's included).
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     pub(crate) image: vk::Image,
-    /// Over every aspect: what attachments use.
+    /// Over every aspect.
     pub(crate) view: vk::ImageView,
-    /// What descriptors use: `view`, except for a combined depth-stencil format, whose shaders
-    /// see the depth aspect alone (a sampled view can't have both).
-    pub(crate) shader_view: vk::ImageView,
     pub(crate) mip_range: Range<u32>,
     /// The extent of mip `mip_range.start`.
     pub(crate) extent: D::Extent,
@@ -88,11 +86,11 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         }
     }
     /// All of mip `mip_range.start`, which copies and blits of the slice touch.
-    pub fn whole(self) -> ImageSlice<'a, F, U, D> {
+    pub fn whole(self) -> ImageSlice<Self> {
         self.region(self.extent)
     }
     /// The `extend` texels at the origin of mip `mip_range.start`.
-    pub fn region(self, extend: D::Extent) -> ImageSlice<'a, F, U, D> {
+    pub fn region(self, extend: D::Extent) -> ImageSlice<Self> {
         ImageSlice {
             view: self,
             offset: D::Offset::default(),
@@ -136,7 +134,6 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         ImageView {
             image: self.image,
             view: self.view,
-            shader_view: self.shader_view,
             mip_range: self.mip_range,
             extent: self.extent,
             handle: self.handle,
@@ -170,33 +167,56 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     }
 }
 
-/// A box of texels of one mip: `extend` texels at `offset` of the view's first mip.
-#[derive(Clone, Copy)]
-pub struct ImageSlice<'a, F: Format, U: ImageUsage, D: Dim = D2> {
-    pub view: ImageView<'a, F, U, D>,
-    pub offset: D::Offset,
-    pub extend: D::Extent,
+/// A box of texels of one mip: `extend` texels at `offset` of the first mip of `view`. Commands
+/// that work on a box take one (`ImageSlice<impl TransferSrcView>`), never a bare view, which
+/// stands for all its mips: `view.whole()` or `view.region(extent)` make one.
+pub struct ImageSlice<R: ImageRef> {
+    pub view: R,
+    pub offset: <R::Dim as Dim>::Offset,
+    pub extend: <R::Dim as Dim>::Extent,
 }
 
-impl<'a, F: Format, U: ImageUsage, D: Dim> ImageSlice<'a, F, U, D> {
-    pub fn offset(mut self, offset: D::Offset) -> Self {
+impl<R: ImageRef> Clone for ImageSlice<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R: ImageRef> Copy for ImageSlice<R> {}
+
+impl<R: ImageRef> ImageSlice<R> {
+    pub fn offset(mut self, offset: <R::Dim as Dim>::Offset) -> Self {
         self.offset = self.offset + offset;
         self
     }
 
-    pub fn grow(mut self, extend: D::Extent) -> Self {
+    pub fn grow(mut self, extend: <R::Dim as Dim>::Extent) -> Self {
         self.extend = self.extend + extend;
         self
     }
 
+    /// The same box of the same view, as an `ImageView`.
+    pub fn resolve<'a>(self) -> ImageSlice<ImageView<'a, R::Format, R::Usage, R::Dim>>
+    where
+        R: 'a,
+    {
+        ImageSlice {
+            view: self.view.view(),
+            offset: self.offset,
+            extend: self.extend,
+        }
+    }
+
     /// The same slice typed as `format` and `usage` (see `ImageView::cast`).
-    pub fn cast<NF: Format, NU: ImageUsage>(
+    pub fn cast<'a, NF: Format, NU: ImageUsage>(
         self,
         format: NF,
         usage: NU,
-    ) -> ImageSlice<'a, NF, NU, D> {
+    ) -> ImageSlice<ImageView<'a, NF, NU, R::Dim>>
+    where
+        R: 'a,
+    {
         ImageSlice {
-            view: self.view.cast(format, usage),
+            view: self.view.view().cast(format, usage),
             offset: self.offset,
             extend: self.extend,
         }
@@ -231,7 +251,7 @@ pub(crate) fn cast_check(
 
 impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     /// All of mip 0: `whole_view().whole()`.
-    pub fn whole(&self) -> ImageSlice<'_, F, U, D> {
+    pub fn whole(&self) -> ImageSlice<ImageView<'_, F, U, D>> {
         self.whole_view().whole()
     }
 }
@@ -246,14 +266,14 @@ pub enum Filter {
 }
 
 impl CommandBuffer {
+    /// Clears every mip of the view `image` to `clear_color`.
     #[validation_trace]
-    pub fn clear_image<'a, F: Format, U: IsTransferDst, D: Dim>(
-        &'a mut self,
-        image: ImageView<'a, F, U, D>,
-        clear_color: F::Texels,
-    ) where
-        F: ColorAspect,
-    {
+    pub fn clear_image<T: TransferDstView>(
+        &mut self,
+        image: T,
+        clear_color: <T::Format as Format>::Texels,
+    ) {
+        let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         self.flush_pending(
@@ -274,16 +294,15 @@ impl CommandBuffer {
             )
         };
     }
+    /// Blits the box `src` into the box `dst`, scaling it to fit.
     #[validation_trace]
-    pub fn blit_image<'a, F: Format, U: IsTransferSrc, F2: Format, U2: IsTransferDst, D: Dim>(
+    pub fn blit_image<S: TransferSrcView, T: TransferDstView<Dim = S::Dim>>(
         &mut self,
-        src: ImageSlice<'a, F, U, D>,
-        dst: ImageSlice<'a, F2, U2, D>,
+        src: ImageSlice<S>,
+        dst: ImageSlice<T>,
         filter: Filter,
-    ) where
-        F: ColorAspect,
-        F2: ColorAspect,
-    {
+    ) {
+        let (src, dst) = (src.resolve(), dst.resolve());
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
@@ -318,21 +337,14 @@ impl CommandBuffer {
             );
         }
     }
+    /// Copies the tightly packed texels of `src` into the box `dst`.
     #[validation_trace]
-    pub fn copy_buffer_to_image<
-        'a,
-        T: Copy + Pod,
-        BU: BufferUsage,
-        F: Format,
-        U: IsTransferDst,
-        D: Dim,
-    >(
+    pub fn copy_buffer_to_image<T: Copy + Pod, BU: BufferUsage, I: TransferDstView>(
         &mut self,
-        src: BufferSlice<'a, T, BU>,
-        dst: ImageSlice<'a, F, U, D>,
-    ) where
-        F: ColorAspect,
-    {
+        src: BufferSlice<'_, T, BU>,
+        dst: ImageSlice<I>,
+    ) {
+        let dst = dst.resolve();
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         check_copy_size(&dst, src.size(), "source");
@@ -353,8 +365,8 @@ impl CommandBuffer {
             .address_flags(src.address_flags())
             .image_subresource(dst.view.subresource_layers(dst.view.mip_range.start))
             .image_layout(vk::ImageLayout::GENERAL)
-            .image_offset(D::offset_3d(dst.offset))
-            .image_extent(D::extent_3d(dst.extend))];
+            .image_offset(I::Dim::offset_3d(dst.offset))
+            .image_extent(I::Dim::extent_3d(dst.extend))];
         unsafe {
             Functions::device_address_commands().cmd_copy_memory_to_image(
                 self.handle,
@@ -365,23 +377,29 @@ impl CommandBuffer {
         };
     }
 
-    /// Copies the texels of `src` (its view's first mip level) into `dst`, tightly packed row
-    /// by row (and slice by slice).
+    /// Copies the texels of the box `src` into `dst`, tightly packed row by row (and slice by
+    /// slice). It takes a slice, never a view:
+    /// ```compile_fail
+    /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer};
+    /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::TransferSrc};
+    /// fn copy(cmd: &mut CommandBuffer, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
+    ///     cmd.copy_image_to_buffer(view, dst);
+    /// }
+    /// ```
+    /// ```
+    /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer};
+    /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::TransferSrc};
+    /// fn copy(cmd: &mut CommandBuffer, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
+    ///     cmd.copy_image_to_buffer(view.whole(), dst);
+    /// }
+    /// ```
     #[validation_trace]
-    pub fn copy_image_to_buffer<
-        'a,
-        T: Copy + Pod,
-        F: Format,
-        U: IsTransferSrc,
-        BU: BufferUsage,
-        D: Dim,
-    >(
+    pub fn copy_image_to_buffer<I: TransferSrcView, T: Copy + Pod, BU: BufferUsage>(
         &mut self,
-        src: ImageSlice<'a, F, U, D>,
-        dst: BufferSlice<'a, T, BU>,
-    ) where
-        F: ColorAspect,
-    {
+        src: ImageSlice<I>,
+        dst: BufferSlice<'_, T, BU>,
+    ) {
+        let src = src.resolve();
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         check_copy_size(&src, dst.size(), "destination");
@@ -402,8 +420,8 @@ impl CommandBuffer {
             .address_flags(dst.address_flags())
             .image_subresource(src.view.subresource_layers(src.view.mip_range.start))
             .image_layout(vk::ImageLayout::GENERAL)
-            .image_offset(D::offset_3d(src.offset))
-            .image_extent(D::extent_3d(src.extend))];
+            .image_offset(I::Dim::offset_3d(src.offset))
+            .image_extent(I::Dim::extent_3d(src.extend))];
         unsafe {
             Functions::device_address_commands().cmd_copy_image_to_memory(
                 self.handle,
@@ -418,7 +436,7 @@ impl CommandBuffer {
 /// Panics unless `buffer` holds the texels of `slice` tightly packed: with address commands,
 /// neither the driver nor the validation layer checks a copy's buffer size.
 fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
-    slice: &ImageSlice<'_, F, U, D>,
+    slice: &ImageSlice<ImageView<'_, F, U, D>>,
     buffer_bytes: u64,
     what: &str,
 ) {
@@ -440,8 +458,8 @@ fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
 
 /// Blit region covering the two slices: from each slice's offset to offset + extent.
 fn blit_region<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
-    src: &ImageSlice<'_, F, U, D>,
-    dst: &ImageSlice<'_, F2, U2, D>,
+    src: &ImageSlice<ImageView<'_, F, U, D>>,
+    dst: &ImageSlice<ImageView<'_, F2, U2, D>>,
 ) -> vk::ImageBlit {
     let corners = |offset: D::Offset, extend: D::Extent| {
         let start = D::offset_3d(offset);
@@ -482,7 +500,6 @@ mod tests {
         ImageView {
             image: vk::Image::from_raw(42),
             view: vk::ImageView::null(),
-            shader_view: vk::ImageView::null(),
             mip_range: mips.into(),
             extent: UVec2::new(64, 32),
             handle: BindlessHandle::none(),

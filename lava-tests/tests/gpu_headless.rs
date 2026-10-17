@@ -22,14 +22,15 @@ use lava::{
     },
     epoch,
     image::{
-        D3, Image, MipChain,
+        D2, D3, DepthSplit, Image, MipChain,
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
         slice::Filter,
         usage::{
             ColorAttachmentSampledTransferSrcTransferDst,
             ColorAttachmentStorageTransferSrcTransferDst, DepthAttachment, Sampled,
             SampledHostCopy, SampledHostCopyTransferSrc, SampledHostCopyTransferSrcTransferDst,
-            SampledStorage, SampledTransferDst, SampledTransferSrcTransferDst,
+            DepthAttachmentSampled, SampledStorage, SampledTransferDst,
+            SampledTransferSrcTransferDst,
             Storage as StorageImage, StorageTransferSrcTransferDst,
         },
     },
@@ -42,7 +43,8 @@ use lava::{
 };
 use lava_tests::bindings::{
     PASS_MAP, TestClock, TestClocks, TestComputeBuffer, TestComputeImage, TestComputeVolume,
-    TestConstants, TestMesh, TestRaster, TestRasterTextured, TestTexturedVertex, TestVertex,
+    TestConstants, TestMesh, TestRaster, TestRasterTextured, TestSampleDepth, TestTexturedVertex,
+    TestVertex,
 };
 
 // ---- helpers ---------------------------------------------------------------------------------
@@ -1765,6 +1767,39 @@ fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
     });
     assert_ne!(pixel(&pixels, IN_LEFT.0, IN_LEFT.1), BLACK);
     assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, BLACK);
+}
+
+/// A depth-stencil image with `DepthSplit` views is drawn to through its view of both aspects,
+/// and a pass reads the depth through its depth-only view, which `bind_sampled` binds.
+#[test]
+fn split_depth_stencil_views_are_drawn_to_and_sampled() {
+    let gpu = gpu();
+    let vertices = two_triangles();
+    let depth = Image::<D32SfloatS8Uint, DepthAttachmentSampled, D2, DepthSplit>::new(EXTENT)
+        .unwrap()
+        .bind_sampled(0);
+    let out = zeroed_buffer::<f32, Storage>((SIZE * SIZE) as usize);
+    render(&gpu, |cmd, target| {
+        let left = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .depth_attachment(depth.whole_view(), Some((0.25, 0)))
+            .draw(&Draw::new(&left, 3, 1, unculled(), None))
+            .record("depth");
+        cmd.compute(
+            &TestSampleDepth::push_bindings(depth.whole_view(), out.range(..)),
+            [SIZE / 8, SIZE / 8, 1],
+            None,
+        );
+    });
+    let depth_at = |(x, y): (u32, u32)| out.host()[(y * SIZE + x) as usize];
+    assert_eq!(depth_at(IN_LEFT), 0.5);
+    assert_eq!(depth_at(IN_RIGHT), 0.25);
+
+    // Bound directly, the view of both aspects is refused.
+    let refused = std::panic::catch_unwind(|| {
+        lava::bindless::bind([depth.whole_view()], [BindlessHandle::sampled(1)])
+    });
+    assert!(refused.is_err(), "shaders read one aspect");
 }
 
 #[test]
