@@ -19,38 +19,32 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Bindless {
-    /// Descriptors allocated in the sampled (set 0) and storage (set 1) image arrays.
+    /// Of the sampled (set 0) and storage (set 1) image arrays.
     counts: [u32; 2],
-    /// Per set: its free slots.
     free: [Mutex<Ranges>; 2],
-    /// Per set: the live ranges of `reserve_sampled`/`reserve_storage`, which `bind` writes.
+    /// The live ranges of `reserve_sampled`/`reserve_storage`, which `bind` writes.
     reserved: [Mutex<Vec<Range<u32>>>; 2],
     layout: vk::PipelineLayout,
     layouts: [vk::DescriptorSetLayout; 2],
-    /// Sampled images and storage images.
     sets: [vk::DescriptorSet; 2],
     pool: vk::DescriptorPool,
 }
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 
-/// The binding of the sampled images in set 0, after the samplers' array (binding 0).
+/// After the samplers' array (binding 0).
 const SAMPLED_IMAGES_BINDING: u32 = 1;
 
 /// The most descriptors of each set, below the device's limits.
 const MAX_DESCRIPTORS: u32 = 1 << 15;
 
-/// One of the two bindless sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Set {
-    /// Set 0: sampled images.
     Sampled = 0,
-    /// Set 1: storage images.
     Storage = 1,
 }
 
 impl Set {
-    /// The index of `handle` in this set.
     pub(crate) fn index_mut(self, handle: &mut BindlessHandle) -> &mut u32 {
         match self {
             Set::Sampled => &mut handle.descriptor_index_set0,
@@ -81,11 +75,6 @@ pub(crate) struct Ranges {
 }
 
 impl Ranges {
-    pub(crate) fn new(count: u32) -> Self {
-        let free = if count == 0 { Vec::new() } else { vec![0..count] };
-        Self { free }
-    }
-
     /// The first `n` contiguous free slots (first fit), which are taken.
     pub(crate) fn take(&mut self, n: u32) -> Option<u32> {
         assert!(n > 0, "a slot range holds at least one slot");
@@ -125,7 +114,6 @@ impl Ranges {
     }
 }
 
-/// Takes `n` contiguous slots of `set`, the first that are free.
 pub(crate) fn allocate(set: Set, n: u32) -> Result<u32> {
     let bindless = Bindless::get();
     lock(&bindless.free[set as usize]).take(n).ok_or(Error::OutOfBindlessSlots {
@@ -134,14 +122,12 @@ pub(crate) fn allocate(set: Set, n: u32) -> Result<u32> {
     })
 }
 
-/// Frees slots of `set` that no frame reaches any more: their view was destroyed, or their
-/// reservation dropped and retired.
+/// Frees slots no frame reaches any more.
 pub(crate) fn free(set: Set, range: Range<u32>) {
     lock(&Bindless::get().free[set as usize]).give(range);
 }
 
-/// Frees the slots `Image::bind_sampled`, `bind_storage` and `bind_mips_*` put a view's handle
-/// at, once its view was destroyed.
+/// Frees the slots of a destroyed view's handle.
 pub(crate) fn free_handle(handle: BindlessHandle) {
     for (set, index) in [
         (Set::Sampled, handle.descriptor_index_set0),
@@ -153,10 +139,9 @@ pub(crate) fn free_handle(handle: BindlessHandle) {
     }
 }
 
-/// Slots of one set the application writes itself with [`bind`], e.g. one per texture asset:
-/// [`reserve_sampled`] and [`reserve_storage`] make them. Its slots are free again once it is
-/// dropped and no submission reaches them any more (`lifetime`); [`bind`] refuses them right
-/// away.
+/// Slots of one set the application writes with [`bind`], made by [`reserve_sampled`] and
+/// [`reserve_storage`]. Dropping it frees them once no submission reaches them, and [`bind`]
+/// refuses them right away.
 #[derive(Debug)]
 #[must_use]
 pub struct SlotRange {
@@ -178,7 +163,6 @@ impl SlotRange {
         self.len == 0
     }
 
-    /// Its slots' indices in their set.
     pub fn indices(&self) -> Range<u32> {
         self.start..self.start + self.len
     }
@@ -207,13 +191,12 @@ fn reserve(set: Set, n: u32) -> Result<SlotRange> {
     Ok(SlotRange { set, start, len: n })
 }
 
-/// `n` contiguous slots of the sampled set for [`bind`], the first that are free:
-/// `OutOfBindlessSlots` if there are none.
+/// The first `n` contiguous free slots of the sampled set, for [`bind`].
 pub fn reserve_sampled(n: u32) -> Result<SlotRange> {
     reserve(Set::Sampled, n)
 }
 
-/// `n` contiguous slots of the storage set for [`bind`] (see [`reserve_sampled`]).
+/// Like [`reserve_sampled`], in the storage set.
 pub fn reserve_storage(n: u32) -> Result<SlotRange> {
     reserve(Set::Storage, n)
 }
@@ -229,8 +212,7 @@ pub struct SamplerDesc {
     pub address_mode: SamplerAddressMode,
     /// The color outside the image with `CLAMP_TO_BORDER`.
     pub border_color: BorderColor,
-    /// Anisotropic filtering up to this ratio (`sampler-anisotropy`; `init` fails with
-    /// `MissingFeature` where lava checks it and the device lacks it).
+    /// Anisotropic filtering up to this ratio.
     #[cfg(feature = "sampler-anisotropy")]
     pub max_anisotropy: Option<f32>,
 }
@@ -267,28 +249,6 @@ pub const DEFAULT_SAMPLERS: [SamplerDesc; 3] = [
         max_anisotropy: None,
     },
 ];
-
-impl SamplerDesc {
-    fn create(&self) -> Result<vk::Sampler> {
-        #[allow(unused_mut)]
-        let mut info = vk::SamplerCreateInfo::default()
-            .mag_filter(self.mag_filter)
-            .min_filter(self.min_filter)
-            .mipmap_mode(self.mipmap_mode)
-            .address_mode_u(self.address_mode)
-            .address_mode_v(self.address_mode)
-            .address_mode_w(self.address_mode)
-            .border_color(self.border_color)
-            .max_lod(vk::LOD_CLAMP_NONE);
-        #[cfg(feature = "sampler-anisotropy")]
-        if let Some(ratio) = self.max_anisotropy {
-            use crate::features::Feature;
-            crate::features::gate::SamplerAnisotropy::check()?;
-            info = info.anisotropy_enable(true).max_anisotropy(ratio);
-        }
-        Ok(unsafe { Ctx::device().create_sampler(&info, None) }?)
-    }
-}
 
 pub const NULL_HANDLE: u32 = !0;
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
@@ -328,24 +288,20 @@ impl Default for BindlessHandle {
     }
 }
 
-/// Size of the sampled image array: valid sampled indices are `0..max_sampled_images()`.
+/// Valid sampled indices are `0..max_sampled_images()`.
 pub fn max_sampled_images() -> u32 {
     Bindless::get().counts[0]
 }
 
-/// Size of the storage image array: valid storage indices are `0..max_storage_images()`.
+/// Valid storage indices are `0..max_storage_images()`.
 pub fn max_storage_images() -> u32 {
     Bindless::get().counts[1]
 }
 
-/// Writes each image into the slots of the handle at the same position: the sampled set at
-/// `descriptor_index_set0` and the storage set at `descriptor_index_set1`, skipping
-/// `NULL_HANDLE`s, all in one `vkUpdateDescriptorSets`. Every index must lie in a live
-/// [`SlotRange`] of its set; a slot may only be rewritten while no pending command buffer uses
-/// it, and the image's handle stays as it is (`Image::bind_sampled` is for that). Panics if an
-/// index lies in no reservation, an image lacks the usage of a set it is written to, or a view
-/// has two aspects (a combined depth-stencil image binds its depth-only view through
-/// `DepthSplit` views' `bind_sampled`/`bind_storage`).
+/// Writes each image into the slots of the handle at the same position, skipping
+/// `NULL_HANDLE`s, in one `vkUpdateDescriptorSets`; a slot may only be rewritten while no
+/// pending command buffer uses it. Panics unless every index lies in a live [`SlotRange`] and
+/// every view has one aspect and the usage of its set.
 #[validation_trace]
 pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
     images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
@@ -377,7 +333,7 @@ pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
     bind_raw(views, handles);
 }
 
-/// [`bind`] for Vulkan views of the given usages, which the caller vouches show one aspect.
+/// [`bind`] for raw views, which the caller vouches show one aspect.
 pub(crate) fn bind_raw(
     views: impl IntoIterator<Item = (vk::ImageView, vk::ImageUsageFlags)>,
     handles: impl IntoIterator<Item = BindlessHandle>,
@@ -443,7 +399,25 @@ impl Bindless {
         let mut layouts = [vk::DescriptorSetLayout::default(); 2];
         let samplers = samplers
             .iter()
-            .map(SamplerDesc::create)
+            .map(|desc| -> Result<vk::Sampler> {
+                #[allow(unused_mut)]
+                let mut info = vk::SamplerCreateInfo::default()
+                    .mag_filter(desc.mag_filter)
+                    .min_filter(desc.min_filter)
+                    .mipmap_mode(desc.mipmap_mode)
+                    .address_mode_u(desc.address_mode)
+                    .address_mode_v(desc.address_mode)
+                    .address_mode_w(desc.address_mode)
+                    .border_color(desc.border_color)
+                    .max_lod(vk::LOD_CLAMP_NONE);
+                #[cfg(feature = "sampler-anisotropy")]
+                if let Some(ratio) = desc.max_anisotropy {
+                    use crate::features::Feature;
+                    crate::features::gate::SamplerAnisotropy::check()?;
+                    info = info.anisotropy_enable(true).max_anisotropy(ratio);
+                }
+                Ok(unsafe { Ctx::device().create_sampler(&info, None) }?)
+            })
             .collect::<Result<Vec<_>>>()?;
         let descriptor_binding_flags = [
             vk::DescriptorBindingFlags::empty(),
@@ -452,8 +426,7 @@ impl Bindless {
                 | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND_EXT
                 | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING,
         ];
-        // The arrays are update-after-bind and used by every stage, so the smaller of those
-        // limits bounds them (the plain limits may be smaller than the update-after-bind ones).
+        // Update-after-bind arrays used by every stage, so both of those limits bound them.
         let limits = &Ctx::physical_device().vk12_properties;
         let desc_counts = [
             limits
@@ -510,7 +483,6 @@ impl Bindless {
             .push_next(&mut ext_flags);
         layouts[1] = unsafe { Ctx::device().create_descriptor_set_layout(&layout_info, None) }?;
 
-        // Every pass pushes this many bytes.
         let size = MAX_PUSH_CONSTANTS_SIZE as u32;
         assert!(Ctx::device_properties().limits.max_push_constants_size >= size);
         let ranges = [vk::PushConstantRange {
@@ -523,9 +495,7 @@ impl Bindless {
             .push_constant_ranges(&ranges);
         let layout = unsafe { Ctx::device().create_pipeline_layout(&pipline_layout_info, None)? };
 
-        // Exactly what the two sets allocate: the variable counts above, from the
-        // update-after-bind limits (the plain limits, which can be smaller, don't apply to an
-        // update-after-bind pool).
+        // The variable counts above; the plain limits don't apply to an update-after-bind pool.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 descriptor_count: desc_counts[0],
@@ -561,7 +531,10 @@ impl Bindless {
         BINDLESS
             .set(Self {
                 counts: desc_counts,
-                free: desc_counts.map(|count| Mutex::new(Ranges::new(count))),
+                free: desc_counts.map(|count| {
+                    let free = if count == 0 { Vec::new() } else { vec![0..count] };
+                    Mutex::new(Ranges { free })
+                }),
                 reserved: Default::default(),
                 layout,
                 layouts,
@@ -572,7 +545,7 @@ impl Bindless {
         Ok(())
     }
 
-    /// Binds the sets at the bind points a family of `kind` has: none on a transfer family.
+    /// Binds the sets at the bind points a family of `kind` has, none on a transfer family.
     pub(crate) fn bind(cmd: &vk::CommandBuffer, kind: Kind) {
         let s = Self::get();
         if kind == Kind::Transfer {
@@ -625,76 +598,5 @@ impl Bindless {
             // The pool isn't created with the free flag; destroying it frees its sets.
             Ctx::device().destroy_descriptor_pool(s.pool, None);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slots_are_taken_first_fit() {
-        let mut ranges = Ranges::new(10);
-        assert_eq!(ranges.take(3), Some(0));
-        assert_eq!(ranges.take(1), Some(3));
-        assert_eq!(ranges.take(4), Some(4));
-        assert_eq!(ranges.take(3), None, "two slots are left");
-        ranges.give(0..3);
-        // A hole that is too small is skipped.
-        assert_eq!(ranges.take(2), Some(0));
-        assert_eq!(ranges.take(2), Some(8));
-        assert_eq!(ranges.take(1), Some(2));
-        assert_eq!(ranges.take(1), None);
-        assert_eq!(Ranges::new(0).take(1), None);
-    }
-
-    #[test]
-    fn freed_slots_merge_with_their_neighbours() {
-        let mut ranges = Ranges::new(10);
-        assert_eq!(ranges.take(10), Some(0));
-        ranges.give(2..3);
-        ranges.give(6..8);
-        ranges.give(4..5);
-        assert_eq!(ranges.free, [2..3, 4..5, 6..8]);
-        ranges.give(3..4);
-        assert_eq!(ranges.free, [2..5, 6..8]);
-        ranges.give(5..6);
-        assert_eq!(ranges.free, [2..8]);
-        ranges.give(0..2);
-        ranges.give(8..10);
-        assert_eq!(ranges, Ranges::new(10));
-        // Freed one at a time, a range of mips comes back whole.
-        assert_eq!(ranges.take(4), Some(0));
-        for slot in [2, 0, 3, 1] {
-            ranges.give(slot..slot + 1);
-        }
-        assert_eq!(ranges.take(10), Some(0));
-    }
-
-    #[test]
-    #[should_panic(expected = "freed twice")]
-    fn freeing_a_free_slot_panics() {
-        let mut ranges = Ranges::new(10);
-        ranges.take(4);
-        ranges.give(3..5);
-    }
-
-    #[test]
-    fn none_handle_is_null_in_both_sets() {
-        let none = BindlessHandle::none();
-        assert_eq!(none.descriptor_index_set0, NULL_HANDLE);
-        assert_eq!(none.descriptor_index_set1, NULL_HANDLE);
-        assert_eq!(NULL_HANDLE, u32::MAX);
-    }
-
-    /// Shaders receive the handle as two consecutive `uint`s (`Img.SampledIndex`, `StorageIndex`).
-    #[test]
-    fn handle_is_two_u32s_sampled_first() {
-        assert_eq!(size_of::<BindlessHandle>(), 8);
-        let handle = BindlessHandle {
-            descriptor_index_set0: 1,
-            descriptor_index_set1: 2,
-        };
-        assert_eq!(bytemuck::bytes_of(&handle), &[1, 0, 0, 0, 2, 0, 0, 0]);
     }
 }

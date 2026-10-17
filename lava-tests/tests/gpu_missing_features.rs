@@ -1,7 +1,4 @@
 //! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`), the functions that need them return `MissingFeature`, and draw state the device can't set dynamically is baked into pipelines and renders the same
-//!
-//! The context leaves off every `dynamic-*` state and the features with an API of their own,
-//! but keeps the raster capabilities, so baked polygon modes, blends and logic ops are drawn.
 mod common;
 
 use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
@@ -31,7 +28,6 @@ const EXTENT: UVec2 = UVec2::splat(SIZE);
 
 type Target = Image<R8G8B8A8Unorm, ColorAttachmentStorageTransferSrcTransferDst>;
 
-/// The features the context leaves off.
 fn disabled() -> Features {
     Features {
         mesh_shader: true,
@@ -74,8 +70,7 @@ fn missing(feature: &'static str) -> MissingFeature {
     MissingFeature { feature }
 }
 
-/// Clears a fresh target to opaque black (or `clear`), lets `record` draw into it, and reads
-/// it back.
+/// Clears a fresh target to `clear`, lets `record` draw into it, and reads it back.
 fn render(
     gpu: &common::Gpu,
     clear: [f32; 4],
@@ -156,13 +151,12 @@ fn disabled_features_are_off() {
     let features = Ctx::features();
     assert_eq!(features.without(disabled()), features);
     assert!(!features.dynamic_blend && !features.mesh_shader);
-    // Without them, lava creates queues of the graphics family alone, and no timeline of the
-    // others.
+    // Without async compute and transfer, only the graphics family gets queues.
     assert_eq!(Ctx::queue_family(Kind::Compute), None);
     assert_eq!(Ctx::queue_family(Kind::Transfer), None);
-    let compute = Timeline::<Compute>::builder().build();
+    let compute = Timeline::<Compute>::new(2);
     assert!(matches!(compute, Err(Error::MissingFeature(m)) if m == missing("async-compute")));
-    let transfer = Timeline::<Transfer>::builder().build();
+    let transfer = Timeline::<Transfer>::new(2);
     assert!(matches!(transfer, Err(Error::MissingFeature(m)) if m == missing("async-transfer")));
 }
 
@@ -227,7 +221,6 @@ fn baked_polygon_modes_draw_like_dynamic_ones() {
     assert_golden("raster_wireframe", &pixels, [SIZE, SIZE]);
 }
 
-/// Draws that differ only in baked state get their own pipelines, bound in between.
 #[test]
 fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
     let gpu = gpu_without();
@@ -257,7 +250,7 @@ fn baked_blends_combine_and_skip() {
             .record("added")
     });
     assert_pixel(&added, 32, 40, [255, 255, 0, 255]);
-    // A skipped attachment keeps its clear: its baked write mask is empty.
+    // A skipped attachment's baked write mask is empty.
     let skipped = render(&gpu, BLUE, |cmd, target| {
         let skip = RasterState::default().blend(Blend::Skip);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])

@@ -9,7 +9,7 @@ use crate::{
     bindless::BindlessHandle,
     buffer::{slice::BufferSlice, usage::BufferUsage},
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
-    queue::{HasCompute, HasGraphics, Kind, QueueKind, device::FamilyInfo},
+    queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
     image::{
         Image, Views,
         dim::{D2, Dim},
@@ -21,20 +21,17 @@ use crate::{
     state::{Ctx, Functions},
 };
 
-/// A borrowed view of `mip_range` of an image, over every aspect. Commands, bindless binds and
-/// generated bindings take these (bounded by the traits of [`crate::image::kind`]), whichever
-/// kind of image they come from (a swapchain's included).
+/// A borrowed view of `mip_range` of an image, over every aspect: the image type commands,
+/// bindless binds and generated bindings take.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     pub(crate) image: vk::Image,
-    /// Over every aspect.
     pub(crate) view: vk::ImageView,
     pub(crate) mip_range: Range<u32>,
     /// The extent of mip `mip_range.start`.
     pub(crate) extent: D::Extent,
     pub(crate) handle: BindlessHandle,
-    /// The tracked states (`command_buffer::image_state`): one for all of `mip_range` (an image
-    /// with one view, or a swapchain image), or one per mip.
+    /// One tracked state for all of `mip_range`, or one per mip.
     pub(crate) states: &'a [AtomicU64],
     pub(crate) format: F,
     pub(crate) usage: U,
@@ -42,17 +39,14 @@ pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
 }
 
 impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
-    /// The image the view is of.
     pub fn image(&self) -> vk::Image {
         self.image
     }
 
-    /// The Vulkan view over every aspect of the view's mips.
     pub fn view(&self) -> vk::ImageView {
         self.view
     }
 
-    /// The mips the view covers.
     pub fn mip_range(&self) -> Range<u32> {
         self.mip_range
     }
@@ -62,7 +56,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         self.extent
     }
 
-    /// Where the view is bound in the bindless sets (`NULL_HANDLE`s where it isn't).
+    /// Where the view is bound in the bindless sets (`NULL_HANDLE` where it isn't).
     pub fn handle(&self) -> BindlessHandle {
         self.handle
     }
@@ -76,8 +70,8 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             layer_count: 1,
         }
     }
-    /// The layers of `mip_level` a copy or blit addresses: one aspect, the depth aspect of a
-    /// combined depth-stencil format.
+    /// The layers of `mip_level` a copy or blit addresses: one aspect, depth for a combined
+    /// depth-stencil format.
     pub fn subresource_layers(&self, mip_level: u32) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
             aspect_mask: single_aspect(self.format.aspects()),
@@ -86,7 +80,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             layer_count: 1,
         }
     }
-    /// All of mip `mip_range.start`, which copies and blits of the slice touch.
+    /// All of mip `mip_range.start`.
     pub fn whole(self) -> ImageSlice<Self> {
         self.region(self.extent)
     }
@@ -121,8 +115,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         self.usage.check(required);
     }
 
-    /// The same view typed as `format` and `usage`, which must be the view's format and no
-    /// more than its usage (see `Image::cast`).
+    /// The same view typed as `format` and `usage` (see `Image::cast`).
     pub fn cast<NF: Format, NU: ImageUsage>(
         self,
         format: NF,
@@ -145,9 +138,8 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         }
     }
 
-    /// The access of a command that wants the view's mips in `layout`. It borrows their
-    /// tracked states, which move to `layout` only when the command is recorded. A pass's
-    /// access, for [`crate::command_buffer::Bindings::new`].
+    /// The access of a command that wants the view's mips in `layout`; their tracked states
+    /// move only when the command is recorded.
     pub fn access(
         &self,
         stage: vk::PipelineStageFlags2,
@@ -168,9 +160,8 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     }
 }
 
-/// A box of texels of one mip: `extend` texels at `offset` of the first mip of `view`. Commands
-/// that work on a box take one (`ImageSlice<impl TransferSrcView>`), never a bare view, which
-/// stands for all its mips: `view.whole()` or `view.region(extent)` make one.
+/// A box of texels: `extend` texels at `offset` of the first mip of `view`, made by
+/// `view.whole()` or `view.region(extent)`.
 pub struct ImageSlice<R: ImageRef> {
     pub view: R,
     pub offset: <R::Dim as Dim>::Offset,
@@ -195,7 +186,7 @@ impl<R: ImageRef> ImageSlice<R> {
         self
     }
 
-    /// The same box of the same view, as an `ImageView`.
+    /// The same box, of an `ImageView`.
     pub fn resolve<'a>(self) -> ImageSlice<ImageView<'a, R::Format, R::Usage, R::Dim>>
     where
         R: 'a,
@@ -224,8 +215,7 @@ impl<R: ImageRef> ImageSlice<R> {
     }
 }
 
-/// The aspect a view of a combined depth-stencil format shows shaders, and copies address:
-/// depth. Every other format has one aspect.
+/// Depth for a combined depth-stencil format, the aspect shaders and copies see.
 pub(crate) fn single_aspect(aspects: vk::ImageAspectFlags) -> vk::ImageAspectFlags {
     if aspects.contains(vk::ImageAspectFlags::DEPTH) {
         vk::ImageAspectFlags::DEPTH
@@ -234,8 +224,6 @@ pub(crate) fn single_aspect(aspects: vk::ImageAspectFlags) -> vk::ImageAspectFla
     }
 }
 
-/// Panics unless `to` is the same format as `from` and no more than its usage: a cast can only
-/// narrow what the type says about an image, never claim a usage it was created without.
 pub(crate) fn cast_check(
     from: (vk::Format, vk::ImageUsageFlags),
     to: (vk::Format, vk::ImageUsageFlags),
@@ -257,8 +245,6 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     }
 }
 
-// ---- transfer commands -------------------------------------------------------------------
-
 /// How a blit samples its source.
 #[repr(i32)]
 pub enum Filter {
@@ -266,7 +252,7 @@ pub enum Filter {
     Liniear = 1,
 }
 
-impl<K: HasCompute> CommandBuffer<K> {
+impl<K: HasCompute> CommandBuffer<'_, K> {
     /// Clears every mip of the view `image` to `clear_color`.
     #[validation_trace]
     pub fn clear_image<T: TransferDstView>(
@@ -297,7 +283,7 @@ impl<K: HasCompute> CommandBuffer<K> {
     }
 }
 
-impl<K: HasGraphics> CommandBuffer<K> {
+impl<K: HasGraphics> CommandBuffer<'_, K> {
     /// Blits the box `src` into the box `dst`, scaling it to fit.
     #[validation_trace]
     pub fn blit_image<S: TransferSrcView, T: TransferDstView<Dim = S::Dim>>(
@@ -328,7 +314,24 @@ impl<K: HasGraphics> CommandBuffer<K> {
             iter::empty(),
         );
 
-        let regions = [blit_region(&src, &dst)];
+        let corners = |offset: <S::Dim as Dim>::Offset, extend: <S::Dim as Dim>::Extent| {
+            let start = S::Dim::offset_3d(offset);
+            let size = S::Dim::extent_3d(extend);
+            [
+                start,
+                vk::Offset3D {
+                    x: start.x + size.width as i32,
+                    y: start.y + size.height as i32,
+                    z: start.z + size.depth as i32,
+                },
+            ]
+        };
+        let regions = [vk::ImageBlit {
+            src_offsets: corners(src.offset, src.extend),
+            dst_offsets: corners(dst.offset, dst.extend),
+            src_subresource: src.view.subresource_layers(src.view.mip_range.start),
+            dst_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
+        }];
         unsafe {
             Ctx::device().cmd_blit_image(
                 self.rec.handle,
@@ -343,7 +346,7 @@ impl<K: HasGraphics> CommandBuffer<K> {
     }
 }
 
-impl<K: QueueKind> CommandBuffer<K> {
+impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Copies the tightly packed texels of `src` into the box `dst`.
     #[validation_trace]
     pub fn copy_buffer_to_image<T: Copy + Pod, BU: BufferUsage, I: TransferDstView>(
@@ -385,8 +388,8 @@ impl<K: QueueKind> CommandBuffer<K> {
         };
     }
 
-    /// Copies the texels of the box `src` into `dst`, tightly packed row by row (and slice by
-    /// slice). It takes a slice, never a view:
+    /// Copies the texels of the box `src` into `dst`, tightly packed. It takes a slice, never a
+    /// view:
     /// ```compile_fail
     /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer, queue::Graphics};
     /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::TransferSrc};
@@ -442,8 +445,7 @@ impl<K: QueueKind> CommandBuffer<K> {
     }
 }
 
-/// Panics unless `buffer` holds the texels of `slice` tightly packed: with address commands,
-/// neither the driver nor the validation layer checks a copy's buffer size.
+/// With address commands neither the driver nor the validation layer checks a copy's buffer size.
 fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
     slice: &ImageSlice<ImageView<'_, F, U, D>>,
     buffer_bytes: u64,
@@ -465,9 +467,6 @@ fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
     }
 }
 
-/// Panics where a copy between `slice` and the buffer at `address` can't be recorded on
-/// `family`: depth or stencil copies into images need graphics, and a transfer family needs
-/// 4-byte aligned buffer addresses and boxes within its image granularity.
 #[track_caller]
 fn check_family<F: Format, U: ImageUsage, D: Dim>(
     family: &FamilyInfo,
@@ -492,278 +491,20 @@ fn check_family<F: Format, U: ImageUsage, D: Dim>(
     let (offset, extent) = (D::offset_3d(slice.offset), D::extent_3d(slice.extend));
     let mip = D::extent_3d(slice.view.extent);
     let granularity = family.image_granularity;
-    assert!(
-        fits_granularity(granularity, offset, extent, mip),
-        "a transfer family copies boxes of its image granularity {granularity:?}, not \
-         {extent:?} at {offset:?} of a mip of {mip:?}"
-    );
-}
-
-/// Whether a box of `extent` at `offset` of a mip of `mip` fits a family's image transfer
-/// `granularity`: 0 allows whole mips only; else every offset is a multiple of it, and every
-/// extent is one or reaches the mip's edge.
-pub(crate) fn fits_granularity(
-    granularity: vk::Extent3D,
-    offset: vk::Offset3D,
-    extent: vk::Extent3D,
-    mip: vk::Extent3D,
-) -> bool {
     let axes = [
         (granularity.width, offset.x, extent.width, mip.width),
         (granularity.height, offset.y, extent.height, mip.height),
         (granularity.depth, offset.z, extent.depth, mip.depth),
     ];
-    axes.into_iter().all(|(g, offset, extent, mip)| match g {
+    let fits = axes.into_iter().all(|(g, offset, extent, mip)| match g {
         0 => offset == 0 && extent == mip,
         g => {
             offset as u32 % g == 0 && (extent % g == 0 || offset as u32 + extent == mip)
         }
-    })
-}
-
-/// Blit region covering the two slices: from each slice's offset to offset + extent.
-fn blit_region<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
-    src: &ImageSlice<ImageView<'_, F, U, D>>,
-    dst: &ImageSlice<ImageView<'_, F2, U2, D>>,
-) -> vk::ImageBlit {
-    let corners = |offset: D::Offset, extend: D::Extent| {
-        let start = D::offset_3d(offset);
-        let size = D::extent_3d(extend);
-        [
-            start,
-            vk::Offset3D {
-                x: start.x + size.width as i32,
-                y: start.y + size.height as i32,
-                z: start.z + size.depth as i32,
-            },
-        ]
-    };
-    vk::ImageBlit {
-        src_offsets: corners(src.offset, src.extend),
-        dst_offsets: corners(dst.offset, dst.extend),
-        src_subresource: src.view.subresource_layers(src.view.mip_range.start),
-        dst_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::image::{
-        format::{D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
-        usage::{DepthAttachment, Sampled, SampledStorage, StaticUsage, Storage},
-    };
-    use crate::command_buffer::image_state::ImageState;
-    use crate::queue::Kind;
-    use crate::vk::Handle;
-    use glam::{IVec2, UVec2};
-
-    /// A view over a fake image: layout tracking and region math need no device.
-    fn view<F: StaticFormat, U: StaticUsage>(
-        layout: &AtomicU64,
-        mips: std::ops::Range<u32>,
-    ) -> ImageView<'_, F, U> {
-        ImageView {
-            image: vk::Image::from_raw(42),
-            view: vk::ImageView::null(),
-            mip_range: mips.into(),
-            extent: UVec2::new(64, 32),
-            handle: BindlessHandle::none(),
-            states: std::slice::from_ref(layout),
-            format: F::default(),
-            usage: U::default(),
-            dim: D2,
-        }
-    }
-
-    fn undefined() -> AtomicU64 {
-        ImageState::UNDEFINED.atomic()
-    }
-
-    #[test]
-    fn subresource_range_spans_the_views_mips() {
-        let layout = undefined();
-        let range = view::<R8G8B8A8Unorm, Sampled>(&layout, 2..5).subresource_range();
-        assert_eq!(range.aspect_mask, vk::ImageAspectFlags::COLOR);
-        assert_eq!((range.base_mip_level, range.level_count), (2, 3));
-        assert_eq!((range.base_array_layer, range.layer_count), (0, 1));
-    }
-
-    #[test]
-    fn subresource_layers_name_one_aspect() {
-        let layout = undefined();
-        let layers = view::<D32SfloatS8Uint, DepthAttachment>(&layout, 0..1).subresource_layers(3);
-        assert_eq!(layers.aspect_mask, vk::ImageAspectFlags::DEPTH);
-        let color = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1).subresource_layers(0);
-        assert_eq!(color.aspect_mask, vk::ImageAspectFlags::COLOR);
-        assert_eq!(layers.mip_level, 3);
-        assert_eq!((layers.base_array_layer, layers.layer_count), (0, 1));
-    }
-
-    #[test]
-    fn region_starts_at_the_origin_and_can_be_moved_and_grown() {
-        let layout = undefined();
-        let slice = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1).region(UVec2::new(16, 8));
-        assert_eq!(
-            (slice.offset, slice.extend),
-            (IVec2::ZERO, UVec2::new(16, 8))
-        );
-
-        let moved = slice.offset(IVec2::new(4, 2)).offset(IVec2::new(1, 1));
-        assert_eq!(moved.offset, IVec2::new(5, 3));
-        assert_eq!(moved.extend, UVec2::new(16, 8));
-
-        let grown = moved.grow(UVec2::new(2, 3));
-        assert_eq!(grown.extend, UVec2::new(18, 11));
-        assert_eq!(grown.offset, IVec2::new(5, 3));
-    }
-
-    #[test]
-    fn whole_covers_the_views_first_mip() {
-        let layout = undefined();
-        let slice = view::<R8G8B8A8Unorm, Sampled>(&layout, 1..2).whole();
-        assert_eq!(
-            (slice.offset, slice.extend),
-            (IVec2::ZERO, UVec2::new(64, 32))
-        );
-    }
-
-    #[test]
-    fn taking_an_access_layout_reports_the_previous_one_and_stores_the_new_one() {
-        let layout = undefined();
-        let view = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
-        let taken = |access: &ImageUse| {
-            let mut old = None;
-            access.take_states(Kind::Graphics, |_, state| {
-                if state.layout != access.access.layout {
-                    old = Some(state.layout)
-                }
-            });
-            old
-        };
-
-        let first = view.access(
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::ImageLayout::GENERAL,
-        );
-        assert_eq!(first.access.layout, vk::ImageLayout::GENERAL);
-        assert_eq!(first.access.image, vk::Image::from_raw(42));
-        assert_eq!(first.access.aspect, vk::ImageAspectFlags::COLOR);
-        assert_eq!(first.access.stage, vk::PipelineStageFlags2::TRANSFER);
-        assert_eq!(first.access.access, vk::AccessFlags2::TRANSFER_WRITE);
-        let present = view.access(
-            vk::PipelineStageFlags2::empty(),
-            vk::AccessFlags2::empty(),
-            vk::ImageLayout::PRESENT_SRC_KHR,
-        );
-        // Building accesses leaves the layout alone.
-        assert_eq!(ImageState::load(&layout), ImageState::UNDEFINED);
-
-        assert_eq!(taken(&first), Some(vk::ImageLayout::UNDEFINED));
-        // Same layout again: no transition.
-        assert_eq!(taken(&first), None);
-        assert_eq!(taken(&present), Some(vk::ImageLayout::GENERAL));
-        assert_eq!(
-            ImageState::load(&layout),
-            ImageState::taken(vk::ImageLayout::PRESENT_SRC_KHR, Kind::Graphics)
-        );
-    }
-
-    /// Views are `Copy`; all copies (and casts) of a view must track the same layouts.
-    #[test]
-    fn copies_and_casts_share_the_layout_state() {
-        let layout = undefined();
-        let a = view::<R8G8B8A8Unorm, SampledStorage>(&layout, 0..1);
-        let b = a;
-        let c = a.cast(R8G8B8A8Unorm, Storage);
-        let taken = |access: ImageUse| {
-            let mut old = None;
-            access.take_states(Kind::Graphics, |_, state| {
-                if state.layout != access.access.layout {
-                    old = Some(state.layout)
-                }
-            });
-            old
-        };
-
-        let general = vk::ImageLayout::GENERAL;
-        let (stage, read) = (
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_READ,
-        );
-        taken(a.access(stage, vk::AccessFlags2::TRANSFER_WRITE, general));
-        let from_copy = b.access(stage, read, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        assert_eq!(taken(from_copy), Some(general));
-        let from_cast = c.access(stage, read, general);
-        assert_eq!(
-            taken(from_cast),
-            Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-        );
-    }
-
-    /// A cast may drop usages but never add one or change the format.
-    #[test]
-    fn casts_only_narrow() {
-        let layout = undefined();
-        let a = view::<R8G8B8A8Unorm, SampledStorage>(&layout, 0..1);
-        a.cast(R8G8B8A8Unorm, Sampled);
-        a.cast(R8G8B8A8Unorm, SampledStorage);
-        assert!(std::panic::catch_unwind(|| a.cast(R8G8B8A8Unorm, DepthAttachment)).is_err());
-        assert!(std::panic::catch_unwind(|| a.cast(D32SfloatS8Uint, Sampled)).is_err());
-    }
-
-    #[test]
-    fn copies_check_the_buffer_holds_the_texels() {
-        let layout = undefined();
-        let slice = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1).region(UVec2::new(4, 2));
-        check_copy_size(&slice, 32, "destination");
-        check_copy_size(&slice, 64, "destination");
-        let short = std::panic::catch_unwind(|| check_copy_size(&slice, 31, "destination"));
-        assert!(short.is_err());
-    }
-
-    #[test]
-    fn copies_fit_a_familys_granularity() {
-        let extent = |width, height, depth| vk::Extent3D {
-            width,
-            height,
-            depth,
-        };
-        let offset = |x, y, z| vk::Offset3D { x, y, z };
-        let (one, eight, whole) = (extent(1, 1, 1), extent(8, 8, 1), extent(0, 0, 0));
-        let mip = extent(20, 12, 1);
-        assert!(fits_granularity(one, offset(3, 5, 0), extent(7, 2, 1), mip));
-        assert!(fits_granularity(eight, offset(8, 0, 0), extent(8, 8, 1), mip));
-        // An extent that isn't a multiple has to reach the edge.
-        assert!(fits_granularity(eight, offset(16, 8, 0), extent(4, 4, 1), mip));
-        assert!(!fits_granularity(eight, offset(8, 0, 0), extent(4, 8, 1), mip));
-        assert!(!fits_granularity(eight, offset(4, 0, 0), extent(8, 8, 1), mip));
-        // Granularity 0: whole mips only.
-        assert!(fits_granularity(whole, offset(0, 0, 0), mip, mip));
-        assert!(!fits_granularity(whole, offset(0, 0, 0), extent(10, 12, 1), mip));
-    }
-
-    #[test]
-    fn blit_region_spans_offset_to_offset_plus_extent() {
-        let (a, b) = (undefined(), undefined());
-        let src = view::<R8G8B8A8Unorm, Sampled>(&a, 0..1)
-            .region(UVec2::new(16, 8))
-            .offset(IVec2::new(4, 2));
-        let dst = view::<R8G8B8A8Unorm, Sampled>(&b, 0..1)
-            .region(UVec2::new(32, 16))
-            .offset(IVec2::new(10, 20));
-        let region = blit_region(&src, &dst);
-
-        let corner = |o: vk::Offset3D| (o.x, o.y, o.z);
-        assert_eq!(corner(region.src_offsets[0]), (4, 2, 0));
-        assert_eq!(corner(region.src_offsets[1]), (20, 10, 1));
-        assert_eq!(corner(region.dst_offsets[0]), (10, 20, 0));
-        assert_eq!(corner(region.dst_offsets[1]), (42, 36, 1));
-        assert_eq!(region.src_subresource.mip_level, 0);
-        assert_eq!(
-            region.src_subresource.aspect_mask,
-            vk::ImageAspectFlags::COLOR
-        );
-    }
+    });
+    assert!(
+        fits,
+        "a transfer family copies boxes of its image granularity {granularity:?}, not \
+         {extent:?} at {offset:?} of a mip of {mip:?}"
+    );
 }

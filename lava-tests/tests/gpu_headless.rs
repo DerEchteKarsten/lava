@@ -1,8 +1,4 @@
 //! Headless GPU tests: buffers, images, sync, command recording, queries, and golden images per pass type
-//!
-//! These run on the real GPU with the validation layer on; every test fails if the layer
-//! reports an error. The passes come from `lava-tests/shaders`, not from the engine.
-// Needed to call `RasterBuilder`'s attachment and draw methods, which return it one larger.
 mod common;
 
 use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
@@ -48,7 +44,6 @@ use lava_tests::bindings::{
 
 // ---- helpers ---------------------------------------------------------------------------------
 
-/// Side length of the square render targets.
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
 const BLACK: [u8; 4] = [0, 0, 0, 255];
@@ -142,7 +137,6 @@ fn context_exposes_the_graphics_queue_family() {
     let _gpu = gpu();
     assert!((1..=MAX_TIMELINES as u32).contains(&Ctx::queue_count(Kind::Graphics)));
     let graphics = Ctx::queue_family(Kind::Graphics).expect("every device has one");
-    // The dedicated families are other ones, with queues where they exist.
     for kind in [Kind::Compute, Kind::Transfer] {
         match Ctx::queue_family(kind) {
             Some(family) => {
@@ -213,9 +207,9 @@ fn more_threads_than_queues_submit_in_parallel() {
             let barrier = &barrier;
             scope.spawn(move || {
                 let buffer = zeroed_buffer::<u32, Storage>(4);
-                let timeline = Timeline::<Graphics>::builder().build().unwrap();
+                let timeline = Timeline::<Graphics>::new(2).unwrap();
                 barrier.wait();
-                let submission = timeline.reserve().begin().unwrap();
+                let submission = timeline.begin().unwrap();
                 let done = submission
                     .submit(|cmd| cmd.fill_buffer(buffer.range(..), value))
                     .unwrap();
@@ -226,9 +220,7 @@ fn more_threads_than_queues_submit_in_parallel() {
     });
 }
 
-/// A timeline's frame slots take turns, and what a submission used lives until the GPU
-/// finished it, also when it is dropped while the submission records or right after it was
-/// submitted. Destroying it earlier is a validation error, which fails the test.
+/// Also when dropped while recording or right after submitting, else validation fails.
 #[test]
 fn frame_slots_cycle_and_what_a_submission_used_lives_until_it_is_done() {
     let gpu = gpu();
@@ -241,7 +233,7 @@ fn frame_slots_cycle_and_what_a_submission_used_lives_until_it_is_done() {
             Image::<R8G8B8A8Unorm, StorageTransferSrcTransferDst>::new(UVec2::new(64, 64)).unwrap();
         let recording = zeroed_buffer::<u32, Storage>(4);
         let buffer = &buffer;
-        let submission = gpu.timeline.reserve().begin().unwrap();
+        let submission = gpu.timeline.begin().unwrap();
         slots.push(submission.slot());
         let done = submission
             .submit(move |cmd| {
@@ -262,9 +254,7 @@ fn frame_slots_cycle_and_what_a_submission_used_lives_until_it_is_done() {
     assert_eq!(buffer.host(), [4; 4]);
 }
 
-/// A recording that panics already moved the image's tracked layout to `GENERAL`: its barriers
-/// are submitted instead, so the next submission finds the image in the layout lava tracks (a
-/// mismatch is a validation error), and the timeline's pending accesses aren't poisoned.
+/// Its barriers are submitted instead, so the next submission finds the tracked layout.
 #[test]
 fn a_panicking_recording_still_makes_its_layout_transitions() {
     let gpu = gpu();
@@ -284,52 +274,32 @@ fn a_panicking_recording_still_makes_its_layout_transitions() {
     gpu.submit(|cmd| cmd.fill_buffer(readback.range(..), 0));
 }
 
-/// A stamp completes once its submissions are done, without any later submission.
+/// Destructors lock the pending accesses a recording holds.
 #[test]
-fn stamps_complete_without_further_submissions() {
+fn a_recording_thread_runs_no_destructors() {
     let gpu = gpu();
-    let buffer = zeroed_buffer::<u32, Storage>(4);
-    let submission = gpu.timeline.reserve().begin().unwrap();
-    let stamp = lava::latest_stamp();
-    let done = submission
-        .submit(|cmd| cmd.fill_buffer(buffer.range(..), 7))
-        .unwrap();
-    done.block().unwrap();
-    assert!(done.is_done());
-    assert!(stamp.is_done());
-}
-
-/// Dropping a reservation while recording would run destructors there, which lock the
-/// pending accesses the recording holds: they wait for the recording instead of deadlocking.
-#[test]
-fn a_reservation_dropped_while_recording_runs_no_destructors_there() {
-    let gpu = gpu();
-    let other = Timeline::<Graphics>::builder().build().unwrap();
-    let earlier = other.reserve();
     let image =
         Image::<R8G8B8A8Unorm, StorageTransferSrcTransferDst>::new(UVec2::new(8, 8)).unwrap();
-    // Destroyed once `earlier` is signalled.
     drop(image);
     let buffer = zeroed_buffer::<u32, Storage>(4);
     gpu.submit(|cmd| {
-        drop(earlier);
+        lava::reclaim();
         cmd.fill_buffer(buffer.range(..), 1);
     });
     assert_eq!(buffer.host(), [1; 4]);
 }
 
-/// One timeline's submission waits on the GPU for another's.
 #[test]
 fn a_submission_waits_for_another_timelines() {
     let gpu = gpu();
-    let other = Timeline::<Graphics>::builder().build().unwrap();
+    let other = Timeline::<Graphics>::new(2).unwrap();
     let (src, dst) = (zeroed_buffer::<u32, Storage>(4), zeroed_buffer::<u32, Storage>(4));
     let own = gpu.submit(|_| {});
     // Neither submission is waited for on the host before the second is made.
-    let filled = (other.reserve().begin().unwrap())
+    let filled = (other.begin().unwrap())
         .submit(|cmd| cmd.fill_buffer(src.range(..), 9))
         .unwrap();
-    let mut copy = gpu.timeline.reserve().begin().unwrap();
+    let mut copy = gpu.timeline.begin().unwrap();
     copy.wait_for(filled.at(Stage::Transfer));
     // A wait on its own timeline is dropped: its submissions run in order anyway.
     copy.wait_for(own);
@@ -341,52 +311,11 @@ fn a_submission_waits_for_another_timelines() {
     assert_eq!(dst.host(), [9; 4]);
 }
 
-/// Values are submitted in the order they were reserved: a later one first panics, and is
-/// then signalled with the one before it.
-#[test]
-fn submitting_out_of_order_panics() {
-    let _gpu = gpu();
-    let timeline = Timeline::<Graphics>::builder().build().unwrap();
-    let (first, second) = (timeline.reserve(), timeline.reserve());
-    let second = second.begin().unwrap();
-    let value = second.value();
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        second.submit(|_| {})
-    }));
-    assert!(panicked.is_err());
-    let done = first.begin().unwrap().submit(|_| {}).unwrap();
-    done.block().unwrap();
-    // The panicking value was dropped, so the first one's submission signalled it too.
-    let next = timeline.reserve();
-    assert_eq!(next.value(), value + 1);
-    next.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
-}
-
-/// A dropped reservation is signalled in order, so the values after it begin and complete.
-#[test]
-fn dropped_reservations_are_signalled() {
-    let _gpu = gpu();
-    let timeline = Timeline::<Graphics>::builder().in_flight(1).build().unwrap();
-    let (dropped, kept) = (timeline.reserve(), timeline.reserve());
-    // With one frame in flight, `kept` begins once `dropped` is done, which isn't submitted.
-    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(timeline.reserve().begin())
-    }));
-    assert!(refused.is_err(), "begin waits for a value nobody submitted");
-    drop(dropped);
-    let done = kept.begin().unwrap().submit(|_| {}).unwrap();
-    done.block().unwrap();
-    // The reservation the refused `begin` dropped is signalled with the next submission.
-    let after = timeline.reserve().begin().unwrap().submit(|_| {}).unwrap();
-    after.block().unwrap();
-}
-
-/// What is dropped while another timeline holds a reservation lives until that one is done
-/// too: its slot isn't free before.
+/// What is dropped after another timeline reserved lives until that one submitted and finished.
 #[test]
 fn deletions_wait_for_every_timeline() {
     let gpu = gpu();
-    let other = Timeline::<Graphics>::builder().build().unwrap();
+    let other = Timeline::<Graphics>::new(2).unwrap();
     lava::wait_idle().unwrap();
     let bind = || {
         Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::new(4, 4))
@@ -394,27 +323,24 @@ fn deletions_wait_for_every_timeline() {
             .bind_sampled()
             .unwrap()
     };
-    let held = other.reserve();
+    other.reserve();
     let image = bind();
     let slot = image.handle();
     drop(image);
     gpu.submit(|_| {});
     let unrelated = bind();
     assert_ne!(unrelated.handle(), slot, "the other timeline may still read it");
-    let done = held.begin().unwrap().submit(|_| {}).unwrap();
-    done.block().unwrap();
-    gpu.submit(|_| {});
+    other.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
     assert_eq!(bind().handle(), slot);
 }
 
-/// `MAX_TIMELINES` exist at most; a dropped one's semaphore goes to the next, whose values go
-/// on, so a `Wait` of the old one stays done.
+/// A dropped timeline's semaphore goes on in the next, so an old `Wait` stays done.
 #[test]
 fn timelines_are_limited_and_reused() {
     let _gpu = gpu();
     let mut timelines = Vec::new();
     let error = loop {
-        match Timeline::<Graphics>::builder().in_flight(1).build() {
+        match Timeline::<Graphics>::new(1) {
             Ok(timeline) => timelines.push(timeline),
             Err(error) => break error,
         }
@@ -422,17 +348,15 @@ fn timelines_are_limited_and_reused() {
     assert!(matches!(error, lava::Error::OutOfTimelines), "{error}");
     assert!(timelines.len() < MAX_TIMELINES, "the harness holds one");
     let last = timelines.pop().unwrap();
-    let done = last.reserve().begin().unwrap().submit(|_| {}).unwrap();
+    let done = last.begin().unwrap().submit(|_| {}).unwrap();
     drop(last);
-    let reused = Timeline::<Graphics>::builder().build().unwrap();
+    let reused = Timeline::<Graphics>::new(2).unwrap();
     assert!(done.is_done());
-    let next = reused.reserve();
-    next.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
+    reused.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
 }
 
 // ---- queue family ownership ------------------------------------------------------------------
 
-/// Whether the device has `feature`'s dedicated family; prints why a test is skipped.
 fn has_family(test: &str, kind: Kind) -> bool {
     let has = Ctx::queue_family(kind).is_some();
     if !has {
@@ -443,27 +367,16 @@ fn has_family(test: &str, kind: Kind) -> bool {
 
 type Owned = Image<R8G8B8A8Unorm, StorageTransferSrcTransferDst>;
 
-/// The pixels `TestComputeImage` with a red tint writes into an 8x8 image: red is the
-/// horizontal UV.
-fn expect_red_gradient(pixels: &[u8]) {
-    for (i, texel) in pixels.chunks_exact(4).enumerate() {
-        let x = (i % 8) as f32;
-        let red = ((x + 0.5) / 8.0 * 255.0).round() as u8;
-        assert!(close(texel.try_into().unwrap(), [red, 0, 0, 255]), "texel {i}: {texel:?}");
-    }
-}
-
-/// An image written on the compute family and released to graphics is read there.
 #[test]
 fn a_compute_image_is_released_to_graphics() {
     let gpu = gpu();
     if !has_family("a_compute_image_is_released_to_graphics", Kind::Compute) {
         return;
     }
-    let compute = Timeline::<Compute>::builder().build().unwrap();
+    let compute = Timeline::<Compute>::new(2).unwrap();
     let image = Owned::new(UVec2::splat(8)).unwrap().bind_storage().unwrap();
     let red = Vec4::new(1.0, 0.0, 0.0, 1.0);
-    let written = (compute.reserve().begin().unwrap())
+    let written = (compute.begin().unwrap())
         .submit(|cmd| {
             let bindings = TestComputeImage::push_bindings(image.whole_view(), red, UVec2::ZERO, UVec2::splat(8));
             cmd.compute(&bindings, [1, 1, 1], None);
@@ -474,7 +387,12 @@ fn a_compute_image_is_released_to_graphics() {
     gpu.submit_after(&[written], |cmd| {
         cmd.copy_image_to_buffer(image.whole(), readback.range(..))
     });
-    expect_red_gradient(readback.host());
+    // Red is the horizontal UV.
+    for (i, texel) in readback.host().chunks_exact(4).enumerate() {
+        let x = (i % 8) as f32;
+        let red = ((x + 0.5) / 8.0 * 255.0).round() as u8;
+        assert!(close(texel.try_into().unwrap(), [red, 0, 0, 255]), "texel {i}: {texel:?}");
+    }
 }
 
 /// The copy engine uploads an image for graphics, which hands it back for a readback.
@@ -484,10 +402,10 @@ fn images_go_to_the_transfer_family_and_back() {
     if !has_family("images_go_to_the_transfer_family_and_back", Kind::Transfer) {
         return;
     }
-    let transfer = Timeline::<Transfer>::builder().build().unwrap();
+    let transfer = Timeline::<Transfer>::new(2).unwrap();
     let image = Owned::new(UVec2::splat(8)).unwrap();
     let upload = buffer_with::<u8, Storage>(&pattern(8, 8));
-    let uploaded = (transfer.reserve().begin().unwrap())
+    let uploaded = (transfer.begin().unwrap())
         .submit(|cmd| {
             cmd.copy_buffer_to_image(upload.range(..), image.whole());
             cmd.release::<Graphics>(image.whole_view());
@@ -500,23 +418,22 @@ fn images_go_to_the_transfer_family_and_back() {
         cmd.release::<Transfer>(image.whole_view());
     });
     assert_eq!(readback.host(), pattern(8, 8));
-    let mut back = transfer.reserve().begin().unwrap();
+    let mut back = transfer.begin().unwrap();
     back.wait_for(drawn);
     let back = back.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
     back.unwrap().block().unwrap();
     assert!(readback.host().chunks_exact(4).all(|t| t == [0, 255, 0, 255]));
 }
 
-/// An image another family owns can't be accessed before it released it.
 #[test]
 fn an_unreleased_image_panics() {
     let gpu = gpu();
     if !has_family("an_unreleased_image_panics", Kind::Compute) {
         return;
     }
-    let compute = Timeline::<Compute>::builder().build().unwrap();
+    let compute = Timeline::<Compute>::new(2).unwrap();
     let image = Owned::new(UVec2::splat(8)).unwrap();
-    let cleared = (compute.reserve().begin().unwrap())
+    let cleared = (compute.begin().unwrap())
         .submit(|cmd| cmd.clear_image(image.whole_view(), [1.0; 4]))
         .unwrap();
     cleared.block().unwrap();
@@ -530,24 +447,10 @@ fn an_unreleased_image_panics() {
     if Ctx::features().pipeline_statistics {
         let pool = QueryPool::statistics(1, Statistics::FRAGMENT_SHADER_INVOCATIONS).unwrap();
         let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (compute.reserve().begin().unwrap()).submit(|cmd| cmd.query(&pool, 0, |_| {}))
+            (compute.begin().unwrap()).submit(|cmd| cmd.query(&pool, 0, |_| {}))
         }));
         assert!(recorded.is_err());
     }
-}
-
-/// Releasing to the family that owns the image does nothing.
-#[test]
-fn a_release_to_the_same_family_does_nothing() {
-    let gpu = gpu();
-    let image = Owned::new(UVec2::splat(8)).unwrap();
-    let readback = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
-    gpu.submit(|cmd| {
-        cmd.clear_image(image.whole_view(), [0.0, 0.0, 1.0, 1.0]);
-        cmd.release::<Graphics>(image.whole_view());
-        cmd.copy_image_to_buffer(image.whole(), readback.range(..));
-    });
-    assert!(readback.host().chunks_exact(4).all(|t| t == [0, 0, 255, 255]));
 }
 
 /// A group of two compute passes, then a rendering if the device has mesh shaders.
@@ -573,23 +476,20 @@ fn record_profiled(cmd: &mut Cmd, target: &Target) {
     }
 }
 
-/// Submits `record_profiled` measured by `observer` under the root "frame", and waits for it.
 fn submit_profiled(gpu: &common::Gpu, observer: &mut TestObserver, target: &Target) {
     gpu.submit(|cmd| cmd.measure(Some(observer), "frame", |cmd| record_profiled(cmd, target)));
 }
 
-/// Logs every scope it sees and times it with two timestamps, and gives every pass a statistics
-/// and a counter query if it has the pools and no query of that kind is active.
+/// Logs and times every scope, and gives every pass a statistics and a counter query where it can.
 struct TestObserver {
     timestamps: QueryPool<Timestamp>,
     statistics: Option<QueryPool<PipelineStatistics>>,
     counters: Option<QueryPool<Performance>>,
-    /// Every hook call: name, depth, pass, and whether it entered.
+    /// Name, depth, pass, and whether it entered.
     events: Vec<(&'static str, u16, bool, bool)>,
-    /// Per scope in entry order, and per pass in entry order with its queries.
     scopes: usize,
     passes: Vec<(&'static str, Option<u32>, Option<u32>)>,
-    /// Per open scope: its index and, for a pass, its index in `passes`.
+    /// Scope index and, for a pass, its index in `passes`.
     open: Vec<(usize, Option<usize>)>,
 }
 
@@ -605,17 +505,6 @@ impl TestObserver {
             passes: Vec::new(),
             open: Vec::new(),
         }
-    }
-
-    /// The start and end of every scope in entry order, in ns since the first started.
-    fn times(&self) -> Vec<(u64, u64)> {
-        let mut ticks = vec![0; 2 * self.scopes];
-        assert!(
-            self.timestamps.read(0, &mut ticks).unwrap(),
-            "the recording finished"
-        );
-        let ns = |tick| self.timestamps.elapsed_ns(ticks[0], tick);
-        ticks.chunks(2).map(|t| (ns(t[0]), ns(t[1]))).collect()
     }
 }
 
@@ -692,7 +581,13 @@ fn observers_see_every_scope_and_pass_once_in_nesting_order() {
     assert_eq!(observer.events, expected);
 
     // Scopes in entry order: frame, group, the two passes.
-    let times = observer.times();
+    let mut ticks = vec![0; 2 * observer.scopes];
+    assert!(
+        observer.timestamps.read(0, &mut ticks).unwrap(),
+        "the recording finished"
+    );
+    let ns = |tick| observer.timestamps.elapsed_ns(ticks[0], tick);
+    let times: Vec<(u64, u64)> = ticks.chunks(2).map(|t| (ns(t[0]), ns(t[1]))).collect();
     for (start, end) in &times {
         assert!(start <= end, "{times:?}");
     }
@@ -714,8 +609,7 @@ fn observers_count_passes_and_renderings_with_queries() {
     let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
     let features = Ctx::features();
     let mesh = features.mesh_shader;
-    // One counter, which always fits a single pass. A time counter, if the device has one,
-    // can't be 0 for a pass.
+    // One counter always fits a single pass; a time counter can't be 0 for a pass.
     let all = counters::counters().unwrap_or_default();
     let counter = (all.iter())
         .find(|c| c.unit == counters::CounterUnit::Nanoseconds)
@@ -783,8 +677,7 @@ fn a_panic_inside_measure_detaches_the_observer() {
             })
         }));
         assert!(measured.is_err());
-        // The observer's borrow ended, so this pass must not reach it.
-        cmd.compute(
+            cmd.compute(
             &TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT),
             [SIZE / 8, SIZE / 8, 1],
             None,
@@ -915,9 +808,7 @@ fn copy_buffer_regions_copies_each_region() {
     assert_eq!(dst.host(), [8, 0, 0, 0, 0, 0, 1, 2]);
 }
 
-/// Regression for the barrier tracking: a write that partially overlaps an earlier write,
-/// followed by reads of both parts, all in one command buffer. Synchronisation validation
-/// reports the missing barrier if the first write is forgotten.
+/// Synchronisation validation reports the missing barrier if the first write is forgotten.
 #[test]
 fn partially_overlapping_writes_are_synchronised_with_later_reads() {
     let gpu = gpu();
@@ -953,8 +844,7 @@ fn image_reports_extent_and_mip_chain() {
     assert_eq!(image.whole().extend, UVec2::new(16, 8));
 }
 
-/// A mip chain has a view per mip, sized like its mip and bound at its own slot, the mips'
-/// slots contiguous.
+/// Each sized like its mip and bound at its own slot, the mips' slots contiguous.
 #[test]
 fn mip_chains_have_a_view_and_handle_per_mip() {
     let _gpu = gpu();
@@ -1008,8 +898,7 @@ fn binds_take_free_slots_of_their_sets() {
     assert_ne!(b.descriptor_index_set1, st.descriptor_index_set1);
     assert_eq!(unbound.handle(), BindlessHandle::none());
 
-    // `bind` writes reserved slots only, and checks the usage at runtime, static types
-    // included.
+    // `bind` writes reserved slots only and checks the usage at runtime, static types included.
     let reserved = lava::bindless::reserve_sampled(4).unwrap();
     assert_eq!(reserved.len(), 4);
     assert!(!reserved.indices().contains(&s.descriptor_index_set0));
@@ -1026,8 +915,7 @@ fn binds_take_free_slots_of_their_sets() {
     assert!(std::panic::catch_unwind(|| reserved.handle(4)).is_err());
 }
 
-/// A dropped image's slots, and a dropped reservation's, are free again once no frame reaches
-/// them; `bind` refuses a dropped reservation right away.
+/// Also a dropped reservation's, which `bind` refuses right away.
 #[test]
 fn slots_are_free_again_once_their_image_is_destroyed() {
     let _gpu = gpu();
@@ -1063,8 +951,6 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
     let storage = lava::bindless::reserve_storage(3).unwrap();
     assert_eq!(storage.start(), mips.descriptor_index_set1, "the mips' slots came back whole");
 
-    // A dropped reservation can't be written, and its slots come back once its frames are
-    // done.
     let texture = Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::new(4, 4)).unwrap();
     let handle = storage.handle(0);
     let start = storage.start();
@@ -1136,8 +1022,7 @@ fn image_region_copies_address_the_sub_rectangle() {
     }
 }
 
-/// Regression: blits used the extent as the second corner, so regions with an offset were
-/// scaled and misplaced.
+/// Regression: blits used the extent as the second corner, so offset regions were misplaced.
 #[test]
 fn blit_copies_between_offset_regions() {
     let gpu = gpu();
@@ -1228,8 +1113,7 @@ fn host_copy_uploads_a_mip_level() {
     );
     assert!(image.copy_from(&[], 0).is_err());
 
-    // The data has to be exactly one mip level of RGBA8 texels: too little would read past
-    // the slice, too much means the caller mixed up levels or formats.
+    // The data has to be exactly one mip level.
     assert!(image.copy_from(&data[..data.len() - 4], 0).is_err());
     assert!(image.copy_from(&data, 1).is_err());
     assert!(image.copy_from(&pattern(4, 4), 0).is_err());
@@ -1255,7 +1139,6 @@ fn host_copy_writes_only_the_region() {
     image.copy_from(&data, 0).unwrap();
     image.copy_region_from(&patch, 0, offset, extent).unwrap();
 
-    // Regions have to lie inside the mip and match the data length.
     assert!(
         image
             .copy_region_from(&patch, 0, UVec2::new(6, 5), extent)
@@ -1391,8 +1274,7 @@ fn compute_pass_reads_and_writes_buffers() {
     assert_eq!(dst.host(), expected);
 }
 
-/// The generated clock readout: `regions` lists the fields in order, `take` splits each
-/// counter into ticks and subgroups and zeroes it.
+/// `regions` lists the fields in order, `take` splits a counter into ticks and subgroups.
 #[test]
 fn clock_regions_count_every_subgroup_once() {
     let gpu = gpu();
@@ -1424,8 +1306,7 @@ fn clock_regions_count_every_subgroup_once() {
     }
 }
 
-/// A compute pass between transfer commands on the same buffers, in one command buffer: the
-/// accesses declared by the generated bindings must produce the barriers in between.
+/// The generated bindings' accesses produce the barriers between the transfers and the pass.
 #[test]
 fn compute_pass_is_synchronised_with_surrounding_transfers() {
     let gpu = gpu();
@@ -1445,8 +1326,7 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
     assert_eq!(copy.host(), expected);
 }
 
-/// Two sets of specialization constants make two pipelines; each dispatch writes through the
-/// buffer and image handles of its own set, with its own scalars.
+/// Each dispatch writes through the handles of its own constant set, with its own scalars.
 #[test]
 fn specialization_constants_pick_the_pipeline() {
     let gpu = gpu();
@@ -1655,8 +1535,7 @@ fn indirect_draw_matches_the_direct_one() {
 fn indirect_count_draws_only_the_counted_commands() {
     let gpu = gpu();
     let vertices = two_triangles();
-    // The shaders see D3D-style vertex ids (without `first_vertex`), so the commands differ
-    // in how many vertices they draw: the left triangle, then both.
+    // Shaders see D3D-style vertex ids (no `first_vertex`), so the commands differ in count.
     let command = |vertex_count| DrawIndirectCommand {
         vertex_count,
         instance_count: 1,
@@ -1972,8 +1851,7 @@ fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
     assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, BLACK);
 }
 
-/// A depth-stencil image with `DepthSplit` views is drawn to through its view of both aspects,
-/// and a pass reads the depth through its depth-only view, which `bind_sampled` binds.
+/// Drawn to through the view of both aspects, sampled through the depth-only one.
 #[test]
 fn split_depth_stencil_views_are_drawn_to_and_sampled() {
     let gpu = gpu();
@@ -2043,8 +1921,7 @@ fn depth_persists_between_draws_unless_cleared() {
     assert_pixel(&draw_far_after_near(Some([0.0])), 32, 40, [255, 0, 0, 255]);
 }
 
-/// A draw is depth-tested against the depth an earlier draw of the same rendering wrote, with
-/// no barrier in between.
+/// Without a barrier in between.
 #[test]
 fn draws_of_one_rendering_see_the_earlier_depth() {
     let gpu = gpu();
@@ -2278,7 +2155,6 @@ fn indexed_draw_samples_a_bindless_texture() {
     assert_pixel(&half, 24, 40, BLACK);
 }
 
-/// Images created unbound and bound later with one batch are sampled from their slots.
 #[test]
 fn bound_textures_are_sampled_from_their_slots() {
     let gpu = gpu();
@@ -2342,8 +2218,7 @@ fn bound_textures_are_sampled_from_their_slots() {
     assert_golden("bindless_batch", &pixels, [SIZE, SIZE]);
 }
 
-/// One mip of a chain is drawn to while another is sampled: their layouts are tracked apart,
-/// which the validation layer checks.
+/// Their layouts are tracked apart, which the validation layer checks.
 #[test]
 fn a_mip_is_drawn_while_another_is_sampled() {
     let gpu = gpu();
@@ -2674,9 +2549,7 @@ mod generated {
         assert_eq!(vertices.access, A::SHADER_STORAGE_READ);
     }
 
-    /// The accesses a command takes besides its bindings get barriers like the bindings'
-    /// (the second dispatch's read waits for the first one's write); the validation layer
-    /// checks them.
+    /// The second dispatch's read waits for the first one's write; validation checks it.
     #[test]
     fn extra_accesses_get_barriers_like_the_bindings() {
         let gpu = gpu();

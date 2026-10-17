@@ -1,10 +1,4 @@
 //! Benchmark of recording lava-tests' passes into real command buffers, headless with the validation layer off: the CPU time of building the bindings and recording them, per scenario
-//!
-//! Run with `cargo bench -p lava-tests --bench recording`.
-//!
-//! Every frame records one scenario into a command buffer of a timeline with two frame slots
-//! and submits it; only the recording closure is timed. The GPU work is tiny (one workgroup per
-//! dispatch, a 64x64 target), so a slot's previous frame is done by the time it begins again.
 
 use std::{hint::black_box, time::Instant};
 
@@ -44,30 +38,6 @@ struct Resources {
     vertices: Buffer<TestVertex, Storage>,
     textured: Vec<Buffer<TestTexturedVertex, Storage>>,
     indices: Buffer<u32, Index>,
-}
-
-impl Resources {
-    fn new() -> Self {
-        let buffer = |len| Buffer::new(len, false).unwrap();
-        Self {
-            target: Target::new(EXTENT).unwrap().bind_storage().unwrap(),
-            textures: (0..TEXTURES)
-                .map(|_| {
-                    Texture::new(UVec2::splat(4))
-                        .unwrap()
-                        .bind_sampled().unwrap()
-                })
-                .collect(),
-            src: buffer(256),
-            dst: (0..16).map(|_| buffer(256)).collect(),
-            out: buffer(256),
-            vertices: Buffer::new(6, false).unwrap(),
-            textured: (0..TEXTURES)
-                .map(|_| Buffer::new(4, false).unwrap())
-                .collect(),
-            indices: Buffer::new(6, false).unwrap(),
-        }
-    }
 }
 
 /// 64 compute passes: 32 with two buffers, 16 with specialization constants that name a buffer
@@ -111,13 +81,11 @@ fn compute(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     }
 }
 
-/// 8 renderings of 8 indexed draws, each with a vertex buffer, a texture and two declared
-/// textures.
+/// 8 renderings of 8 indexed draws, each with a vertex buffer, a texture and two declared ones.
 fn many_draws(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     let draw = |i: usize| {
         TestRasterTextured::push_bindings(r.textured[i].range(..), r.textures[i].whole_view(), 0)
     };
-    // Two textures each draw reaches through a handle.
     let textures = |d: usize| {
         [(d + 1) % TEXTURES, (d + 32) % TEXTURES]
             .map(|t| ImageUse::sampled_read(r.textures[t].whole_view()))
@@ -158,7 +126,6 @@ fn declared(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
 
 /// 8 renderings of 4 mesh-shader launches without accesses: a binding of push constants only.
 fn mesh(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
-    // Only run where the device has mesh shaders.
     let launch = |i: u32| {
         TestMesh::push_bindings(Vec4::ONE, Vec2::new(i as f32, 0.0), 0.1).expect("mesh shaders")
     };
@@ -178,8 +145,26 @@ const FRAMES: usize = 3000;
 
 fn main() {
     lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
-    let timeline = Timeline::<Graphics>::builder().in_flight(2).build().unwrap();
-    let resources = Resources::new();
+    let timeline = Timeline::<Graphics>::new(2).unwrap();
+    let buffer = |len| Buffer::new(len, false).unwrap();
+    let resources = Resources {
+        target: Target::new(EXTENT).unwrap().bind_storage().unwrap(),
+        textures: (0..TEXTURES)
+            .map(|_| {
+                Texture::new(UVec2::splat(4))
+                    .unwrap()
+                    .bind_sampled().unwrap()
+            })
+            .collect(),
+        src: buffer(256),
+        dst: (0..16).map(|_| buffer(256)).collect(),
+        out: buffer(256),
+        vertices: Buffer::new(6, false).unwrap(),
+        textured: (0..TEXTURES)
+            .map(|_| Buffer::new(4, false).unwrap())
+            .collect(),
+        indices: Buffer::new(6, false).unwrap(),
+    };
 
     let mut scenarios: Vec<(&str, fn(&mut CommandBuffer<Graphics>, &Resources))> = vec![
         ("compute", compute),
@@ -197,7 +182,7 @@ fn main() {
         let mut times = Vec::with_capacity(FRAMES);
         for frame in 0..WARMUP + FRAMES {
             let mut elapsed = 0;
-            (timeline.reserve().begin().unwrap())
+            (timeline.begin().unwrap())
                 .submit(|cmd| {
                     let start = Instant::now();
                     scenario(cmd, black_box(&resources));

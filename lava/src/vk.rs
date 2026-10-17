@@ -1,10 +1,4 @@
 //! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands` and `VK_EXT_depth_clamp_control`, their types and their device functions
-//!
-//! Everything of `ash::vk` is re-exported, so `lava::vk` is a superset. The added structs mirror
-//! the registry's (and ash master's) layout, implement ash 0.38's `TaggedStructure` and
-//! `Extends*` traits, so `push_next` takes them, and have the usual builder setters. Their
-//! device functions are loaded by [`device_address_commands::Device`] and
-//! [`depth_clamp_control::Device`]. Delete this module's additions once an ash release has them.
 
 use core::ffi::{CStr, c_void};
 use core::marker::PhantomData;
@@ -30,7 +24,6 @@ impl core::fmt::Debug for AddressCommandFlagsKHR {
     }
 }
 
-/// `VkDepthClampModeEXT`.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
 pub struct DepthClampModeEXT(i32);
@@ -47,7 +40,6 @@ impl DepthClampModeEXT {
     }
 }
 
-/// The `VkStructureType`s and `VkDynamicState` the added structs and commands use.
 mod values {
     use super::{DynamicState, StructureType};
     pub const DEVICE_MEMORY_COPY_KHR: StructureType = StructureType::from_raw(1_000_318_000);
@@ -69,11 +61,9 @@ mod values {
     pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
         DynamicState::from_raw(1_000_582_000);
 }
-/// `VK_DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT` (`VK_EXT_depth_clamp_control`).
 pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
     values::DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT;
 
-/// `VkDeviceAddressRangeKHR`.
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct DeviceAddressRangeKHR {
@@ -81,7 +71,6 @@ pub struct DeviceAddressRangeKHR {
     pub size: DeviceSize,
 }
 
-/// `VkStridedDeviceAddressRangeKHR`.
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct StridedDeviceAddressRangeKHR {
@@ -90,7 +79,6 @@ pub struct StridedDeviceAddressRangeKHR {
     pub stride: DeviceSize,
 }
 
-/// `VkDepthClampRangeEXT`.
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
 pub struct DepthClampRangeEXT {
@@ -98,8 +86,8 @@ pub struct DepthClampRangeEXT {
     pub max_depth_clamp: f32,
 }
 
-/// A struct with `sType` and `pNext` (`$next` is `*const` for inputs, `*mut` for outputs),
-/// its `Default`, its `TaggedStructure` impl and a setter per field.
+/// A struct with `sType` and `pNext` (`*const` for inputs, `*mut` for outputs) and a setter per
+/// field.
 macro_rules! tagged {
     (
         $(#[$attr:meta])*
@@ -146,7 +134,6 @@ macro_rules! tagged {
 }
 
 tagged! {
-    /// `VkBindIndexBuffer3InfoKHR`.
     BindIndexBuffer3InfoKHR = BIND_INDEX_BUFFER_3_INFO_KHR, *const c_void {
         address_range: DeviceAddressRangeKHR,
         address_flags: AddressCommandFlagsKHR,
@@ -154,7 +141,6 @@ tagged! {
     }
 }
 tagged! {
-    /// `VkDrawIndirect2InfoKHR`.
     DrawIndirect2InfoKHR = DRAW_INDIRECT_2_INFO_KHR, *const c_void {
         address_range: StridedDeviceAddressRangeKHR,
         address_flags: AddressCommandFlagsKHR,
@@ -162,7 +148,6 @@ tagged! {
     }
 }
 tagged! {
-    /// `VkDrawIndirectCount2InfoKHR`.
     DrawIndirectCount2InfoKHR = DRAW_INDIRECT_COUNT_2_INFO_KHR, *const c_void {
         address_range: StridedDeviceAddressRangeKHR,
         address_flags: AddressCommandFlagsKHR,
@@ -172,14 +157,12 @@ tagged! {
     }
 }
 tagged! {
-    /// `VkDispatchIndirect2InfoKHR`.
     DispatchIndirect2InfoKHR = DISPATCH_INDIRECT_2_INFO_KHR, *const c_void {
         address_range: DeviceAddressRangeKHR,
         address_flags: AddressCommandFlagsKHR,
     }
 }
 tagged! {
-    /// `VkDeviceMemoryCopyKHR`.
     DeviceMemoryCopyKHR = DEVICE_MEMORY_COPY_KHR, *const c_void {
         src_range: DeviceAddressRangeKHR,
         src_flags: AddressCommandFlagsKHR,
@@ -188,7 +171,6 @@ tagged! {
     }
 }
 tagged! {
-    /// `VkDeviceMemoryImageCopyKHR`.
     DeviceMemoryImageCopyKHR = DEVICE_MEMORY_IMAGE_COPY_KHR, *const c_void {
         address_range: DeviceAddressRangeKHR,
         address_flags: AddressCommandFlagsKHR,
@@ -201,7 +183,6 @@ tagged! {
     }
 }
 tagged! {
-    /// `VkAccelerationStructureCreateInfo2KHR`.
     AccelerationStructureCreateInfo2KHR = ACCELERATION_STRUCTURE_CREATE_INFO_2_KHR, *const c_void {
         create_flags: AccelerationStructureCreateFlagsKHR,
         address_range: DeviceAddressRangeKHR,
@@ -210,7 +191,6 @@ tagged! {
     }
 }
 tagged! {
-    /// `VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR`.
     PhysicalDeviceDeviceAddressCommandsFeaturesKHR =
         PHYSICAL_DEVICE_DEVICE_ADDRESS_COMMANDS_FEATURES_KHR, *mut c_void {
         device_address_commands: Bool32,
@@ -219,7 +199,6 @@ tagged! {
 unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'_> {}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'_> {}
 tagged! {
-    /// `VkPhysicalDeviceDepthClampControlFeaturesEXT`.
     PhysicalDeviceDepthClampControlFeaturesEXT =
         PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT, *mut c_void {
         depth_clamp_control: Bool32,
@@ -228,7 +207,6 @@ tagged! {
 unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
 
-/// A struct whose regions are a pointer and a count, set together by `regions`.
 macro_rules! with_regions {
     ($(#[$attr:meta])* $name:ident = $s_type:ident, $region:ident { $($field:ident: $ty:ty),* }) => {
         $(#[$attr])*
@@ -280,17 +258,14 @@ macro_rules! with_regions {
 }
 
 with_regions! {
-    /// `VkCopyDeviceMemoryInfoKHR`.
     CopyDeviceMemoryInfoKHR = COPY_DEVICE_MEMORY_INFO_KHR, DeviceMemoryCopyKHR {}
 }
 with_regions! {
-    /// `VkCopyDeviceMemoryImageInfoKHR`.
     CopyDeviceMemoryImageInfoKHR = COPY_DEVICE_MEMORY_IMAGE_INFO_KHR, DeviceMemoryImageCopyKHR {
         image: Image
     }
 }
 
-/// Loads device functions by name; a missing one is `None`.
 fn load<T: Copy>(instance: &ash::Instance, device: Device, name: &CStr) -> Option<T> {
     assert_eq!(size_of::<T>(), size_of::<unsafe extern "system" fn()>());
     let f = unsafe { instance.get_device_proc_addr(device, name.as_ptr()) }?;
@@ -298,14 +273,13 @@ fn load<T: Copy>(instance: &ash::Instance, device: Device, name: &CStr) -> Optio
     Some(unsafe { core::mem::transmute_copy(&f) })
 }
 
-/// Panics naming a device function the driver didn't return.
 #[cold]
 fn missing(name: &str) -> ! {
     panic!("the Vulkan driver has no {name}")
 }
 
-/// `VK_KHR_device_address_commands`: the commands that take address ranges instead of buffers.
-/// Only the ones lava records are loaded.
+/// `VK_KHR_device_address_commands`: the commands lava records that take address ranges instead
+/// of buffers.
 pub mod device_address_commands {
     use super::*;
 
@@ -332,7 +306,6 @@ pub mod device_address_commands {
         *mut AccelerationStructureKHR,
     ) -> Result;
 
-    /// The extension's device functions.
     #[derive(Clone)]
     pub struct Device {
         handle: super::Device,
@@ -353,8 +326,7 @@ pub mod device_address_commands {
     }
 
     impl Device {
-        /// Loads the functions of `device`. The mesh and acceleration structure ones are only
-        /// there with those extensions.
+        /// The mesh and acceleration structure functions are only there with those extensions.
         pub fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
             let handle = device.handle();
             macro_rules! load {
@@ -382,7 +354,6 @@ pub mod device_address_commands {
         }
     }
 
-    /// One method per command, with ash master's names and arguments.
     macro_rules! info_commands {
         ($($method:ident($field:ident, $info:ident) = $vk_name:literal;)*) => {
             impl Device {
@@ -412,7 +383,6 @@ pub mod device_address_commands {
     }
 
     impl Device {
-        /// `vkCmdUpdateMemoryKHR`.
         #[inline]
         pub unsafe fn cmd_update_memory(
             &self,
@@ -435,7 +405,6 @@ pub mod device_address_commands {
             }
         }
 
-        /// `vkCmdFillMemoryKHR`.
         #[inline]
         pub unsafe fn cmd_fill_memory(
             &self,
@@ -450,7 +419,6 @@ pub mod device_address_commands {
             unsafe { f(command_buffer, dst_range, dst_flags, data) }
         }
 
-        /// `vkCreateAccelerationStructure2KHR`.
         #[inline]
         pub unsafe fn create_acceleration_structure2(
             &self,
@@ -477,7 +445,6 @@ pub mod depth_clamp_control {
     type CmdSetRange =
         unsafe extern "system" fn(CommandBuffer, DepthClampModeEXT, *const DepthClampRangeEXT);
 
-    /// The extension's device function.
     #[derive(Clone)]
     pub struct Device {
         set_depth_clamp_range: Option<CmdSetRange>,
@@ -494,7 +461,7 @@ pub mod depth_clamp_control {
             }
         }
 
-        /// `vkCmdSetDepthClampRangeEXT`; `range` is only read with `USER_DEFINED_RANGE`.
+        /// `range` is only read with `USER_DEFINED_RANGE`.
         #[inline]
         pub unsafe fn cmd_set_depth_clamp_range(
             &self,

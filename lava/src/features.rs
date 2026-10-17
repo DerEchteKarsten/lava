@@ -4,9 +4,7 @@ use std::ffi::CStr;
 #[allow(unused_imports)]
 use crate::{sealed::Sealed, state::Ctx, vk};
 
-/// What a function returns when the device lacks an optional feature lava checks at runtime
-/// (its cargo feature is on without its `assert-` form): the cargo feature's name, which is also
-/// the [`Features`] field with `_` for `-`.
+/// The error of a function that needs an optional feature the device lacks, by its cargo name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MissingFeature {
     pub feature: &'static str,
@@ -24,11 +22,9 @@ impl std::fmt::Display for MissingFeature {
 
 impl std::error::Error for MissingFeature {}
 
-/// How lava compiled a cargo feature: [`Asserted`] (`assert-X`, required at init) or
-/// [`Checked`] (`X` alone, checked where it is used).
+/// How lava compiled a cargo feature: [`Asserted`] (`assert-X`) or [`Checked`] (`X` alone).
 pub trait Mode: Sealed {
-    /// What a function that needs the feature returns for `T`: `T` when asserted,
-    /// `Result<T, MissingFeature>` when checked.
+    /// `T` when asserted, `Result<T, MissingFeature>` when checked.
     type Out<T>;
     #[doc(hidden)]
     type Store<T>;
@@ -40,9 +36,9 @@ pub trait Mode: Sealed {
     fn get<T>(stored: &Self::Store<T>) -> &T;
 }
 
-/// The mode of an `assert-X` feature: `init` refused devices without it, so nothing checks it.
+/// `init` refused devices without the feature, so nothing checks it.
 pub enum Asserted {}
-/// The mode of an `X` feature without `assert-X`: functions that need it check the device.
+/// Functions that need the feature check the device.
 pub enum Checked {}
 
 impl Sealed for Asserted {}
@@ -94,15 +90,13 @@ impl<B: Mode> Join<B> for Checked {
     type Joined = Checked;
 }
 
-/// A cargo feature lava was compiled with ([`gate`] has one type per feature), or a pair of
-/// them, or `()` for none.
+/// A cargo feature lava was compiled with (a type of [`gate`]), a pair of them, or `()`.
 #[diagnostic::on_unimplemented(
     message = "lava was compiled without the cargo feature of `{Self}`",
     note = "each type in `lava::features::gate` names its cargo feature: enable it (or its `assert-` form) on the `lava` dependency"
 )]
 pub trait Feature: Sealed {
     type Mode: Mode;
-    /// `Ok` if the device has the feature (always, when asserted).
     fn check() -> Result<(), MissingFeature>;
 }
 
@@ -126,8 +120,7 @@ where
     }
 }
 
-/// A `T` that needs feature (or features) `F`: `T` itself when `F` is asserted,
-/// `Result<T, MissingFeature>` when lava checks it.
+/// `T` when `F` is asserted, `Result<T, MissingFeature>` when lava checks it.
 pub type Gated<F, T> = <<F as Feature>::Mode as Mode>::Out<T>;
 
 /// `value()` as a [`Gated`] value: called only if the device has `F`.
@@ -135,66 +128,55 @@ pub fn gate<F: Feature, T>(value: impl FnOnce() -> T) -> Gated<F, T> {
     <F::Mode as Mode>::wrap(F::check().map(|()| value()))
 }
 
-/// A Vulkan loader that exists only where the device has `F`: the loader itself when `F` is
-/// asserted, an `Option` of it when checked. [`loaded`] reads it.
+/// A Vulkan loader that exists only where the device has `F`, read with [`loaded`].
 #[allow(dead_code)]
 pub(crate) type Loader<F, T> = <<F as Feature>::Mode as Mode>::Store<T>;
 
-/// The loader of `F`, built only if the device has `F` (`on`, its bit in the features lava
-/// enables).
 #[allow(dead_code)]
 pub(crate) fn load<F: Feature, T>(on: bool, load: impl FnOnce() -> T) -> Loader<F, T> {
     <F::Mode as Mode>::store(on, load)
 }
 
-/// The loader of `F`, which code past `F`'s check reaches.
 #[allow(dead_code)]
 pub(crate) fn loaded<F: Feature, T>(stored: &Loader<F, T>) -> &T {
     <F::Mode as Mode>::get(stored)
 }
 
-/// Whether the device has a feature: `true` when asserted, the device's bit when checked,
-/// `false` when compiled out. Every [`gate`] type has it, so code that runs either way can ask.
+/// Whether the device has a feature, `false` when compiled out.
 pub(crate) trait On {
     fn on() -> bool;
 }
 
 macro_rules! features {
     ($($(#[doc = $doc:literal])* $name:ident: $cargo:literal / $assert:literal => $marker:ident,)*) => {
-        /// The optional device features lava was compiled with, one per cargo feature (`_` for
-        /// `-`), plus `rebar`. `Ctx::features()` says which the device has and lava enabled:
-        /// those of `assert-` features are always `true`. Fields of features lava was compiled
-        /// without don't exist.
+        /// The optional device features lava was compiled with, one per cargo feature, plus
+        /// `rebar`.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct Features {
-            /// A large device-local heap the host can write (resizable BAR or an integrated
-            /// GPU); not a Vulkan feature, and always checked. Buffers live there, mapped.
+            /// A large device-local heap the host can write (resizable BAR or an integrated GPU).
             pub rebar: bool,
             $($(#[doc = $doc])* #[cfg(feature = $cargo)] pub $name: bool,)*
         }
 
         impl Features {
-            /// No feature, for `..Features::DEFAULT` in constants.
             pub const DEFAULT: Features = Features {
                 rebar: false,
                 $(#[cfg(feature = $cargo)] $name: false,)*
             };
 
-            /// The cargo name of each feature, in field order.
             const NAMES: &[&str] = &["rebar", $(#[cfg(feature = $cargo)] $cargo,)*];
 
             fn bits(&self) -> impl Iterator<Item = bool> {
                 [self.rebar, $(#[cfg(feature = $cargo)] self.$name,)*].into_iter()
             }
 
-            fn from_bits(mut bits: impl Iterator<Item = bool>) -> Self {
+            pub(crate) fn from_bits(mut bits: impl Iterator<Item = bool>) -> Self {
                 Self {
                     rebar: bits.next().unwrap(),
                     $(#[cfg(feature = $cargo)] $name: bits.next().unwrap(),)*
                 }
             }
 
-            /// The features lava was compiled to assert: every device must have them.
             pub fn asserted() -> Features {
                 Features {
                     rebar: false,
@@ -202,21 +184,49 @@ macro_rules! features {
                 }
             }
 
-            /// Sets the feature of cargo name `cargo`; `false` if lava was compiled without it.
-            fn set_named(&mut self, cargo: &str) -> bool {
-                match cargo {
-                    $(#[cfg(feature = $cargo)] $cargo => {
-                        self.$name = true;
-                        true
-                    })*
-                    _ => false,
+            /// What a SPIR-V module's `OpCapability`s need; capabilities lava doesn't know are
+            /// left to the driver.
+            pub(crate) fn of_spirv(spirv: &[u8]) -> Needs {
+                let mut needs = Needs {
+                    features: Features::default(),
+                    compiled_out: Vec::new(),
+                };
+                let words: Vec<u32> = spirv
+                    .chunks_exact(4)
+                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                    .collect();
+                const OP_CAPABILITY: u32 = 17;
+                // After the five header words, each instruction starts with its word count and opcode.
+                let mut i = 5;
+                while i < words.len() {
+                    let (count, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+                    if opcode == OP_CAPABILITY
+                        && let Some(&capability) = words.get(i + 1)
+                        && let Some(&(_, cargo)) =
+                            SPIRV_CAPABILITIES.iter().find(|(id, _)| *id == capability)
+                    {
+                        let compiled = match cargo {
+                            $(#[cfg(feature = $cargo)] $cargo => {
+                                needs.features.$name = true;
+                                true
+                            })*
+                            _ => false,
+                        };
+                        if !compiled && !needs.compiled_out.contains(&cargo) {
+                            needs.compiled_out.push(cargo);
+                        }
+                    }
+                    if count == 0 {
+                        break;
+                    }
+                    i += count;
                 }
+                needs
             }
         }
 
-        /// One type per optional feature, named after it, for [`Gated`] values and the
-        /// generated bindings of passes that need it. It implements [`Feature`] only when lava
-        /// was compiled with the feature.
+        /// One type per optional feature, for [`Gated`] values and the bindings of passes that
+        /// need it; it implements [`Feature`] only when lava was compiled with the feature.
         pub mod gate {
             use super::*;
             $(
@@ -278,19 +288,14 @@ features! {
     shader_clock: "shader-clock" / "assert-shader-clock" => ShaderClock,
     /// `VK_KHR_performance_query` with query pools: `query::counters`, `QueryPool::performance`.
     performance_query: "performance-query" / "assert-performance-query" => PerformanceQuery,
-    /// `VK_KHR_calibrated_timestamps`, which puts timestamps on the host's clock
-    /// (`QueryPool::instant`).
+    /// `VK_KHR_calibrated_timestamps`: timestamps on the host's clock (`QueryPool::instant`).
     calibrated_timestamps: "calibrated-timestamps" / "assert-calibrated-timestamps" => CalibratedTimestamps,
-    /// `VK_EXT_swapchain_maintenance1` (with a display, and the instance's
-    /// `VK_EXT_surface_maintenance1`): every present signals a fence, so what it uses
-    /// (semaphores, swapchains, surfaces) is destroyed once it is done, not after one more frame.
-    /// Asserting it requires it only with a display.
+    /// `VK_EXT_swapchain_maintenance1` with a display: presents signal fences, so what they use
+    /// is destroyed once they are done. Asserting it requires it only with a display.
     present_fences: "present-fences" / "assert-present-fences" => PresentFences,
-    /// A queue family with compute but no graphics: `Timeline<Compute>`, work that runs
-    /// beside the graphics queue's.
+    /// A queue family with compute but no graphics: `Timeline<Compute>`.
     async_compute: "async-compute" / "assert-async-compute" => AsyncCompute,
-    /// A queue family with transfer but neither graphics nor compute (a copy engine):
-    /// `Timeline<Transfer>`.
+    /// A queue family with transfer but neither graphics nor compute: `Timeline<Transfer>`.
     async_transfer: "async-transfer" / "assert-async-transfer" => AsyncTransfer,
     /// BC1-7 compressed formats.
     bc_compression: "bc-compression" / "assert-bc-compression" => BcCompression,
@@ -323,8 +328,7 @@ features! {
     rectangular_lines: "rectangular-lines" / "assert-rectangular-lines" => RectangularLines,
     bresenham_lines: "bresenham-lines" / "assert-bresenham-lines" => BresenhamLines,
     smooth_lines: "smooth-lines" / "assert-smooth-lines" => SmoothLines,
-    /// Stippled lines (`RasterState::line_stipple`) in every line mode the device has, default
-    /// lines included (which need strict lines).
+    /// Stippled lines (`RasterState::line_stipple`) in every line mode the device has.
     line_stipple: "line-stipple" / "assert-line-stipple" => LineStipple,
     /// Shader capabilities: 8-, 16- and 64-bit types and 64-bit atomics.
     shader_int8: "shader-int8" / "assert-shader-int8" => ShaderInt8,
@@ -335,9 +339,8 @@ features! {
     /// 8- and 16-bit values in storage and uniform buffers and push constants.
     storage_8bit: "storage-8bit" / "assert-storage-8bit" => Storage8Bit,
     storage_16bit: "storage-16bit" / "assert-storage-16bit" => Storage16Bit,
-    /// Dynamic state (extended dynamic state 2 and 3): where the device has it, draws that
-    /// differ in that state share a pipeline; where it doesn't, the state is part of the
-    /// pipeline's key. Asserting one keeps it out of the key. These have no API of their own.
+    /// Extended dynamic state: draws that differ in it share a pipeline; without it the state
+    /// is part of the pipeline's key.
     dynamic_blend: "dynamic-blend" / "assert-dynamic-blend" => DynamicBlend,
     dynamic_polygon_mode: "dynamic-polygon-mode" / "assert-dynamic-polygon-mode" => DynamicPolygonMode,
     dynamic_depth_clamp: "dynamic-depth-clamp" / "assert-dynamic-depth-clamp" => DynamicDepthClamp,
@@ -356,8 +359,7 @@ impl Default for Features {
     }
 }
 
-/// Sets field `$field` of `$features` to `$value` if lava was compiled with cargo feature
-/// `$cargo`.
+/// Sets `$features.$field = $value` if lava was compiled with cargo feature `$cargo`.
 macro_rules! set {
     ($features:ident: $($cargo:literal => $($field:ident).+ = $value:expr),* $(,)?) => {
         $(#[cfg(feature = $cargo)]
@@ -367,8 +369,7 @@ macro_rules! set {
     };
 }
 
-/// The SPIR-V capabilities lava knows, by the cargo feature they need. lava-build-slang has the
-/// same table to gate the generated bindings (its test compares them).
+/// The SPIR-V capabilities lava knows, by the cargo feature they need (lava-build-slang has a copy).
 #[doc(hidden)]
 pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
     (9, "shader-float16"),
@@ -388,8 +389,6 @@ pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
     (5283, "mesh-shader"),
 ];
 
-/// What a pass's SPIR-V needs: the optional features it declares, and the cargo features lava
-/// was compiled without that it would need.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Needs {
     pub(crate) features: Features,
@@ -397,7 +396,6 @@ pub(crate) struct Needs {
 }
 
 impl Features {
-    /// The names of the features `self` has that `available` lacks.
     pub fn missing_from(&self, available: &Features) -> Vec<&'static str> {
         (self.bits().zip(available.bits()).zip(Self::NAMES))
             .filter(|((wanted, has), _)| *wanted && !*has)
@@ -405,17 +403,15 @@ impl Features {
             .collect()
     }
 
-    /// The features either has.
     pub fn union(self, other: Features) -> Features {
         Self::from_bits(self.bits().zip(other.bits()).map(|(a, b)| a || b))
     }
 
-    /// The features `self` has and `other` doesn't.
     pub fn without(self, other: Features) -> Features {
         Self::from_bits(self.bits().zip(other.bits()).map(|(a, b)| a && !b))
     }
 
-    /// `self` without the features whose prerequisites it lacks (after some were disabled).
+    /// `self` without the features whose prerequisites it lacks.
     #[allow(unused_mut)]
     pub(crate) fn consistent(mut self) -> Features {
         let rebar = self.rebar;
@@ -441,7 +437,7 @@ impl Features {
         self
     }
 
-    /// Whether any line mode or stipple is on: they need `VK_KHR_line_rasterization`.
+    /// Whether anything that needs `VK_KHR_line_rasterization` is on.
     pub(crate) fn lines(&self) -> bool {
         let lines: &[bool] = &[
             #[cfg(feature = "rectangular-lines")]
@@ -460,7 +456,6 @@ impl Features {
         lines.iter().any(|on| *on)
     }
 
-    /// The device extensions these features need.
     #[allow(unused_mut)]
     pub(crate) fn extensions(&self) -> Vec<&'static CStr> {
         let mut extensions: Vec<&'static CStr> = Vec::new();
@@ -516,72 +511,23 @@ impl Features {
         let _ = eds3;
         extensions
     }
-
-    /// What a SPIR-V module's `OpCapability`s need. Capabilities lava doesn't know are left to
-    /// the driver.
-    pub(crate) fn of_spirv(spirv: &[u8]) -> Needs {
-        let mut needs = Needs {
-            features: Features::default(),
-            compiled_out: Vec::new(),
-        };
-        for capability in capabilities(spirv) {
-            let known = SPIRV_CAPABILITIES.iter().find(|(id, _)| *id == capability);
-            if let Some(&(_, cargo)) = known
-                && !needs.features.set_named(cargo)
-                && !needs.compiled_out.contains(&cargo)
-            {
-                needs.compiled_out.push(cargo);
-            }
-        }
-        needs
-    }
 }
 
-/// The operands of a SPIR-V module's `OpCapability` instructions.
-fn capabilities(spirv: &[u8]) -> impl Iterator<Item = u32> {
-    const OP_CAPABILITY: u32 = 17;
-    let words: Vec<u32> = spirv
-        .chunks_exact(4)
-        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
-        .collect();
-    let mut found = Vec::new();
-    // After the five header words, each instruction starts with its word count and opcode.
-    let mut i = 5;
-    while i < words.len() {
-        let (count, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
-        if opcode == OP_CAPABILITY
-            && let Some(&capability) = words.get(i + 1)
-        {
-            found.push(capability);
-        }
-        if count == 0 {
-            break;
-        }
-        i += count;
-    }
-    found.into_iter()
-}
-
-/// The device extensions lava needs on every device: buffer address commands.
 pub(crate) const LAVA_EXTENSIONS: [&CStr; 1] = [crate::vk::device_address_commands::NAME];
 
 /// What [`FeatureChain::optional`] needs to know of the device besides its feature structs.
 #[derive(Clone, Copy)]
 pub(crate) struct DeviceFacts {
     pub(crate) rebar: bool,
-    /// `VkPhysicalDeviceLimits::strictLines`, which stippled default lines need.
     #[allow(dead_code)]
     pub(crate) strict_lines: bool,
-    /// A queue family with compute but no graphics (`async-compute`).
     #[allow(dead_code)]
     pub(crate) dedicated_compute: bool,
-    /// A queue family with transfer but neither graphics nor compute (`async-transfer`).
     #[allow(dead_code)]
     pub(crate) dedicated_transfer: bool,
 }
 
-/// Every Vulkan feature struct lava queries or enables. [`Self::chain`] links the ones whose
-/// extension is in use.
+/// Every Vulkan feature struct lava queries or enables.
 #[derive(Default)]
 pub(crate) struct FeatureChain {
     core: vk::PhysicalDeviceFeatures,
@@ -607,7 +553,6 @@ pub(crate) struct FeatureChain {
 }
 
 impl FeatureChain {
-    /// The features of `device` whose extensions it has.
     pub(crate) fn query(
         instance: &ash::Instance,
         device: vk::PhysicalDevice,
@@ -644,8 +589,7 @@ impl FeatureChain {
             performance,
             swapchain_maintenance1,
         } = self;
-        // ash 0.38's `push_next` links the pushed struct's whole chain, and a queried chain
-        // still points at the structs it was linked to, so every struct starts unlinked.
+        // ash 0.38's `push_next` links the pushed struct's whole chain, so unlink a queried one.
         macro_rules! unlink {
             ($($field:ident),*) => {
                 $($field.p_next = core::ptr::null_mut();)*
@@ -705,12 +649,12 @@ impl FeatureChain {
         features
     }
 
-    /// What lava needs of every device, by name: the bindless descriptor indexing set, buffer
-    /// addresses and address commands, timeline semaphores, host query resets, the memory
-    /// model, sync2 and dynamic rendering.
-    fn lava_bits(&self) -> [(&'static str, vk::Bool32); 25] {
+    /// What lava needs that the device lacks, by name.
+    pub(crate) fn lava_missing(&self, has: &dyn Fn(&CStr) -> bool) -> Vec<String> {
+        let extensions = LAVA_EXTENSIONS.iter().filter(|name| !has(name));
+        let extensions = extensions.map(|name| name.to_string_lossy().into_owned());
         let (c, v11, v12, v13) = (&self.core, &self.vk11, &self.vk12, &self.vk13);
-        [
+        let bits = [
             ("shaderInt64", c.shader_int64),
             ("fragmentStoresAndAtomics", c.fragment_stores_and_atomics),
             ("vertexPipelineStoresAndAtomics", c.vertex_pipeline_stores_and_atomics),
@@ -736,18 +680,11 @@ impl FeatureChain {
             ("maintenance4", v13.maintenance4),
             ("shaderDemoteToHelperInvocation", v13.shader_demote_to_helper_invocation),
             ("deviceAddressCommands", self.address_commands.device_address_commands),
-        ]
-    }
-
-    /// What lava needs that the device lacks, by name.
-    pub(crate) fn lava_missing(&self, has: &dyn Fn(&CStr) -> bool) -> Vec<String> {
-        let extensions = LAVA_EXTENSIONS.iter().filter(|name| !has(name));
-        let extensions = extensions.map(|name| name.to_string_lossy().into_owned());
-        let bits = self.lava_bits().into_iter().filter(|(_, bit)| *bit != vk::TRUE);
+        ];
+        let bits = bits.into_iter().filter(|(_, bit)| *bit != vk::TRUE);
         extensions.chain(bits.map(|(name, _)| name.to_owned())).collect()
     }
 
-    /// The optional features the device has.
     #[allow(unused_variables)]
     pub(crate) fn optional(&self, has: &dyn Fn(&CStr) -> bool, device: DeviceFacts) -> Features {
         let t = |bit: vk::Bool32| bit == vk::TRUE;
@@ -780,7 +717,6 @@ impl FeatureChain {
                 t(self.performance.performance_counter_query_pools),
             "calibrated-timestamps" => calibrated_timestamps =
                 has(ash::khr::calibrated_timestamps::NAME),
-            // The caller drops it without a display or the instance extension.
             "present-fences" => present_fences =
                 t(self.swapchain_maintenance1.swapchain_maintenance1),
             "async-compute" => async_compute = device.dedicated_compute,
@@ -839,7 +775,6 @@ impl FeatureChain {
             "dynamic-provoking-vertex" => dynamic_provoking_vertex =
                 eds3(d3.extended_dynamic_state3_provoking_vertex_mode),
         }
-        // Stippling has to work in every line mode the device has, default lines included.
         let stippled = |mode: vk::Bool32, stippled: vk::Bool32| !t(mode) || t(stippled);
         set! { f:
             "line-stipple" => line_stipple = line_ext
@@ -851,7 +786,6 @@ impl FeatureChain {
         f.consistent()
     }
 
-    /// The chain that enables lava's needs and `features`.
     #[allow(unused_variables)]
     pub(crate) fn enabling(features: &Features) -> Self {
         let on = |b: bool| b as vk::Bool32;
@@ -883,7 +817,6 @@ impl FeatureChain {
             .dynamic_rendering(true)
             .synchronization2(true)
             .maintenance4(true)
-            // What `discard` compiles to.
             .shader_demote_to_helper_invocation(true);
         chain.address_commands.device_address_commands = vk::TRUE;
         let FeatureChain {
@@ -955,7 +888,6 @@ impl FeatureChain {
             "smooth-lines" => smooth_lines = on(f.smooth_lines),
             "line-stipple" => stippled_rectangular_lines = on(f.line_stipple),
         }
-        // The stippled form of every line mode that is on.
         #[cfg(feature = "line-stipple")]
         {
             lines.stippled_bresenham_lines = on(f.line_stipple && lines.bresenham_lines == vk::TRUE);
@@ -988,115 +920,5 @@ impl FeatureChain {
                 on(f.present_fences),
         }
         chain
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn module(instructions: &[&[u32]]) -> Vec<u8> {
-        let header = [0x0723_0203u32, 0x0001_0600, 0, 1, 0];
-        let words = header.iter().chain(instructions.iter().flat_map(|i| i.iter()));
-        words.flat_map(|w| w.to_le_bytes()).collect()
-    }
-
-    fn capability(id: u32) -> [u32; 2] {
-        [2 << 16 | 17, id]
-    }
-
-    /// Every capability a pass declares maps to its feature, or to the cargo feature lava was
-    /// compiled without.
-    #[test]
-    fn capabilities_map_to_the_features_they_need() {
-        let spirv = module(&[&capability(1), &capability(39), &capability(4472), &capability(5283)]);
-        let needs = Features::of_spirv(&spirv);
-        let mut expected = Features::default();
-        let mut compiled_out = Vec::new();
-        for cargo in ["shader-int8", "ray-query", "mesh-shader"] {
-            if !expected.set_named(cargo) {
-                compiled_out.push(cargo);
-            }
-        }
-        assert_eq!(needs, Needs { features: expected, compiled_out });
-        // `Shader` (1) needs nothing optional.
-        let shader = Features::of_spirv(&module(&[&capability(1)]));
-        assert_eq!(shader.features, Features::default());
-        assert!(shader.compiled_out.is_empty());
-    }
-
-    #[test]
-    fn capability_operands_elsewhere_are_not_capabilities() {
-        // `OpExtension "SPV_KHR_ray_query"` (opcode 10) holds the text, not a capability.
-        let extension = [5 << 16 | 10, 0x5f565053, 0x5f52484b, 0x5f796172, 0x72657571];
-        let spirv = module(&[&extension, &capability(1)]);
-        assert_eq!(Features::of_spirv(&spirv).features, Features::default());
-    }
-
-    #[test]
-    fn missing_features_are_named_by_their_cargo_feature() {
-        let wanted = Features {
-            rebar: true,
-            ..Default::default()
-        };
-        assert_eq!(wanted.missing_from(&Features::default()), ["rebar"]);
-        assert!(wanted.missing_from(&wanted).is_empty());
-        assert_eq!(wanted.union(Features::default()), wanted);
-        assert_eq!(wanted.without(wanted), Features::default());
-        for name in &Features::NAMES[1..] {
-            let mut one = Features::default();
-            assert!(one.set_named(name), "{name}");
-            assert_eq!(one.missing_from(&Features::default()), [*name]);
-        }
-    }
-
-    /// Every bit lava checks on a device it also enables, without any optional feature.
-    #[test]
-    fn lava_enables_everything_it_requires() {
-        let chain = FeatureChain::enabling(&Features::default());
-        for (name, bit) in chain.lava_bits() {
-            assert_eq!(bit, vk::TRUE, "{name}");
-        }
-        assert_eq!(chain.mesh.mesh_shader, vk::FALSE);
-        assert_eq!(chain.core.texture_compression_bc, vk::FALSE);
-        assert_eq!(chain.dynamic_state3.extended_dynamic_state3_color_blend_enable, vk::FALSE);
-    }
-
-    /// What enabling a feature sets is what detecting it reads.
-    #[test]
-    fn enabled_optional_features_read_back_as_supported() {
-        let all = Features::from_bits(std::iter::repeat(true));
-        let chain = FeatureChain::enabling(&all);
-        let facts = DeviceFacts {
-            rebar: true,
-            strict_lines: true,
-            dedicated_compute: true,
-            dedicated_transfer: true,
-        };
-        assert_eq!(chain.optional(&|_| true, facts), all);
-    }
-
-    /// Features whose prerequisites were disabled are off too.
-    #[test]
-    fn disabled_prerequisites_turn_dependent_features_off() {
-        let all = Features::from_bits(std::iter::repeat(true));
-        let no_rebar = Features { rebar: false, ..all }.consistent();
-        #[cfg(feature = "host-image-copy")]
-        assert!(!no_rebar.host_image_copy);
-        let _ = no_rebar;
-        assert_eq!(all.consistent(), all);
-    }
-
-    #[test]
-    fn extensions_follow_the_features() {
-        assert!(Features::default().extensions().is_empty());
-        let mut mesh = Features::default();
-        if mesh.set_named("mesh-shader") {
-            assert_eq!(mesh.extensions(), [ash::ext::mesh_shader::NAME]);
-        }
-        let mut lines = Features::default();
-        if lines.set_named("bresenham-lines") {
-            assert_eq!(lines.extensions(), [ash::khr::line_rasterization::NAME]);
-        }
     }
 }

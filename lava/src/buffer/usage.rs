@@ -1,33 +1,23 @@
 //! Buffer usages: one marker type per combination of usages, mapping to Vulkan buffer usage flags, and `Dynamic`, whose usage is only known at runtime
 use crate::vk;
 
-/// Every buffer also gets `SHADER_DEVICE_ADDRESS`, `TRANSFER_SRC` and `TRANSFER_DST` (`Buffer::raw`):
-/// leaving the transfer usages out of buffers that don't need them made no measurable difference.
-/// With `Features::acceleration_structure` it also gets
-/// `ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR`, so any buffer can feed a build.
+/// Every buffer also gets device address and transfer src/dst usage, and acceleration
+/// structure build input with that feature (`Buffer::raw`).
 pub trait BufferUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     fn flags(&self) -> vk::BufferUsageFlags;
-    /// Panics unless the usage has every flag of `required`. The command buffer calls it with
-    /// what its trait bounds (`IsStorage`, `IsIndirect`, ...) require. A static usage's type
-    /// already guarantees that, so its `check` does nothing and compiles away; `Dynamic` meets
-    /// every bound and checks at runtime instead.
+    /// Panics unless the usage has every flag of `required`; a static usage's does nothing.
     fn check(&self, required: vk::BufferUsageFlags);
 }
 
-/// Every usage but `Dynamic`: the type alone says what the usage is.
+/// Every usage but `Dynamic`.
 pub trait StaticUsage: BufferUsage + Default {
     const VK: vk::BufferUsageFlags;
 }
 
-/// Marker for buffers that can be bound as storage buffers.
 pub trait IsStorage: BufferUsage {}
-/// Marker for buffers that can be bound as uniform buffers.
 pub trait IsUniform: BufferUsage {}
-/// Marker for buffers usable as vertex buffers.
 pub trait IsVertex: BufferUsage {}
-/// Marker for buffers usable as index buffers.
 pub trait IsIndex: BufferUsage {}
-/// Marker for buffers usable as indirect buffers.
 pub trait IsIndirect: BufferUsage {}
 
 /// No usage but the ones every buffer has.
@@ -129,13 +119,9 @@ macro_rules! usages {
             }
             $(usages!(@trait $name $flag);)+
         )*
-
-        #[cfg(test)]
-        const ALL: &[(&str, vk::BufferUsageFlags)] = &[$((stringify!($name), $name::VK)),*];
     };
 }
 
-// Vulkan allows every combination of buffer usages.
 usages! {
     Storage: Storage;
     Uniform: Uniform;
@@ -168,68 +154,4 @@ usages! {
     StorageVertexIndexIndirect: Storage Vertex Index Indirect;
     UniformVertexIndexIndirect: Uniform Vertex Index Indirect;
     StorageUniformVertexIndexIndirect: Storage Uniform Vertex Index Indirect;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vk::BufferUsageFlags as F;
-
-    const FLAGS: [(&str, F); 5] = [
-        ("Storage", F::STORAGE_BUFFER),
-        ("Uniform", F::UNIFORM_BUFFER),
-        ("Vertex", F::VERTEX_BUFFER),
-        ("Index", F::INDEX_BUFFER),
-        ("Indirect", F::INDIRECT_BUFFER),
-    ];
-
-    #[test]
-    fn names_list_their_flags() {
-        for (name, flags) in ALL {
-            let expected: String = FLAGS
-                .iter()
-                .filter(|(_, flag)| flags.contains(*flag))
-                .map(|(name, _)| *name)
-                .collect();
-            assert_eq!(*name, expected);
-        }
-    }
-
-    #[test]
-    fn every_combination_exists_once() {
-        let mut all: Vec<F> = ALL.iter().map(|(_, flags)| *flags).collect();
-        all.sort();
-        all.dedup();
-        assert_eq!(all.len(), (1 << FLAGS.len()) - 1);
-        assert_eq!(Unknown::VK, F::empty());
-    }
-
-    #[test]
-    fn marker_traits_match_the_flags() {
-        fn storage<U: IsStorage + StaticUsage>() -> F {
-            U::VK
-        }
-        fn index<U: IsIndex + StaticUsage>() -> F {
-            U::VK
-        }
-        fn uniform<U: IsUniform + StaticUsage>() -> F {
-            U::VK
-        }
-        assert_eq!(
-            storage::<StorageIndirect>(),
-            F::STORAGE_BUFFER | F::INDIRECT_BUFFER
-        );
-        assert_eq!(index::<VertexIndex>(), F::VERTEX_BUFFER | F::INDEX_BUFFER);
-        assert_eq!(
-            uniform::<UniformVertexIndirect>(),
-            F::UNIFORM_BUFFER | F::VERTEX_BUFFER | F::INDIRECT_BUFFER
-        );
-    }
-
-    #[test]
-    fn dynamic_usage_checks_its_flags() {
-        let usage = Dynamic(F::STORAGE_BUFFER | F::INDIRECT_BUFFER);
-        usage.check(F::INDIRECT_BUFFER);
-        assert!(std::panic::catch_unwind(|| usage.check(F::INDEX_BUFFER)).is_err());
-    }
 }

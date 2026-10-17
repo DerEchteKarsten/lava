@@ -3,12 +3,9 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Item, parse_macro_input};
 
-/// Records the caller's location in `crate::state::CALLSITE` for the duration of the function.
-///
-/// The location is held by a `crate::state::CallsiteGuard`, so it is released on every exit
-/// path (early `return`, `?`, panic) and only by the outermost traced call. Only in debug
-/// builds of the crate that uses it: the expansion is guarded by `cfg(debug_assertions)`, which
-/// is evaluated there, not in this proc-macro crate (whose build profile may differ).
+/// Records the caller's location in `crate::state::CALLSITE` while the function runs, released
+/// on every exit path by a `crate::state::CallsiteGuard`. Only in debug builds of the crate
+/// that uses it.
 #[proc_macro_attribute]
 pub fn validation_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item: Item = parse_macro_input!(item as Item);

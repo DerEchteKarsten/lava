@@ -18,7 +18,6 @@ mod tests {
         let (mut specialized_compute, mut specialized_raytracing) = (Vec::new(), Vec::new());
         for pass in PASS_MAP.passes {
             let specialized = !pass.constants.is_empty();
-            // The constants fill their struct exactly.
             let end = pass.constants.iter().map(|c| c.offset as usize + c.size);
             assert_eq!(end.max().unwrap_or(0), pass.constants_size, "{}", pass.name);
             let names: Vec<&str> = match pass.kind {
@@ -78,7 +77,7 @@ mod tests {
                 );
             }
         }
-        // Each kind indexes its own pipeline array densely, which lava sizes by counting.
+        // lava sizes each kind's pipeline array by counting.
         for indices in [
             compute,
             raster,

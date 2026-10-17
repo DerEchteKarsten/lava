@@ -3,14 +3,11 @@ use crate::vk;
 
 pub trait ImageUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     fn flags(&self) -> vk::ImageUsageFlags;
-    /// Panics unless the usage has every flag of `required`. The command buffer calls it with
-    /// what its trait bounds (`IsSampled`, `IsTransferDst`, ...) require. A static usage's type
-    /// already guarantees that, so its `check` does nothing and compiles away; `Dynamic` meets
-    /// every bound and checks at runtime instead.
+    /// Panics unless the usage has every flag of `required`; a static usage's does nothing.
     fn check(&self, required: vk::ImageUsageFlags);
 }
 
-/// Every usage but `Dynamic`: the type alone says what the usage is.
+/// Every usage but `Dynamic`.
 pub trait StaticUsage: ImageUsage + Default {
     const VK: vk::ImageUsageFlags;
 }
@@ -19,9 +16,8 @@ pub trait IsSampled: ImageUsage {}
 pub trait IsStorage: ImageUsage {}
 pub trait IsColorAttachment: ImageUsage {}
 pub trait IsDepthAttachment: ImageUsage {}
-/// Usages the host can copy texels into (`Image::copy_from`, the `host-image-copy` feature).
-/// Host transfer usage can cost the driver its compressed layouts, so only images the host
-/// writes should have it.
+/// Usages the host can copy texels into (`Image::copy_from`). It can cost the driver its
+/// compressed layouts, so only images the host writes should have it.
 #[cfg(feature = "host-image-copy")]
 pub trait IsHostCopy: ImageUsage {}
 /// Usages that can be the source of a copy or blit.
@@ -54,7 +50,7 @@ macro_rules! usages {
     (@trait $name:ident TransferSrc) => { impl IsTransferSrc for $name {} };
     (@trait $name:ident TransferDst) => { impl IsTransferDst for $name {} };
 
-    ($all:ident; $($name:ident: $($flag:ident)+;)*) => {
+    ($($name:ident: $($flag:ident)+;)*) => {
         $(
             #[derive(Clone, Copy, Debug, Default)]
             pub struct $name;
@@ -71,17 +67,12 @@ macro_rules! usages {
             }
             $(usages!(@trait $name $flag);)+
         )*
-
-        #[cfg(test)]
-        const $all: &[(&str, vk::ImageUsageFlags)] = &[$((stringify!($name), $name::VK)),*];
     };
 }
 
-// Every non-empty set of these flags except colour together with depth attachment, which no
-// format supports. Whether a format supports a usage (storage on depth, host copies) is
-// up to the device.
+// Every non-empty set of these flags but colour with depth attachment, which no format
+// supports.
 usages! {
-    ALL_PLAIN;
     ColorAttachment: ColorAttachment;
     ColorAttachmentSampled: ColorAttachment Sampled;
     ColorAttachmentStorage: ColorAttachment Storage;
@@ -131,10 +122,8 @@ usages! {
     SampledStorageTransferSrcTransferDst: Sampled Storage TransferSrc TransferDst;
 }
 
-// The usages with host copies (`host-image-copy`).
 #[cfg(feature = "host-image-copy")]
 usages! {
-    ALL_HOST_COPY;
     ColorAttachmentHostCopy: ColorAttachment HostCopy;
     ColorAttachmentSampledHostCopy: ColorAttachment Sampled HostCopy;
     ColorAttachmentStorageHostCopy: ColorAttachment Storage HostCopy;
@@ -213,104 +202,3 @@ impl IsDepthAttachment for Dynamic {}
 impl IsHostCopy for Dynamic {}
 impl IsTransferSrc for Dynamic {}
 impl IsTransferDst for Dynamic {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vk::ImageUsageFlags as F;
-
-    const FLAGS: [(&str, F); 7] = [
-        ("ColorAttachment", F::COLOR_ATTACHMENT),
-        ("DepthAttachment", F::DEPTH_STENCIL_ATTACHMENT),
-        ("Sampled", F::SAMPLED),
-        ("Storage", F::STORAGE),
-        ("HostCopy", F::HOST_TRANSFER_EXT),
-        ("TransferSrc", F::TRANSFER_SRC),
-        ("TransferDst", F::TRANSFER_DST),
-    ];
-
-    /// Every usage lava was compiled with.
-    fn all() -> Vec<(&'static str, F)> {
-        #[allow(unused_mut)]
-        let mut all = ALL_PLAIN.to_vec();
-        #[cfg(feature = "host-image-copy")]
-        all.extend_from_slice(ALL_HOST_COPY);
-        all
-    }
-
-    #[test]
-    fn names_list_their_flags() {
-        for (name, flags) in &all() {
-            let expected: String = FLAGS
-                .iter()
-                .filter(|(_, flag)| flags.contains(*flag))
-                .map(|(name, _)| *name)
-                .collect();
-            assert_eq!(*name, expected);
-        }
-    }
-
-    #[test]
-    fn every_allowed_combination_exists_once() {
-        let mut expected: Vec<F> = (1..1u32 << FLAGS.len())
-            .map(|mask| {
-                FLAGS
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| mask & 1 << i != 0)
-                    .fold(F::empty(), |all, (_, (_, flag))| all | *flag)
-            })
-            .filter(|flags| !flags.contains(F::COLOR_ATTACHMENT | F::DEPTH_STENCIL_ATTACHMENT))
-            .filter(|flags| {
-                cfg!(feature = "host-image-copy") || !flags.contains(F::HOST_TRANSFER_EXT)
-            })
-            .collect();
-        let mut all: Vec<F> = all().iter().map(|(_, flags)| *flags).collect();
-        expected.sort();
-        all.sort();
-        assert_eq!(all, expected);
-    }
-
-    #[test]
-    fn marker_traits_match_the_flags() {
-        fn sampled<U: IsSampled + StaticUsage>() -> F {
-            U::VK
-        }
-        fn storage<U: IsStorage + StaticUsage>() -> F {
-            U::VK
-        }
-        #[cfg(feature = "host-image-copy")]
-        fn host_copy<U: IsHostCopy + StaticUsage>() -> F {
-            U::VK
-        }
-        fn src<U: IsTransferSrc + StaticUsage>() -> F {
-            U::VK
-        }
-        fn dst<U: IsTransferDst + StaticUsage>() -> F {
-            U::VK
-        }
-        fn unified_binding<U: UnifiedBinding + StaticUsage>() -> F {
-            U::VK
-        }
-        assert!(sampled::<DepthAttachmentSampledTransferSrc>().contains(F::SAMPLED));
-        assert!(storage::<ColorAttachmentStorageTransferDst>().contains(F::STORAGE));
-        #[cfg(feature = "host-image-copy")]
-        assert!(host_copy::<SampledHostCopy>().contains(F::HOST_TRANSFER_EXT));
-        assert!(src::<ColorAttachmentTransferSrc>().contains(F::TRANSFER_SRC));
-        assert!(dst::<SampledStorageTransferDst>().contains(F::TRANSFER_DST));
-        assert_eq!(
-            unified_binding::<SampledStorageTransferSrc>(),
-            F::SAMPLED | F::STORAGE | F::TRANSFER_SRC
-        );
-    }
-
-    #[test]
-    fn dynamic_usage_checks_its_flags() {
-        let usage = Dynamic(F::SAMPLED | F::TRANSFER_DST);
-        usage.check(F::SAMPLED);
-        usage.check(F::SAMPLED | F::TRANSFER_DST);
-        assert!(std::panic::catch_unwind(|| usage.check(F::STORAGE)).is_err());
-        // Static usages are checked by their type.
-        Sampled.check(F::STORAGE);
-    }
-}

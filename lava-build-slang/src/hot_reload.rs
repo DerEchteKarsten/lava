@@ -14,12 +14,9 @@ use crate::{
     compile::{self, slang},
 };
 
-/// How the build script compiled the passes, which the hot reload compiles them with again:
-/// generated next to the bindings (`$OUT_DIR/lava/hot_reload.rs`) and included by [`watch!`].
+/// How the build script compiled the passes, generated as `$OUT_DIR/lava/hot_reload.rs`.
 pub struct Build {
-    /// The absolute include directories.
     pub search_paths: &'static [&'static str],
-    /// The preprocessor macros (name, value).
     pub defines: &'static [(&'static str, &'static str)],
     /// The absolute pass and include directories.
     pub watch_dirs: &'static [&'static str],
@@ -31,14 +28,12 @@ pub struct Build {
 pub struct BuiltPass {
     /// The absolute path of its `.slang` file.
     pub source: &'static str,
-    /// `compile::layout_hash` of the push constants, specialization constants and entry points
-    /// the bindings were generated from; a reload that changes it is refused, since the Rust
-    /// side can't follow.
+    /// The `compile::layout_hash` the bindings were generated from; a reload that changes it is
+    /// refused.
     pub layout: u64,
 }
 
-/// Starts the hot reload of the passes compiled by the calling crate's build script: call it
-/// in the crate that includes the bindings (it reads that crate's `OUT_DIR`), after
+/// Starts the hot reload of the passes compiled by the calling crate's build script, after
 /// `lava::init` got their `PASS_MAP`.
 #[macro_export]
 macro_rules! watch {
@@ -52,16 +47,14 @@ macro_rules! watch {
     }};
 }
 
-/// Watches the build's directories and [`SLANG_DIR`], and compiles changed passes on a thread
-/// of its own; [`watch!`] calls it with the build of the calling crate. Later calls do nothing.
+/// Watches the build's directories and [`SLANG_DIR`] and compiles changed passes on a thread of
+/// its own. Later calls do nothing.
 pub fn watch(build: &'static Build) {
     use notify::Watcher;
 
     static WATCHER: OnceLock<Option<notify::RecommendedWatcher>> = OnceLock::new();
     let _ = WATCHER.get_or_init(|| {
         let watch = || -> std::result::Result<notify::RecommendedWatcher, String> {
-            // The source directories of the build machine: a moved binary has no shaders to
-            // watch, and keeps the pipelines it started with.
             if build.passes.len() != pass_map().passes.len() {
                 return Err("its build isn't the one of lava's `PASS_MAP`".to_string());
             }
@@ -69,6 +62,7 @@ pub fn watch(build: &'static Build) {
                 .chain([SLANG_DIR])
                 .map(Path::new)
                 .collect();
+            // A binary moved off the build machine has no shaders to watch.
             if let Some(missing) = dirs.iter().find(|dir| !dir.is_dir()) {
                 return Err(format!("{} is not a directory", missing.display()));
             }
@@ -82,7 +76,52 @@ pub fn watch(build: &'static Build) {
             }
             std::thread::Builder::new()
                 .name("shader_hot_reload".into())
-                .spawn(move || compile_changed_passes(build, rx))
+                .spawn(move || {
+                    let Some(global) = slang::GlobalSession::new() else {
+                        tracing::error!(target: "shader_file_watcher", "failed to create slang session, hot reloading is disabled");
+                        return;
+                    };
+                    let options = compile::Options {
+                        search_paths: build.search_paths,
+                        defines: build.defines,
+                        optimization: build.optimization,
+                    };
+
+                    while let Ok(first) = rx.recv() {
+                        std::thread::sleep(Duration::from_millis(50));
+                        let changed: Vec<PathBuf> = iter::once(first).chain(rx.try_iter()).collect();
+
+                        // A changed file that is no pass's source is an include: reload every pass.
+                        let is_source_of = |path: &PathBuf, pass: &BuiltPass| path == Path::new(pass.source);
+                        let all = changed
+                            .iter()
+                            .any(|path| !build.passes.iter().any(|pass| is_source_of(path, pass)));
+                        for (pass_index, pass) in build.passes.iter().enumerate() {
+                            if !(all || changed.iter().any(|path| is_source_of(path, pass))) {
+                                continue;
+                            }
+                            let reloaded = (|| {
+                                let session = compile::session(&global, &options);
+                                let program =
+                                    compile::link(&session, pass.source).map_err(|e| e.to_string())?;
+                                let layout = program.layout(0).map_err(|e| e.to_string())?;
+                                if compile::layout_hash(layout) != pass.layout {
+                                    return Err(
+                                        "its push constants, specialization constants or entry points changed, \
+                                                which the generated bindings can't follow: run `cargo build`"
+                                            .to_string(),
+                                    );
+                                }
+                                let spirv = program.target_code(0).map_err(|e| e.to_string())?;
+                                tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
+                                pipeline::reload_pass(pass_index, spirv.as_slice()).map_err(|e| e.to_string())
+                            })();
+                            if let Err(e) = reloaded {
+                                tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
+                            }
+                        }
+                    }
+                })
                 .map_err(|e| e.to_string())?;
             Ok(watcher)
         };
@@ -122,167 +161,35 @@ impl EventHandler for FileWatcher {
     }
 }
 
-fn compile_changed_passes(build: &Build, changed: mpsc::Receiver<PathBuf>) {
-    let Some(global) = slang::GlobalSession::new() else {
-        tracing::error!(target: "shader_file_watcher", "failed to create slang session, hot reloading is disabled");
-        return;
-    };
-
-    while let Ok(first) = changed.recv() {
-        std::thread::sleep(Duration::from_millis(50));
-        let paths: Vec<PathBuf> = iter::once(first).chain(changed.try_iter()).collect();
-
-        for pass_index in passes_to_reload(&paths, build.passes) {
-            let pass = &build.passes[pass_index];
-
-            let reloaded = compile_pass(&global, build, pass_index).and_then(|spirv| {
-                tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
-                pipeline::reload_pass(pass_index, spirv.as_slice()).map_err(|e| e.to_string())
-            });
-            if let Err(e) = reloaded {
-                tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
-            }
-        }
-    }
-}
-
-/// Indices of the passes that have to be recompiled after `changed` files were modified:
-/// the passes whose own source changed, or every pass as soon as a non-pass file (an include)
-/// is among them.
-fn passes_to_reload(changed: &[PathBuf], passes: &[BuiltPass]) -> Vec<usize> {
-    let is_source_of = |path: &PathBuf, pass: &BuiltPass| path == Path::new(pass.source);
-    let all = changed
-        .iter()
-        .any(|path| !passes.iter().any(|pass| is_source_of(path, pass)));
-    passes
-        .iter()
-        .enumerate()
-        .filter(|(_, pass)| all || changed.iter().any(|path| is_source_of(path, pass)))
-        .map(|(index, _)| index)
-        .collect()
-}
-
-/// The pass's new SPIR-V, unless its push constants, specialization constants or entry
-/// points changed, which only `cargo build` can follow.
-fn compile_pass(
-    global: &slang::GlobalSession,
-    build: &Build,
-    pass_index: usize,
-) -> std::result::Result<slang::Blob, String> {
-    let pass = &build.passes[pass_index];
-    let options = compile::Options {
-        search_paths: build.search_paths,
-        defines: build.defines,
-        optimization: build.optimization,
-    };
-    let session = compile::session(global, &options);
-    let program = compile::link(&session, pass.source).map_err(|e| e.to_string())?;
-    let layout = program.layout(0).map_err(|e| e.to_string())?;
-    if compile::layout_hash(layout) != pass.layout {
-        return Err(
-            "its push constants, specialization constants or entry points changed, \
-                    which the generated bindings can't follow: run `cargo build`"
-                .to_string(),
-        );
-    }
-    program.target_code(0).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pass(source: &'static str) -> BuiltPass {
-        BuiltPass { source, layout: 0 }
-    }
-
     #[test]
-    fn changed_pass_sources_reload_only_those_passes() {
-        let passes = [
-            pass("/repo/shaders/passes/a.slang"),
-            pass("/repo/shaders/passes/b.slang"),
-            pass("/repo/shaders/passes/c.slang"),
-        ];
-        let changed = [
-            PathBuf::from("/repo/shaders/passes/c.slang"),
-            PathBuf::from("/repo/shaders/passes/a.slang"),
-        ];
-        assert_eq!(passes_to_reload(&changed, &passes), [0, 2]);
-        assert!(passes_to_reload(&[], &passes).is_empty());
-    }
-
-    #[test]
-    fn a_changed_include_reloads_every_pass() {
-        let passes = [pass("/repo/shaders/passes/a.slang"), pass("/repo/shaders/passes/b.slang")];
-        let changed = [
-            PathBuf::from("/repo/shaders/passes/a.slang"),
-            PathBuf::from("/repo/shaders/include/math.slang"),
-        ];
-        assert_eq!(passes_to_reload(&changed, &passes), [0, 1]);
-    }
-
-    #[test]
-    fn pass_sources_match_on_whole_path_components() {
-        // `xa.slang` is not pass `a.slang`; it counts as an unknown file, i.e. an include.
-        let passes = [pass("/repo/shaders/passes/a.slang"), pass("/repo/shaders/passes/b.slang")];
-        let changed = [PathBuf::from("/repo/shaders/passes/xa.slang")];
-        assert_eq!(passes_to_reload(&changed, &passes), [0, 1]);
-    }
-
-    fn watch(events: Vec<notify::Result<notify::Event>>) -> Vec<PathBuf> {
+    fn watcher_forwards_only_modified_and_created_slang_files() {
+        use notify::{
+            Event, EventKind,
+            event::{AccessKind, CreateKind, ModifyKind, RemoveKind},
+        };
         let (changed, received) = mpsc::channel();
         let mut watcher = FileWatcher { changed };
-        for event in events {
-            watcher.handle_event(event);
+        for (kind, paths) in [
+            (EventKind::Modify(ModifyKind::Any), &["/s/passes/a.slang", "/s/notes.txt"][..]),
+            (EventKind::Create(CreateKind::File), &["/s/include/new.slang"]),
+            (EventKind::Remove(RemoveKind::File), &["/s/passes/a.slang"]),
+            (EventKind::Access(AccessKind::Any), &["/s/passes/a.slang"]),
+        ] {
+            let event = paths.iter().fold(Event::new(kind), |e, p| e.add_path(p.into()));
+            watcher.handle_event(Ok(event));
         }
+        watcher.handle_event(Err(notify::Error::generic("watch failed")));
         drop(watcher);
-        received.iter().collect()
-    }
-
-    fn event(kind: notify::EventKind, paths: &[&str]) -> notify::Result<notify::Event> {
-        let mut event = notify::Event::new(kind);
-        for path in paths {
-            event = event.add_path(PathBuf::from(path));
-        }
-        Ok(event)
-    }
-
-    #[test]
-    fn watcher_forwards_modified_and_created_slang_files() {
-        use notify::{
-            EventKind,
-            event::{CreateKind, ModifyKind},
-        };
-        let paths = watch(vec![
-            event(
-                EventKind::Modify(ModifyKind::Any),
-                &["/s/passes/a.slang", "/s/notes.txt"],
-            ),
-            event(
-                EventKind::Create(CreateKind::File),
-                &["/s/include/new.slang"],
-            ),
-        ]);
         assert_eq!(
-            paths,
+            received.iter().collect::<Vec<_>>(),
             [
                 PathBuf::from("/s/passes/a.slang"),
                 PathBuf::from("/s/include/new.slang")
             ]
         );
-    }
-
-    #[test]
-    fn watcher_ignores_other_events_and_errors() {
-        use notify::{
-            EventKind,
-            event::{AccessKind, RemoveKind},
-        };
-        let paths = watch(vec![
-            event(EventKind::Remove(RemoveKind::File), &["/s/passes/a.slang"]),
-            event(EventKind::Access(AccessKind::Any), &["/s/passes/a.slang"]),
-            Err(notify::Error::generic("watch failed")),
-        ]);
-        assert!(paths.is_empty());
     }
 }

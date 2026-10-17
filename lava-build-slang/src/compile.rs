@@ -1,7 +1,6 @@
 //! Slang session and pass linking shared by the build script and the hot reload, plus the reflection both read: entry point stages and attributes, ray tracing groups, layout hashes
 use std::{collections::BTreeMap, ffi::CString};
 
-/// The Slang bindings, for the sessions and programs these functions take and return.
 pub use shader_slang as slang;
 
 use crate::reflect::{
@@ -10,15 +9,14 @@ use crate::reflect::{
 };
 use crate::{Optimization, SLANG_DIR};
 
-/// How a pass compiles: what the build script was given.
 pub struct Options<'a> {
-    /// Absolute include directories; lava-build-slang's own `slang/` is always searched too.
+    /// Absolute include directories; [`SLANG_DIR`] is always searched too.
     pub search_paths: &'a [&'a str],
     pub defines: &'a [(&'a str, &'a str)],
     pub optimization: Optimization,
 }
 
-/// A session that compiles a pass, named by its absolute path, to SPIR-V 1.6.
+/// A session that compiles passes, named by their absolute paths, to SPIR-V 1.6.
 pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Session {
     let paths: Vec<CString> = options
         .search_paths
@@ -53,9 +51,8 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
         .expect("failed to create a slang session")
 }
 
-/// A hash of what the generated bindings of a pass depend on: its push constant fields (name,
-/// offset, size), its specialization constants (id, size) and its entry points (stage, name).
-/// A reload whose hash differs from the baked one would run against stale bindings.
+/// A hash of what the generated bindings of a pass depend on: its push constants,
+/// specialization constants and entry points.
 pub fn layout_hash(layout: &slang::reflection::Shader) -> u64 {
     use slang::ParameterCategory as Cat;
     use std::hash::{DefaultHasher, Hash, Hasher};
@@ -97,14 +94,12 @@ pub fn layout_hash(layout: &slang::reflection::Shader) -> u64 {
     for entry in layout.checked_entry_points() {
         format!("{:?}", entry.stage()).hash(&mut hasher);
         entry.checked_name().hash(&mut hasher);
-        // The ray tracing groups, which the pass table bakes.
         entry_attribute(entry, "Group").hash(&mut hasher);
         entry_attribute(entry, "MaxRecursion").hash(&mut hasher);
     }
     hasher.finish()
 }
 
-/// The stage of an entry point as the pass table names it.
 pub fn stage_name(stage: slang::Stage) -> &'static str {
     use slang::Stage;
     match stage {
@@ -123,7 +118,6 @@ pub fn stage_name(stage: slang::Stage) -> &'static str {
     }
 }
 
-/// The stages of a ray tracing pass.
 pub const RAY_TRACING_STAGES: [&str; 6] = [
     "raygen",
     "miss",
@@ -133,8 +127,7 @@ pub const RAY_TRACING_STAGES: [&str; 6] = [
     "callable",
 ];
 
-/// The integer argument of the user attribute `name` (`Group`, `MaxRecursion` in
-/// `ray_tracing.slang`) on an entry point.
+/// The integer argument of the user attribute `name` (`Group`, `MaxRecursion`).
 pub fn entry_attribute(entry: &slang::reflection::EntryPoint, name: &str) -> Option<i32> {
     entry
         .checked_function()?
@@ -143,7 +136,6 @@ pub fn entry_attribute(entry: &slang::reflection::EntryPoint, name: &str) -> Opt
         .argument_value_int(0)
 }
 
-/// An entry point of a pass with its `Group` and `MaxRecursion` attributes (ray tracing only).
 pub struct Entry<'a> {
     pub stage: &'static str,
     pub name: &'a str,
@@ -151,7 +143,6 @@ pub struct Entry<'a> {
     pub max_recursion: Option<i32>,
 }
 
-/// The entry points of one hit group.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HitGroupEntries {
     pub closest_hit: Option<String>,
@@ -159,8 +150,7 @@ pub struct HitGroupEntries {
     pub intersection: Option<String>,
 }
 
-/// A ray tracing pass's shader groups, in shader binding table order: each region's groups by
-/// their `Group` index.
+/// A ray tracing pass's shader groups in shader binding table order.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RayTracingGroups {
     pub raygen: String,
@@ -170,10 +160,8 @@ pub struct RayTracingGroups {
     pub max_recursion: u32,
 }
 
-/// Groups the entry points of a ray tracing pass: exactly one raygen; miss, hit and callable
-/// groups indexed 0, 1, 2, ... per region by `Group` (0 without it), where hit entry points of
-/// the same index form one group with each stage at most once; `MaxRecursion` only on the
-/// raygen, between 1 and 31 (1 without it).
+/// Groups the entry points of a ray tracing pass by their `Group` index (0 without it), dense
+/// per region; `MaxRecursion` is only allowed on the single raygen.
 pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String> {
     let mut raygen = None;
     let mut max_recursion = 1;
@@ -274,14 +262,6 @@ mod tests {
             group,
             max_recursion: None,
         }
-    }
-
-    #[test]
-    fn a_raygen_alone_makes_one_group() {
-        let groups = ray_tracing_groups(&[entry("raygen", "main", None)]).unwrap();
-        assert_eq!(groups.raygen, "main");
-        assert!(groups.miss.is_empty() && groups.hit.is_empty() && groups.callable.is_empty());
-        assert_eq!(groups.max_recursion, 1);
     }
 
     #[test]

@@ -1,6 +1,5 @@
 //! Links the Slang compiler into every binary that uses lava-build-slang
 fn main() {
-    // `-lslang` can resolve to the unrelated S-Lang library in /usr/lib, which comes first in
-    // the search path of the final binary.
+    // `-lslang` can resolve to the unrelated S-Lang library.
     println!("cargo::rustc-link-lib=dylib=slang-compiler");
 }

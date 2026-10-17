@@ -1,4 +1,4 @@
-//! Global Vulkan context: instance, device, queues, features, and validation logging
+//! Global Vulkan context: instance, device selection and creation, queues, features, and validation logging
 use std::{
     cell::Cell,
     ffi::{c_char, c_void},
@@ -24,12 +24,12 @@ use std::ffi::{CStr, CString};
 use crate::features::{Loader, gate, load, loaded};
 use crate::{
     Config,
-    features::{FeatureChain, Features, LAVA_EXTENSIONS},
+    features::{DeviceFacts, FeatureChain, Features, LAVA_EXTENSIONS},
     queue::{
         Kind,
-        device::{DeviceQueues, queue_count},
+        DeviceQueues, FamilyQueues, MAX_TIMELINES,
     },
-    vkobjects::physical_device::PhysicalDevice,
+    vkobjects::physical_device::{PhysicalDevice, QueueFamily, pick_queue_families},
 };
 
 pub use crate::vk as raw_vulkan;
@@ -51,8 +51,7 @@ pub struct Ctx {
 
 static STATE: OnceLock<Ctx> = OnceLock::new();
 
-/// Runs its closure when dropped, unless disarmed: undoes a step of `Ctx::init` when a later
-/// one fails, so a failed init leaks nothing.
+/// Undoes a step of `Ctx::init` when a later one fails, unless disarmed.
 struct Undo<F: FnOnce()>(Option<F>);
 
 impl<F: FnOnce()> Undo<F> {
@@ -70,7 +69,6 @@ impl<F: FnOnce()> Drop for Undo<F> {
 }
 
 impl Ctx {
-    /// Panics before `lava::init` succeeded.
     pub(crate) fn get() -> &'static Self {
         STATE
             .get()
@@ -85,7 +83,6 @@ impl Ctx {
     pub fn device_properties() -> &'static vk::PhysicalDeviceProperties {
         &Ctx::get().physical_device.properties
     }
-    /// The device's mesh shader limits.
     #[cfg(feature = "mesh-shader")]
     pub fn mesh_shader_properties()
     -> crate::features::Gated<gate::MeshShader, &'static vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>>
@@ -94,13 +91,11 @@ impl Ctx {
             &Ctx::get().physical_device.mesh_shader_properties
         })
     }
-    /// The index of the queue family of `kind`, `None` where lava has none (the device lacks a
-    /// dedicated family, or its feature is off). Presenting goes through the graphics family.
+    /// The family index of `kind`'s queues, `None` where lava has none.
     pub fn queue_family(kind: Kind) -> Option<u32> {
         Ctx::get().queues.family(kind).map(|family| family.index)
     }
-    /// How many queues lava created of the family of `kind` (at most `MAX_TIMELINES`, 0 where
-    /// there is none).
+    /// How many queues lava created of `kind`'s family (at most `MAX_TIMELINES`).
     pub fn queue_count(kind: Kind) -> u32 {
         let family = Ctx::get().queues.family(kind);
         family.map_or(0, |family| family.queues.len() as u32)
@@ -112,8 +107,7 @@ impl Ctx {
             .expect("allocator mutex was poisoned")
     }
 
-    /// The optional features lava enabled: every one the device has that lava was compiled with
-    /// and `Config::disabled` doesn't name. Those of `assert-` features are always on.
+    /// The optional features lava enabled: those the device has, minus `Config::disabled`.
     pub fn features() -> Features {
         Ctx::get().features
     }
@@ -121,8 +115,7 @@ impl Ctx {
         &Ctx::get().features
     }
 
-    /// Creates the instance, device, and allocator. With a display, the instance gets the
-    /// platform surface extensions and the device gets a swapchain; without it lava runs headless.
+    #[validation_trace]
     pub(super) fn init(config: &Config) -> Result<()> {
         if STATE.get().is_some() {
             return Err(Error::message("lava is already initialised"));
@@ -130,17 +123,7 @@ impl Ctx {
         let display = config.display.as_ref();
         let entry = unsafe { Entry::load()? };
         let app_info = vk::ApplicationInfo::default().api_version(make_api_version(0, 1, 4, 0));
-        let layer_names = unsafe {
-            [
-                CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0"),
-                // CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_timeline_semaphore\0"),
-                // CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_synchronization2\0")
-            ]
-        };
-        let layers_names_raw: Vec<*const c_char> = layer_names
-            .iter()
-            .map(|raw_name| raw_name.as_ptr())
-            .collect();
+        let layers_names_raw = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
 
         let mut instance_extensions = match display {
             Some(display) => ash_window::enumerate_required_extensions(*display)
@@ -149,8 +132,6 @@ impl Ctx {
             None => Vec::new(),
         };
 
-        // Present fences (`Features::present_fences`) need the surface maintenance instance
-        // extensions.
         let surface_maintenance = [
             ash::khr::get_surface_capabilities2::NAME,
             ash::ext::surface_maintenance1::NAME,
@@ -165,7 +146,6 @@ impl Ctx {
             instance_extensions.extend(surface_maintenance.iter().map(|name| name.as_ptr()));
         }
 
-        // The validation layer and debug names and labels, in debug builds.
         let debug = cfg!(debug_assertions) && config.validation;
         let mut validation_features = vk::ValidationFeaturesEXT::default();
         let mut validation_f;
@@ -220,7 +200,6 @@ impl Ctx {
                     .create_debug_utils_messenger(&debug_info, None)?
             };
         }
-        // Destroyed before the instance.
         let undo_messenger = Undo(Some({
             let debug_utils = instance_debug_utils.clone();
             move || {
@@ -232,7 +211,6 @@ impl Ctx {
 
         let surface_fn = display.map(|_| ash::khr::surface::Instance::new(&entry, &instance));
 
-        // Every device must have the asserted features; present fences only with a display.
         #[allow(unused_mut)]
         let mut required = Features::asserted();
         #[cfg(feature = "assert-present-fences")]
@@ -247,9 +225,137 @@ impl Ctx {
                 asserted_and_disabled.join(", ")
             )));
         }
-        let physical_devices = PhysicalDevice::enumerate_physical_devices(&instance)?;
-        let (physical_device, families) =
-            PhysicalDevice::select_suitable_physical_device(physical_devices.as_slice(), &required)?;
+        let mut physical_devices = unsafe { instance.enumerate_physical_devices()? }
+            .into_iter()
+            .map(|handel| {
+                let properties = unsafe { instance.get_physical_device_properties(handel) };
+                let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+                    .to_str()?
+                    .to_owned();
+                let queue_families =
+                    unsafe { instance.get_physical_device_queue_family_properties(handel) }
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, p)| QueueFamily {
+                            num_queues: p.queue_count,
+                            index: index as _,
+                            handel: p,
+                        })
+                        .collect::<Vec<_>>();
+                let supported_extensions =
+                    unsafe { instance.enumerate_device_extension_properties(handel)? }
+                        .into_iter()
+                        .map(|p| {
+                            let name = unsafe { CStr::from_ptr(p.extension_name.as_ptr()) };
+                            Ok(name.to_str()?.to_owned())
+                        })
+                        .collect::<Result<Vec<String>>>()?;
+                let has = |name: &CStr| {
+                    (supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes())
+                };
+                let chain = FeatureChain::query(&instance, handel, &has);
+
+                let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
+                let mut rt_pipeline_properties =
+                    vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+                let mut acc_properties =
+                    vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+                let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+                let mut properties2 = vk::PhysicalDeviceProperties2::default()
+                    .push_next(&mut rt_pipeline_properties)
+                    .push_next(&mut acc_properties)
+                    .push_next(&mut mesh_shader_properties)
+                    .push_next(&mut vk12_properties);
+                unsafe { instance.get_physical_device_properties2(handel, &mut properties2) };
+                // Detach them from the chain on this stack.
+                mesh_shader_properties.p_next = std::ptr::null_mut();
+                vk12_properties.p_next = std::ptr::null_mut();
+                rt_pipeline_properties.p_next = std::ptr::null_mut();
+                acc_properties.p_next = std::ptr::null_mut();
+                let _ = (&rt_pipeline_properties, &acc_properties);
+
+                let mem_properties =
+                    unsafe { instance.get_physical_device_memory_properties(handel) };
+                let rebar = mem_properties.memory_types
+                    [..mem_properties.memory_type_count as usize]
+                    .iter()
+                    .any(|e| {
+                        e.property_flags.contains(
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL
+                                | vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        ) && mem_properties.memory_heaps[e.heap_index as usize].size
+                            > 500 * 1024 * 1024
+                    });
+                let families = pick_queue_families(&queue_families);
+                let facts = DeviceFacts {
+                    rebar,
+                    strict_lines: properties.limits.strict_lines == vk::TRUE,
+                    dedicated_compute: families.as_ref().is_some_and(|f| f.compute.is_some()),
+                    dedicated_transfer: families.as_ref().is_some_and(|f| f.transfer.is_some()),
+                };
+                let supported_features = chain.optional(&has, facts);
+                let lava_missing = chain.lava_missing(&has);
+                Ok(PhysicalDevice {
+                    properties,
+                    mesh_shader_properties,
+                    vk12_properties,
+                    mem_properties,
+                    handel,
+                    name,
+                    queue_families,
+                    supported_extensions,
+                    #[cfg(feature = "acceleration-structure")]
+                    acceleration_structure_properties: supported_features
+                        .acceleration_structure
+                        .then_some(acc_properties),
+                    #[cfg(feature = "ray-tracing-pipeline")]
+                    ray_tracing_pipeline_properties: supported_features
+                        .ray_tracing_pipeline
+                        .then_some(rt_pipeline_properties),
+                    supported_features,
+                    lava_missing,
+                })
+            })
+            .collect::<Result<Vec<PhysicalDevice>>>()?;
+        physical_devices.sort_by_key(|pd| match pd.properties.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+            _ => 2,
+        });
+
+        let mut rejected = Vec::new();
+        let mut selected = None;
+        for device in physical_devices.iter().filter(|device| {
+            device.properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                || device.properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+        }) {
+            let mut missing = device.lava_missing.clone();
+            missing.extend(
+                required
+                    .missing_from(&device.supported_features)
+                    .into_iter()
+                    .map(|name| format!("`{name}` (lava asserts it)")),
+            );
+            let families = pick_queue_families(&device.queue_families);
+            if families.is_none() {
+                missing.push("a queue family with graphics, compute and timestamps".into());
+            }
+            match families {
+                Some(families) if missing.is_empty() => {
+                    selected = Some((device.clone(), families));
+                    break;
+                }
+                _ => rejected.push(format!("{} lacks {}", device.name, missing.join(", "))),
+            }
+        }
+        let Some((physical_device, families)) = selected else {
+            return Err(Error::message(&if rejected.is_empty() {
+                "no GPU found".to_owned()
+            } else {
+                format!("no suitable GPU: {}", rejected.join("; "))
+            }));
+        };
         #[allow(unused_mut)]
         let mut features = physical_device.supported_features;
         #[cfg(feature = "present-fences")]
@@ -268,7 +374,6 @@ impl Ctx {
             extensions.push(ash::khr::swapchain::NAME);
         }
 
-        // The dedicated families only where their feature is on.
         #[cfg(feature = "async-compute")]
         let compute = families.compute.as_ref().filter(|_| features.async_compute);
         #[cfg(not(feature = "async-compute"))]
@@ -278,9 +383,33 @@ impl Ctx {
         #[cfg(not(feature = "async-transfer"))]
         let transfer = None;
         let used = [Some(&families.graphics), compute, transfer];
-        let queues = used.iter().flatten().map(|f| (f.index, queue_count(f))).collect();
-        let device = create_device(queues, &physical_device, &features, &extensions, &instance)?;
-        // Destroyed before the messenger and the instance, after the allocator.
+        let count = |family: &QueueFamily| family.num_queues.min(MAX_TIMELINES as u32);
+        let mut queue_families: Vec<(u32, u32)> =
+            used.iter().flatten().map(|f| (f.index, count(f))).collect();
+        queue_families.sort_unstable();
+        queue_families.dedup_by_key(|(index, _)| *index);
+        let queue_priorities = queue_families
+            .iter()
+            .map(|(_, count)| vec![1.0f32; *count as usize])
+            .collect::<Vec<_>>();
+        let queue_create_infos = queue_families
+            .iter()
+            .zip(&queue_priorities)
+            .map(|((index, _), priorities)| {
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(*index)
+                    .queue_priorities(priorities)
+            })
+            .collect::<Vec<_>>();
+        let extension_names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
+        let mut enabled = FeatureChain::enabling(&features);
+        let mut features2 = enabled.chain(&|name| extensions.contains(&name));
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&extension_names)
+            .push_next(&mut features2);
+        let device =
+            unsafe { instance.create_device(physical_device.handel, &device_create_info, None)? };
         let undo_device = Undo(Some({
             let device = device.clone();
             move || unsafe { device.destroy_device(None) }
@@ -348,12 +477,23 @@ impl Ctx {
                 instance,
                 entry,
                 surface: surface_fn,
-                debug_utils: instance_debug_utils,
                 device_debug_utils: debug_utils,
             })
             .map_err(|_| Error::message("Vulkan functions were already initialized"))?;
 
-        let queues = DeviceQueues::new(&device, used);
+        let kinds = [Kind::Graphics, Kind::Compute, Kind::Transfer];
+        let queues = DeviceQueues(std::array::from_fn(|i| {
+            used[i].map(|family| FamilyQueues {
+                kind: kinds[i],
+                index: family.index,
+                timestamp_valid_bits: family.handel.timestamp_valid_bits,
+                image_granularity: family.handel.min_image_transfer_granularity,
+                queues: (0..count(family))
+                    .map(|q| Mutex::new(unsafe { device.get_device_queue(family.index, q) }))
+                    .collect(),
+                timelines: Mutex::new(vec![0; count(family) as usize].into()),
+            })
+        }));
         STATE
             .set(Ctx {
                 device,
@@ -376,10 +516,8 @@ thread_local! {
     pub static CALLSITE: Cell<Option<Location<'static>>> = Cell::new(None);
 }
 
-/// Holds the caller location in [`CALLSITE`] while a `#[validation_trace]` function runs.
-///
-/// Only the outermost guard on a thread owns the location, and it clears it on drop, so the
-/// location survives nested traced calls and is released on early returns.
+/// Holds the caller location in [`CALLSITE`] while a `#[validation_trace]` function runs; only
+/// the outermost guard on a thread sets and clears it.
 pub struct CallsiteGuard {
     owns: bool,
 }
@@ -450,7 +588,7 @@ pub struct Functions {
     instance: ash::Instance,
     #[cfg(feature = "host-image-copy")]
     host_image_copy: Loader<gate::HostImageCopy, ash::ext::host_image_copy::Device>,
-    // Loaded whatever the device has: lava calls them only for dynamic state it enabled.
+    // Loaded on every device; called only for dynamic state lava enabled.
     dynamic_state2: ash::ext::extended_dynamic_state2::Device,
     dynamic_state3: ash::ext::extended_dynamic_state3::Device,
     line_rasterization: ash::khr::line_rasterization::Device,
@@ -459,7 +597,6 @@ pub struct Functions {
     entry: ash::Entry,
     swapchain: ash::khr::swapchain::Device,
     surface: Option<ash::khr::surface::Instance>,
-    debug_utils: Option<ash::ext::debug_utils::Instance>,
     device_debug_utils: Option<ash::ext::debug_utils::Device>,
     #[cfg(feature = "mesh-shader")]
     mesh: Loader<gate::MeshShader, ash::ext::mesh_shader::Device>,
@@ -493,7 +630,6 @@ impl Functions {
     pub(crate) fn surface() -> Option<&'static ash::khr::surface::Instance> {
         get().surface.as_ref()
     }
-    /// Past a `HostImageCopy` check.
     #[cfg(feature = "host-image-copy")]
     pub(crate) fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
         loaded::<gate::HostImageCopy, _>(&get().host_image_copy)
@@ -525,10 +661,6 @@ impl Functions {
     pub(crate) fn debug_utils() -> Option<&'static ash::ext::debug_utils::Device> {
         get().device_debug_utils.as_ref()
     }
-    pub(crate) fn instance_debug_utils() -> Option<&'static ash::ext::debug_utils::Instance> {
-        get().debug_utils.as_ref()
-    }
-    /// The loaders below are reached only past their feature's check.
     #[cfg(feature = "performance-query")]
     pub(crate) fn performance_query() -> &'static (
         ash::khr::performance_query::Instance,
@@ -567,29 +699,9 @@ impl Functions {
             }
         }
     }
-
-    pub(crate) fn cmd_start_label(cmd: &vk::CommandBuffer, name: &str) {
-        if let Some(debug_utils) = Self::debug_utils() {
-            let name = debug_name(name);
-            let name_info = vk::DebugUtilsLabelEXT::default().label_name(&name);
-            unsafe { debug_utils.cmd_begin_debug_utils_label(*cmd, &name_info) };
-        }
-    }
-    pub(crate) fn cmd_insert_label(cmd: &vk::CommandBuffer, name: &str) {
-        if let Some(debug_utils) = Self::debug_utils() {
-            let name = debug_name(name);
-            let name_info = vk::DebugUtilsLabelEXT::default().label_name(&name);
-            unsafe { debug_utils.cmd_insert_debug_utils_label(*cmd, &name_info) };
-        }
-    }
-    pub(crate) fn cmd_end_label(cmd: &vk::CommandBuffer) {
-        if let Some(debug_utils) = Self::debug_utils() {
-            unsafe { debug_utils.cmd_end_debug_utils_label(*cmd) };
-        }
-    }
 }
-/// Converts a debug name to a C string. Names may already carry a trailing NUL (pass entry
-/// names do); anything from the first NUL on is dropped.
+
+/// A debug name as a C string, cut at its first NUL (pass entry names carry one).
 pub(crate) fn debug_name(name: &str) -> CString {
     let end = name.find('\0').unwrap_or(name.len());
     CString::new(&name[..end]).expect("interior NULs were cut off")
@@ -599,214 +711,4 @@ fn get() -> &'static Functions {
     FUNCTIONS
         .get()
         .expect("Vulkan functions have not been initialized")
-}
-
-#[validation_trace]
-pub(super) fn create_device(
-    mut queue_families: Vec<(u32, u32)>,
-    physical_device: &PhysicalDevice,
-    features: &Features,
-    extensions: &[&CStr],
-    instance: &ash::Instance,
-) -> Result<ash::Device> {
-    // One priority per queue: up to `MAX_TIMELINES` queues of each selected family are
-    // created, so that timelines can each get their own (`DeviceQueues`).
-    queue_families.sort_unstable();
-    queue_families.dedup_by_key(|(index, _)| *index);
-    let queue_priorities = queue_families
-        .iter()
-        .map(|(_, count)| vec![1.0f32; *count as usize])
-        .collect::<Vec<_>>();
-    let queue_create_infos = queue_families
-        .iter()
-        .zip(&queue_priorities)
-        .map(|((index, _), priorities)| {
-            vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(*index)
-                .queue_priorities(priorities)
-        })
-        .collect::<Vec<_>>();
-
-    let extension_names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
-    let mut enabled = FeatureChain::enabling(features);
-    let mut features2 = enabled.chain(&|name| extensions.contains(&name));
-    let device_create_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(&queue_create_infos)
-        .enabled_extension_names(&extension_names);
-    // `push_next` links `features2` with its whole chain; every struct in it lives in `enabled`.
-    let device_create_info = device_create_info.push_next(&mut features2);
-
-    let device =
-        unsafe { instance.create_device(physical_device.handel, &device_create_info, None)? };
-
-    Ok(device)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-    use tracing::field::{Field, Visit};
-    use tracing_subscriber::{Layer, layer::SubscriberExt};
-
-    #[test]
-    fn debug_names_end_at_the_first_nul() {
-        assert_eq!(debug_name("pipeline").as_bytes(), b"pipeline");
-        // Pass entry names already carry their terminator.
-        assert_eq!(debug_name("skybox\0").as_bytes(), b"skybox");
-        assert_eq!(debug_name("a\0b").as_bytes(), b"a");
-        assert_eq!(debug_name("").as_bytes(), b"");
-    }
-
-    #[track_caller]
-    fn here() -> &'static Location<'static> {
-        Location::caller()
-    }
-
-    #[test]
-    fn callsite_guard_sets_and_clears_the_location() {
-        assert!(CALLSITE.get().is_none());
-        let location = here();
-        {
-            let _guard = CallsiteGuard::enter(location);
-            assert_eq!(CALLSITE.get().unwrap().line(), location.line());
-        }
-        assert!(CALLSITE.get().is_none());
-    }
-
-    #[test]
-    fn nested_callsite_guards_keep_the_outermost_location() {
-        let outer = here();
-        let inner = here();
-        let _outer_guard = CallsiteGuard::enter(outer);
-        {
-            let _inner_guard = CallsiteGuard::enter(inner);
-            assert_eq!(CALLSITE.get().unwrap().line(), outer.line());
-        }
-        // The inner guard must not clear what the outer one owns.
-        assert_eq!(CALLSITE.get().unwrap().line(), outer.line());
-    }
-
-    #[derive(Debug, Default, Clone)]
-    struct Captured {
-        level: String,
-        target: String,
-        message: String,
-        location: Option<String>,
-    }
-
-    impl Visit for Captured {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.message = format!("{value:?}");
-            }
-        }
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "validation_location" {
-                self.location = Some(value.to_owned());
-            }
-        }
-    }
-
-    struct Capture(Arc<Mutex<Vec<Captured>>>);
-
-    impl<S: tracing::Subscriber> Layer<S> for Capture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut captured = Captured {
-                level: event.metadata().level().to_string(),
-                target: event.metadata().target().to_owned(),
-                ..Default::default()
-            };
-            event.record(&mut captured);
-            self.0.lock().unwrap().push(captured);
-        }
-    }
-
-    /// Calls the debug callback the way the validation layer does and returns what it logged.
-    fn log(
-        severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-        message: Option<&CStr>,
-    ) -> Vec<Captured> {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Capture(events.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            let mut data = vk::DebugUtilsMessengerCallbackDataEXT::default();
-            if let Some(message) = message {
-                data.p_message = message.as_ptr();
-            }
-            let result = unsafe {
-                vulkan_debug_callback(
-                    severity,
-                    vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-                    &data,
-                    std::ptr::null_mut(),
-                )
-            };
-            // The callback must never ask the driver to abort the call.
-            assert_eq!(result, vk::FALSE);
-        });
-        events.lock().unwrap().clone()
-    }
-
-    #[test]
-    fn validation_messages_are_logged_at_the_matching_level() {
-        use vk::DebugUtilsMessageSeverityFlagsEXT as S;
-        for (severity, level) in [
-            (S::ERROR, "ERROR"),
-            (S::WARNING, "WARN"),
-            (S::INFO, "DEBUG"),
-            (S::VERBOSE, "TRACE"),
-        ] {
-            let events = log(severity, Some(c"something is wrong"));
-            assert_eq!(events.len(), 1, "{level}");
-            assert_eq!(events[0].level, level);
-            assert_eq!(events[0].target, "vulkan-validation");
-            assert_eq!(events[0].message, "something is wrong");
-        }
-    }
-
-    #[test]
-    fn validation_messages_carry_the_recorded_callsite() {
-        let severity = vk::DebugUtilsMessageSeverityFlagsEXT::ERROR;
-        assert_eq!(log(severity, Some(c"m"))[0].location, None);
-
-        let location = here();
-        let _guard = CallsiteGuard::enter(location);
-        let events = log(severity, Some(c"m"));
-        assert_eq!(
-            events[0].location.as_deref(),
-            Some(location.to_string().as_str())
-        );
-    }
-
-    #[test]
-    fn shader_printf_output_is_logged_as_info_without_the_layer_prefix() {
-        let events = log(
-            vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
-            Some(c"Validation Information: [ WARNING-DEBUG-PRINTF ] DebugPrintf:\nvalue = 42"),
-        );
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].level, "INFO");
-        assert_eq!(events[0].message, "value = 42");
-    }
-
-    #[test]
-    fn callbacks_without_a_message_log_nothing() {
-        let severity = vk::DebugUtilsMessageSeverityFlagsEXT::ERROR;
-        assert!(log(severity, None).is_empty());
-
-        let result = unsafe {
-            vulkan_debug_callback(
-                severity,
-                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(result, vk::FALSE);
-    }
 }

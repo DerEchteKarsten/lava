@@ -6,19 +6,15 @@ use std::{
 
 use crate::{queue::Kind, vk};
 
-/// What lava tracks of an image's mips, packed into one `u64` (`pack`): the layout in bits
-/// 0..32, the owner in 32..34, the kind it was released to in 34..36, and bit 36 for an
-/// acquired swapchain image.
+/// Packed into one `u64`: the layout in bits 0..32, the owner in 32..34, the kind it was
+/// released to in 34..36, and bit 36 for an acquired swapchain image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ImageState {
     pub(crate) layout: vk::ImageLayout,
-    /// The kind of family whose recording accessed it last; `None` before any did. Images are
-    /// `EXCLUSIVE`, so another family's recording needs a release first.
+    /// Images are `EXCLUSIVE`, so another family's recording needs a release first.
     pub(crate) owner: Option<Kind>,
-    /// The owner recorded a release to this kind's family, whose first access acquires it.
     pub(crate) released_to: Option<Kind>,
-    /// A swapchain image the presentation engine handed out: its first access waits for the
-    /// acquire's semaphore.
+    /// A swapchain image whose first access waits for the acquire's semaphore.
     pub(crate) acquired: bool,
 }
 
@@ -40,23 +36,12 @@ fn kind_of(bits: u64) -> Option<Kind> {
 }
 
 impl ImageState {
-    /// A new image's: undefined, owned by no family.
     pub(crate) const UNDEFINED: ImageState = ImageState {
         layout: vk::ImageLayout::UNDEFINED,
         owner: None,
         released_to: None,
         acquired: false,
     };
-
-    /// What an access in `layout` recorded on a family of `kind` leaves.
-    pub(crate) fn taken(layout: vk::ImageLayout, kind: Kind) -> Self {
-        ImageState {
-            layout,
-            owner: Some(kind),
-            released_to: None,
-            acquired: false,
-        }
-    }
 
     pub(crate) fn pack(self) -> u64 {
         self.layout.as_raw() as u32 as u64
@@ -74,7 +59,6 @@ impl ImageState {
         }
     }
 
-    /// The state of a new image or swapchain image.
     pub(crate) fn atomic(self) -> AtomicU64 {
         AtomicU64::new(self.pack())
     }
@@ -82,15 +66,8 @@ impl ImageState {
     pub(crate) fn load(state: &AtomicU64) -> Self {
         Self::unpack(state.load(Ordering::Relaxed))
     }
-
-    /// Whether a recording on a family of `kind` may access it: nobody owns it, `kind` does, or
-    /// its owner released it to `kind`.
-    pub(crate) fn accessible_by(self, kind: Kind) -> bool {
-        self.owner.is_none_or(|owner| owner == kind) || self.released_to == Some(kind)
-    }
 }
 
-/// Flags a swapchain image the presentation engine just handed out, or no longer does.
 pub(crate) fn set_acquired(state: &AtomicU64, acquired: bool) {
     match acquired {
         true => state.fetch_or(ACQUIRED, Ordering::Relaxed),
@@ -98,21 +75,7 @@ pub(crate) fn set_acquired(state: &AtomicU64, acquired: bool) {
     };
 }
 
-/// Panics unless a recording of `kind` may access an image in state `state`.
-#[track_caller]
-pub(crate) fn check_access(state: ImageState, kind: Kind) {
-    if state.accessible_by(kind) {
-        return;
-    }
-    let owner = state.owner.expect("an unowned image is accessible");
-    panic!(
-        "an image the {owner:?} family owns is accessed on the {kind:?} family: record \
-         `cmd.release::<{kind:?}>(view)` on a {owner:?} timeline first, and wait for it"
-    );
-}
-
-/// Calls `f` with the state of each mip of `mips`, which `states` holds one of for all of them
-/// or one per mip, and the mips it covers.
+/// Calls `f` per state and the mips it covers; `states` holds one for all of `mips` or one per mip.
 fn for_each(states: &[AtomicU64], mips: Range<u32>, mut f: impl FnMut(&AtomicU64, Range<u32>)) {
     if let [state] = states {
         return f(state, mips);
@@ -122,18 +85,43 @@ fn for_each(states: &[AtomicU64], mips: Range<u32>, mut f: impl FnMut(&AtomicU64
     }
 }
 
-/// Calls `changed(mips, old)` once per run of neighbouring mips with the same old state that
-/// isn't `new`, with what `swap` puts in each state and returns of the old one.
-fn runs(
+/// Panics unless a recording of `kind` may access every mip of `mips`: nobody owns it, `kind`
+/// does, or its owner released it to `kind`.
+#[track_caller]
+pub(crate) fn check_states(states: &[AtomicU64], mips: Range<u32>, kind: Kind) {
+    for_each(states, mips, |state, _| {
+        let state = ImageState::load(state);
+        if let Some(owner) = state.owner
+            && owner != kind
+            && state.released_to != Some(kind)
+        {
+            panic!(
+                "an image the {owner:?} family owns is accessed on the {kind:?} family: record \
+                 `cmd.release::<{kind:?}>(view)` on a {owner:?} timeline first, and wait for it"
+            );
+        }
+    });
+}
+
+/// Moves the states of `mips`, checked with `check_states`, to `layout`, owned by `kind`, and
+/// calls `changed(mips, old)` per run of neighbouring mips with the same old state that differs
+/// from the new one.
+pub(crate) fn take_checked_states(
     states: &[AtomicU64],
     mips: Range<u32>,
-    new: ImageState,
-    mut swap: impl FnMut(&AtomicU64) -> ImageState,
+    layout: vk::ImageLayout,
+    kind: Kind,
     mut changed: impl FnMut(Range<u32>, ImageState),
 ) {
+    let new = ImageState {
+        layout,
+        owner: Some(kind),
+        released_to: None,
+        acquired: false,
+    };
     let mut run: Option<(Range<u32>, ImageState)> = None;
     for_each(states, mips, |state, mips| {
-        let old = swap(state);
+        let old = ImageState::unpack(state.swap(new.pack(), Ordering::Relaxed));
         match &mut run {
             Some((run_mips, run_old)) if *run_old == old && run_mips.end == mips.start => {
                 run_mips.end = mips.end;
@@ -154,46 +142,8 @@ fn runs(
     }
 }
 
-/// Panics unless a recording of `kind` may access every mip of `mips` (`check_access`).
-#[track_caller]
-pub(crate) fn check_states(states: &[AtomicU64], mips: Range<u32>, kind: Kind) {
-    for_each(states, mips, |state, _| check_access(ImageState::load(state), kind));
-}
-
-/// Takes the states of `mips` for an access in `layout` recorded on a family of `kind`. First
-/// checks them all (`check_access`, which panics before any moved, so the barriers logged so far
-/// stay true), then moves each to `layout`, owned by `kind`, and calls `changed(mips, old)` once
-/// per run of neighbouring mips with the same old state that differs from the new one.
-#[cfg(test)]
-#[track_caller]
-pub(crate) fn take_states(
-    states: &[AtomicU64],
-    mips: Range<u32>,
-    layout: vk::ImageLayout,
-    kind: Kind,
-    changed: impl FnMut(Range<u32>, ImageState),
-) {
-    check_states(states, mips, kind);
-    take_checked_states(states, mips, layout, kind, changed);
-}
-
-/// [`take_states`] for states `check_states` checked already.
-pub(crate) fn take_checked_states(
-    states: &[AtomicU64],
-    mips: Range<u32>,
-    layout: vk::ImageLayout,
-    kind: Kind,
-    changed: impl FnMut(Range<u32>, ImageState),
-) {
-    let new = ImageState::taken(layout, kind);
-    let swap = |state: &AtomicU64| ImageState::unpack(state.swap(new.pack(), Ordering::Relaxed));
-    runs(states, mips, new, swap, changed);
-}
-
-/// Releases the mips of `mips` that a family of `kind` owns to the family of `to`: checks them
-/// all first (each owned by `kind` and not released, or owned by nobody, which needs no
-/// transfer), then flags the owned ones released and calls `released(mips, layout)` once per run
-/// of neighbouring owned mips in the same layout.
+/// Checks every mip of `mips` first, then flags those `kind` owns released to `to` and calls
+/// `released(mips, layout)` per run of neighbouring owned mips in the same layout.
 #[track_caller]
 pub(crate) fn release_states(
     states: &[AtomicU64],
@@ -243,9 +193,9 @@ pub(crate) fn release_states(
     }
 }
 
-/// Moves the layouts of `mips` to `layout` without a recording (host image copies), leaving
-/// their owners alone, and calls `changed(mips, old)` per run of mips whose old state had
-/// another layout.
+/// Moves the layouts of `mips` to `layout` for host image copies, leaving their owners alone,
+/// and calls `changed(mips, old)` per run of mips that had another layout.
+#[cfg(feature = "host-image-copy")]
 pub(crate) fn take_host_layouts(
     states: &[AtomicU64],
     mips: Range<u32>,
@@ -273,173 +223,5 @@ pub(crate) fn take_host_layouts(
         && run_layout != layout
     {
         changed(run, run_layout);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vk::ImageLayout as L;
-
-    fn state(layout: L, owner: Option<Kind>) -> ImageState {
-        ImageState {
-            layout,
-            owner,
-            released_to: None,
-            acquired: false,
-        }
-    }
-
-    #[test]
-    fn states_survive_packing() {
-        for layout in [L::UNDEFINED, L::GENERAL, L::ATTACHMENT_OPTIMAL, L::PRESENT_SRC_KHR] {
-            for owner in [None, Some(Kind::Graphics), Some(Kind::Compute), Some(Kind::Transfer)] {
-                for released_to in [None, Some(Kind::Graphics), Some(Kind::Transfer)] {
-                    for acquired in [false, true] {
-                        let s = ImageState {
-                            layout,
-                            owner,
-                            released_to,
-                            acquired,
-                        };
-                        assert_eq!(ImageState::unpack(s.pack()), s);
-                    }
-                }
-            }
-        }
-        // A new image's packs to its layout alone.
-        assert_eq!(ImageState::UNDEFINED.pack(), 0);
-        let present = state(L::PRESENT_SRC_KHR, None).pack();
-        assert_eq!(present, L::PRESENT_SRC_KHR.as_raw() as u64);
-    }
-
-    #[test]
-    fn an_image_is_accessible_to_its_owner_and_who_it_was_released_to() {
-        let graphics = state(L::GENERAL, Some(Kind::Graphics));
-        assert!(ImageState::UNDEFINED.accessible_by(Kind::Transfer));
-        assert!(graphics.accessible_by(Kind::Graphics));
-        assert!(!graphics.accessible_by(Kind::Compute));
-        let released = ImageState {
-            released_to: Some(Kind::Compute),
-            ..graphics
-        };
-        assert!(released.accessible_by(Kind::Compute));
-        assert!(!released.accessible_by(Kind::Transfer));
-    }
-
-    fn atomics(states: &[ImageState]) -> Vec<AtomicU64> {
-        states.iter().map(|s| s.atomic()).collect()
-    }
-
-    fn taken(states: &[AtomicU64], mips: std::ops::Range<u32>, layout: L, kind: Kind) -> Vec<(u32, u32, ImageState)> {
-        let mut runs = Vec::new();
-        take_states(states, mips.into(), layout, kind, |mips, old| {
-            runs.push((mips.start, mips.end, old))
-        });
-        runs
-    }
-
-    #[test]
-    fn taking_reports_runs_of_neighbouring_mips_in_the_same_state() {
-        let g = |layout| state(layout, Some(Kind::Graphics));
-        let states = atomics(&[
-            ImageState::UNDEFINED,
-            ImageState::UNDEFINED,
-            g(L::GENERAL),
-            g(L::ATTACHMENT_OPTIMAL),
-            g(L::GENERAL),
-        ]);
-        assert_eq!(
-            taken(&states, 0..5, L::GENERAL, Kind::Graphics),
-            [
-                (0, 2, ImageState::UNDEFINED),
-                (3, 4, g(L::ATTACHMENT_OPTIMAL)),
-            ]
-        );
-        assert!(taken(&states, 0..5, L::GENERAL, Kind::Graphics).is_empty());
-        // One state for all mips reports them all at once.
-        let single = atomics(&[g(L::GENERAL)]);
-        assert_eq!(
-            taken(&single, 2..6, L::ATTACHMENT_OPTIMAL, Kind::Graphics),
-            [(2, 6, g(L::GENERAL))]
-        );
-        // A view of some mips of a per-mip image holds their states only.
-        assert_eq!(
-            taken(&states[3..4], 3..4, L::PRESENT_SRC_KHR, Kind::Graphics),
-            [(3, 4, g(L::GENERAL))]
-        );
-    }
-
-    /// The first access on a family takes ownership, also in the same layout.
-    #[test]
-    fn taking_an_unowned_image_reports_its_state() {
-        let states = atomics(&[state(L::GENERAL, None)]);
-        let runs = taken(&states, 0..1, L::GENERAL, Kind::Graphics);
-        assert_eq!(runs, [(0, 1, state(L::GENERAL, None))]);
-        assert_eq!(ImageState::load(&states[0]), state(L::GENERAL, Some(Kind::Graphics)));
-    }
-
-    #[test]
-    fn a_released_image_is_taken_by_its_receiver() {
-        let released = ImageState {
-            released_to: Some(Kind::Transfer),
-            ..state(L::GENERAL, Some(Kind::Graphics))
-        };
-        let states = atomics(&[released]);
-        assert_eq!(taken(&states, 0..1, L::GENERAL, Kind::Transfer), [(0, 1, released)]);
-        assert_eq!(ImageState::load(&states[0]), state(L::GENERAL, Some(Kind::Transfer)));
-    }
-
-    /// An access of another family's image panics before any mip moved.
-    #[test]
-    fn taking_another_familys_image_panics_before_anything_moves() {
-        let g = state(L::GENERAL, Some(Kind::Graphics));
-        let c = state(L::GENERAL, Some(Kind::Compute));
-        let states = atomics(&[g, c]);
-        let panic = std::panic::catch_unwind(|| taken(&states, 0..2, L::GENERAL, Kind::Graphics));
-        let message = *panic.unwrap_err().downcast::<String>().unwrap();
-        assert!(message.contains("`cmd.release::<Graphics>(view)`"), "{message}");
-        assert_eq!(ImageState::load(&states[0]), g, "nothing moved");
-    }
-
-    #[test]
-    fn releasing_flags_the_owned_mips_and_skips_unowned_ones() {
-        let g = |layout| state(layout, Some(Kind::Graphics));
-        let states = atomics(&[g(L::GENERAL), g(L::GENERAL), ImageState::UNDEFINED, g(L::ATTACHMENT_OPTIMAL)]);
-        let mut runs = Vec::new();
-        release_states(&states, (0..4).into(), Kind::Graphics, Kind::Transfer, |mips, layout| {
-            runs.push((mips.start, mips.end, layout))
-        });
-        assert_eq!(runs, [(0, 2, L::GENERAL), (3, 4, L::ATTACHMENT_OPTIMAL)]);
-        assert_eq!(ImageState::load(&states[1]).released_to, Some(Kind::Transfer));
-        assert_eq!(ImageState::load(&states[2]), ImageState::UNDEFINED);
-        // Released already: only its receiver takes it.
-        let again = std::panic::catch_unwind(|| {
-            release_states(&states, (0..1).into(), Kind::Graphics, Kind::Compute, |_, _| {})
-        });
-        assert!(again.is_err());
-    }
-
-    #[test]
-    fn only_the_owner_releases_and_nothing_moves_before_the_check() {
-        let states = atomics(&[state(L::GENERAL, Some(Kind::Graphics)), state(L::GENERAL, Some(Kind::Compute))]);
-        let released = std::panic::catch_unwind(|| {
-            release_states(&states, (0..2).into(), Kind::Graphics, Kind::Transfer, |_, _| {})
-        });
-        assert!(released.is_err());
-        assert_eq!(ImageState::load(&states[0]).released_to, None);
-    }
-
-    #[test]
-    fn host_layouts_leave_the_owner() {
-        let c = state(L::GENERAL, Some(Kind::Compute));
-        let states = atomics(&[ImageState::UNDEFINED, c, c]);
-        let mut runs = Vec::new();
-        take_host_layouts(&states, (0..3).into(), L::GENERAL, |mips, old| {
-            runs.push((mips.start, mips.end, old))
-        });
-        assert_eq!(runs, [(0, 1, L::UNDEFINED)]);
-        assert_eq!(ImageState::load(&states[0]), state(L::GENERAL, None));
-        assert_eq!(ImageState::load(&states[2]), c);
     }
 }

@@ -1,8 +1,4 @@
 //! GPU ray tracing tests: acceleration structure builds, refits and compaction, ray queries and ray tracing pipelines on a small scene
-//!
-//! The scene (`shaders/include/ray_scene.slang`): a non-opaque wall at z = 0 seen along
-//! +Z, a triangle and a sphere (an AABB) in front of it, and a second triangle that the rays'
-//! mask skips. Each test skips when the device lacks what it needs.
 mod common;
 
 use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
@@ -28,7 +24,6 @@ const EXTENT: UVec2 = UVec2::splat(SIZE);
 
 type Target = Image<R8G8B8A8Unorm, StorageTransferSrcTransferDst>;
 
-/// Whether the device can run the tests that need `feature`; prints why a test is skipped.
 fn supported(test: &str, feature: bool) -> bool {
     if !feature {
         eprintln!("SKIPPED {test}: the device lacks the ray tracing features it needs");
@@ -36,16 +31,13 @@ fn supported(test: &str, feature: bool) -> bool {
     feature
 }
 
-fn target() -> Target {
-    Target::new(EXTENT).unwrap().bind_storage().unwrap()
-}
-
 /// Lets `record` write `targets` in one submission and reads them back.
 fn render_many<const N: usize>(
     gpu: &common::Gpu,
     record: impl FnOnce(&mut Cmd, &[Target; N]),
 ) -> [Vec<u8>; N] {
-    let targets: [Target; N] = std::array::from_fn(|_| target());
+    let targets: [Target; N] =
+        std::array::from_fn(|_| Target::new(EXTENT).unwrap().bind_storage().unwrap());
     let readbacks: [Buffer<u8>; N] =
         std::array::from_fn(|_| zeroed_buffer((SIZE * SIZE * 4) as usize));
     gpu.submit(|cmd| {
@@ -65,14 +57,10 @@ fn render(gpu: &common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> 
     pixels
 }
 
-fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
-    let i = ((y * SIZE + x) * 4) as usize;
-    pixels[i..i + 4].try_into().unwrap()
-}
-
 #[track_caller]
 fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 3]) {
-    let actual = pixel(pixels, x, y);
+    let i = ((y * SIZE + x) * 4) as usize;
+    let actual: [u8; 4] = pixels[i..i + 4].try_into().unwrap();
     let close = actual[..3].iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 2);
     assert!(
         close && actual[3] == 255,
@@ -80,7 +68,6 @@ fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 3]) {
     );
 }
 
-/// The ray query pass's image of `tlas`.
 fn trace_query(cmd: &mut Cmd, target: &Target, tlas: &Tlas) {
     cmd.compute(
         &TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT).unwrap(),
@@ -111,7 +98,6 @@ const SHADOWED: (u32, u32) = (25, 27);
 /// In one of the holes the any-hit shader cuts into the wall.
 const HOLE: (u32, u32) = (33, 33);
 
-/// The scene's acceleration structures and what they were built from.
 struct Scene {
     wall: Blas,
     triangle: Blas,
@@ -143,8 +129,6 @@ fn scratch(size: u64) -> Buffer<u8> {
     Buffer::raw(Storage, false, size, Some(scratch_alignment() as u32)).unwrap()
 }
 
-/// Builds the scene's BLASes with `blas_flags` and its TLAS in one submission, reusing one
-/// scratch buffer.
 fn scene(gpu: &common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) -> Scene {
     let wall_vertices = buffer_with::<Vec3, Storage>(&[
         Vec3::new(-0.9, -0.9, 0.0),
@@ -203,7 +187,6 @@ fn scene(gpu: &common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) -> S
     }
 }
 
-/// What the ray query pass draws of the scene.
 fn assert_query_image(pixels: &[u8]) {
     assert_pixel(pixels, BACKGROUND.0, BACKGROUND.1, [0, 0, 0]);
     // The masked triangle in front of it is invisible.
@@ -225,18 +208,6 @@ fn ray_queries_hit_triangles_and_aabbs_through_the_instance_mask() {
     assert_golden("ray_query", &pixels, [SIZE, SIZE]);
 }
 
-/// What the pipeline draws of the scene.
-fn assert_pipeline_image(pixels: &[u8]) {
-    let sky = [51, 153, 77];
-    assert_pixel(pixels, BACKGROUND.0, BACKGROUND.1, sky);
-    assert_pixel(pixels, WALL.0, WALL.1, [204, 204, 204]);
-    assert_pixel(pixels, SHADOWED.0, SHADOWED.1, [82, 82, 82]);
-    assert_pixel(pixels, HOLE.0, HOLE.1, sky);
-    assert_pixel(pixels, TRIANGLE.0, TRIANGLE.1, [255, 51, 26]);
-    // Shaded by the normal's z, 0.98 here.
-    assert_pixel(pixels, SPHERE.0, SPHERE.1, [25, 101, 253]);
-}
-
 #[test]
 fn ray_tracing_pipelines_run_every_shader_kind() {
     let gpu = gpu();
@@ -245,7 +216,14 @@ fn ray_tracing_pipelines_run_every_shader_kind() {
     }
     let scene = scene(&gpu, BuildFlags::default(), BuildFlags::default());
     let pixels = render(&gpu, |cmd, target| trace_pipeline(cmd, target, &scene.tlas));
-    assert_pipeline_image(&pixels);
+    let sky = [51, 153, 77];
+    assert_pixel(&pixels, BACKGROUND.0, BACKGROUND.1, sky);
+    assert_pixel(&pixels, WALL.0, WALL.1, [204, 204, 204]);
+    assert_pixel(&pixels, SHADOWED.0, SHADOWED.1, [82, 82, 82]);
+    assert_pixel(&pixels, HOLE.0, HOLE.1, sky);
+    assert_pixel(&pixels, TRIANGLE.0, TRIANGLE.1, [255, 51, 26]);
+    // Shaded by the normal's z, 0.98 here.
+    assert_pixel(&pixels, SPHERE.0, SPHERE.1, [25, 101, 253]);
     assert_golden("ray_tracing", &pixels, [SIZE, SIZE]);
 }
 
@@ -301,7 +279,6 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
         cmd.build(&[(&tlas, Instances::new(written.range(..)))], scratch.range(..));
         trace_query(cmd, target, &tlas);
     });
-    // The shader's instances are the host's, bit for bit.
     assert_eq!(written.host(), scene.instances.host());
     assert_query_image(&pixels);
 }

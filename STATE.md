@@ -7,15 +7,19 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - Recording one image on two timelines without a `Wait` between them corrupts its tracked state undetected (both move it); so does accessing a released image without waiting for the release's submission. A debug check could remember the last timeline and value per image.
 - Host image copies (`Image::copy_from`) leave the image's owner alone; check that against `VK_EXT_host_image_copy`'s rules for images another family owns.
 - Dropping a `PresentSurface` while an `AcquiredImage` is outstanding (never submitted) destroys an acquire semaphore whose signal may still be pending.
+- Replaced swapchains are destroyed by their surface at its next `acquire`, so a surface that stops acquiring keeps its old swapchains (and their bindless slots) until it is dropped.
 - Recording 64 compute dispatches costs about 7% more than before timelines (`lava-tests` recording bench, 2026-10-17, `taskset -c 2`, alternating builds: 22 vs 20.5 µs; draws, declared accesses and mesh launches at par). Not found without a profiler; `compute_barriers` and the barrier log were ruled out.
 ----intended----
-- A held `Reservation` on any timeline holds back every deletion (its stamp includes the value): reserve right before reading, and submit or drop it soon.
+- A `reserve()` without a following submission holds back every deletion until the timeline's next submission: reserve right before reading.
+- `submit` signals the timeline's stamp, which may cover a `reserve()` made for a later frame (pipelined extract before the previous frame submitted); core's extract runs after the previous render submitted.
 - Swapchain images are owned by graphics: compositing into them on an async compute timeline isn't supported (the present would need an ownership transfer back first).
 - Taking back a dropped `AcquiredImage` waits on the host for an empty submission that consumes its signalled semaphores; it happens only when an image is dropped unpresented.
-- Without present fences, what a present may use waits for a later value of the timeline that presented it (or an idle device); objects retired after the last `wait_idle` are only destroyed by `lava::destroy`.
+- Without present fences, a replaced swapchain waits for a later value of the timeline that presented it.
 - `VkSwapchainPresentModesCreateInfoEXT` names only the swapchain's own mode, so a present-mode change recreates the swapchain.
 
 ## lava: optional features (cargo features `X` / `assert-X`, 2026-10-17)
+----find solutions----
+- `vkCmdDispatch(): ... 144 bytes were never set with vkCmdPushConstants` (a validation warning) on the engine's headless `render` of sponza, at `core/src/render/render.rs:802`: passes push only their own struct, and the rest of the range is never set.
 ----intended----
 - `PassKind` and the `kind::*` markers stay compiled whatever the features: they describe the pass map. A pass map whose SPIR-V needs a compiled-out feature fails at `init`, and its generated bindings don't compile.
 - `line-stipple` is one feature for every line mode the device has (default lines need `strictLines` and stippled rectangular lines), so a device with stippled Bresenham but not stippled smooth lines has no stippling at all.

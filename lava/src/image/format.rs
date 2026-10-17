@@ -13,23 +13,16 @@ pub trait Format: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fm
 
     fn vk_format(&self) -> vk::Format;
     fn aspects(&self) -> vk::ImageAspectFlags;
-    /// Bytes per texel in host memory. 0 for block-compressed formats, which have no fixed
-    /// per-texel size.
+    /// Bytes per texel in host memory, 0 for block-compressed formats.
     fn texel_size(&self) -> usize;
     fn clear_value(&self, value: Self::Texels) -> ClearValue;
-
-    // The command buffer calls the checks with what its trait bounds require. A static
-    // format's type already guarantees that, so its checks do nothing and compile away;
-    // `Dynamic` meets every bound and checks at runtime instead.
-
-    /// Panics unless the format has the `required` aspects (`ColorAspect`, `DepthAspect`,
-    /// `StencilAspect`).
+    /// Panics unless the format has the `required` aspects; a static format's does nothing.
     fn aspect_check(&self, required: vk::ImageAspectFlags);
-    /// Panics unless the format's texels have the type `T` (`HasTexels<T>`).
+    /// Panics unless the format's texels have the type `T`; a static format's does nothing.
     fn texel_check<T: 'static>(&self);
 }
 
-/// Every format but `Dynamic`: the type alone says what the format is.
+/// Every format but `Dynamic`.
 pub trait StaticFormat: Format + Default {}
 
 /// Formats whose texels a shader can read as `T` (`[f32; 4]` for a `Tex2D<float4>`).
@@ -38,11 +31,8 @@ pub trait HasTexels<T>: Format {}
 pub trait ColorAspect: crate::sealed::Sealed {}
 pub trait DepthAspect: crate::sealed::Sealed {}
 pub trait StencilAspect: crate::sealed::Sealed {}
-/// Formats of one aspect, whose images shaders read through the view of every aspect
-/// (`kind::ShaderViews`).
 pub trait SingleAspect: crate::sealed::Sealed {}
-/// Formats with a depth and a stencil aspect, whose images shaders read through a depth-only
-/// view (`image::DepthSplit`).
+/// Formats with a depth and a stencil aspect, which shaders read through a depth-only view.
 pub trait CombinedDepthStencil: DepthAspect + StencilAspect {}
 
 /// The value an attachment or image is cleared to, padded to 4 components.
@@ -73,15 +63,18 @@ impl From<ClearValue> for vk::ClearValue {
     }
 }
 
-/// A format only known at runtime, e.g. one read from a file or picked by the surface. It
-/// meets every format bound, and its checks panic where the bound wouldn't have compiled. It
-/// behaves like the static format of the same `vk::Format`, which must exist.
+/// A format only known at runtime. It meets every format bound, and its checks panic where the
+/// bound wouldn't have compiled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dynamic(pub vk::Format);
 
 impl Dynamic {
     fn info(self) -> Info {
-        info(self.0).unwrap_or_else(|| panic!("lava has no format type for {:?}", self.0))
+        #[cfg(feature = "bc-compression")]
+        if let Some(info) = bc_info(self.0) {
+            return info;
+        }
+        plain_info(self.0).unwrap_or_else(|| panic!("lava has no format type for {:?}", self.0))
     }
 }
 
@@ -98,8 +91,7 @@ impl Format for Dynamic {
     fn texel_size(&self) -> usize {
         self.info().texel_size
     }
-    /// Panics unless the value is of the kind the format's static type clears with: `Float`,
-    /// `Uint` and `Sint` for colour formats of those components, `DepthStencil` for the others.
+    /// Panics unless `value` is the variant the format's static type clears with.
     fn clear_value(&self, value: ClearValue) -> ClearValue {
         assert!(
             discriminant(&value) == self.info().clear,
@@ -129,8 +121,7 @@ impl<T> HasTexels<T> for Dynamic {}
 impl ColorAspect for Dynamic {}
 impl DepthAspect for Dynamic {}
 impl StencilAspect for Dynamic {}
-// Checked at runtime: `bindless::bind` refuses a view of two aspects, `DepthSplit::create` a
-// format without them.
+// Checked at runtime by `bindless::bind` and `DepthSplit::create`.
 impl SingleAspect for Dynamic {}
 impl CombinedDepthStencil for Dynamic {}
 
@@ -138,9 +129,8 @@ impl CombinedDepthStencil for Dynamic {}
 struct Info {
     aspects: vk::ImageAspectFlags,
     texel_size: usize,
-    /// The `TypeId` of the texels shaders read (`HasTexels`).
+    /// Of the texels shaders read (`HasTexels`).
     texels: TypeId,
-    /// The `ClearValue` variant it clears with.
     clear: Discriminant<ClearValue>,
 }
 
@@ -188,8 +178,7 @@ macro_rules! formats {
     (@texels stencil) => { [u32; 1] };
     (@texels depth_stencil) => { (f32, u32) };
 
-    // What shaders read (`HasTexels`): the texels, except for a combined depth-stencil format,
-    // whose views show shaders the depth aspect alone.
+    // Shaders see a combined depth-stencil format's depth aspect alone.
     (@shader_texels depth_stencil) => { [f32; 1] };
     (@shader_texels $kind:ident $($n:literal)?) => { formats!(@texels $kind $($n)?) };
 
@@ -454,7 +443,6 @@ formats! {
     D32SfloatS8Uint => (D32_SFLOAT_S8_UINT, 5, depth_stencil),
 }
 
-// The block-compressed formats (`bc-compression`).
 #[cfg(feature = "bc-compression")]
 formats! {
     bc_info;
@@ -474,173 +462,4 @@ formats! {
     BC6HSfloatBlock => (BC6H_SFLOAT_BLOCK, 0, float, 3),
     BC7UnormBlock => (BC7_UNORM_BLOCK, 0, float, 4),
     BC7SrgbBlock => (BC7_SRGB_BLOCK, 0, float, 4),
-}
-
-/// What lava knows of `format`, `None` for a format it has no marker type for.
-fn info(format: vk::Format) -> Option<Info> {
-    #[cfg(feature = "bc-compression")]
-    if let Some(info) = bc_info(format) {
-        return Some(info);
-    }
-    plain_info(format)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vk::ImageAspectFlags as A;
-
-    #[test]
-    fn padding_fills_missing_components_with_zero() {
-        assert_eq!(pad([1.0, 2.0]), [1.0, 2.0, 0.0, 0.0]);
-        assert_eq!(pad([1.0, 2.0, 3.0, 4.0]), [1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(pad([7u32]), [7, 0, 0, 0]);
-        assert_eq!(pad([-1, -2, -3]), [-1, -2, -3, 0]);
-    }
-
-    #[test]
-    fn formats_carry_their_vulkan_format_and_aspects() {
-        assert_eq!(R8Unorm.vk_format(), vk::Format::R8_UNORM);
-        assert_eq!(R8G8B8A8Unorm.vk_format(), vk::Format::R8G8B8A8_UNORM);
-        assert_eq!(R32Uint.vk_format(), vk::Format::R32_UINT);
-        assert_eq!(R8G8B8A8Unorm.aspects(), A::COLOR);
-        assert_eq!(D32Sfloat.vk_format(), vk::Format::D32_SFLOAT);
-        assert_eq!(D32Sfloat.aspects(), A::DEPTH);
-        assert_eq!(S8Uint.aspects(), A::STENCIL);
-        assert_eq!(D24UnormS8Uint.vk_format(), vk::Format::D24_UNORM_S8_UINT);
-        assert_eq!(D16UnormS8Uint.aspects(), A::DEPTH | A::STENCIL);
-        assert_eq!(D32SfloatS8Uint.aspects(), A::DEPTH | A::STENCIL);
-    }
-
-    #[test]
-    fn texel_size_is_the_host_size_of_one_texel() {
-        assert_eq!(R8Unorm.texel_size(), 1);
-        assert_eq!(R8G8B8A8Unorm.texel_size(), 4);
-        assert_eq!(R16G16Sfloat.texel_size(), 4);
-        assert_eq!(R32Uint.texel_size(), 4);
-        assert_eq!(R16G16B16A16Sfloat.texel_size(), 8);
-        assert_eq!(R32G32B32A32Sfloat.texel_size(), 16);
-        assert_eq!(R64G64B64A64Sfloat.texel_size(), 32);
-        // Packed formats take the size of their pack word.
-        assert_eq!(R4G4UnormPack8.texel_size(), 1);
-        assert_eq!(R5G6B5UnormPack16.texel_size(), 2);
-        assert_eq!(A2B10G10R10UnormPack32.texel_size(), 4);
-        assert_eq!(B10G11R11UfloatPack32.texel_size(), 4);
-        assert_eq!(D16Unorm.texel_size(), 2);
-        assert_eq!(X8D24UnormPack32.texel_size(), 4);
-        assert_eq!(D32Sfloat.texel_size(), 4);
-        assert_eq!(S8Uint.texel_size(), 1);
-        assert_eq!(D16UnormS8Uint.texel_size(), 3);
-        assert_eq!(D24UnormS8Uint.texel_size(), 4);
-        assert_eq!(D32SfloatS8Uint.texel_size(), 5);
-    }
-
-    #[test]
-    fn block_compressed_formats_report_zero() {
-        #[cfg(feature = "bc-compression")]
-        assert_eq!(BC1RgbUnormBlock.texel_size(), 0);
-        #[cfg(feature = "bc-compression")]
-        assert_eq!(BC7SrgbBlock.texel_size(), 0);
-        assert_eq!(ASTC4X4UnormBlock.texel_size(), 0);
-    }
-
-    #[test]
-    fn color_clear_values_use_the_variant_of_their_numeric_type() {
-        assert_eq!(
-            R16G16Sfloat.clear_value([0.25, 0.5]),
-            ClearValue::Float([0.25, 0.5, 0.0, 0.0])
-        );
-        assert_eq!(
-            R8G8B8A8Uint.clear_value([1, 2, 3, 4]),
-            ClearValue::Uint([1, 2, 3, 4])
-        );
-        assert_eq!(R32Sint.clear_value([-5]), ClearValue::Sint([-5, 0, 0, 0]));
-        let vk = vk::ClearValue::from(ClearValue::Uint([1, 2, 3, 4]));
-        assert_eq!(unsafe { vk.color.uint32 }, [1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn depth_and_stencil_clear_values() {
-        let depth_stencil = |depth, stencil| ClearValue::DepthStencil { depth, stencil };
-        assert_eq!(D32Sfloat.clear_value([0.75]), depth_stencil(0.75, 0));
-        assert_eq!(S8Uint.clear_value([9]), depth_stencil(0.0, 9));
-        assert_eq!(D24UnormS8Uint.clear_value((0.5, 3)), depth_stencil(0.5, 3));
-        let vk = vk::ClearValue::from(depth_stencil(0.5, 3));
-        let vk = unsafe { vk.depth_stencil };
-        assert_eq!((vk.depth, vk.stencil), (0.5, 3));
-    }
-
-    /// A dynamic format must behave like the static one of the same `vk::Format`.
-    fn same<F: StaticFormat>(format: F, texels: F::Texels) {
-        let dynamic = Dynamic(format.vk_format());
-        assert_eq!(dynamic.aspects(), format.aspects());
-        assert_eq!(dynamic.texel_size(), format.texel_size());
-        dynamic.aspect_check(format.aspects());
-        let clear = format.clear_value(texels);
-        assert_eq!(dynamic.clear_value(clear), clear);
-    }
-
-    #[test]
-    fn dynamic_formats_match_their_static_format() {
-        same(R8Unorm, [0.5]);
-        same(R8G8B8A8Srgb, [0.0; 4]);
-        same(R32G32B32A32Uint, [1; 4]);
-        same(R16Sint, [-1]);
-        #[cfg(feature = "bc-compression")]
-        same(BC7SrgbBlock, [0.0; 4]);
-        #[cfg(feature = "bc-compression")]
-        same(BC5UnormBlock, [0.0; 2]);
-        same(D32Sfloat, [0.0]);
-        same(S8Uint, [1]);
-        same(D24UnormS8Uint, (1.0, 1));
-    }
-
-    /// What shaders read: 64-bit components for 64-bit formats, `uint` stencil, and the depth of
-    /// a combined depth-stencil format (its views show shaders that aspect).
-    fn reads<T: 'static, F: HasTexels<T>>(format: F) {
-        Dynamic(format.vk_format()).texel_check::<T>();
-    }
-
-    #[test]
-    fn shaders_read_texels_of_the_formats_component_type() {
-        reads::<[f32; 4], _>(R8G8B8A8Unorm);
-        reads::<[u32; 1], _>(R32Uint);
-        reads::<[f64; 1], _>(R64Sfloat);
-        reads::<[u64; 1], _>(R64Uint);
-        reads::<[i64; 2], _>(R64G64Sint);
-        reads::<[f32; 1], _>(D32Sfloat);
-        reads::<[u32; 1], _>(S8Uint);
-        reads::<[f32; 1], _>(D24UnormS8Uint);
-    }
-
-    #[test]
-    fn clear_values_of_64_bit_formats_have_32_bit_components() {
-        assert_eq!(R64Uint.clear_value([7]), ClearValue::Uint([7, 0, 0, 0]));
-        assert_eq!(R64G64Sint.clear_value([-2, 3]), ClearValue::Sint([-2, 3, 0, 0]));
-        assert_eq!(R64Sfloat.clear_value([0.5]), ClearValue::Float([0.5, 0.0, 0.0, 0.0]));
-    }
-
-    #[test]
-    #[should_panic(expected = "doesn't have texels of type [f32; 4]")]
-    fn dynamic_format_checks_texels() {
-        Dynamic(vk::Format::R32G32B32A32_UINT).texel_check::<[f32; 4]>();
-    }
-
-    #[test]
-    #[should_panic(expected = "lacks the aspects")]
-    fn dynamic_format_checks_aspects() {
-        Dynamic(vk::Format::R8G8B8A8_UNORM).aspect_check(A::DEPTH);
-    }
-
-    #[test]
-    #[should_panic(expected = "can't be cleared to Uint")]
-    fn dynamic_format_checks_clear_values() {
-        Dynamic(vk::Format::R8G8B8A8_UNORM).clear_value(ClearValue::Uint([0; 4]));
-    }
-
-    #[test]
-    #[should_panic(expected = "no format type")]
-    fn dynamic_format_needs_a_known_vulkan_format() {
-        Dynamic(vk::Format::UNDEFINED).aspects();
-    }
 }

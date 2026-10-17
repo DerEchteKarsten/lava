@@ -1,8 +1,4 @@
 //! Windowed GPU tests: init with a display, surfaces, swapchains, presenting, multi-window
-//!
-//! Runs without the libtest harness because the window needs the main thread's event loop.
-//! The tests share one lava context and run in order; a window shows up briefly while they
-//! present. Without a Wayland or X11 display the binary reports that it skipped.
 mod common;
 
 use std::process::ExitCode;
@@ -56,15 +52,14 @@ fn surface_for(window: &Window) -> lava::Result<Surface> {
     }
 }
 
-/// Acquires an image for a window of `size`, clears it to `color` in a submission that
-/// presents it, and presents it. Returns the image's handle.
+/// Acquires, clears to `color` and presents an image; returns its handle.
 fn present_frame(
     timeline: &Timeline<Graphics>,
     surface: &mut Surface,
     size: glam::UVec2,
     color: [f32; 4],
 ) -> BindlessHandle {
-    let submission = timeline.reserve().begin().unwrap();
+    let submission = timeline.begin().unwrap();
     let image = surface.acquire(size).unwrap().expect("the window has an extent");
     let view = surface.image(&image);
     let handle = view.handle();
@@ -84,13 +79,12 @@ fn acquire_and(
     surface: &mut Surface,
     record: impl FnOnce(&mut lava::command_buffer::CommandBuffer<Graphics>, &Surface, &AcquiredImage),
 ) -> AcquiredImage {
-    let submission = timeline.reserve().begin().unwrap();
+    let submission = timeline.begin().unwrap();
     let image = surface.acquire(SIZE).unwrap().unwrap();
     submission.submit(|cmd| record(cmd, surface, &image)).unwrap();
     image
 }
 
-/// Everything that needs a window, in order. Panics on the first failure.
 fn run(event_loop: &ActiveEventLoop) {
     let window = create_window(event_loop, "lava test");
     let step = |name: &str| println!("test {name} ... ok");
@@ -115,7 +109,7 @@ fn run(event_loop: &ActiveEventLoop) {
     assert_eq!(surface.format().0, vk::Format::B8G8R8A8_UNORM);
     step("surface_reports_its_format_and_modes");
 
-    let timeline = Timeline::<Graphics>::builder().build().unwrap();
+    let timeline = Timeline::<Graphics>::new(2).unwrap();
     let mut handles = Vec::new();
     for color in [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]] {
         handles.push(present_frame(&timeline, &mut surface, SIZE, color));
@@ -133,9 +127,11 @@ fn run(event_loop: &ActiveEventLoop) {
     assert_eq!(surface.size(), SIZE / 2);
     let new = present_frame(&timeline, &mut surface, SIZE / 2, [1.0, 0.0, 1.0, 1.0]);
     assert!(!handles.contains(&new), "the old swapchain's slots stay taken until it is destroyed");
-    // Destroyed once no submission or present uses it, which an idle device has: then its
-    // slots are free again, and the first free ones.
-    lava::wait_idle().unwrap();
+    // An acquire destroys the old swapchain once nothing uses it, freeing the lowest slots.
+    for _ in 0..2 {
+        lava::wait_idle().unwrap();
+        present_frame(&timeline, &mut surface, SIZE / 2, [0.0, 0.0, 0.0, 1.0]);
+    }
     let lowest = handles.iter().map(|h| h.descriptor_index_set1).min().unwrap();
     let reserved = lava::bindless::reserve_storage(old_images as u32).unwrap();
     assert_eq!(reserved.start(), lowest);
@@ -187,8 +183,7 @@ fn run(event_loop: &ActiveEventLoop) {
     assert_ne!(other, first);
     step("second_window_has_its_own_surface");
 
-    // Waiting for the device destroys everything dropped before, while the windows are still
-    // open.
+    // Destroys the surfaces while the windows are still open.
     drop(second);
     drop(surface);
     drop(timeline);

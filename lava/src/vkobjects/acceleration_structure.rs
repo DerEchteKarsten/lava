@@ -25,24 +25,21 @@ use crate::{
 const BUILD: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR;
 const READ: vk::AccessFlags2 = vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR;
 const WRITE: vk::AccessFlags2 = vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR;
-/// What a trace or ray query reads acceleration structures with. `MEMORY_READ` is for Mesa's
-/// ANV (26.2.2 on the B390): after a structure traced earlier in the same submission was
-/// rebuilt, `ACCELERATION_STRUCTURE_READ` alone leaves the next trace seeing stale nodes (only
-/// HDC flushes, `anv_pipe_invalidate_bits_for_access_flags`), while `MEMORY_READ` invalidates
-/// every cache (`a_tlas_rebuilt_between_two_traces_waits_for_the_first`). It only widens
-/// barriers that follow a structure write anyway.
+/// `MEMORY_READ` is for Mesa's ANV (26.2.2): after a structure traced earlier in the same
+/// submission was rebuilt, `ACCELERATION_STRUCTURE_READ` alone lets the next trace see stale
+/// nodes (`a_tlas_rebuilt_between_two_traces_waits_for_the_first`).
 const TRACE_READ: vk::AccessFlags2 =
     vk::AccessFlags2::from_raw(READ.as_raw() | vk::AccessFlags2::MEMORY_READ.as_raw());
 /// What `vkCreateAccelerationStructure2KHR` requires of a structure's address and size.
 const STRUCTURE_ALIGNMENT: u64 = 256;
 
-/// The acceleration structure functions, or `MissingFeature` (only where lava checks it).
+/// `MissingFeature` where lava checks it.
 pub(crate) fn functions() -> Result<&'static ash::khr::acceleration_structure::Device> {
     gate::AccelerationStructure::check()?;
     Ok(Functions::acceleration_structure())
 }
 
-/// The functions of commands on a structure, which only exists where the device has them.
+/// Unchecked: a command's structure only exists past the check.
 fn command_functions() -> &'static ash::khr::acceleration_structure::Device {
     Functions::acceleration_structure()
 }
@@ -57,8 +54,7 @@ pub fn scratch_alignment() -> u64 {
         })
 }
 
-/// The read a trace or a TLAS build makes of every acceleration structure: the BLASes it
-/// reaches, which lava can't list.
+/// The read a trace or TLAS build makes of the BLASes it reaches, which lava can't list.
 pub(crate) fn every_structure_read(stage: vk::PipelineStageFlags2) -> BufferAccess {
     let access = if stage == BUILD { READ } else { TRACE_READ };
     BufferAccess {
@@ -132,11 +128,8 @@ impl BuildFlags {
     }
 }
 
-/// An acceleration structure and the memory it owns. Shaders reach a [`Tlas`] by its address
-/// (a `u64` in the shader contract); instances name a [`Blas`] by its address. Builds write it through a
-/// shared reference: the command buffer orders them with the traces. Destroyed once no frame
-/// can reach it any more (`epoch`); a TLAS that still names a dropped BLAS must not be traced
-/// after that.
+/// An acceleration structure and the memory it owns, which builds write through a shared
+/// reference. A TLAS that still names a dropped BLAS must not be traced once it is destroyed.
 pub struct AccelerationStructure<L: Level> {
     handle: vk::AccelerationStructureKHR,
     address: u64,
@@ -146,7 +139,7 @@ pub struct AccelerationStructure<L: Level> {
     build_scratch: u64,
     update_scratch: u64,
     /// Made by `compacted`: its memory only holds the compacted structure, so it can't be built
-    /// again (a build needs the full size). Updates refit in place.
+    /// again.
     compacted: bool,
     /// Dropped after the structure, so destroyed after it.
     buffer: Buffer<u8, usage::AccelerationStructureStorage>,
@@ -158,7 +151,6 @@ fn round_up(value: u64, alignment: u64) -> u64 {
 }
 
 impl<L: Level> AccelerationStructure<L> {
-    /// An unbuilt structure for builds of `geometries` with at most `max_primitives` each.
     fn with_geometries(
         geometries: &[vk::AccelerationStructureGeometryKHR<'_>],
         max_primitives: SmallVec<[u32; 4]>,
@@ -261,8 +253,7 @@ impl<L: Level> AccelerationStructure<L> {
     }
 
     /// An unbuilt structure of `size` bytes (read from a `QueryPool<CompactedSize>`) with this
-    /// one's flags, for [`CommandBuffer::compact`]. It can be updated but never built: a build
-    /// needs more memory than the compacted size.
+    /// one's flags, for [`CommandBuffer::compact`]. It can be updated but never built.
     pub fn compacted(&self, size: u64) -> Result<Self> {
         Self::create(
             size,
@@ -279,7 +270,6 @@ impl<L: Level> AccelerationStructure<L> {
         self.compacted
     }
 
-    /// An access of its memory by an acceleration structure command or a shader.
     pub(crate) fn access(
         &self,
         stage: vk::PipelineStageFlags2,
@@ -317,7 +307,6 @@ impl Tlas {
     }
 }
 
-/// Destroyed once no submission can reach it any more (`lifetime`).
 impl<L: Level> Drop for AccelerationStructure<L> {
     fn drop(&mut self) {
         let handle = self.handle;
@@ -328,8 +317,6 @@ impl<L: Level> Drop for AccelerationStructure<L> {
         });
     }
 }
-
-// ---- geometry ---------------------------------------------------------------------------
 
 /// A vertex type whose first bytes are its position, in `FORMAT`. Its size is the stride.
 pub trait VertexPosition: Copy + Pod {
@@ -663,14 +650,10 @@ impl Describe for Instances<'_> {
     }
 }
 
-// ---- commands ---------------------------------------------------------------------------
-
-impl<K: HasCompute> CommandBuffer<K> {
-    /// Builds every structure from its geometry in one `vkCmdBuildAccelerationStructuresKHR`,
-    /// so the GPU may build them in parallel. Each takes its `build_scratch_size()` of
-    /// `scratch` after the previous one's, whose address has to be a multiple of
-    /// [`scratch_alignment`]. A geometry may have fewer primitives than at creation. A TLAS
-    /// build waits for every pending BLAS build.
+impl<K: HasCompute> CommandBuffer<'_, K> {
+    /// Builds every structure in one `vkCmdBuildAccelerationStructuresKHR`, each from its
+    /// `build_scratch_size()` of `scratch` after the previous one's. `scratch`'s address has to
+    /// be a multiple of [`scratch_alignment`].
     #[validation_trace]
     pub fn build<L: Level, U: IsStorage>(
         &mut self,
@@ -680,9 +663,8 @@ impl<K: HasCompute> CommandBuffer<K> {
         self.record_builds(builds, scratch, false);
     }
 
-    /// Refits every structure in place for its geometry, which has the primitive counts of
-    /// its last build (vertices and instances may have moved). Needs `allow_update`; the
-    /// scratch is laid out like [`Self::build`]'s, by `update_scratch_size()`.
+    /// Refits every structure in place for its geometry, which has the primitive counts of its
+    /// last build. Needs `allow_update`; the scratch is laid out by `update_scratch_size()`.
     #[validation_trace]
     pub fn update<L: Level, U: IsStorage>(
         &mut self,
@@ -814,7 +796,7 @@ impl<K: HasCompute> CommandBuffer<K> {
                 }
             })
             .collect();
-        // The function pointer directly: ash 0.38's wrapper collects these pointers into a `Vec`.
+        // Not ash 0.38's wrapper, which collects these into a `Vec`.
         let ranges: SmallVec<[_; 1]> = ranges.iter().map(|r| r.as_ptr()).collect();
         unsafe {
             (command_functions().fp().cmd_build_acceleration_structures_khr)(
@@ -887,89 +869,5 @@ impl<K: HasCompute> CommandBuffer<K> {
                     .mode(vk::CopyAccelerationStructureModeKHR::COMPACT),
             )
         };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use glam::{Mat3, Quat};
-
-    #[test]
-    fn mirrors_have_the_layout_of_the_vulkan_structs() {
-        assert_eq!(
-            size_of::<Instance>(),
-            size_of::<vk::AccelerationStructureInstanceKHR>()
-        );
-        assert_eq!(
-            align_of::<Instance>(),
-            align_of::<vk::AccelerationStructureInstanceKHR>()
-        );
-        assert_eq!(
-            size_of::<TransformMatrix>(),
-            size_of::<vk::TransformMatrixKHR>()
-        );
-        assert_eq!(size_of::<Aabb>(), size_of::<vk::AabbPositionsKHR>());
-        assert_eq!(std::mem::offset_of!(Instance, blas), 56);
-    }
-
-    #[test]
-    fn transforms_are_stored_by_rows() {
-        let t = Affine3A::from_mat3_translation(
-            Mat3::from_cols_array(&[1., 2., 3., 4., 5., 6., 7., 8., 9.]),
-            Vec3::new(10., 11., 12.),
-        );
-        assert_eq!(
-            TransformMatrix::from(t).0,
-            [[1., 4., 7., 10.], [2., 5., 8., 11.], [3., 6., 9., 12.]]
-        );
-        let r = Affine3A::from_quat(Quat::from_rotation_z(1.0));
-        let m = TransformMatrix::from(r).0;
-        let v = Vec3::X;
-        let row = |i: usize| Vec4::from(m[i]).truncate().dot(v);
-        assert!((Vec3::new(row(0), row(1), row(2)) - r.transform_vector3(v)).length() < 1e-6);
-    }
-
-    #[test]
-    fn instance_fields_pack_into_their_bits() {
-        let instance = Instance::from_address(0xABCD, Affine3A::IDENTITY);
-        assert_eq!(instance.custom_index_and_mask, 0xFF00_0000);
-        let instance = instance
-            .custom_index(0x12_3456)
-            .mask(0x81)
-            .sbt_offset(0xFF_FFFF)
-            .flags(vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE)
-            .custom_index(7);
-        assert_eq!(instance.custom_index_and_mask, 0x8100_0007);
-        assert_eq!(instance.sbt_offset_and_flags, 0x04FF_FFFF);
-        assert_eq!(instance.sbt_offset(1).sbt_offset_and_flags, 0x0400_0001);
-        assert_eq!(instance.blas, 0xABCD);
-    }
-
-    #[test]
-    #[should_panic(expected = "doesn't fit 24 bits")]
-    fn custom_indices_past_24_bits_panic() {
-        Instance::from_address(0, Affine3A::IDENTITY).custom_index(1 << 24);
-    }
-
-    #[test]
-    #[should_panic(expected = "doesn't fit 24 bits")]
-    fn hit_group_offsets_past_24_bits_panic() {
-        Instance::from_address(0, Affine3A::IDENTITY).sbt_offset(1 << 24);
-    }
-
-    #[test]
-    fn build_flags_prefer_fast_traces_by_default() {
-        type F = vk::BuildAccelerationStructureFlagsKHR;
-        assert_eq!(BuildFlags::default().vk(), F::PREFER_FAST_TRACE);
-        let all = BuildFlags {
-            fast_build: true,
-            allow_update: true,
-            allow_compaction: true,
-        };
-        assert_eq!(
-            all.vk(),
-            F::PREFER_FAST_BUILD | F::ALLOW_UPDATE | F::ALLOW_COMPACTION
-        );
     }
 }

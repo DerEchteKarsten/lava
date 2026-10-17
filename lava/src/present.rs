@@ -1,0 +1,670 @@
+//! Presenting to a window: `PresentSurface` owns a surface, its swapchain and the semaphores between them, recreates the swapchain when needed and destroys replaced ones once their presents are done, and hands out one acquired image at a time; the table of acquired images whose acquire a submission waits for and whose present it signals
+use std::{
+    collections::VecDeque,
+    fmt,
+    marker::PhantomData,
+    sync::{Arc, LazyLock, Mutex, atomic::AtomicU64},
+};
+
+use crate::vk;
+use glam::UVec2;
+use hashbrown::HashMap;
+use lava_macros::validation_trace;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use smallvec::SmallVec;
+
+use crate::{
+    bindless::{self, BindlessHandle},
+    command_buffer::{
+        CommandBuffer,
+        image_state::{ImageState, set_acquired},
+    },
+    error::{Error, Result},
+    features::{On, gate},
+    image::{
+        D2, format,
+        kind::ImageRef,
+        slice::ImageView,
+        usage::{ColorAttachmentTransferDst, StaticUsage},
+    },
+    lifetime::{self, Stamp, latest_stamp},
+    queue::{
+        HasGraphics, lock,
+        timeline::{completed, forget_image, poll},
+    },
+    state::{Ctx, Functions},
+};
+
+/// An acquired swapchain image.
+pub(crate) struct Entry {
+    /// What the image's first access waits for (its state's `acquired` flag).
+    pub(crate) acquire: vk::Semaphore,
+    /// The image's own, signalled by the submission that presents it.
+    present: vk::Semaphore,
+    /// The timeline and value of the submission that waited for `acquire`.
+    pub(crate) waited: Option<(usize, u64)>,
+    /// The queue, timeline and value of the submission that presented it.
+    pub(crate) presented: Option<(&'static Mutex<vk::Queue>, usize, u64)>,
+}
+
+pub(crate) static PRESENTS: LazyLock<Mutex<HashMap<vk::Image, Entry>>> =
+    LazyLock::new(Default::default);
+
+/// A recording's wait for an acquired image, at the stage of its first access.
+pub(crate) struct AcquireWait {
+    pub(crate) image: vk::Image,
+    pub(crate) semaphore: vk::Semaphore,
+    pub(crate) stage: vk::PipelineStageFlags2,
+}
+
+/// A recording's present of an image: its submission signals the image's present semaphore.
+pub(crate) struct PresentSignal {
+    pub(crate) image: vk::Image,
+    pub(crate) semaphore: vk::Semaphore,
+}
+
+impl<K: HasGraphics> CommandBuffer<'_, K> {
+    /// Moves `image`, an acquired image of a `PresentSurface`, into `PRESENT_SRC_KHR`. The
+    /// submission signals what `PresentSurface::present` waits for.
+    #[validation_trace]
+    pub fn present(&mut self, image: impl ImageRef<Dim = D2>) {
+        let image = image.view();
+        let semaphore = lock(&PRESENTS).get(&image.image).map(|entry| entry.present);
+        let semaphore = semaphore
+            .expect("`present` takes an image `PresentSurface::acquire` handed out, not presented yet");
+        self.rec.flush_pending(
+            std::iter::once(image.access(
+                vk::PipelineStageFlags2::empty(),
+                vk::AccessFlags2::empty(),
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            )),
+            std::iter::empty(),
+        );
+        if !self.rec.presents.iter().any(|p| p.image == image.image) {
+            let image = image.image;
+            self.rec.presents.push(PresentSignal { image, semaphore });
+        }
+    }
+}
+
+struct SwapchainImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    handle: BindlessHandle,
+    state: AtomicU64,
+    present: vk::Semaphore,
+}
+
+struct Swapchain {
+    handle: vk::SwapchainKHR,
+    extent: UVec2,
+    present_mode: usize,
+    images: SmallVec<[SwapchainImage; 5]>,
+    /// The fences of its presents not known to be done (`present-fences`).
+    fences: Vec<vk::Fence>,
+    /// The timeline and value of the last submission that presented one of its images.
+    presenter: Option<(usize, u64)>,
+}
+
+impl Swapchain {
+    fn destroy(self) {
+        let device = Ctx::device();
+        for image in &self.images {
+            lock(&PRESENTS).remove(&image.image);
+            forget_image(image.image);
+            bindless::free_handle(image.handle);
+            unsafe {
+                device.destroy_image_view(image.view, None);
+                device.destroy_semaphore(image.present, None);
+            }
+        }
+        for fence in self.fences {
+            unsafe { device.destroy_fence(fence, None) };
+        }
+        unsafe { Functions::swapchain().destroy_swapchain(self.handle, None) };
+    }
+}
+
+/// A window's surface and its swapchain of images of usage `U`, each bound in every bindless
+/// set `U` allows. A frame acquires an image, records into [`Self::image`] in a submission that
+/// ends with `cmd.present(view)`, and presents it.
+pub struct PresentSurface<U: StaticUsage = ColorAttachmentTransferDst> {
+    surface: vk::SurfaceKHR,
+    format: vk::SurfaceFormatKHR,
+    present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,
+    present_mode: usize,
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    swapchain: Option<Swapchain>,
+    /// Replaced swapchains, with what they wait for.
+    old: Vec<(Swapchain, Stamp)>,
+    recreate: bool,
+    /// Acquire semaphores nothing uses.
+    free: Vec<vk::Semaphore>,
+    /// Acquire semaphores a submission waited for, free once it finished.
+    waited: VecDeque<(vk::Semaphore, usize, u64)>,
+    /// Signalled present fences.
+    fences: Vec<vk::Fence>,
+    outstanding: Arc<Mutex<Outstanding>>,
+    _usage: PhantomData<fn() -> U>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Outstanding {
+    #[default]
+    None,
+    Acquired(u32),
+    /// Dropped without a present.
+    Abandoned(u32),
+}
+
+/// An image [`PresentSurface::acquire`] handed out. Dropping it instead of presenting it makes
+/// the next acquire recreate the swapchain.
+#[must_use]
+pub struct AcquiredImage {
+    index: u32,
+    outstanding: Arc<Mutex<Outstanding>>,
+    presented: bool,
+}
+
+impl AcquiredImage {
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl fmt::Debug for AcquiredImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcquiredImage").field("index", &self.index).finish()
+    }
+}
+
+impl Drop for AcquiredImage {
+    fn drop(&mut self) {
+        if !self.presented {
+            *lock(&self.outstanding) = Outstanding::Abandoned(self.index);
+        }
+    }
+}
+
+impl<U: StaticUsage> fmt::Debug for PresentSurface<U> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PresentSurface")
+            .field("format", &self.format)
+            .field("present_mode", &self.present_modes[self.present_mode].1)
+            .field("size", &self.size())
+            .finish()
+    }
+}
+
+fn surface_fn() -> Result<&'static ash::khr::surface::Instance> {
+    Functions::surface().ok_or_else(|| {
+        Error::message("lava was initialised without a display handle; surfaces are unavailable")
+    })
+}
+
+impl<U: StaticUsage> PresentSurface<U> {
+    /// A surface for `window`, whose images have the first of `preferred` the surface has whose
+    /// format supports `U`, else any such. The first [`Self::acquire`] makes the swapchain.
+    ///
+    /// # Safety
+    /// `display` and `window` must be valid handles, and the window must outlive the surface.
+    #[validation_trace]
+    pub unsafe fn new(
+        display: &RawDisplayHandle,
+        window: &RawWindowHandle,
+        preferred: &[vk::SurfaceFormatKHR],
+    ) -> Result<Self> {
+        let surface_fn = surface_fn()?;
+        let (entry, instance) = (Functions::entry(), Functions::instance());
+        let surface = unsafe { ash_window::create_surface(entry, instance, *display, *window, None)? };
+        let made = (|| {
+            let device = Ctx::physical_device().handel;
+            let family = Ctx::get().queues.graphics().index;
+            let can_present =
+                unsafe { surface_fn.get_physical_device_surface_support(device, family, surface)? };
+            if !can_present {
+                return Err(Error::message("the graphics queue family cannot present to this surface"));
+            }
+            let formats = unsafe { surface_fn.get_physical_device_surface_formats(device, surface)? };
+            let modes = unsafe { surface_fn.get_physical_device_surface_present_modes(device, surface)? };
+            let capabilities =
+                unsafe { surface_fn.get_physical_device_surface_capabilities(device, surface)? };
+            let usage = U::VK;
+            if !capabilities.supported_usage_flags.contains(usage) {
+                return Err(Error::message(format!(
+                    "the surface supports the image usages {:?}, swapchain images need {usage:?}",
+                    capabilities.supported_usage_flags
+                )));
+            }
+            use vk::{FormatFeatureFlags as F, ImageUsageFlags as I};
+            let needed = [
+                (I::COLOR_ATTACHMENT, F::COLOR_ATTACHMENT),
+                (I::STORAGE, F::STORAGE_IMAGE),
+                (I::SAMPLED, F::SAMPLED_IMAGE),
+                (I::TRANSFER_SRC, F::TRANSFER_SRC),
+                (I::TRANSFER_DST, F::TRANSFER_DST),
+            ];
+            let needed = (needed.into_iter())
+                .filter(|(u, _)| usage.contains(*u))
+                .fold(F::empty(), |all, (_, f)| all | f);
+            let usable = |f: &&vk::SurfaceFormatKHR| {
+                let properties =
+                    unsafe { instance.get_physical_device_format_properties(device, f.format) };
+                properties.optimal_tiling_features.contains(needed)
+            };
+            // No preference of the surface (none, or one `UNDEFINED`): any of `preferred`.
+            let format = match &formats[..] {
+                [] => preferred.iter().find(usable),
+                [only] if only.format == vk::Format::UNDEFINED => preferred.iter().find(usable),
+                _ => (preferred.iter().filter(|p| formats.contains(p)))
+                    .chain(&formats)
+                    .find(usable),
+            };
+            let format = *format.ok_or_else(|| {
+                Error::message(format!("the surface has no format whose images support {usage:?}"))
+            })?;
+            // FIFO is always supported.
+            let present_modes = [
+                (vk::PresentModeKHR::FIFO, "FIFO (vsync)"),
+                (vk::PresentModeKHR::FIFO_RELAXED, "FIFO relaxed"),
+                (vk::PresentModeKHR::MAILBOX, "Mailbox"),
+                (vk::PresentModeKHR::IMMEDIATE, "Immediate"),
+            ];
+            let present_modes = (present_modes.into_iter())
+                .filter(|(mode, _)| *mode == vk::PresentModeKHR::FIFO || modes.contains(mode))
+                .collect();
+            Ok(Self {
+                surface,
+                format,
+                present_modes,
+                present_mode: 0,
+                capabilities,
+                swapchain: None,
+                old: Vec::new(),
+                recreate: false,
+                free: Vec::new(),
+                waited: VecDeque::new(),
+                fences: Vec::new(),
+                outstanding: Arc::default(),
+                _usage: PhantomData,
+            })
+        })();
+        if made.is_err() {
+            unsafe { surface_fn.destroy_surface(surface, None) };
+        }
+        made
+    }
+
+    pub fn format(&self) -> format::Dynamic {
+        format::Dynamic(self.format.format)
+    }
+
+    /// The extent of the swapchain's images, zero before the first acquire.
+    pub fn size(&self) -> UVec2 {
+        self.swapchain.as_ref().map_or(UVec2::ZERO, |s| s.extent)
+    }
+
+    pub fn num_images(&self) -> usize {
+        self.swapchain.as_ref().map_or(0, |s| s.images.len())
+    }
+
+    /// The present modes the surface supports, FIFO first, with their names.
+    pub fn present_modes(&self) -> &[(vk::PresentModeKHR, &'static str)] {
+        &self.present_modes
+    }
+
+    pub fn present_mode(&self) -> usize {
+        self.present_mode
+    }
+
+    /// Presents with mode `index` of `present_modes` from the next acquire on.
+    pub fn set_present_mode(&mut self, index: usize) {
+        assert!(index < self.present_modes.len(), "present mode {index} of {}", self.present_modes.len());
+        self.present_mode = index;
+    }
+
+    pub fn handle(&self) -> vk::SurfaceKHR {
+        self.surface
+    }
+
+    /// The next image for a window of `size`, `None` while the window has no extent. Panics
+    /// while an acquired image is neither presented nor dropped.
+    #[validation_trace]
+    pub fn acquire(&mut self, size: UVec2) -> Result<Option<AcquiredImage>> {
+        let device = Ctx::device();
+        let outstanding = *lock(&self.outstanding);
+        match outstanding {
+            Outstanding::Acquired(_) => {
+                panic!("an image acquired before is still outstanding: present or drop it first")
+            }
+            Outstanding::Abandoned(index) => {
+                self.recover(index)?;
+                *lock(&self.outstanding) = Outstanding::None;
+            }
+            Outstanding::None => {}
+        }
+        let free = &mut self.free;
+        self.waited.retain(|&(semaphore, t, v)| {
+            let done = completed(t) >= v || poll(t) >= v;
+            if done {
+                free.push(semaphore);
+            }
+            !done
+        });
+        let signalled = |fence: &vk::Fence| unsafe { device.get_fence_status(*fence) }.unwrap_or(false);
+        if let Some(swapchain) = &mut self.swapchain {
+            for fence in swapchain.fences.extract_if(.., |fence| signalled(fence)) {
+                self.fences.push(fence);
+            }
+        }
+        for (swapchain, _) in self.old.extract_if(.., |(swapchain, stamp)| {
+            let presented = match gate::PresentFences::on() {
+                true => swapchain.fences.iter().all(signalled),
+                false => swapchain.presenter.is_none_or(|(t, v)| poll(t) > v),
+            };
+            presented && stamp.is_done()
+        }) {
+            swapchain.destroy();
+        }
+        if size.x == 0 || size.y == 0 {
+            return Ok(None);
+        }
+        for _ in 0..3 {
+            let physical_device = Ctx::physical_device().handel;
+            self.capabilities = unsafe {
+                surface_fn()?.get_physical_device_surface_capabilities(physical_device, self.surface)?
+            };
+            let (min, max) = (self.capabilities.min_image_extent, self.capabilities.max_image_extent);
+            if max.width == 0 || max.height == 0 {
+                return Ok(None);
+            }
+            let extent = vk::Extent2D {
+                width: size.x.clamp(min.width, max.width.max(min.width)),
+                height: size.y.clamp(min.height, max.height.max(min.height)),
+            };
+            let stale = self.swapchain.as_ref().is_none_or(|s| {
+                s.extent != UVec2::new(extent.width, extent.height) || s.present_mode != self.present_mode
+            });
+            if stale || self.recreate {
+                let _span = tracing::info_span!("recreate swapchain").entered();
+                let caps = &self.capabilities;
+                let mode = self.present_modes[self.present_mode].0;
+                let usage = U::VK;
+                let mut info = vk::SwapchainCreateInfoKHR::default()
+                    .surface(self.surface)
+                    .min_image_count(caps.min_image_count)
+                    .image_format(self.format.format)
+                    .image_color_space(self.format.color_space)
+                    .image_extent(extent)
+                    .image_array_layers(1)
+                    .image_usage(usage)
+                    .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .pre_transform(caps.current_transform)
+                    .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                    .present_mode(mode)
+                    .clipped(true)
+                    .old_swapchain(self.swapchain.as_ref().map_or_else(Default::default, |s| s.handle));
+                let modes = [mode];
+                let mut modes_info = vk::SwapchainPresentModesCreateInfoEXT::default().present_modes(&modes);
+                if gate::PresentFences::on() {
+                    info = info.push_next(&mut modes_info);
+                }
+                let handle = unsafe { Functions::swapchain().create_swapchain(&info, None)? };
+                tracing::info!("made a swapchain of {}x{} images, presenting {mode:?}", extent.width, extent.height);
+                let mut swapchain = Swapchain {
+                    handle,
+                    extent: UVec2::new(extent.width, extent.height),
+                    present_mode: self.present_mode,
+                    images: SmallVec::new(),
+                    fences: Vec::new(),
+                    presenter: None,
+                };
+                let made = (|| -> Result<()> {
+                    let images = unsafe { Functions::swapchain().get_swapchain_images(handle)? };
+                    for (i, image) in images.into_iter().enumerate() {
+                        Functions::set_debug_name(&format!("Swapchain image {i}"), image);
+                        let info = vk::ImageViewCreateInfo::default()
+                            .format(self.format.format)
+                            .image(image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            });
+                        let view = unsafe { device.create_image_view(&info, None)? };
+                        let present = match unsafe { device.create_semaphore(&Default::default(), None) } {
+                            Ok(present) => present,
+                            Err(err) => {
+                                unsafe { device.destroy_image_view(view, None) };
+                                return Err(err.into());
+                            }
+                        };
+                        let state = ImageState::UNDEFINED.atomic();
+                        let handle = BindlessHandle::none();
+                        swapchain.images.push(SwapchainImage { image, view, handle, state, present });
+                    }
+                    for (set, flag) in [
+                        (bindless::Set::Sampled, vk::ImageUsageFlags::SAMPLED),
+                        (bindless::Set::Storage, vk::ImageUsageFlags::STORAGE),
+                    ] {
+                        if !usage.contains(flag) {
+                            continue;
+                        }
+                        let mut indices = SmallVec::<[u32; 5]>::new();
+                        for image in &mut swapchain.images {
+                            let index = bindless::allocate(set, 1)?;
+                            *set.index_mut(&mut image.handle) = index;
+                            indices.push(index);
+                        }
+                        bindless::bind_raw(
+                            swapchain.images.iter().map(|image| (image.view, usage)),
+                            indices.into_iter().map(|index| set.handle(index)),
+                        );
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = made {
+                    swapchain.destroy();
+                    return Err(err);
+                }
+                if let Some(old) = self.swapchain.replace(swapchain) {
+                    self.old.push((old, latest_stamp()));
+                }
+                self.recreate = false;
+            }
+            let semaphore = match self.free.pop() {
+                Some(semaphore) => semaphore,
+                None => unsafe { device.create_semaphore(&Default::default(), None)? },
+            };
+            let swapchain = self.swapchain.as_ref().expect("made above");
+            let acquired = unsafe {
+                let _span = tracing::info_span!("wait for swapchain image").entered();
+                let fence = vk::Fence::null();
+                Functions::swapchain().acquire_next_image(swapchain.handle, u64::MAX, semaphore, fence)
+            };
+            match acquired {
+                Ok((index, suboptimal)) => {
+                    self.recreate |= suboptimal;
+                    let image = &swapchain.images[index as usize];
+                    let entry = Entry {
+                        acquire: semaphore,
+                        present: image.present,
+                        waited: None,
+                        presented: None,
+                    };
+                    lock(&PRESENTS).insert(image.image, entry);
+                    set_acquired(&image.state, true);
+                    *lock(&self.outstanding) = Outstanding::Acquired(index);
+                    return Ok(Some(AcquiredImage {
+                        index,
+                        outstanding: self.outstanding.clone(),
+                        presented: false,
+                    }));
+                }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.free.push(semaphore);
+                    self.recreate = true;
+                }
+                Err(err) => {
+                    self.free.push(semaphore);
+                    return Err(err.into());
+                }
+            }
+        }
+        Err(Error::message("the swapchain was still out of date after three recreations"))
+    }
+
+    /// The view of `image`, for the submission that draws into it and presents it.
+    pub fn image(&self, image: &AcquiredImage) -> ImageView<'_, format::Dynamic, U> {
+        let swapchain = self.swapchain.as_ref().expect("an image was acquired");
+        let i = &swapchain.images[image.index as usize];
+        ImageView {
+            image: i.image,
+            view: i.view,
+            mip_range: (0..1).into(),
+            extent: swapchain.extent,
+            handle: i.handle,
+            states: std::slice::from_ref(&i.state),
+            format: self.format(),
+            usage: U::default(),
+            dim: D2,
+        }
+    }
+
+    /// Presents `image` on the queue of the submission that recorded `cmd.present` of it.
+    /// Panics if none did.
+    #[validation_trace]
+    pub fn present(&mut self, mut image: AcquiredImage) -> Result<()> {
+        let index = image.index;
+        let swapchain = self.swapchain.as_ref().expect("an image was acquired");
+        let (handle, vk_image) = (swapchain.handle, swapchain.images[index as usize].image);
+        let entry = lock(&PRESENTS).remove(&vk_image).expect("an acquired image is in the table");
+        let Some((queue, t, v)) = entry.presented else {
+            lock(&PRESENTS).insert(vk_image, entry);
+            panic!("no submission presented the image: record `cmd.present(surface.image(&image))` and submit it first");
+        };
+        image.presented = true;
+        drop(image);
+        *lock(&self.outstanding) = Outstanding::None;
+        let (wt, wv) = entry.waited.expect("a presenting submission waited for the acquire");
+        self.waited.push_back((entry.acquire, wt, wv));
+
+        let device = Ctx::device();
+        let (swapchains, indices, waits) = ([handle], [index], [entry.present]);
+        let mut info = vk::PresentInfoKHR::default()
+            .swapchains(&swapchains)
+            .image_indices(&indices)
+            .wait_semaphores(&waits);
+        let fence = match gate::PresentFences::on() {
+            false => None,
+            true => Some([match self.fences.pop() {
+                Some(fence) => {
+                    unsafe { device.reset_fences(&[fence])? };
+                    fence
+                }
+                None => unsafe { device.create_fence(&Default::default(), None)? },
+            }]),
+        };
+        let swapchain = self.swapchain.as_mut().expect("an image was acquired");
+        swapchain.presenter = Some((t, v));
+        let mut fence_info = vk::SwapchainPresentFenceInfoEXT::default();
+        if let Some(fence) = &fence {
+            fence_info = fence_info.fences(fence);
+            info = info.push_next(&mut fence_info);
+            swapchain.fences.push(fence[0]);
+        }
+        let _span = tracing::info_span!("present").entered();
+        let presented = unsafe { Functions::swapchain().queue_present(*lock(queue), &info) };
+        match presented {
+            Ok(suboptimal) => self.recreate |= suboptimal,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate = true,
+            Err(err) => return Err(err.into()),
+        }
+        Ok(())
+    }
+
+    /// Takes back image `index`, dropped instead of presented, consuming the semaphores it left
+    /// signalled.
+    fn recover(&mut self, index: u32) -> Result<()> {
+        self.recreate = true;
+        let Some(swapchain) = &self.swapchain else {
+            return Ok(());
+        };
+        let image = &swapchain.images[index as usize];
+        set_acquired(&image.state, false);
+        let Some(entry) = lock(&PRESENTS).remove(&image.image) else {
+            return Ok(());
+        };
+        let mut signalled = SmallVec::<[vk::Semaphore; 2]>::new();
+        match entry.waited {
+            Some((t, v)) => self.waited.push_back((entry.acquire, t, v)),
+            None => signalled.push(entry.acquire),
+        }
+        if entry.presented.is_some() {
+            signalled.push(entry.present);
+        }
+        if !signalled.is_empty() {
+            let device = Ctx::device();
+            let waits: SmallVec<[_; 2]> = (signalled.iter())
+                .map(|&semaphore| {
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(semaphore)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                })
+                .collect();
+            let fence = unsafe { device.create_fence(&Default::default(), None)? };
+            let submitted = {
+                let queue = lock(&Ctx::get().queues.graphics().queues[0]);
+                let info = vk::SubmitInfo2::default().wait_semaphore_infos(&waits);
+                unsafe { device.queue_submit2(*queue, &[info], fence) }
+            };
+            let waited = submitted.and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
+            unsafe { device.destroy_fence(fence, None) };
+            waited?;
+        }
+        if entry.waited.is_none() {
+            self.free.push(entry.acquire);
+        }
+        Ok(())
+    }
+}
+
+impl<U: StaticUsage> Drop for PresentSurface<U> {
+    fn drop(&mut self) {
+        let outstanding = *lock(&self.outstanding);
+        if let Outstanding::Abandoned(index) = outstanding
+            && let Err(err) = self.recover(index)
+        {
+            tracing::error!(%err, "failed to take back a dropped swapchain image");
+        }
+        let mut swapchains: Vec<Swapchain> = self.old.drain(..).map(|(s, _)| s).collect();
+        swapchains.extend(self.swapchain.take());
+        let fences: Vec<vk::Fence> = swapchains.iter().flat_map(|s| s.fences.iter().copied()).collect();
+        let device = Ctx::device();
+        if !fences.is_empty() && unsafe { device.wait_for_fences(&fences, true, 1_000_000_000) }.is_err() {
+            tracing::warn!("a present's fence didn't signal before its surface was dropped");
+        }
+        let mut semaphores = std::mem::take(&mut self.free);
+        semaphores.extend(self.waited.drain(..).map(|(semaphore, ..)| semaphore));
+        let fences = std::mem::take(&mut self.fences);
+        let surface = self.surface;
+        lifetime::retire(move || {
+            for swapchain in swapchains {
+                swapchain.destroy();
+            }
+            let device = Ctx::device();
+            for semaphore in semaphores {
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+            for fence in fences {
+                unsafe { device.destroy_fence(fence, None) };
+            }
+            if let Some(surface_fn) = Functions::surface() {
+                unsafe { surface_fn.destroy_surface(surface, None) };
+            }
+        });
+    }
+}

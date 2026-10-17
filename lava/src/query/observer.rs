@@ -11,29 +11,26 @@ pub struct ScopeInfo {
     pub name: &'static str,
     /// 0 for the root `measure` names.
     pub depth: u16,
-    /// A compute or ray tracing pass, or a rendering (`RasterBuilder::record`), named by its
-    /// generated struct or its `record` name; else a `CommandBuffer::scope` or the root.
+    /// A pass or rendering, named by its generated struct or `record` name; else a
+    /// `CommandBuffer::scope` or the root.
     pub pass: bool,
 }
 
-/// Watches the scopes of a recording while `CommandBuffer::measure` attaches it: the root,
-/// every `CommandBuffer::scope`, and every pass and rendering, which are scopes of their own.
-/// Each is entered and exited once, in nesting order. Its hooks can record queries that
-/// bracket the scope's commands: what `on_enter` records comes before them (a pass's barriers
-/// included), what `on_exit` records after them. Passes don't nest, and neither renderings nor
-/// passes contain other scopes.
+/// Watches the root, every `CommandBuffer::scope` and every pass and rendering of a recording
+/// while `CommandBuffer::measure` attaches it, each entered and exited once in nesting order.
+/// What `on_enter` records comes before the scope's commands (a pass's barriers included), what
+/// `on_exit` records after them.
 pub trait ScopeObserver {
     fn on_enter(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo);
     fn on_exit(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo);
 }
 
 /// What a [`ScopeObserver`] can record at the edges of a scope: queries, nothing else.
-pub struct QueryRecorder<'a> {
-    pub(crate) cmd: &'a mut Recording,
+pub struct QueryRecorder<'a, 'p> {
+    pub(crate) cmd: &'a mut Recording<'p>,
 }
 
-impl QueryRecorder<'_> {
-    /// See `CommandBuffer::write_timestamp`.
+impl QueryRecorder<'_, '_> {
     pub fn write_timestamp(
         &mut self,
         pool: &QueryPool<Timestamp>,

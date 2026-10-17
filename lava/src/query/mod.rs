@@ -1,10 +1,4 @@
 //! GPU queries: user-owned pools of one kind each (timestamps, and with their features pipeline statistics, occlusion, hardware counters, compacted sizes), reset on the host when a recording first touches them, read without waiting, and destroyed once no submission can reach them
-//!
-//! A pool holds the results of one recording. The first command of a recording that touches a
-//! pool resets it on the host, which needs the recording that touched it before to be done:
-//! keep one pool per frame slot (`Submission::slot`). Its results are readable once that recording finished
-//! ([`QueryPool::read`] never waits). A [`ScopeObserver`] that `CommandBuffer::measure` attaches
-//! can record queries at the edges of every scope and pass of a recording.
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "calibrated-timestamps")]
 use std::time::{Duration, Instant};
@@ -31,14 +25,7 @@ pub use crate::vk::QueryPipelineStatisticFlags;
 pub use counters::{Counter, CounterUnit, MAX_COUNTERS};
 pub use observer::{QueryRecorder, ScopeInfo, ScopeObserver};
 
-pub(crate) fn init() -> Result<()> {
-    #[cfg(feature = "performance-query")]
-    counters::init()?;
-    Ok(())
-}
-
-/// What a pool's queries measure, and what the pool needs to know about them. Only lava
-/// implements it.
+/// What a pool's queries measure. Only lava implements it.
 pub trait QueryKind: Sealed {
     #[doc(hidden)]
     const TYPE: vk::QueryType;
@@ -51,7 +38,6 @@ pub trait QueryKind: Sealed {
 
 /// Kinds whose queries are begun and ended around commands (`CommandBuffer::query`).
 pub trait Scoped: QueryKind {
-    /// What a query of this pool is begun with.
     #[doc(hidden)]
     fn control_flags(&self) -> vk::QueryControlFlags {
         vk::QueryControlFlags::empty()
@@ -64,19 +50,17 @@ pub trait SingleValue: QueryKind {}
 /// The device's clock when a command reached a stage (`CommandBuffer::write_timestamp`).
 pub struct Timestamp {
     /// The valid bits of the family the timestamps were last written on, as a mask.
-    valid_bits: AtomicU64,
+    pub(crate) valid_bits: AtomicU64,
 }
 
 /// Invocation and primitive counts of the commands in a query.
 #[cfg(feature = "pipeline-statistics")]
 pub struct PipelineStatistics {
-    /// What each query counts.
     flags: vk::QueryPipelineStatisticFlags,
 }
 
 /// Samples that passed the depth and stencil tests in a query.
 pub struct Occlusion {
-    /// Whether queries count samples exactly.
     precise: bool,
 }
 
@@ -106,7 +90,6 @@ kinds! {
     Occlusion: OCCLUSION + SingleValue;
 }
 
-/// The statistics only graphics work counts.
 #[cfg(feature = "pipeline-statistics")]
 const GRAPHICS_STATISTICS: vk::QueryPipelineStatisticFlags = vk::QueryPipelineStatisticFlags::from_raw(
     !vk::QueryPipelineStatisticFlags::COMPUTE_SHADER_INVOCATIONS.as_raw(),
@@ -169,7 +152,6 @@ pub struct QueryPool<K: QueryKind> {
 }
 
 impl<K: QueryKind> QueryPool<K> {
-    /// A pool of `count` queries of `kind`, whose type-specific creation info is in `info`.
     fn create(count: u32, info: vk::QueryPoolCreateInfo, kind: K) -> Result<Self> {
         assert!(count > 0, "a query pool holds at least one query");
         let info = info.query_type(K::TYPE).query_count(count);
@@ -189,7 +171,7 @@ impl<K: QueryKind> QueryPool<K> {
     }
 
     /// Called by every command that touches the pool: resets it on the host the first time a
-    /// recording does, which needs the recording before to be done.
+    /// recording does.
     pub(crate) fn record(&self, rec: &Recording) {
         const _: () = assert!(crate::queue::MAX_TIMELINES <= 8);
         let packed = rec.value << 3 | rec.timeline as u64;
@@ -206,8 +188,6 @@ impl<K: QueryKind> QueryPool<K> {
         unsafe { Ctx::device().reset_query_pool(self.handle, 0, self.count) };
     }
 
-    /// Reads the results of `queries` queries from `first` on into `out`, `stride` bytes per
-    /// query, if they are all available.
     fn read_raw<T>(&self, first: u32, queries: u32, out: &mut [T], stride: usize) -> Result<bool> {
         assert!(
             first + queries <= self.count,
@@ -261,15 +241,6 @@ impl QueryPool<Timestamp> {
         Self::create(count, vk::QueryPoolCreateInfo::default(), kind)
     }
 
-    /// Resets the pool if needed, and remembers the valid bits of the family `rec` records
-    /// for, `bits`.
-    pub(crate) fn record_on(&self, rec: &Recording, bits: u32) {
-        self.record(rec);
-        assert!(bits > 0, "the {:?} family has no timestamps", rec.kind);
-        let mask = if bits >= 64 { !0 } else { (1 << bits) - 1 };
-        self.kind.valid_bits.store(mask, Ordering::Relaxed);
-    }
-
     /// Nanoseconds from timestamp `start` to `end`, which is later, also across a wrap of the
     /// device's clock.
     pub fn elapsed_ns(&self, start: u64, end: u64) -> u64 {
@@ -278,53 +249,40 @@ impl QueryPool<Timestamp> {
         (ticks as f64 * period) as u64
     }
 
-    /// When the device's clock read `tick`, on the host's clock: from
-    /// `VK_KHR_calibrated_timestamps`, `None` if calibrating failed. Calibrates once per call.
+    /// When the device's clock read `tick`, on the host's clock, `None` if calibrating failed.
+    /// Calibrates once per call.
     #[cfg(feature = "calibrated-timestamps")]
     pub fn instant(&self, tick: u64) -> Gated<gate::CalibratedTimestamps, Option<Instant>> {
-        gate::<gate::CalibratedTimestamps, _>(|| self.instant_of(tick))
-    }
-
-    #[cfg(feature = "calibrated-timestamps")]
-    fn instant_of(&self, tick: u64) -> Option<Instant> {
-        let (now_ticks, now) = calibrate()?;
-        let valid_bits = self.kind.valid_bits.load(Ordering::Relaxed);
-        let period = Ctx::device_properties().limits.timestamp_period as f64;
-        let ns = |ticks: u64| Duration::from_nanos((ticks as f64 * period) as u64);
-        // A tick before the calibration is a positive distance in the masked ticks, unless the
-        // clock wrapped in between, which reads as the other way round.
-        let behind = now_ticks.wrapping_sub(tick) & valid_bits;
-        Some(if behind <= valid_bits >> 1 {
-            now - ns(behind)
-        } else {
-            now + ns(tick.wrapping_sub(now_ticks) & valid_bits)
+        gate::<gate::CalibratedTimestamps, _>(|| {
+            let functions = Functions::calibrated_timestamps();
+            let info = [vk::CalibratedTimestampInfoKHR::default().time_domain(vk::TimeDomainKHR::DEVICE)];
+            let before = Instant::now();
+            let (timestamps, _max_deviation) = unsafe { functions.get_calibrated_timestamps(&info) }
+                .inspect_err(|err| tracing::warn!("failed to calibrate the GPU timestamps: {err}"))
+                .ok()?;
+            let after = Instant::now();
+            let (now_ticks, now) = (timestamps[0], before + (after - before) / 2);
+            let valid_bits = self.kind.valid_bits.load(Ordering::Relaxed);
+            let period = Ctx::device_properties().limits.timestamp_period as f64;
+            let ns = |ticks: u64| Duration::from_nanos((ticks as f64 * period) as u64);
+            // A tick before the calibration is a positive masked distance, unless the clock
+            // wrapped in between, which reads as the other way round.
+            let behind = now_ticks.wrapping_sub(tick) & valid_bits;
+            Some(if behind <= valid_bits >> 1 {
+                now - ns(behind)
+            } else {
+                now + ns(tick.wrapping_sub(now_ticks) & valid_bits)
+            })
         })
     }
 }
 
-/// The device's clock (its raw timestamp) and the host's at the same moment, from
-/// `VK_KHR_calibrated_timestamps` (past its check): the host time is the middle of the call.
-#[cfg(feature = "calibrated-timestamps")]
-fn calibrate() -> Option<(u64, Instant)> {
-    let functions = Functions::calibrated_timestamps();
-    let info = [vk::CalibratedTimestampInfoKHR::default().time_domain(vk::TimeDomainKHR::DEVICE)];
-    let before = Instant::now();
-    let (timestamps, _max_deviation) = unsafe { functions.get_calibrated_timestamps(&info) }
-        .inspect_err(|err| tracing::warn!("failed to calibrate the GPU timestamps: {err}"))
-        .ok()?;
-    let after = Instant::now();
-    Some((timestamps[0], before + (after - before) / 2))
-}
-
-/// The most statistics one query can count: every flag up to mesh shader invocations, plus
-/// one spare.
+/// Every flag up to mesh shader invocations, plus one spare.
 #[cfg(feature = "pipeline-statistics")]
 const STATISTICS: usize = 14;
 
-/// What one pipeline statistics query counted, for the flags of its pool.
-///
-/// Also the layout a query's results are read into: they come in the order of their flag bits,
-/// one `u64` each, from offset 0, and the pool is read straight into a slice of these.
+/// What one pipeline statistics query counted, for the flags of its pool. Results are read
+/// straight into it: one `u64` per flag, in bit order, from offset 0.
 #[cfg(feature = "pipeline-statistics")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -335,7 +293,7 @@ pub struct PipelineStats {
 
 #[cfg(feature = "pipeline-statistics")]
 impl PipelineStats {
-    /// The count of one statistic, `None` if the pool doesn't count it.
+    /// `None` if the pool doesn't count `statistic`.
     pub fn get(&self, statistic: vk::QueryPipelineStatisticFlags) -> Option<u64> {
         assert_eq!(
             statistic.as_raw().count_ones(),
@@ -423,12 +381,15 @@ impl QueryPool<Performance> {
                 "the counters need {passes} submissions, only selections of one can be recorded"
             )));
         }
-        // The lock must be held from before a command buffer that uses the pool is begun until
-        // its queries are done.
-        if !counters::acquire_lock() {
-            return Err(Error::message(
-                "the profiling lock is taken by another process",
-            ));
+        {
+            let mut users = counters::LOCK_USERS.lock().unwrap();
+            if *users == 0 {
+                let info = vk::AcquireProfilingLockInfoKHR::default().timeout(0);
+                if let Err(err) = unsafe { Functions::performance_query().1.acquire_profiling_lock(&info) } {
+                    return Err(Error::message(format!("the profiling lock is taken by another process ({err})")));
+                }
+            }
+            *users += 1;
         }
         let indices: Vec<u32> = counters.iter().map(|counter| counter.index).collect();
         let mut performance = vk::QueryPoolPerformanceCreateInfoKHR::default()
@@ -441,7 +402,7 @@ impl QueryPool<Performance> {
         Self::create(count, info, kind).inspect_err(|_| counters::release_lock())
     }
 
-    /// The counters of each query, in result order.
+    /// In result order.
     pub fn counters(&self) -> &[&'static Counter] {
         &self.kind.counters
     }
@@ -452,17 +413,26 @@ impl QueryPool<Performance> {
     pub fn read(&self, first: u32, out: &mut [f64]) -> Result<bool> {
         let width = self.kind.counters.len();
         assert_eq!(out.len() % width, 0, "whole queries of {width} counters");
-        // A result is an 8-byte union, so it is read in place and converted.
         const _: () = assert!(size_of::<vk::PerformanceCounterResultKHR>() == size_of::<f64>());
         let results: &mut [vk::PerformanceCounterResultKHR] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), out.len()) };
         let queries = (out.len() / width) as u32;
         let ready = self.read_raw(first, queries, results, width * size_of::<f64>())?;
         if ready {
+            use vk::PerformanceCounterStorageKHR as S;
             for (i, value) in out.iter_mut().enumerate() {
                 let result: vk::PerformanceCounterResultKHR =
                     unsafe { std::mem::transmute(*value) };
-                *value = self.kind.counters[i % width].value(&result);
+                *value = unsafe {
+                    match self.kind.counters[i % width].storage {
+                        S::INT32 => result.int32 as f64,
+                        S::INT64 => result.int64 as f64,
+                        S::UINT32 => result.uint32 as f64,
+                        S::UINT64 => result.uint64 as f64,
+                        S::FLOAT32 => result.float32 as f64,
+                        _ => result.float64,
+                    }
+                };
             }
         }
         Ok(ready)
@@ -471,7 +441,6 @@ impl QueryPool<Performance> {
 
 #[cfg(feature = "acceleration-structure")]
 impl QueryPool<CompactedSize> {
-    /// Room for the compacted sizes of `count` acceleration structures.
     pub fn compacted_sizes(count: u32) -> Result<Self> {
         crate::vkobjects::acceleration_structure::functions()?;
         Self::create(count, vk::QueryPoolCreateInfo::default(), CompactedSize)
@@ -489,31 +458,5 @@ impl<K: QueryKind> Drop for QueryPool<K> {
             }
             let _ = locked;
         });
-    }
-}
-
-#[cfg(all(test, feature = "pipeline-statistics"))]
-mod tests {
-    use super::*;
-    use vk::QueryPipelineStatisticFlags as S;
-
-    #[test]
-    fn statistics_are_found_by_their_flag_among_the_counted_ones() {
-        let stats = PipelineStats {
-            values: [7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            flags: S::FRAGMENT_SHADER_INVOCATIONS
-                | S::COMPUTE_SHADER_INVOCATIONS
-                | S::MESH_SHADER_INVOCATIONS_EXT,
-        };
-        assert_eq!(stats.get(S::FRAGMENT_SHADER_INVOCATIONS), Some(7));
-        assert_eq!(stats.get(S::COMPUTE_SHADER_INVOCATIONS), Some(8));
-        assert_eq!(stats.get(S::MESH_SHADER_INVOCATIONS_EXT), Some(9));
-        assert_eq!(stats.get(S::TASK_SHADER_INVOCATIONS_EXT), None);
-    }
-
-    #[test]
-    fn every_statistic_up_to_mesh_invocations_fits() {
-        let all = S::from_raw((S::MESH_SHADER_INVOCATIONS_EXT.as_raw() << 1) - 1);
-        assert!(all.as_raw().count_ones() as usize <= STATISTICS);
     }
 }

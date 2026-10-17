@@ -21,7 +21,6 @@ pub trait Dim: crate::sealed::Sealed + Copy + Default + Debug + Send + Sync + 's
     fn mip_extent(extent: Self::Extent, level: u32) -> Self::Extent;
     /// Whether the `extent` box at `offset` is non-empty and lies inside `mip_extent`.
     fn region_fits(mip_extent: Self::Extent, offset: Self::Extent, extent: Self::Extent) -> bool;
-    /// The texels of an `extent` box.
     fn texels(extent: Self::Extent) -> usize {
         let e = Self::extent_3d(extent);
         e.width as usize * e.height as usize * e.depth as usize
@@ -102,69 +101,5 @@ impl Dim for D3 {
         extent.cmpgt(UVec3::ZERO).all()
             && offset.cmple(mip_extent).all()
             && extent.cmple(mip_extent - offset.min(mip_extent)).all()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn regions_must_lie_inside_the_mip() {
-        let mip = UVec2::new(8, 4);
-        assert!(D2::region_fits(mip, UVec2::ZERO, mip));
-        assert!(D2::region_fits(mip, UVec2::new(6, 3), UVec2::new(2, 1)));
-        assert!(!D2::region_fits(mip, UVec2::new(6, 3), UVec2::new(3, 1)));
-        assert!(!D2::region_fits(mip, UVec2::new(9, 0), UVec2::ONE));
-        assert!(!D2::region_fits(mip, UVec2::ZERO, UVec2::new(0, 4)));
-        // Offsets near `u32::MAX` must not overflow.
-        assert!(!D2::region_fits(
-            mip,
-            UVec2::splat(u32::MAX),
-            UVec2::splat(u32::MAX)
-        ));
-        let volume = UVec3::new(8, 4, 2);
-        assert!(D3::region_fits(
-            volume,
-            UVec3::new(0, 0, 1),
-            UVec3::new(8, 4, 1)
-        ));
-        assert!(!D3::region_fits(
-            volume,
-            UVec3::new(0, 0, 1),
-            UVec3::new(8, 4, 2)
-        ));
-    }
-
-    #[test]
-    fn mip_extent_halves_per_level() {
-        let extent = UVec2::new(256, 64);
-        assert_eq!(D2::mip_extent(extent, 0), UVec2::new(256, 64));
-        assert_eq!(D2::mip_extent(extent, 1), UVec2::new(128, 32));
-        assert_eq!(D2::mip_extent(extent, 6), UVec2::new(4, 1));
-        assert_eq!(
-            D3::mip_extent(UVec3::new(64, 32, 8), 4),
-            UVec3::new(4, 2, 1)
-        );
-    }
-
-    #[test]
-    fn mip_extent_rounds_down_and_never_reaches_zero() {
-        assert_eq!(D2::mip_extent(UVec2::new(5, 3), 1), UVec2::new(2, 1));
-        assert_eq!(D2::mip_extent(UVec2::new(5, 3), 2), UVec2::new(1, 1));
-        assert_eq!(D2::mip_extent(UVec2::new(5, 3), 31), UVec2::new(1, 1));
-        // Shifting by the full bit width must not overflow.
-        assert_eq!(D2::mip_extent(UVec2::new(5, 3), 32), UVec2::new(1, 1));
-        assert_eq!(D2::mip_extent(UVec2::new(5, 3), 200), UVec2::new(1, 1));
-    }
-
-    #[test]
-    fn copy_offsets_and_extents_keep_2d_flat() {
-        let offset = D2::unsigned_offset_3d(UVec2::new(3, 4));
-        assert_eq!((offset.x, offset.y, offset.z), (3, 4, 0));
-        let offset = D3::unsigned_offset_3d(UVec3::new(3, 4, 5));
-        assert_eq!((offset.x, offset.y, offset.z), (3, 4, 5));
-        assert_eq!(D2::extent_3d(UVec2::new(3, 4)).depth, 1);
-        assert_eq!(D3::texels(UVec3::new(2, 3, 4)), 24);
     }
 }

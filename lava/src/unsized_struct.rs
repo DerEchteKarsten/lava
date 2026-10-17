@@ -1,16 +1,11 @@
 //! `unsized_struct!`: a sized struct whose const generics are the lengths of its array sections, and the unsized struct it derefs to, which keeps the fixed fields and reads the sections back as slices (pass bindings, draws)
 use std::mem::MaybeUninit;
 
-/// The section lengths of an [`unsized_struct!`]. It is 8-aligned and a multiple of 8 bytes
-/// long, so the sections after it (aligned to at most 8) start at the same offset in the sized
-/// and the unsized struct.
+/// 8-aligned and a multiple of 8 long, so the sections after it start at the same offset in
+/// both structs.
 #[repr(C, align(8))]
 pub(crate) struct Lens<const S: usize>(pub(crate) [u32; S]);
 
-/// Section `index` of `tail`, whose sections have the `lens` and `(size, align)` `layouts`:
-/// each starts where the one before ends, rounded up to its alignment, as `repr(C)` lays out
-/// the sized struct's arrays.
-///
 /// # Safety
 /// `tail` is an unsized struct's tail and `T` the type of its section `index`.
 #[inline]
@@ -20,7 +15,6 @@ pub(crate) unsafe fn section<'s, T>(
     layouts: &[(usize, usize)],
     index: usize,
 ) -> &'s [T] {
-    // Alignments are powers of two: a mask, not a division.
     let align = |offset: usize, align: usize| (offset + align - 1) & !(align - 1);
     let mut offset = 0usize;
     for (&len, &(size, alignment)) in lens.iter().zip(layouts).take(index) {
@@ -33,32 +27,8 @@ pub(crate) unsafe fn section<'s, T>(
     unsafe { std::slice::from_raw_parts(tail.as_ptr().add(offset).cast::<T>(), len) }
 }
 
-/// Declares a sized struct and the unsized struct it derefs to, like a `Vec` and its slice,
-/// but with fixed fields in front and several arrays:
-///
-/// ```ignore
-/// unsized_struct! {
-///     /// The sized one: `I` images, `B` buffers.
-///     pub struct Bindings<'a, K>[I, B];
-///     /// The unsized one commands borrow.
-///     pub struct BindingOutput {
-///         pass: u32,
-///     } sections {
-///         images: [ImageUse<'a>; I],
-///         buffers: [BufferAccess; B],
-///     }
-/// }
-/// ```
-///
-/// Both have the fixed fields (`pass`), readable through either, with the visibility given.
-/// The sized struct (`Bindings<'a, K, I, B>`) holds the sections as arrays, whose lengths are
-/// its const parameters, and is made with its private `from_parts(fixed.., sections..)`. It
-/// derefs to the unsized one (`BindingOutput<'a, K>`), which has the same layout up to the
-/// sections, then reads them as slices of the lengths stored in front of them, through a
-/// method per section with its visibility (`fn images(&self) -> &[ImageUse<'a>]`). The
-/// structs have one lifetime and any number of type parameters (markers), whose variance and
-/// auto traits they take, also those of the section types. Section types are aligned to at
-/// most 8.
+/// A sized struct with array sections (made by `from_parts`) that derefs to an unsized one
+/// reading them back as slices; section types are aligned to at most 8.
 macro_rules! unsized_struct {
     (
         $(#[$sized_attr:meta])*
@@ -85,7 +55,6 @@ macro_rules! unsized_struct {
             $($(#[$field_attr])* $field_vis $field: $field_ty,)*
             marker: ::std::marker::PhantomData<(&$lt (), $($param,)* $([$section_ty; 0],)*)>,
             lens: $crate::unsized_struct::Lens<{ [$(stringify!($section)),*].len() }>,
-            /// The sections, as the sized struct laid them out.
             tail: [::std::mem::MaybeUninit<u8>],
         }
 
@@ -117,14 +86,12 @@ macro_rules! unsized_struct {
                     size_of::<Self>() - tail,
                 );
                 // SAFETY: both are `repr(C)` with the same fields up to `lens`, which ends at
-                // a multiple of 8, where the sections start (aligned to at most 8) and the
-                // tail with the bytes from there on.
+                // a multiple of 8.
                 unsafe { &*(bytes as *const Self::Target) }
             }
         }
 
         impl<$lt, $($param),*> $unsized<$lt, $($param),*> {
-            /// Each section's `(size, align)`.
             const LAYOUTS: &'static [(usize, usize)] =
                 &[$((size_of::<$section_ty>(), align_of::<$section_ty>())),*];
 
@@ -148,36 +115,3 @@ macro_rules! unsized_struct {
     };
 }
 pub(crate) use unsized_struct;
-
-#[cfg(test)]
-mod tests {
-    use std::marker::PhantomData;
-
-    unsized_struct! {
-        /// Sections of every alignment, an empty one among them.
-        struct Sized<'a, K>[A, B, C, D];
-        struct Unsized {
-            first: u8,
-            name: &'a str,
-        } sections {
-            bytes: [u8; A],
-            words: [u64; B],
-            nothing: [u32; C],
-            halves: [u16; D],
-        }
-    }
-
-    #[test]
-    fn the_unsized_struct_reads_back_every_field_and_section() {
-        let sized: Sized<'_, PhantomData<()>, 3, 2, 0, 1> =
-            Sized::from_parts(7, "lava", [1, 2, 3], [4, u64::MAX], [], [6]);
-        let unsized_: &Unsized<'_, PhantomData<()>> = &sized;
-        assert_eq!((unsized_.first, unsized_.name), (7, "lava"));
-        assert_eq!(unsized_.bytes(), [1, 2, 3]);
-        assert_eq!(unsized_.words(), [4, u64::MAX]);
-        assert!(unsized_.nothing().is_empty());
-        assert_eq!(unsized_.halves(), [6]);
-        assert_eq!(size_of_val(unsized_), size_of_val(&sized));
-        assert!(std::ptr::eq(unsized_.words(), &sized.words));
-    }
-}

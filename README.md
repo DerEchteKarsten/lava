@@ -105,10 +105,8 @@ fn main() -> lava::Result<()> {
     let mut values = Buffer::<u32, Storage>::new(256, true)?;
     values.host_mut().iter_mut().enumerate().for_each(|(i, v)| *v = i as u32);
 
-    let timeline = Timeline::<Graphics>::builder().build()?;
-    // Reserve before reading anything the GPU work reaches, begin once a frame slot is free,
-    // then record and submit.
-    let submission = timeline.reserve().begin()?;
+    let timeline = Timeline::<Graphics>::new(2)?;
+    let submission = timeline.begin()?;
     let done = submission.submit(|cmd| {
         cmd.compute(&Double::push_bindings(values.range(..), 256), [4, 1, 1], None);
     })?;

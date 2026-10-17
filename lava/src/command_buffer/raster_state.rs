@@ -43,7 +43,6 @@ pub struct BlendEquation {
 }
 
 impl Blend {
-    /// The equation, or `None` for an unblended (or skipped) attachment.
     pub(crate) fn equation(self) -> Option<BlendEquation> {
         use BlendFactor as F;
         let both = |src, dst, src_alpha, dst_alpha| BlendEquation {
@@ -96,13 +95,10 @@ pub struct DepthBias {
     pub clamp: f32,
 }
 
-/// Where depths are clamped instead of clipped.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum DepthClamp {
-    /// To the viewport's depth range.
     Viewport,
-    /// To `[min, max]`.
     #[cfg_attr(not(feature = "depth-clamp-control"), allow(dead_code))]
     Range { min: f32, max: f32 },
 }
@@ -135,7 +131,6 @@ impl Default for StencilFace {
     }
 }
 
-/// The stencil test of front and back faces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stencil {
     pub front: StencilFace,
@@ -149,13 +144,9 @@ pub struct LineStipple {
     pub pattern: u16,
 }
 
-/// The state of one draw into `COLOR_ATTACHMENTS` color attachments. Draws that differ only
-/// here share a pipeline wherever the device has the state as dynamic state; elsewhere the
-/// state is part of the pipeline's key (the `dynamic-*` features). The defaults draw filled,
-/// back-face-culled triangles with clockwise front faces, depth-tested with `GREATER`
-/// (reversed depth) and depth-writing when the rendering has a depth attachment, and
-/// replace every color attachment. Setters of state that needs an optional feature return a
-/// [`Gated`] state.
+/// The state of one draw into `COLOR_ATTACHMENTS` color attachments. The defaults draw
+/// back-face-culled triangles with clockwise front faces, depth-tested with `GREATER` (reversed
+/// depth) and depth-writing, and replace every color attachment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RasterState<const COLOR_ATTACHMENTS: usize> {
     pub(super) topology: PrimitiveTopology,
@@ -229,13 +220,11 @@ setters! {
     topology: PrimitiveTopology,
     /// Whether the index `!0` restarts strips and fans.
     primitive_restart: bool,
-    /// Discards every primitive before rasterization.
     rasterizer_discard: bool,
     cull_mode: CullModeFlags,
     front_face: FrontFace,
     /// The depth test against the depth attachment; `None` draws without one.
     depth_test: Option<CompareOp>,
-    /// Whether fragments that pass the depth test write their depth.
     depth_write: bool,
     depth_bias: Option<DepthBias>,
     /// The stencil test against the depth attachment's stencil; `None` draws without one.
@@ -246,8 +235,6 @@ setters! {
     write_masks: [ColorComponentFlags; COLOR_ATTACHMENTS],
 }
 
-/// Setters of state that needs feature `$marker` (cargo feature `$cargo`), which exist only
-/// with it.
 macro_rules! gated_setters {
     ($($(#[doc = $doc:literal])* $cargo:literal => $marker:ident: $name:ident($state:ident $(, $arg:ident: $ty:ty)*) $body:block)*) => {
         impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
@@ -334,8 +321,6 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
         self
     }
 
-    /// The state without the per-attachment parts, and those: a draw keeps them in its own
-    /// sections.
     pub(super) fn split(self) -> (RasterState<0>, [Blend; COLOR_ATTACHMENTS], [ColorComponentFlags; COLOR_ATTACHMENTS]) {
         let state = RasterState {
             topology: self.topology,
@@ -364,15 +349,9 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
         };
         (state, self.blends, self.write_masks)
     }
-
-    /// Whether the draw writes depth into a depth attachment.
-    pub(super) fn writes_depth(&self) -> bool {
-        self.depth_test.is_some() && self.depth_write
-    }
 }
 
-/// Field `$field` of `$features` (the device's), or `false` if lava was compiled without cargo
-/// feature `$cargo`.
+/// Field `$field` of `$features`, or `false` if lava was compiled without cargo feature `$cargo`.
 macro_rules! on {
     ($features:expr, $cargo:literal, $field:ident) => {{
         #[allow(unused_variables)]
@@ -388,8 +367,6 @@ macro_rules! on {
 }
 pub(crate) use on;
 
-/// Which of a draw's states the device sets dynamically, by the `dynamic-*` features (and the
-/// capabilities whose state only exists with them).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Dynamic {
     pub(crate) blend: bool,
@@ -434,35 +411,33 @@ impl Dynamic {
     }
 }
 
-/// The state a raster pipeline bakes in because the device can't set it dynamically: part of
-/// its key. A field exists only where its capability is compiled and its `dynamic-*` feature
-/// isn't asserted (`bake_*` cfgs, from `build.rs`), and holds the draw's value only where the
-/// device lacks the dynamic state; elsewhere it keeps its default, so draws share pipelines.
+/// A field exists only where its capability is compiled and its `dynamic-*` feature isn't
+/// asserted (`bake_*` cfgs), and holds the draw's value only where the device lacks the dynamic
+/// state, so draws share pipelines elsewhere.
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub(crate) struct Baked {
     #[cfg(bake_polygon_mode)]
-    polygon_mode: PolygonMode,
+    pub(crate) polygon_mode: PolygonMode,
     #[cfg(bake_depth_clamp)]
-    depth_clamp: bool,
+    pub(crate) depth_clamp: bool,
     #[cfg(bake_depth_clip)]
-    depth_clip: bool,
+    pub(crate) depth_clip: bool,
     #[cfg(bake_depth_clip_negative_one_to_one)]
-    depth_clip_negative_one_to_one: bool,
+    pub(crate) depth_clip_negative_one_to_one: bool,
     #[cfg(bake_logic_op)]
-    logic_op: Option<LogicOp>,
+    pub(crate) logic_op: Option<LogicOp>,
     #[cfg(bake_conservative_rasterization)]
-    conservative: ConservativeRasterizationModeEXT,
+    pub(crate) conservative: ConservativeRasterizationModeEXT,
     #[cfg(bake_line_mode)]
-    line_mode: LineRasterizationModeKHR,
+    pub(crate) line_mode: LineRasterizationModeKHR,
     #[cfg(bake_line_stipple)]
-    line_stipple: bool,
+    pub(crate) line_stipple: bool,
     #[cfg(bake_provoking_vertex)]
-    provoking_vertex: ProvokingVertexModeEXT,
+    pub(crate) provoking_vertex: ProvokingVertexModeEXT,
 }
 
 #[allow(unused_variables, unused_mut)]
 impl Baked {
-    /// What a pipeline bakes in for a draw of `state` on a device with `dynamic`.
     pub(crate) fn of(state: &RasterState<0>, dynamic: &Dynamic) -> Self {
         let mut baked = Self::default();
         #[cfg(bake_polygon_mode)]
@@ -503,66 +478,8 @@ impl Baked {
         }
         baked
     }
-
-    // What a pipeline is made with; where the state is dynamic (or has no field) it is ignored
-    // or the default.
-    pub(crate) fn polygon_mode(&self) -> PolygonMode {
-        #[cfg(bake_polygon_mode)]
-        return self.polygon_mode;
-        #[cfg(not(bake_polygon_mode))]
-        PolygonMode::FILL
-    }
-    pub(crate) fn depth_clamp(&self) -> bool {
-        #[cfg(bake_depth_clamp)]
-        return self.depth_clamp;
-        #[cfg(not(bake_depth_clamp))]
-        false
-    }
-    pub(crate) fn depth_clip(&self) -> bool {
-        #[cfg(bake_depth_clip)]
-        return self.depth_clip;
-        #[cfg(not(bake_depth_clip))]
-        true
-    }
-    pub(crate) fn depth_clip_negative_one_to_one(&self) -> bool {
-        #[cfg(bake_depth_clip_negative_one_to_one)]
-        return self.depth_clip_negative_one_to_one;
-        #[cfg(not(bake_depth_clip_negative_one_to_one))]
-        false
-    }
-    pub(crate) fn logic_op(&self) -> Option<LogicOp> {
-        #[cfg(bake_logic_op)]
-        return self.logic_op;
-        #[cfg(not(bake_logic_op))]
-        None
-    }
-    pub(crate) fn conservative(&self) -> ConservativeRasterizationModeEXT {
-        #[cfg(bake_conservative_rasterization)]
-        return self.conservative;
-        #[cfg(not(bake_conservative_rasterization))]
-        ConservativeRasterizationModeEXT::DISABLED
-    }
-    pub(crate) fn line_mode(&self) -> LineRasterizationModeKHR {
-        #[cfg(bake_line_mode)]
-        return self.line_mode;
-        #[cfg(not(bake_line_mode))]
-        LineRasterizationModeKHR::DEFAULT
-    }
-    pub(crate) fn line_stipple(&self) -> bool {
-        #[cfg(bake_line_stipple)]
-        return self.line_stipple;
-        #[cfg(not(bake_line_stipple))]
-        false
-    }
-    pub(crate) fn provoking_vertex(&self) -> ProvokingVertexModeEXT {
-        #[cfg(bake_provoking_vertex)]
-        return self.provoking_vertex;
-        #[cfg(not(bake_provoking_vertex))]
-        ProvokingVertexModeEXT::FIRST_VERTEX
-    }
 }
 
-/// What a color attachment's write mask is with its blend: nothing for `Skip`.
 pub(crate) fn effective_write_mask(blend: Blend, mask: ColorComponentFlags) -> ColorComponentFlags {
     match blend {
         Blend::Skip => ColorComponentFlags::empty(),
@@ -570,61 +487,6 @@ pub(crate) fn effective_write_mask(blend: Blend, mask: ColorComponentFlags) -> C
     }
 }
 
-/// Every pipeline's dynamic state: all of a draw's state besides the shaders, the attachment
-/// formats and what the device can't set dynamically (`dynamic`). Mesh pipelines leave out
-/// the input assembly ones, which they don't have.
-pub(crate) fn dynamic_states(mesh: bool, dynamic: &Dynamic) -> Vec<vk::DynamicState> {
-    use vk::DynamicState as D;
-    let mut states = vec![
-        D::VIEWPORT_WITH_COUNT,
-        D::SCISSOR_WITH_COUNT,
-        D::LINE_WIDTH,
-        D::DEPTH_BIAS,
-        D::BLEND_CONSTANTS,
-        D::DEPTH_BOUNDS,
-        D::STENCIL_COMPARE_MASK,
-        D::STENCIL_WRITE_MASK,
-        D::STENCIL_REFERENCE,
-        D::CULL_MODE,
-        D::FRONT_FACE,
-        D::DEPTH_TEST_ENABLE,
-        D::DEPTH_WRITE_ENABLE,
-        D::DEPTH_COMPARE_OP,
-        D::DEPTH_BOUNDS_TEST_ENABLE,
-        D::STENCIL_TEST_ENABLE,
-        D::STENCIL_OP,
-        D::RASTERIZER_DISCARD_ENABLE,
-        D::DEPTH_BIAS_ENABLE,
-    ];
-    let optional: [(bool, &[vk::DynamicState]); 12] = [
-        (
-            dynamic.blend,
-            &[D::COLOR_BLEND_ENABLE_EXT, D::COLOR_BLEND_EQUATION_EXT, D::COLOR_WRITE_MASK_EXT],
-        ),
-        (dynamic.polygon_mode, &[D::POLYGON_MODE_EXT]),
-        (dynamic.depth_clamp, &[D::DEPTH_CLAMP_ENABLE_EXT]),
-        (dynamic.depth_clamp_range, &[vk::DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT]),
-        (dynamic.depth_clip, &[D::DEPTH_CLIP_ENABLE_EXT]),
-        (dynamic.depth_clip_negative_one_to_one, &[D::DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT]),
-        (dynamic.logic_op, &[D::LOGIC_OP_EXT, D::LOGIC_OP_ENABLE_EXT]),
-        (dynamic.conservative, &[D::CONSERVATIVE_RASTERIZATION_MODE_EXT]),
-        (dynamic.line_mode, &[D::LINE_RASTERIZATION_MODE_EXT]),
-        (dynamic.line_stipple_enable, &[D::LINE_STIPPLE_ENABLE_EXT]),
-        (dynamic.line_stipple, &[D::LINE_STIPPLE_KHR]),
-        (dynamic.provoking_vertex, &[D::PROVOKING_VERTEX_MODE_EXT]),
-    ];
-    for (on, dynamic) in optional {
-        if on {
-            states.extend_from_slice(dynamic);
-        }
-    }
-    if !mesh {
-        states.extend([D::PRIMITIVE_TOPOLOGY, D::PRIMITIVE_RESTART_ENABLE]);
-    }
-    states
-}
-
-/// What the attachments of a rendering decide about its draws' state.
 #[derive(Clone, Copy)]
 pub(super) struct Rendering {
     pub(super) color_attachments: usize,
@@ -632,11 +494,8 @@ pub(super) struct Rendering {
     pub(super) stencil: bool,
 }
 
-/// The input assembly state last set in a rendering, which only vertex draws set.
 pub(super) type Assembly = Option<(PrimitiveTopology, bool)>;
 
-/// A draw's state as the draw keeps it: the [`RasterState`] without the per-attachment parts,
-/// which it derefs to, and a blend and write mask per color attachment.
 #[derive(Clone, Copy)]
 pub(super) struct DrawState<'s> {
     pub(super) state: &'s RasterState<0>,
@@ -653,10 +512,8 @@ impl Deref for DrawState<'_> {
 }
 
 impl DrawState<'_> {
-    /// Records the dynamic state (`dynamic`) that differs from `last`, the state recorded
-    /// before in this rendering (`None`: everything), for a draw of a rendering with
-    /// `rendering`'s attachments. Vertex draws also set the input assembly that differs from
-    /// `assembly`. What isn't dynamic is in the bound pipeline.
+    /// Records the dynamic state that differs from `last` (`None`: everything); what isn't
+    /// dynamic is in the bound pipeline.
     pub(super) fn record(
         &self,
         last: Option<&Self>,
@@ -808,7 +665,6 @@ impl DrawState<'_> {
                 d3.cmd_set_color_blend_enable(cmd, 0, &enables);
                 d3.cmd_set_color_blend_equation(cmd, 0, &equations);
             }
-            // A skipped attachment writes nothing.
             if dynamic.blend && (blends_changed || (n > 0 && changed!(write_masks[..n]))) {
                 let masks: SmallVec<[ColorComponentFlags; 8]> = (self.blends[..n].iter())
                     .zip(&self.write_masks[..n])

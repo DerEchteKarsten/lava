@@ -1,13 +1,5 @@
 //! Null-checked Slang reflection: shader-slang 0.1.0 turns some null results of Slang's C API into references, so these `checked_*` methods return `Option`s, calling the C API directly where 0.1.0's wrapper would dereference null
-//!
-//! The iterators go through 0.1.0's `*_by_index` methods, which already check. Generic type
-//! parameters come back as [`Variable`]s, as the C API returns them (0.1.0 types them as
-//! `TypeParameter`, which its `concrete_type` doesn't take). Use these instead of 0.1.0's
-//! `name`, `type_layout`, `element_type_layout`, `function`, `fields`, `parameters`,
-//! `entry_points`, `user_attributes`, `type_parameters`, `value_parameters` and `concrete_type`.
-//! Delete this module once slang-rs releases its null-checked API (its git main has it).
-
-use std::ffi::{CStr, c_char};
+use std::ffi::CStr;
 
 use shader_slang::reflection::{
     EntryPoint, Function, Generic, Shader, Type, TypeLayout, UserAttribute, Variable,
@@ -15,33 +7,17 @@ use shader_slang::reflection::{
 };
 use shader_slang_sys as sys;
 
-/// The C object behind a 0.1.0 wrapper reference (every wrapper is `repr(transparent)` over the
-/// opaque C struct, so a reference to it is the C pointer).
+/// The C object behind a 0.1.0 wrapper, which is `repr(transparent)` over it.
 fn raw<T, P>(wrapper: &T) -> *mut P {
     (wrapper as *const T).cast_mut().cast()
 }
 
-/// `ptr` as a reference to its 0.1.0 wrapper `T`, or `None` for null.
-///
 /// # Safety
 /// `ptr` is null or points to the C object `T` wraps, which lives for `'a`.
 unsafe fn wrap<'a, T, P>(ptr: *mut P) -> Option<&'a T> {
     unsafe { ptr.cast::<T>().as_ref() }
 }
 
-/// A C string from Slang, or `None` for null or invalid UTF-8.
-///
-/// # Safety
-/// `ptr` is null or a C string that lives for `'a`.
-unsafe fn string<'a>(ptr: *const c_char) -> Option<&'a str> {
-    if ptr.is_null() {
-        None
-    } else {
-        unsafe { CStr::from_ptr(ptr) }.to_str().ok()
-    }
-}
-
-/// The name of a reflected object, if it has one.
 pub trait CheckedName {
     fn checked_name(&self) -> Option<&str>;
 }
@@ -51,7 +27,11 @@ macro_rules! checked_name {
         $(impl CheckedName for $wrapper {
             fn checked_name(&self) -> Option<&str> {
                 // SAFETY: Slang's names live as long as the object they name.
-                unsafe { string(sys::$function(raw(self))) }
+                let name = unsafe { sys::$function(raw(self)) };
+                if name.is_null() {
+                    return None;
+                }
+                unsafe { CStr::from_ptr(name) }.to_str().ok()
             }
         })*
     };
@@ -71,8 +51,7 @@ impl CheckedName for TypeLayout {
 }
 
 pub trait CheckedTypeLayout {
-    /// The element type of an array, the pointee of a pointer, the contents of a constant
-    /// buffer; `None` for a pointer whose pointee Slang doesn't lay out.
+    /// `None` for a pointer whose pointee Slang doesn't lay out.
     fn checked_element_type_layout(&self) -> Option<&TypeLayout>;
     fn checked_fields(&self) -> impl Iterator<Item = &VariableLayout>;
 }
@@ -145,7 +124,6 @@ pub trait CheckedGeneric {
     /// The type parameters, as the variables the C API returns.
     fn checked_type_parameters(&self) -> impl Iterator<Item = &Variable>;
     fn checked_value_parameters(&self) -> impl Iterator<Item = &Variable>;
-    /// The type a specialization gives the type parameter `parameter`.
     fn checked_concrete_type(&self, parameter: &Variable) -> Option<&Type>;
 }
 

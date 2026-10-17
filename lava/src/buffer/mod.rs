@@ -9,6 +9,7 @@ use std::{
 use crate::error::Result;
 use crate::vk::{self};
 use bytemuck::Pod;
+use smallvec::SmallVec;
 use gpu_allocator::{
     MemoryLocation,
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme},
@@ -21,16 +22,16 @@ use crate::{
         usage::{BufferUsage, StaticUsage, Storage},
     },
     lifetime,
-    queue::timeline::forget_buffer,
+    command_buffer::BufferAccess,
+    queue::{lock, timeline::INDICES},
     state::Ctx,
 };
 
 pub mod slice;
 pub mod usage;
 
-/// A buffer of `T`s (`u8` when untyped). Its usage is a type (`usage::Storage`), which the
-/// command buffer's bounds check at compile time, or a `usage::Dynamic` value, which it checks
-/// at runtime (`usage_check`).
+/// A buffer of `T`s (`u8` when untyped). A static usage type is checked at compile time, a
+/// `usage::Dynamic` value at runtime.
 #[derive(Debug)]
 pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
     pub(crate) handle: vk::Buffer,
@@ -57,13 +58,17 @@ impl<T: Copy + Pod, U: BufferUsage> IndexMut<usize> for Buffer<T, U> {
     }
 }
 
-/// Destroyed once no submission can reach it any more (`lifetime`).
 impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     fn drop(&mut self) {
         let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
-        let range = (self.address..self.address + self.num_bytes).into();
+        let range = self.address..self.address + self.num_bytes;
         lifetime::retire(move || {
-            forget_buffer(range);
+            for index in INDICES.iter() {
+                let pending = &mut lock(&index.state).pending;
+                let outside = |access: &BufferAccess| !range.contains(&access.range.start);
+                pending.buffer_reads.retain(|read| outside(&read.read));
+                pending.buffer_writes.retain(|write| outside(&write.write));
+            }
             unsafe { Ctx::device().destroy_buffer(handle, None) };
             if let Err(err) = Ctx::allocator().free(allocation) {
                 tracing::error!(%err, "failed to free buffer allocation");
@@ -79,8 +84,8 @@ impl<'a, T: Copy + Pod, U: BufferUsage> Into<BufferSlice<'a, T, U>> for &'a Buff
 }
 
 impl<T: Copy + Pod, U: StaticUsage> Buffer<T, U> {
-    /// A buffer of `size` elements; `cpu_writable` ones are host-visible, so `host`, `host_mut`
-    /// and `host_ptr` work on them on every device (on a device with `rebar` on every buffer).
+    /// A buffer of `size` elements; `cpu_writable` ones are mapped on every device, the others
+    /// only with `rebar`.
     #[validation_trace]
     pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
         Self::with_usage(U::default(), size, cpu_writable)
@@ -110,10 +115,9 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             flags |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
         }
         let mut create_info = vk::BufferCreateInfo::default().size(num_bytes).usage(flags);
-        // Shared between every family lava created queues of, so no queue needs an ownership
-        // transfer for it. Buffers have no compression that concurrent sharing could cost,
-        // unlike images, which are exclusive to one family at a time.
-        let families = Ctx::get().queues.family_indices();
+        // Concurrent, so buffers need no ownership transfers: they have no compression it
+        // could cost, unlike images.
+        let families: SmallVec<[u32; 3]> = Ctx::get().queues.iter().map(|f| f.index).collect();
         if families.len() > 1 {
             create_info = create_info
                 .sharing_mode(vk::SharingMode::CONCURRENT)
@@ -179,12 +183,11 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         })
     }
 
-    /// The device address of its first byte, which shaders reach it through.
+    /// The device address of its first byte.
     pub fn address(&self) -> u64 {
         self.address
     }
 
-    /// The Vulkan buffer.
     pub fn handle(&self) -> vk::Buffer {
         self.handle
     }
@@ -201,8 +204,8 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         self.usage
     }
 
-    /// Whether the host can access it (`host`, `host_mut`, `host_ptr`): it was created
-    /// `cpu_writable`, or the device has `rebar`, which maps every buffer.
+    /// Whether the host can access it: it was created `cpu_writable`, or the device has
+    /// `rebar`.
     pub fn is_mapped(&self) -> bool {
         self.allocation.mapped_ptr().is_some()
     }
@@ -223,28 +226,21 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         ptr
     }
 
-    /// The mapping as a slice. Panics unless the buffer is mapped (`is_mapped`).
-    ///
-    /// What the GPU wrote is there once its submission's fence passed: every submission ends
-    /// with a barrier that makes its writes host-visible.
+    /// The mapping as a slice; panics unless `is_mapped`. GPU writes are visible once their
+    /// submission completed.
     pub fn host(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.mapped(), self.len()) }
     }
 
-    /// The mapping as a mutable slice. Panics unless the buffer is mapped (`is_mapped`).
-    ///
-    /// The GPU may still read the buffer for a frame in flight: write only that frame slot's
-    /// part of a ring, or a buffer no pending frame uses.
+    /// The mapping as a mutable slice; panics unless `is_mapped`. The GPU may still read it
+    /// for a frame in flight.
     pub fn host_mut(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.mapped(), self.len()) }
     }
 
-    /// The mapping as a pointer, for buffers whose elements are owned one at a time through a
-    /// shared reference (slots handed out by an allocator). Panics unless the buffer is mapped
-    /// (`is_mapped`).
-    ///
-    /// Dereferencing it is `unsafe`: the caller must own the element it accesses, and nothing
-    /// may call `host`/`host_mut` on the buffer while such elements are live.
+    /// The mapping as a pointer, for elements owned one at a time through a shared reference;
+    /// panics unless `is_mapped`. A dereference must own its element, with no `host`/`host_mut`
+    /// borrow live.
     pub fn host_ptr(&self) -> *mut T {
         self.mapped()
     }
@@ -254,15 +250,13 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         ManuallyDrop::new(self).take(usage)
     }
 
-    /// The same buffer as bytes with its usage as a runtime value, e.g. to keep buffers of
-    /// different types together. Commands check the usage at runtime.
+    /// The same buffer as bytes with its usage as a runtime value.
     pub fn erase(self) -> DynamicBuffer {
         let usage = usage::Dynamic(self.usage.flags());
         ManuallyDrop::new(self).take(usage)
     }
 
-    /// Moves the buffer into one of another element type and usage, leaving `self` without
-    /// memory; `self` must not destroy its handle unless it gets the memory back.
+    /// Leaves `self` without memory, so `self` must not be dropped.
     fn take<B: Copy + Pod, NU: BufferUsage>(&mut self, usage: NU) -> Buffer<B, NU> {
         Buffer {
             handle: self.handle,

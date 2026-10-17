@@ -1,18 +1,11 @@
-//! Queues and timelines: the kinds of queue family lava submits to (graphics, and with `async-compute`/`async-transfer` dedicated compute and transfer families), the timelines whose submissions run on them in order (`Timeline`, `Reservation`, `Submission`), and the `Wait`s that order work across timelines
+//! Queues: the kinds of queue family lava submits to (graphics, and with `async-compute`/`async-transfer` dedicated compute and transfer families), the device's queues of each, and the `Wait`s that order work across timelines
 use std::sync::{Mutex, MutexGuard};
 
-use crate::{
-    error::Result,
-    features::MissingFeature,
-    sealed::Sealed,
-    vk,
-};
+use crate::{error::Result, features::MissingFeature, sealed::Sealed, vk};
 
-pub(crate) mod device;
-mod submit;
 pub(crate) mod timeline;
 
-pub use timeline::{Reservation, Submission, Timeline, TimelineBuilder};
+pub use timeline::{Submission, Timeline};
 
 /// The most timelines that can exist at once, and the most queues lava creates per family.
 pub const MAX_TIMELINES: usize = 8;
@@ -21,37 +14,30 @@ pub const MAX_TIMELINES: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Kind {
-    /// Graphics, compute and transfer: every device has it, and it presents.
     Graphics = 1,
-    /// Compute and transfer without graphics (`async-compute`).
     Compute = 2,
-    /// Transfer alone, a copy engine (`async-transfer`).
     Transfer = 3,
 }
 
 impl Kind {
-    /// Its slot in per-kind arrays.
     pub(crate) fn slot(self) -> usize {
         self as usize - 1
     }
 }
 
-/// A kind of queue family as a type: what a [`Timeline`] submits to and a
-/// `CommandBuffer` records for. Only lava implements it.
+/// A kind of queue family as a type, for `Timeline` and `CommandBuffer`. Only lava implements it.
 pub trait QueueKind: Sealed + Send + Sync + 'static {
     const KIND: Kind;
-    /// `Ok` where lava has a family of this kind (`async-compute`, `async-transfer`).
+    /// `Ok` where lava has a family of this kind.
     fn check() -> Result<(), MissingFeature>;
 }
 
-/// The kinds that dispatch compute, trace rays, build acceleration structures and clear images:
-/// [`Graphics`] and [`Compute`].
+/// [`Graphics`] and [`Compute`]: dispatches, traces, acceleration structures, image clears.
 pub trait HasCompute: QueueKind {}
 
-/// The kind that renders, blits and presents: [`Graphics`].
+/// [`Graphics`]: renderings, blits, presents.
 pub trait HasGraphics: HasCompute {}
 
-/// The graphics family, which every device has.
 #[derive(Debug)]
 pub enum Graphics {}
 impl Sealed for Graphics {}
@@ -64,7 +50,7 @@ impl QueueKind for Graphics {
 impl HasCompute for Graphics {}
 impl HasGraphics for Graphics {}
 
-/// A dedicated compute family (`async-compute`): work that runs beside the graphics queue's.
+/// A dedicated compute family (`async-compute`).
 #[cfg(feature = "async-compute")]
 #[derive(Debug)]
 pub enum Compute {}
@@ -81,7 +67,7 @@ impl QueueKind for Compute {
 #[cfg(feature = "async-compute")]
 impl HasCompute for Compute {}
 
-/// A dedicated transfer family (`async-transfer`), a copy engine: copies, fills and updates.
+/// A dedicated transfer family (`async-transfer`): copies, fills and updates.
 #[cfg(feature = "async-transfer")]
 #[derive(Debug)]
 pub enum Transfer {}
@@ -96,72 +82,37 @@ impl QueueKind for Transfer {
     }
 }
 
-/// Where a submission waits for another timeline's work ([`Wait::at`]): at every command (the
-/// default), or only at one kind of lava command, so that the others run before the wait. The
-/// stages before it in the submission then run before the awaited work is done, so it must name
-/// the kind of the first command that touches what the wait guards.
+/// The kind of command a [`Wait`] holds back: everything (the default), or only that kind, so
+/// the commands before it run before the awaited work is done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Stage {
     #[default]
     All,
-    /// `compute` dispatches, direct and indirect.
     Compute,
-    /// `raytrace` launches, direct and indirect.
     RayTracing,
-    /// `raster` renderings: their draws, attachments, indirect arguments and index buffers.
     Raster,
-    /// Copies, blits and clears.
     Transfer,
 }
 
-impl Stage {
-    pub(crate) fn flags(self) -> vk::PipelineStageFlags2 {
-        use vk::PipelineStageFlags2 as F;
-        match self {
-            Stage::All => F::ALL_COMMANDS,
-            Stage::Compute => F::COMPUTE_SHADER | F::DRAW_INDIRECT,
-            Stage::RayTracing => F::RAY_TRACING_SHADER_KHR | F::DRAW_INDIRECT,
-            Stage::Raster => F::ALL_GRAPHICS,
-            Stage::Transfer => F::ALL_TRANSFER,
-        }
-    }
-}
-
-/// The completion of one submission (`Submission::submit` returns it): another timeline's
-/// submission waits for it with `Submission::wait_for`, at [`Stage::All`] unless
-/// [`Self::at`] names a later one, and the host with [`Self::block`].
+/// The completion of a submission (`Submission::submit`): another timeline's submission waits for
+/// it with `Submission::wait_for`, the host with [`Self::block`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wait {
     pub(crate) timeline: u8,
     pub(crate) value: u64,
-    stage: Stage,
+    pub(crate) stage: Stage,
 }
 
 impl Wait {
-    pub(crate) fn new(timeline: usize, value: u64) -> Self {
-        Self {
-            timeline: timeline as u8,
-            value,
-            stage: Stage::All,
-        }
-    }
-
-    /// Waited for only at `stage` (see [`Stage`]).
     pub fn at(self, stage: Stage) -> Self {
         Self { stage, ..self }
     }
 
-    pub fn stage(&self) -> Stage {
-        self.stage
-    }
-
-    /// Whether the GPU finished the submission. Polls the timeline, never waits.
     pub fn is_done(&self) -> bool {
         timeline::poll(self.timeline as usize) >= self.value
     }
 
-    /// Waits until the GPU finished the submission, then destroys what that frees
-    /// (`lifetime::reclaim`).
+    /// Waits until the GPU finished the submission, then destroys what that frees.
     pub fn block(&self) -> Result<()> {
         timeline::wait_value(self.timeline as usize, self.value)?;
         crate::lifetime::reclaim();
@@ -169,8 +120,54 @@ impl Wait {
     }
 }
 
-/// Locks `mutex`, also after a panic while it was held: what lava keeps in these mutexes stays
-/// usable (pending accesses can only be more than what runs, which costs barriers at most).
+/// Locks `mutex`, also after a panic while it was held.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[derive(Debug)]
+pub(crate) struct FamilyQueues {
+    pub(crate) kind: Kind,
+    pub(crate) index: u32,
+    pub(crate) timestamp_valid_bits: u32,
+    pub(crate) image_granularity: vk::Extent3D,
+    pub(crate) queues: Box<[Mutex<vk::Queue>]>,
+    /// How many timelines are pinned to each queue.
+    pub(crate) timelines: Mutex<Box<[u32]>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DeviceQueues(pub(crate) [Option<FamilyQueues>; 3]);
+
+impl DeviceQueues {
+    pub(crate) fn family(&self, kind: Kind) -> Option<&FamilyQueues> {
+        self.0[kind.slot()].as_ref()
+    }
+
+    pub(crate) fn graphics(&self) -> &FamilyQueues {
+        self.family(Kind::Graphics).expect("every device has one")
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &FamilyQueues> {
+        self.0.iter().flatten()
+    }
+}
+
+/// What a recording knows of its family, and every kind's family index
+/// (`QUEUE_FAMILY_IGNORED` where lava has none).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FamilyInfo {
+    pub(crate) kind: Kind,
+    pub(crate) timestamp_valid_bits: u32,
+    pub(crate) image_granularity: vk::Extent3D,
+    pub(crate) indices: [u32; 3],
+}
+
+impl FamilyInfo {
+    #[track_caller]
+    pub(crate) fn index(&self, kind: Kind) -> u32 {
+        let index = self.indices[kind.slot()];
+        assert_ne!(index, vk::QUEUE_FAMILY_IGNORED, "lava has no {kind:?} family");
+        index
+    }
 }

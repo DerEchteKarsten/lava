@@ -14,7 +14,6 @@ use lava::{
 use tracing::field::{Field, Visit};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
 
-/// Validation errors reported by the Vulkan validation layer since the current test started.
 static VALIDATION_ERRORS: LazyLock<Arc<Mutex<Vec<String>>>> = LazyLock::new(Default::default);
 
 struct ValidationCapture;
@@ -40,10 +39,8 @@ impl<S: tracing::Subscriber> Layer<S> for ValidationCapture {
     }
 }
 
-/// What the tests record into.
-pub type Cmd = CommandBuffer<Graphics>;
+pub type Cmd<'p> = CommandBuffer<'p, Graphics>;
 
-/// The process-wide lava context plus the one graphics timeline all tests share.
 pub struct Gpu {
     pub timeline: Timeline<Graphics>,
 }
@@ -54,13 +51,10 @@ pub fn capture_validation_errors() {
         .expect("no other tracing subscriber is installed");
 }
 
-/// Returns and forgets the validation errors reported so far.
 pub fn take_validation_errors() -> Vec<String> {
     std::mem::take(&mut *VALIDATION_ERRORS.lock().unwrap())
 }
 
-/// The features the context leaves off (`Config::disabled`), set by a test binary before its
-/// first `gpu()`.
 static DISABLED: OnceLock<lava::Features> = OnceLock::new();
 
 /// Makes the process's context leave `features` off; call before the first `gpu()`.
@@ -83,12 +77,11 @@ static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
         "headless lava init failed; the GPU tests need a Vulkan 1.4 GPU and the Khronos validation layer",
     );
     Mutex::new(Gpu {
-        timeline: Timeline::builder().build().unwrap(),
+        timeline: Timeline::new(2).unwrap(),
     })
 });
 
-/// Exclusive access to the GPU for one test. When the test ends without panicking, the guard
-/// fails it if the validation layer reported any error in the meantime.
+/// Exclusive access to the GPU for one test; fails it on validation errors when dropped.
 pub struct GpuGuard(MutexGuard<'static, Gpu>);
 
 impl std::ops::Deref for GpuGuard {
@@ -106,7 +99,6 @@ impl Drop for GpuGuard {
         }
         let report = format!("Vulkan validation errors:\n{}", errors.join("\n\n"));
         if std::thread::panicking() {
-            // The test already failed; the validation errors usually explain why.
             eprintln!("{report}");
         } else {
             panic!("{report}");
@@ -114,8 +106,7 @@ impl Drop for GpuGuard {
     }
 }
 
-/// Locks the GPU for the calling test. Tests run one at a time: lava's context is global and
-/// some devices have a single graphics queue.
+/// Tests run one at a time: lava's context is global and some devices have one graphics queue.
 pub fn gpu() -> GpuGuard {
     let guard = GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     take_validation_errors();
@@ -130,7 +121,7 @@ impl Gpu {
 
     /// Like [`Self::submit`], after `waits` of other timelines.
     pub fn submit_after(&self, waits: &[Wait], record: impl FnOnce(&mut Cmd)) -> Wait {
-        let mut submission = self.timeline.reserve().begin().unwrap();
+        let mut submission = self.timeline.begin().unwrap();
         for &wait in waits {
             submission.wait_for(wait);
         }
