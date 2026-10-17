@@ -2,7 +2,7 @@
 use std::{
     ffi::CStr,
     iter,
-    sync::{Arc, Mutex, MutexGuard, atomic::AtomicU32},
+    sync::{Arc, Mutex, MutexGuard, atomic::AtomicU64},
 };
 
 use crate::{
@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 
 use crate::{
     bindless,
-    command_buffer::CommandBuffer,
+    command_buffer::{CommandBuffer, image_state::ImageState},
     epoch,
     image::{
         D2,
@@ -37,7 +37,7 @@ struct SwapchainImage {
     image: vk::Image,
     view: vk::ImageView,
     handle: BindlessHandle,
-    layout: AtomicU32,
+    state: AtomicU64,
 }
 
 /// The images a surface presents, with usage `U` (any static image usage the surface allows;
@@ -111,7 +111,7 @@ impl<U: StaticUsage> Swapchain<U> {
             mip_range: (0..1).into(),
             extent: self.size,
             handle: image.handle,
-            layouts: std::slice::from_ref(&image.layout),
+            states: std::slice::from_ref(&image.state),
             format: self.format,
             usage: self.usage,
             dim: D2,
@@ -234,7 +234,7 @@ impl<U: StaticUsage> Swapchain<U> {
                     handle: BindlessHandle::none(),
                     image,
                     view,
-                    layout: AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32),
+                    state: ImageState::UNDEFINED.atomic(),
                 })
             })
             .collect::<Result<SmallVec<[SwapchainImage; 5]>>>()?;

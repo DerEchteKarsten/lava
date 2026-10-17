@@ -16,7 +16,7 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    command_buffer::{Barriers, BufferAccess, CommandBuffer, ImageAccess, QueueCaps},
+    command_buffer::{Barriers, CommandBuffer, QueueCaps, pending::PendingAccesses},
     epoch::{self, Epoch},
     queue::{
         Kind,
@@ -519,89 +519,6 @@ impl Drop for FrameSlot {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PendingAccesses {
-    pub(crate) buffer_reads: SmallVec<[PendingRead; 8]>,
-    pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
-    pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
-    pub(crate) image_writes: SmallVec<[PendingWrite<ImageAccess>; 8]>,
-    /// The epoch of the frame being recorded, which the accesses it records are tagged with.
-    pub(crate) epoch: u64,
-}
-
-/// A buffer read later writes may have to wait for, with the epoch of the frame that made it:
-/// once that completed, nothing has to.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingRead {
-    pub(crate) read: BufferAccess,
-    pub(crate) epoch: u64,
-}
-
-impl std::ops::Deref for PendingRead {
-    type Target = BufferAccess;
-    fn deref(&self) -> &BufferAccess {
-        &self.read
-    }
-}
-
-/// A write later commands may have to wait for, and what the barriers recorded since already
-/// made it visible to: those accesses need no barrier for it anymore.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingWrite<A> {
-    pub(crate) write: A,
-    /// The epoch of the frame that made it.
-    pub(crate) epoch: u64,
-    /// The destination scopes of those barriers: each made the write visible to its accesses
-    /// at its stages (every pair of them), but not to its accesses at another barrier's stages.
-    pub(crate) visible: SmallVec<[(vk::PipelineStageFlags2, vk::AccessFlags2); 2]>,
-}
-
-impl<A> PendingWrite<A> {
-    pub(crate) fn new(write: A, epoch: u64) -> Self {
-        Self {
-            write,
-            epoch,
-            visible: SmallVec::new(),
-        }
-    }
-
-    /// Whether one barrier made the write visible to `access` at `stage`: two barriers, one to
-    /// sampled reads in fragment shaders and one to storage reads in compute shaders, don't
-    /// make it visible to sampled reads in compute shaders.
-    pub(crate) fn visible_to(
-        &self,
-        stage: vk::PipelineStageFlags2,
-        access: vk::AccessFlags2,
-    ) -> bool {
-        (self.visible.iter()).any(|&(stages, accesses)| {
-            stages.contains(stage) && accesses.contains(access)
-        })
-    }
-
-    /// Remembers that a barrier made the write visible to `access` at `stage`. A scope merges
-    /// into one of the same stages or the same accesses, or replaces one it contains: only then
-    /// is the merged scope exactly the pairs of both.
-    pub(crate) fn make_visible(&mut self, stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) {
-        if self.visible_to(stage, access) {
-            return;
-        }
-        (self.visible).retain(|&mut (stages, accesses)| {
-            !(stage.contains(stages) && access.contains(accesses))
-        });
-        for (stages, accesses) in &mut self.visible {
-            if *stages == stage {
-                *accesses |= access;
-                return;
-            }
-            if *accesses == access {
-                *stages |= stage;
-                return;
-            }
-        }
-        self.visible.push((stage, access));
-    }
-}
-
 /// Why a recording didn't reach the GPU.
 enum Failed {
     Panic(Box<dyn std::any::Any + Send>),
@@ -623,8 +540,14 @@ fn execute_command<Q: QueueFamilie, F: FnOnce(&mut CommandBuffer)>(
     let epoch = slot.epoch.as_ref().map_or(0, Epoch::value);
     let mut taken = std::mem::take(&mut *pending);
     taken.retire(epoch::completed());
+    // Lava records no ownership transfers yet, so only the graphics family accesses images.
+    let kind = match caps(queue.family).images {
+        true => Kind::Graphics,
+        false => Kind::Transfer,
+    };
     let mut cmd = CommandBuffer::new(
         slot.buffer.handle,
+        kind,
         taken,
         epoch,
         slot.family,

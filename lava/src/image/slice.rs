@@ -1,5 +1,5 @@
 //! Borrowed image views of a mip range (over every aspect) and their slices, the only image types commands take (bounded by the traits of `kind`), with the layouts they track for barriers, and the image transfer commands (clear, blit, copies to and from buffers)
-use std::{iter, range::Range, sync::atomic::AtomicU32};
+use std::{iter, range::Range, sync::atomic::AtomicU64};
 
 use crate::vk;
 use bytemuck::Pod;
@@ -32,9 +32,9 @@ pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     /// The extent of mip `mip_range.start`.
     pub(crate) extent: D::Extent,
     pub(crate) handle: BindlessHandle,
-    /// The tracked layouts: one for all of `mip_range` (an image with one view, or a swapchain
-    /// image), or one per mip.
-    pub(crate) layouts: &'a [AtomicU32],
+    /// The tracked states (`command_buffer::image_state`): one for all of `mip_range` (an image
+    /// with one view, or a swapchain image), or one per mip.
+    pub(crate) states: &'a [AtomicU64],
     pub(crate) format: F,
     pub(crate) usage: U,
     pub(crate) dim: D,
@@ -137,7 +137,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             mip_range: self.mip_range,
             extent: self.extent,
             handle: self.handle,
-            layouts: self.layouts,
+            states: self.states,
             format,
             usage,
             dim: self.dim,
@@ -145,7 +145,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     }
 
     /// The access of a command that wants the view's mips in `layout`. It borrows their
-    /// tracked layouts, which move to `layout` only when the command is recorded. A pass's
+    /// tracked states, which move to `layout` only when the command is recorded. A pass's
     /// access, for [`crate::command_buffer::Bindings::new`].
     pub fn access(
         &self,
@@ -162,7 +162,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
                 aspect: self.format.aspects(),
                 mip_range: self.mip_range,
             },
-            layouts: self.layouts,
+            states: self.states,
         }
     }
 }
@@ -488,13 +488,14 @@ mod tests {
         format::{D32SfloatS8Uint, R8G8B8A8Unorm, StaticFormat},
         usage::{DepthAttachment, Sampled, SampledStorage, StaticUsage, Storage},
     };
+    use crate::command_buffer::image_state::ImageState;
+    use crate::queue::Kind;
     use crate::vk::Handle;
     use glam::{IVec2, UVec2};
-    use std::sync::atomic::Ordering;
 
     /// A view over a fake image: layout tracking and region math need no device.
     fn view<F: StaticFormat, U: StaticUsage>(
-        layout: &AtomicU32,
+        layout: &AtomicU64,
         mips: std::ops::Range<u32>,
     ) -> ImageView<'_, F, U> {
         ImageView {
@@ -503,15 +504,15 @@ mod tests {
             mip_range: mips.into(),
             extent: UVec2::new(64, 32),
             handle: BindlessHandle::none(),
-            layouts: std::slice::from_ref(layout),
+            states: std::slice::from_ref(layout),
             format: F::default(),
             usage: U::default(),
             dim: D2,
         }
     }
 
-    fn undefined() -> AtomicU32 {
-        AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32)
+    fn undefined() -> AtomicU64 {
+        ImageState::UNDEFINED.atomic()
     }
 
     #[test]
@@ -568,7 +569,11 @@ mod tests {
         let view = view::<R8G8B8A8Unorm, Sampled>(&layout, 0..1);
         let taken = |access: &ImageUse| {
             let mut old = None;
-            access.take_layouts(|_, layout| old = Some(layout));
+            access.take_states(Kind::Graphics, |_, state| {
+                if state.layout != access.access.layout {
+                    old = Some(state.layout)
+                }
+            });
             old
         };
 
@@ -588,18 +593,15 @@ mod tests {
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
         // Building accesses leaves the layout alone.
-        assert_eq!(
-            layout.load(Ordering::Relaxed),
-            vk::ImageLayout::UNDEFINED.as_raw() as u32
-        );
+        assert_eq!(ImageState::load(&layout), ImageState::UNDEFINED);
 
         assert_eq!(taken(&first), Some(vk::ImageLayout::UNDEFINED));
         // Same layout again: no transition.
         assert_eq!(taken(&first), None);
         assert_eq!(taken(&present), Some(vk::ImageLayout::GENERAL));
         assert_eq!(
-            layout.load(Ordering::Relaxed),
-            vk::ImageLayout::PRESENT_SRC_KHR.as_raw() as u32
+            ImageState::load(&layout),
+            ImageState::taken(vk::ImageLayout::PRESENT_SRC_KHR, Kind::Graphics)
         );
     }
 
@@ -612,7 +614,11 @@ mod tests {
         let c = a.cast(R8G8B8A8Unorm, Storage);
         let taken = |access: ImageUse| {
             let mut old = None;
-            access.take_layouts(|_, layout| old = Some(layout));
+            access.take_states(Kind::Graphics, |_, state| {
+                if state.layout != access.access.layout {
+                    old = Some(state.layout)
+                }
+            });
             old
         };
 

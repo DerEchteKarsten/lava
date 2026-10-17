@@ -6,7 +6,7 @@ use std::{
     panic::AssertUnwindSafe,
     ptr::NonNull,
     range::Range,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::AtomicU64,
 };
 
 use crate::vk::{self, IndexType, PipelineStageFlags2 as S2};
@@ -26,8 +26,8 @@ use crate::{
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
+    queue::Kind,
     state::{Ctx, Functions},
-    vkobjects::queue::{PendingAccesses, PendingRead, PendingWrite},
 };
 #[cfg(feature = "acceleration-structure")]
 use crate::vkobjects::acceleration_structure::Tlas;
@@ -37,9 +37,13 @@ use lava_macros::validation_trace;
 use smallvec::{SmallVec, smallvec};
 
 mod binding_output;
+pub(crate) mod image_state;
+pub(crate) mod pending;
 mod raster_state;
 use crate::unsized_struct::unsized_struct;
 use binding_output::Sections;
+use image_state::{ImageState, check_states, take_states};
+use pending::{PendingAccesses, all_read_access, all_write_access};
 pub use binding_output::{BindingOutput, Bindings, kind};
 pub use raster_state::*;
 
@@ -70,9 +74,6 @@ pub(crate) const EVERY_BUFFER: Range<u64> = Range {
     end: u64::MAX,
 };
 
-/// How many pending buffer writes are kept before the completed ones are folded into one.
-const MAX_PENDING_BUFFER_WRITES: usize = 64;
-
 impl BufferAccess {
     /// Whether the two accesses touch the same memory.
     fn overlaps(&self, other: &BufferAccess) -> bool {
@@ -100,57 +101,37 @@ pub struct ImageAccess {
     pub mip_range: Range<u32>,
 }
 
-/// An image access of a command that isn't recorded yet, with the tracked layouts of its mips,
+/// An image access of a command that isn't recorded yet, with the tracked states of its mips,
 /// which only move when the command is recorded (see [`compute_barriers`]). Made by
 /// `ImageView::access` (a binding generator's part of [`Bindings::new`]).
 #[derive(Debug, Clone)]
 pub struct ImageUse<'a> {
     pub access: ImageAccess,
-    /// One layout for all of `access.mip_range`, or one per mip.
-    pub(crate) layouts: &'a [AtomicU32],
+    /// One state for all of `access.mip_range`, or one per mip (`image_state`).
+    pub(crate) states: &'a [AtomicU64],
 }
 
 impl ImageUse<'_> {
-    /// Moves the tracked layouts of the access's mips to the one it asks for, and calls
-    /// `transition(mips, old_layout)` once per run of neighbouring mips that had the same old
-    /// layout and need a transition.
-    pub(crate) fn take_layouts(&self, mut transition: impl FnMut(Range<u32>, vk::ImageLayout)) {
-        let new = self.access.layout;
-        let swap = |layout: &AtomicU32| {
-            vk::ImageLayout::from_raw(layout.swap(new.as_raw() as u32, Ordering::Relaxed) as i32)
-        };
-        let mips = self.access.mip_range;
-        if let [layout] = self.layouts {
-            let old = swap(layout);
-            if old != new {
-                transition(mips, old);
-            }
-            return;
-        }
-        let mut run: Option<(u32, vk::ImageLayout)> = None;
-        for (mip, layout) in (mips.start..).zip(self.layouts) {
-            let old = swap(layout);
-            match run {
-                Some((_, run_old)) if run_old == old => {}
-                Some((start, run_old)) => {
-                    if run_old != new {
-                        transition((start..mip).into(), run_old);
-                    }
-                    run = Some((mip, old));
-                }
-                None => run = Some((mip, old)),
-            }
-        }
-        if let Some((start, old)) = run
-            && old != new
-        {
-            transition((start..mips.end).into(), old);
-        }
+    /// Takes the tracked states of the access's mips for a recording on a family of `kind`
+    /// (`image_state::take_states`): they move to the layout it asks for, owned by `kind`, and
+    /// `changed(mips, old)` is called per run of neighbouring mips whose old state differed.
+    #[track_caller]
+    pub(crate) fn take_states(&self, kind: Kind, changed: impl FnMut(Range<u32>, ImageState)) {
+        let access = &self.access;
+        take_states(self.states, access.mip_range, access.layout, kind, changed);
+    }
+
+    /// Panics unless a recording on a family of `kind` may access the image.
+    #[track_caller]
+    pub(crate) fn check_states(&self, kind: Kind) {
+        check_states(self.states, self.access.mip_range, kind);
     }
 }
 
 pub struct CommandBuffer {
     pub(crate) handle: vk::CommandBuffer,
+    /// The kind of family it records for, which takes the images it accesses.
+    pub(crate) kind: Kind,
     pub(crate) pending_accesses: PendingAccesses,
     /// The epoch of the frame being recorded, which the query pools it touches remember.
     pub(crate) epoch: u64,
@@ -949,6 +930,11 @@ impl CommandBuffer {
     }
 
     fn pipeline_barrier(&self, barriers: &Barriers) {
+        // Barriers of one call are unordered, so acquires go first in their own.
+        if !barriers.acquires.is_empty() {
+            let info = vk::DependencyInfo::default().image_memory_barriers(&barriers.acquires);
+            unsafe { Ctx::device().cmd_pipeline_barrier2(self.handle, &info) };
+        }
         let mut info = vk::DependencyInfo::default();
         let memory = barriers.memory.map(|memory| [memory]);
         if let Some(memory) = &memory {
@@ -1130,6 +1116,7 @@ impl CommandBuffer {
         }
         let barriers = compute_barriers(
             &self.pending_accesses,
+            self.kind,
             image_acceses.clone(),
             buffer_acceses.clone(),
         );
@@ -1289,10 +1276,11 @@ impl CommandBuffer {
         self.active_queries &= !bit;
     }
 
-    /// A command buffer recording into `handle` for the frame of `epoch` on queue `family`,
-    /// logging its barriers into `barrier_log` (empty, lent by the frame slot).
+    /// A command buffer recording into `handle` for the frame of `epoch` on queue `family`, of
+    /// `kind`, logging its barriers into `barrier_log` (empty, lent by the frame slot).
     pub(crate) fn new(
         handle: vk::CommandBuffer,
+        kind: Kind,
         mut pending_accesses: PendingAccesses,
         epoch: u64,
         family: u32,
@@ -1302,6 +1290,7 @@ impl CommandBuffer {
         pending_accesses.epoch = epoch;
         Self {
             handle,
+            kind,
             pending_accesses,
             epoch,
             family,
@@ -1326,9 +1315,13 @@ impl CommandBuffer {
     }
 }
 
-/// Barriers one command needs before it may run, given what is still pending.
+/// Barriers one command needs before it may run, given what is still pending. Logged whole
+/// (`CommandBuffer::barrier_log`), so a replay records them the same way.
 #[derive(Clone, Debug)]
 pub(crate) struct Barriers {
+    /// Queue family ownership acquires of images another family released to this one,
+    /// recorded in a call of their own before the others.
+    pub(crate) acquires: SmallVec<[vk::ImageMemoryBarrier2<'static>; 1]>,
     /// The dependency on the pending accesses the command conflicts with; `None` without a
     /// hazard, when only a layout transition is needed, since that carries its own stages.
     pub(crate) memory: Option<vk::MemoryBarrier2<'static>>,
@@ -1458,6 +1451,7 @@ impl BufferAccess {
 /// image must still be recorded one after the other and submitted in that order.
 pub(crate) fn compute_barriers<'a>(
     pending: &PendingAccesses,
+    kind: Kind,
     image_acceses: impl Iterator<Item = ImageUse<'a>> + Clone,
     buffer_acceses: impl Iterator<Item = BufferAccess>,
 ) -> Option<Barriers> {
@@ -1525,10 +1519,17 @@ pub(crate) fn compute_barriers<'a>(
         }
     }
 
+    // Every image is checked before any state moves: a panic then leaves the tracking as the
+    // barriers logged so far describe it.
+    for image in image_acceses.clone() {
+        image.check_states(kind);
+    }
     let mut image_barriers: SmallVec<[vk::ImageMemoryBarrier2; 1]> = SmallVec::new();
     for image in image_acceses {
-        image.take_layouts(|mips, old_layout| {
-            image_barriers.push(transition_barrier(pending, &image.access, mips, old_layout))
+        image.take_states(kind, |mips, old| {
+            if old.layout != image.access.layout {
+                image_barriers.push(transition_barrier(pending, &image.access, mips, old.layout))
+            }
         });
     }
 
@@ -1549,6 +1550,7 @@ pub(crate) fn compute_barriers<'a>(
     }
 
     Some(Barriers {
+        acquires: SmallVec::new(),
         memory: hazard.then(|| {
             vk::MemoryBarrier2::default()
                 .src_stage_mask(src_stage)
@@ -1610,6 +1612,9 @@ fn transition_barrier(
         .dst_access_mask(dst_access)
         .old_layout(old_layout)
         .new_layout(image_access.layout)
+        // Not a queue family ownership transfer (ash's default would be family 0 to 0).
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image_access.image)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: image_access.aspect,
@@ -1620,236 +1625,8 @@ fn transition_barrier(
         })
 }
 
-impl PendingAccesses {
-    /// Remembers what `barriers` made the pending writes in their source scope visible to.
-    /// A memory barrier covers every write of its source stages and access types, also those
-    /// it wasn't recorded for.
-    pub(crate) fn made_visible(&mut self, barriers: &Barriers) {
-        let memory = barriers.memory.map(|m| {
-            (
-                m.src_stage_mask,
-                m.src_access_mask,
-                m.dst_stage_mask,
-                m.dst_access_mask,
-            )
-        });
-        if let Some((src_stage, src_access, dst_stage, dst_access)) = memory {
-            for w in &mut self.buffer_writes {
-                if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
-                    w.make_visible(dst_stage, dst_access);
-                }
-            }
-        }
-        for w in &mut self.image_writes {
-            let image = w.write.image;
-            let transitions = barriers
-                .images
-                .iter()
-                .filter(|b| b.image == image)
-                .map(|b| {
-                    (
-                        b.src_stage_mask,
-                        b.src_access_mask,
-                        b.dst_stage_mask,
-                        b.dst_access_mask,
-                    )
-                });
-            for (src_stage, src_access, dst_stage, dst_access) in
-                memory.into_iter().chain(transitions)
-            {
-                if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
-                    w.make_visible(dst_stage, dst_access);
-                }
-            }
-        }
-    }
-
-    /// Drops what the GPU finished, every epoch up to `completed`: the buffer reads, which no
-    /// later write has to wait for any more, and, once there are many, the buffer writes, which
-    /// later accesses still have to be made visible to: they fold into one write of every
-    /// address (`EVERY_BUFFER`). Image accesses stay; there is one of each kind per image.
-    pub(crate) fn retire(&mut self, completed: u64) {
-        self.buffer_reads.retain(|read| read.epoch > completed);
-        if self.buffer_writes.len() <= MAX_PENDING_BUFFER_WRITES {
-            return;
-        }
-        let (mut stage, mut access) = (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE);
-        self.buffer_writes.retain(|w| {
-            let fold = w.epoch <= completed && w.write.range != EVERY_BUFFER;
-            if fold {
-                stage |= w.write.stage;
-                access |= w.write.access;
-            }
-            !fold
-        });
-        if stage.is_empty() && access.is_empty() {
-            return;
-        }
-        match (self.buffer_writes.iter_mut()).find(|w| w.write.range == EVERY_BUFFER) {
-            Some(every) => {
-                every.write.stage |= stage;
-                every.write.access |= access;
-                every.visible.clear();
-            }
-            None => {
-                let write = BufferAccess {
-                    stage,
-                    access,
-                    range: EVERY_BUFFER,
-                };
-                self.buffer_writes.push(PendingWrite::new(write, 0));
-            }
-        }
-    }
-
-    /// Forgets the accesses of an image that is being destroyed.
-    pub(crate) fn forget_image(&mut self, image: vk::Image) {
-        self.image_reads.retain(|read| read.image != image);
-        self.image_writes.retain(|write| write.write.image != image);
-    }
-
-    /// Forgets the accesses within the addresses of a buffer that is being destroyed.
-    pub(crate) fn forget_buffer(&mut self, range: std::ops::Range<u64>) {
-        let outside = |access: &BufferAccess| !range.contains(&access.range.start);
-        self.buffer_reads.retain(|read| outside(&read.read));
-        self.buffer_writes.retain(|write| outside(&write.write));
-    }
-
-    /// Adds the accesses of another queue's submissions, which this queue's have to wait for
-    /// too. An access both have is only waited for twice.
-    pub(crate) fn append(&mut self, other: PendingAccesses) {
-        self.buffer_reads.extend(other.buffer_reads);
-        self.image_reads.extend(other.image_reads);
-        self.buffer_writes.extend(other.buffer_writes);
-        self.image_writes.extend(other.image_writes);
-    }
-
-    /// Remembers the accesses of a command that was just recorded, so later commands can be
-    /// synchronised against them.
-    ///
-    /// An older buffer access is only forgotten once a newer one covers its whole range: a
-    /// partially overlapped write still has bytes nobody has synchronised with. A covered write
-    /// is forgotten by a newer write, a covered read by a newer write, whose barrier waited for
-    /// it. A newer read doesn't wait for older reads, so it takes over their stages and accesses.
-    pub(crate) fn record(
-        &mut self,
-        image_acceses: impl Iterator<Item = ImageAccess>,
-        buffer_acceses: impl Iterator<Item = BufferAccess>,
-    ) {
-        for access in buffer_acceses {
-            let covers = |a: &BufferAccess| {
-                access.range.start <= a.range.start && a.range.end <= access.range.end
-            };
-            let writes = access.access.intersects(all_write_access());
-            let reads = access.access.intersects(all_read_access());
-
-            if writes {
-                self.buffer_writes.retain(|a| !covers(&a.write));
-                self.buffer_writes
-                    .push(PendingWrite::new(access.clone(), self.epoch));
-                // An acceleration structure write waited for every read of every structure,
-                // and every later one runs at the same build stage, after that barrier.
-                let structure_write = access
-                    .access
-                    .contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR);
-                self.buffer_reads.retain(|a| {
-                    !covers(a) && !(structure_write && a.range == EVERY_ACCELERATION_STRUCTURE)
-                });
-            }
-            if reads {
-                let mut read = access.clone();
-                self.buffer_reads.retain(|a| {
-                    let covered = covers(a);
-                    if covered {
-                        read.stage |= a.stage;
-                        read.access |= a.access;
-                    }
-                    !covered
-                });
-                self.buffer_reads.push(PendingRead {
-                    read,
-                    epoch: self.epoch,
-                });
-            }
-        }
-
-        for access in image_acceses {
-            let same_image = |a: &ImageAccess| a.image == access.image;
-            let writes = access.access.intersects(all_write_access());
-            let reads = access.access.intersects(all_read_access());
-
-            if writes {
-                self.image_writes.retain(|a| !same_image(&a.write));
-                self.image_writes
-                    .push(PendingWrite::new(access.clone(), self.epoch));
-                self.image_reads.retain(|a| !same_image(a));
-            }
-            if reads {
-                let mut read = access.clone();
-                self.image_reads.retain(|a| {
-                    let same = same_image(a);
-                    if same {
-                        read.stage |= a.stage;
-                        read.access |= a.access;
-                    }
-                    !same
-                });
-                self.image_reads.push(read);
-            }
-        }
-    }
-}
-
-fn all_write_access() -> vk::AccessFlags2 {
-    vk::AccessFlags2::SHADER_WRITE
-        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-        | vk::AccessFlags2::TRANSFER_WRITE
-        | vk::AccessFlags2::HOST_WRITE
-        | vk::AccessFlags2::MEMORY_WRITE
-        | vk::AccessFlags2::SHADER_STORAGE_WRITE
-        | vk::AccessFlags2::TRANSFORM_FEEDBACK_WRITE_EXT
-        | vk::AccessFlags2::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT
-        | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR
-        | vk::AccessFlags2::COMMAND_PREPROCESS_WRITE_NV
-        | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR
-        | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR
-        | vk::AccessFlags2::MICROMAP_WRITE_EXT
-        | vk::AccessFlags2::OPTICAL_FLOW_WRITE_NV
-}
-
-fn all_read_access() -> vk::AccessFlags2 {
-    vk::AccessFlags2::INDIRECT_COMMAND_READ
-        | vk::AccessFlags2::INDEX_READ
-        | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
-        | vk::AccessFlags2::UNIFORM_READ
-        | vk::AccessFlags2::INPUT_ATTACHMENT_READ
-        | vk::AccessFlags2::SHADER_READ
-        | vk::AccessFlags2::COLOR_ATTACHMENT_READ
-        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-        | vk::AccessFlags2::TRANSFER_READ
-        | vk::AccessFlags2::HOST_READ
-        | vk::AccessFlags2::MEMORY_READ
-        | vk::AccessFlags2::SHADER_SAMPLED_READ
-        | vk::AccessFlags2::SHADER_STORAGE_READ
-        | vk::AccessFlags2::SHADER_BINDING_TABLE_READ_KHR
-        | vk::AccessFlags2::TRANSFORM_FEEDBACK_COUNTER_READ_EXT
-        | vk::AccessFlags2::CONDITIONAL_RENDERING_READ_EXT
-        | vk::AccessFlags2::COLOR_ATTACHMENT_READ_NONCOHERENT_EXT
-        | vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
-        | vk::AccessFlags2::FRAGMENT_DENSITY_MAP_READ_EXT
-        | vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR
-        | vk::AccessFlags2::COMMAND_PREPROCESS_READ_NV
-        | vk::AccessFlags2::DESCRIPTOR_BUFFER_READ_EXT
-        | vk::AccessFlags2::INVOCATION_MASK_READ_HUAWEI
-        | vk::AccessFlags2::VIDEO_DECODE_READ_KHR
-        | vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
-        | vk::AccessFlags2::MICROMAP_READ_EXT
-        | vk::AccessFlags2::OPTICAL_FLOW_READ_NV
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::features::Features;
     use crate::image::{slice::ImageView, usage::ImageUsage};
@@ -1859,13 +1636,13 @@ mod tests {
     };
     use crate::vk::Handle;
     use std::iter;
+    use pending::MAX_PENDING_BUFFER_WRITES;
     use std::marker::PhantomData;
-    use std::sync::atomic::AtomicU32;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
     // ---- helpers -------------------------------------------------------------------------
 
-    fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess {
+    pub(crate) fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess {
         BufferAccess {
             stage,
             access,
@@ -1873,16 +1650,16 @@ mod tests {
         }
     }
 
-    fn read(range: std::ops::Range<u64>) -> BufferAccess {
+    pub(crate) fn read(range: std::ops::Range<u64>) -> BufferAccess {
         buffer(S::VERTEX_SHADER, A::SHADER_STORAGE_READ, range)
     }
 
-    fn write(range: std::ops::Range<u64>) -> BufferAccess {
+    pub(crate) fn write(range: std::ops::Range<u64>) -> BufferAccess {
         buffer(S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE, range)
     }
 
     /// An access of image `id`, whose tracked layout is `old_layout` until it is recorded.
-    fn image(id: u64, stage: S, access: A, old_layout: L, layout: L) -> ImageUse<'static> {
+    pub(crate) fn image(id: u64, stage: S, access: A, old_layout: L, layout: L) -> ImageUse<'static> {
         ImageUse {
             access: ImageAccess {
                 stage,
@@ -1892,11 +1669,11 @@ mod tests {
                 aspect: vk::ImageAspectFlags::COLOR,
                 mip_range: (0..1).into(),
             },
-            layouts: std::slice::from_ref(Box::leak(Box::new(self::layout(old_layout)))),
+            states: std::slice::from_ref(Box::leak(Box::new(self::layout(old_layout)))),
         }
     }
 
-    fn image_read(id: u64) -> ImageUse<'static> {
+    pub(crate) fn image_read(id: u64) -> ImageUse<'static> {
         image(
             id,
             S::FRAGMENT_SHADER,
@@ -1906,7 +1683,7 @@ mod tests {
         )
     }
 
-    fn image_write(id: u64) -> ImageUse<'static> {
+    pub(crate) fn image_write(id: u64) -> ImageUse<'static> {
         image(
             id,
             S::COMPUTE_SHADER,
@@ -1916,7 +1693,7 @@ mod tests {
         )
     }
 
-    fn pending(buffers: &[BufferAccess], images: &[ImageUse]) -> PendingAccesses {
+    pub(crate) fn pending(buffers: &[BufferAccess], images: &[ImageUse]) -> PendingAccesses {
         let mut pending = PendingAccesses::default();
         pending.record(
             images.iter().map(|image| image.access.clone()),
@@ -1926,17 +1703,18 @@ mod tests {
     }
 
     fn buffer_barrier(pending: &PendingAccesses, access: &BufferAccess) -> Option<Barriers> {
-        compute_barriers(pending, iter::empty(), iter::once(access.clone()))
+        compute_barriers(pending, Kind::Graphics, iter::empty(), iter::once(access.clone()))
     }
 
     fn image_barrier(pending: &PendingAccesses, access: &ImageUse) -> Option<Barriers> {
-        compute_barriers(pending, iter::once(access.clone()), iter::empty())
+        compute_barriers(pending, Kind::Graphics, iter::once(access.clone()), iter::empty())
     }
 
     /// A command buffer that is never handed to Vulkan: enough for state-only code paths.
     fn offline_cmd() -> CommandBuffer {
         CommandBuffer::new(
             vk::CommandBuffer::null(),
+            Kind::Graphics,
             PendingAccesses::default(),
             0,
             0,
@@ -1945,12 +1723,12 @@ mod tests {
         )
     }
 
-    fn view<F: StaticFormat, U: StaticUsage>(layout: &AtomicU32) -> ImageView<'_, F, U> {
+    fn view<F: StaticFormat, U: StaticUsage>(layout: &AtomicU64) -> ImageView<'_, F, U> {
         dynamic_view(layout, F::default(), U::default())
     }
 
     fn dynamic_view<F: Format, U: ImageUsage>(
-        layout: &AtomicU32,
+        layout: &AtomicU64,
         format: F,
         usage: U,
     ) -> ImageView<'_, F, U> {
@@ -1960,15 +1738,20 @@ mod tests {
             mip_range: (0..1).into(),
             extent: EXTENT,
             handle: crate::bindless::BindlessHandle::none(),
-            layouts: std::slice::from_ref(layout),
+            states: std::slice::from_ref(layout),
             format,
             usage,
             dim: crate::image::D2,
         }
     }
 
-    fn layout(layout: L) -> AtomicU32 {
-        AtomicU32::new(layout.as_raw() as u32)
+    /// The state of an image in `layout` that no family owns yet.
+    fn layout(layout: L) -> AtomicU64 {
+        ImageState {
+            layout,
+            ..ImageState::UNDEFINED
+        }
+        .atomic()
     }
 
     // ---- access classification -----------------------------------------------------------
@@ -2219,33 +2002,6 @@ mod tests {
 
     // ---- access recording ----------------------------------------------------------------
 
-    #[test]
-    fn accesses_are_recorded_by_kind() {
-        let read_write = buffer(
-            S::COMPUTE_SHADER,
-            A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
-            0..10,
-        );
-        let pending = pending(&[read(20..30), write(40..50), read_write], &[]);
-        assert_eq!(pending.buffer_reads.len(), 2);
-        assert_eq!(pending.buffer_writes.len(), 2);
-    }
-
-    #[test]
-    fn a_covering_access_replaces_the_older_ones() {
-        let pending = pending(&[write(10..20), write(30..40), write(0..100)], &[]);
-        assert_eq!(pending.buffer_writes.len(), 1);
-        assert_eq!(pending.buffer_writes[0].write.range, (0u64..100).into());
-
-        // Same range again: still a single entry, lists don't grow frame over frame.
-        let mut pending = pending;
-        for _ in 0..10 {
-            pending.record(iter::empty(), [write(0..100), read(0..100)].into_iter());
-        }
-        assert_eq!(pending.buffer_writes.len(), 1);
-        assert_eq!(pending.buffer_reads.len(), 1);
-    }
-
     /// Regression: a write that only partially overlapped an older pending write used to
     /// erase it, so a later read of the untouched part got no barrier.
     #[test]
@@ -2271,37 +2027,6 @@ mod tests {
                 .src_stage_mask
                 .contains(S::TRANSFER)
         );
-    }
-
-    #[test]
-    fn forgetting_drops_only_the_accesses_of_the_destroyed_object() {
-        let mut p = pending(
-            &[read(0..10), write(10..20), read(100..110), write(120..130)],
-            &[image_read(1), image_write(2), image_read(3), image_write(3)],
-        );
-        p.forget_buffer(100..200);
-        p.forget_image(vk::Image::from_raw(3));
-        assert_eq!(p.buffer_reads.len(), 1);
-        assert_eq!(p.buffer_reads[0].range, (0u64..10).into());
-        assert_eq!(p.buffer_writes.len(), 1);
-        assert_eq!(p.buffer_writes[0].write.range, (10u64..20).into());
-        assert_eq!(p.image_reads.len(), 1);
-        assert_eq!(p.image_reads[0].image, vk::Image::from_raw(1));
-        assert_eq!(p.image_writes.len(), 1);
-        assert_eq!(p.image_writes[0].write.image, vk::Image::from_raw(2));
-    }
-
-    #[test]
-    fn image_accesses_replace_older_ones_of_the_same_image_only() {
-        let other_stage = image(1, S::TRANSFER, A::TRANSFER_WRITE, L::GENERAL, L::GENERAL);
-        let pending = pending(&[], &[image_write(1), image_write(2), other_stage]);
-        assert_eq!(pending.image_writes.len(), 2);
-        let first = pending
-            .image_writes
-            .iter()
-            .find(|a| a.write.image == vk::Image::from_raw(1))
-            .unwrap();
-        assert_eq!(first.write.stage, S::TRANSFER);
     }
 
     /// Regression: a read replaced the older reads of the same image, so a fragment read
@@ -2331,16 +2056,6 @@ mod tests {
             barriers.memory.unwrap().src_stage_mask,
             S::VERTEX_SHADER | S::COMPUTE_SHADER
         );
-    }
-
-    #[test]
-    fn a_write_forgets_the_reads_it_waited_for() {
-        let p = pending(&[], &[image_read(1), image_write(1)]);
-        assert!(p.image_reads.is_empty());
-
-        let p = pending(&[read(0..10), read(20..30), write(0..15)], &[]);
-        assert_eq!(p.buffer_reads.len(), 1);
-        assert_eq!(p.buffer_reads[0].range, (20u64..30).into());
     }
 
     // ---- image hazards and layout transitions --------------------------------------------
@@ -2380,6 +2095,9 @@ mod tests {
             transition.subresource_range.aspect_mask,
             vk::ImageAspectFlags::COLOR
         );
+        // Not an ownership transfer: ash's default (0 to 0) would name a family.
+        assert_eq!(transition.src_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+        assert_eq!(transition.dst_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
         // The access's mips: the helper's image has one.
         let range = transition.subresource_range;
         assert_eq!((range.base_mip_level, range.level_count), (0, 1));
@@ -2407,7 +2125,7 @@ mod tests {
                 wanted,
             );
             access.access.mip_range = mips.clone().into();
-            access.layouts = &layouts[mips.start as usize..mips.end as usize];
+            access.states = &layouts[mips.start as usize..mips.end as usize];
             access
         };
         let transitions = |access: &ImageUse| {
@@ -2438,6 +2156,22 @@ mod tests {
             transitions(&access(2..5, L::GENERAL)),
             [(3, 1, vk::ImageLayout::ATTACHMENT_OPTIMAL)]
         );
+    }
+
+    /// A command whose second image another family owns panics before the first one's state
+    /// moved, so the logged barriers still describe every tracked state.
+    #[test]
+    fn an_unreleased_image_panics_before_any_state_moves() {
+        let mine = image(1, S::TRANSFER, A::TRANSFER_WRITE, L::UNDEFINED, L::GENERAL);
+        let theirs = image(2, S::TRANSFER, A::TRANSFER_READ, L::GENERAL, L::GENERAL);
+        theirs.take_states(Kind::Compute, |_, _| {});
+        let accesses = [mine.clone(), theirs];
+        let nothing = PendingAccesses::default();
+        let panic = std::panic::catch_unwind(|| {
+            compute_barriers(&nothing, Kind::Graphics, accesses.iter().cloned(), iter::empty())
+        });
+        assert!(panic.is_err());
+        assert_eq!(ImageState::load(&mine.states[0]).layout, L::UNDEFINED);
     }
 
     #[test]
@@ -2514,7 +2248,12 @@ mod tests {
         images: &[ImageUse],
         buffers: &[BufferAccess],
     ) -> Option<Barriers> {
-        let barriers = compute_barriers(pending, images.iter().cloned(), buffers.iter().cloned());
+        let barriers = compute_barriers(
+            pending,
+            Kind::Graphics,
+            images.iter().cloned(),
+            buffers.iter().cloned(),
+        );
         if let Some(barriers) = &barriers {
             pending.made_visible(barriers);
         }
@@ -2612,22 +2351,6 @@ mod tests {
     }
 
     #[test]
-    fn visible_scopes_merge_only_where_that_is_exact() {
-        let mut write = PendingWrite::new((), 0);
-        write.make_visible(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ);
-        write.make_visible(S::COMPUTE_SHADER, A::SHADER_SAMPLED_READ);
-        assert_eq!(write.visible.len(), 1, "same accesses: one scope");
-        write.make_visible(S::COMPUTE_SHADER, A::SHADER_STORAGE_READ);
-        assert_eq!(write.visible.len(), 2);
-        assert!(!write.visible_to(S::FRAGMENT_SHADER, A::SHADER_STORAGE_READ));
-        // A scope containing another replaces it.
-        let wide_stages = S::VERTEX_SHADER | S::FRAGMENT_SHADER | S::COMPUTE_SHADER;
-        write.make_visible(wide_stages, A::SHADER_SAMPLED_READ | A::SHADER_STORAGE_READ);
-        assert_eq!(write.visible.len(), 1);
-        assert!(write.visible_to(S::VERTEX_SHADER, A::SHADER_STORAGE_READ));
-    }
-
-    #[test]
     fn a_new_write_is_not_visible_to_anything() {
         let mut pending = pending(&[write(0..100)], &[]);
         flush(&mut pending, &[], &[read(0..100)]);
@@ -2681,6 +2404,7 @@ mod tests {
         ];
         let barriers = compute_barriers(
             &PendingAccesses::default(),
+            Kind::Graphics,
             accesses.into_iter(),
             iter::empty(),
         )
@@ -2706,7 +2430,7 @@ mod tests {
         let nothing = PendingAccesses::default();
         let transition = |access: &ImageUse| {
             let barriers =
-                compute_barriers(&nothing, iter::once(access.clone()), iter::empty()).unwrap();
+                compute_barriers(&nothing, Kind::Graphics, iter::once(access.clone()), iter::empty()).unwrap();
             let [transition] = barriers.images.as_slice() else {
                 panic!("one transition");
             };
@@ -2912,7 +2636,7 @@ mod tests {
             builder.depth_attachment(view::<D32Sfloat, DepthAttachment>(&depth), None);
             let depth = builder.depth_access();
             let accesses = builder.color.iter().map(|c| c.access.clone()).chain(depth);
-            compute_barriers(&nothing, accesses, iter::empty()).map_or(vec![], |barriers| {
+            compute_barriers(&nothing, Kind::Graphics, accesses, iter::empty()).map_or(vec![], |barriers| {
                 let transitions = barriers.images.iter();
                 transitions.map(|t| (t.old_layout, t.new_layout)).collect()
             })
@@ -2930,7 +2654,7 @@ mod tests {
             L::GENERAL,
         );
         let mut old = None;
-        sampled.take_layouts(|_, layout| old = Some(layout));
+        sampled.take_states(Kind::Graphics, |_, state| old = Some(state.layout));
         assert_eq!(old, Some(vk::ImageLayout::ATTACHMENT_OPTIMAL));
         assert_eq!(
             draw(&mut cmd),

@@ -27,7 +27,7 @@ unsized_struct! {
     /// commands don't depend on that size. The generated `Pass::push_bindings` (and
     /// `constant_bindings` for a pass with specialization constants) returns it as a sized
     /// [`Bindings`], which derefs to this, so `cmd.compute(&Pass::push_bindings(..), ..)` records
-    /// it. It borrows its images' tracked layouts until it is recorded, and can be recorded more
+    /// it. It borrows its images' tracked states until it is recorded, and can be recorded more
     /// than once.
     pub struct BindingOutput {
         /// The pass's index in the pass map.
@@ -142,14 +142,14 @@ fn concat<T, const N: usize, const M: usize, const O: usize>(a: [T; N], b: [T; M
 mod tests {
     use super::*;
     use crate::command_buffer::ImageAccess;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::AtomicU64;
     use crate::vk::{self, Handle};
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
     /// What a binding generator puts in comes back out of the unsized bytes unchanged.
     #[test]
     fn bindings_read_back_every_section() {
-        let layouts = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+        let layouts = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
         let image = ImageUse {
             access: ImageAccess {
                 stage: S::COMPUTE_SHADER,
@@ -159,7 +159,7 @@ mod tests {
                 aspect: vk::ImageAspectFlags::COLOR,
                 mip_range: (1..3).into(),
             },
-            layouts: &layouts[1..],
+            states: &layouts[1..],
         };
         let buffer = BufferAccess {
             stage: S::COMPUTE_SHADER,
@@ -175,7 +175,7 @@ mod tests {
                         image: vk::Image::from_raw(3),
                         ..image.access.clone()
                     },
-                    layouts: &layouts[..1],
+                    states: &layouts[..1],
                 }],
                 [],
             );
@@ -195,7 +195,7 @@ mod tests {
         let images: Vec<_> = output.sections().images().collect();
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].access, image.access);
-        assert!(std::ptr::eq(images[0].layouts, &layouts[1..]));
+        assert!(std::ptr::eq(images[0].states, &layouts[1..]));
         assert_eq!(images[1].access.image, vk::Image::from_raw(3));
         let buffers: Vec<_> = output.sections().buffers().collect();
         assert_eq!(buffers, [buffer.clone()]);

@@ -7,7 +7,8 @@ use smallvec::SmallVec;
 use crate::{
     queue::{Kind, MAX_TIMELINES, lock},
     state::Ctx,
-    vkobjects::{physical_device::QueueFamily, queue::PendingAccesses},
+    command_buffer::pending::PendingAccesses,
+    vkobjects::physical_device::QueueFamily,
 };
 
 /// The queues of every family lava created queues of, by [`Kind`].

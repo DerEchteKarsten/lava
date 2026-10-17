@@ -3,7 +3,7 @@ use std::{
     iter,
     mem::{self, ManuallyDrop},
     range::Range,
-    sync::atomic::AtomicU32,
+    sync::atomic::AtomicU64,
 };
 
 use crate::error::{Error, Result};
@@ -13,6 +13,7 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindless::{self, BindlessHandle, NULL_HANDLE},
+    command_buffer::image_state::ImageState,
     epoch,
     image::{
         format::{Format, StaticFormat, bc_block},
@@ -169,9 +170,9 @@ impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
 pub trait Views: crate::sealed::Sealed + std::fmt::Debug + Send + Sync + 'static + Sized {
     #[doc(hidden)]
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self>;
-    /// The view over every mip and aspect, its handle and the layouts it covers.
+    /// The view over every mip and aspect, its handle and the states it covers.
     #[doc(hidden)]
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]);
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]);
     #[doc(hidden)]
     fn whole_handle(&mut self) -> &mut BindlessHandle;
     /// The view of every mip that descriptors get: the whole view, or its depth-only view for
@@ -184,9 +185,9 @@ pub trait Views: crate::sealed::Sealed + std::fmt::Debug + Send + Sync + 'static
 
 /// Views with one view per mip besides the whole one: [`PerMip`] and [`DepthSplitMips`].
 pub trait MipViews: Views {
-    /// Mip `level`'s view over every aspect, the one descriptors get, its handle and layout.
+    /// Mip `level`'s view over every aspect, the one descriptors get, its handle and state.
     #[doc(hidden)]
-    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU32);
+    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU64);
     #[doc(hidden)]
     fn mip_handle_mut(&mut self, level: u32) -> &mut BindlessHandle;
 }
@@ -197,7 +198,7 @@ pub trait MipViews: Views {
 pub struct Single {
     view: vk::ImageView,
     handle: BindlessHandle,
-    layout: AtomicU32,
+    state: AtomicU64,
 }
 
 /// The view over every mip plus one view per mip, each with its handle, and a layout per mip:
@@ -207,7 +208,7 @@ pub struct PerMip {
     view: vk::ImageView,
     handle: BindlessHandle,
     mips: Box<[MipView]>,
-    layouts: Box<[AtomicU32]>,
+    layouts: Box<[AtomicU64]>,
 }
 
 #[derive(Debug)]
@@ -234,8 +235,8 @@ pub struct DepthSplitMips {
     mip_shaders: Box<[vk::ImageView]>,
 }
 
-fn undefined() -> AtomicU32 {
-    AtomicU32::new(vk::ImageLayout::UNDEFINED.as_raw() as u32)
+fn undefined() -> AtomicU64 {
+    ImageState::UNDEFINED.atomic()
 }
 
 impl crate::sealed::Sealed for Single {}
@@ -245,11 +246,11 @@ impl Views for Single {
         Ok(Single {
             view: raw.create_view((0..raw.mip_levels).into(), aspects)?,
             handle: BindlessHandle::none(),
-            layout: undefined(),
+            state: undefined(),
         })
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
-        (self.view, self.handle, std::slice::from_ref(&self.layout))
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
+        (self.view, self.handle, std::slice::from_ref(&self.state))
     }
     fn whole_handle(&mut self) -> &mut BindlessHandle {
         &mut self.handle
@@ -284,7 +285,7 @@ impl Views for PerMip {
         views.mips = mips.into();
         Ok(views)
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
         (self.view, self.handle, &self.layouts)
     }
     fn whole_handle(&mut self) -> &mut BindlessHandle {
@@ -293,7 +294,7 @@ impl Views for PerMip {
 }
 
 impl MipViews for PerMip {
-    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU32) {
+    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU64) {
         let mip = &self.mips[level as usize];
         (
             mip.view,
@@ -328,7 +329,7 @@ impl Views for DepthSplit {
         let shader = raw.create_view((0..raw.mip_levels).into(), vk::ImageAspectFlags::DEPTH)?;
         Ok(DepthSplit { views, shader })
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
         self.views.whole()
     }
     fn whole_handle(&mut self) -> &mut BindlessHandle {
@@ -364,7 +365,7 @@ impl Views for DepthSplitMips {
         views.mip_shaders = mips.into();
         Ok(views)
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU32]) {
+    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
         self.views.whole()
     }
     fn whole_handle(&mut self) -> &mut BindlessHandle {
@@ -376,7 +377,7 @@ impl Views for DepthSplitMips {
 }
 
 impl MipViews for DepthSplitMips {
-    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU32) {
+    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU64) {
         let (view, _, handle, layout) = self.views.mip(level);
         (view, self.mip_shaders[level as usize], handle, layout)
     }
@@ -519,8 +520,8 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 
     /// The view over every mip.
     pub fn whole_view(&self) -> ImageView<'_, F, U, D> {
-        let (view, handle, layouts) = self.views.whole();
-        self.view(view, (0..self.raw.mip_levels).into(), handle, layouts)
+        let (view, handle, states) = self.views.whole();
+        self.view(view, (0..self.raw.mip_levels).into(), handle, states)
     }
 
     fn view<'a>(
@@ -528,7 +529,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         view: vk::ImageView,
         mip_range: Range<u32>,
         handle: BindlessHandle,
-        layouts: &'a [AtomicU32],
+        states: &'a [AtomicU64],
     ) -> ImageView<'a, F, U, D> {
         ImageView {
             image: self.raw.image,
@@ -536,7 +537,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             mip_range,
             extent: self.mip_extent(mip_range.start),
             handle,
-            layouts,
+            states,
             format: self.raw.format,
             usage: self.raw.usage,
             dim: D::default(),
@@ -606,9 +607,9 @@ impl<F: Format, U: ImageUsage, D: Dim, V: MipViews> Image<F, U, D, V> {
     /// The view of mip `level` alone, sized `mip_extent(level)`: for a storage write, an
     /// attachment or a copy of one mip. The whole view samples across mips.
     pub fn mip_view(&self, level: u32) -> ImageView<'_, F, U, D> {
-        let (view, _, handle, layout) = self.views.mip(level);
-        let layouts = std::slice::from_ref(layout);
-        self.view(view, (level..level + 1).into(), handle, layouts)
+        let (view, _, handle, state) = self.views.mip(level);
+        let states = std::slice::from_ref(state);
+        self.view(view, (level..level + 1).into(), handle, states)
     }
 
     /// Binds mip `i`'s view at slot `first + i` of `set`, `mip_levels` contiguous free slots.
@@ -678,7 +679,7 @@ use crate::features::Feature;
 use crate::features::gate;
 #[cfg(feature = "host-image-copy")]
 use crate::{
-    command_buffer::{ImageAccess, ImageUse},
+    command_buffer::image_state::take_host_layouts,
     features::Feature,
     image::usage::IsHostCopy,
     state::Functions,
@@ -770,27 +771,18 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
     ) -> Result<()> {
         let image = self.raw.image;
         let aspect = self.raw.format.aspects();
-        let (_, _, layouts) = self.views.whole();
-        // Every mip not in `GENERAL` yet moves there, as if a command accessed the whole view.
-        let to_general = ImageUse {
-            access: ImageAccess {
-                stage: vk::PipelineStageFlags2::HOST,
-                access: vk::AccessFlags2::HOST_WRITE,
-                image,
-                layout: vk::ImageLayout::GENERAL,
-                aspect,
-                mip_range: (0..self.raw.mip_levels).into(),
-            },
-            layouts,
-        };
+        let (_, _, states) = self.views.whole();
+        // Every mip not in `GENERAL` yet moves there. A host copy is no queue's access, so the
+        // image keeps its owner.
         let mut transitions: smallvec::SmallVec<[vk::HostImageLayoutTransitionInfoEXT; 1]> =
             smallvec::SmallVec::new();
-        to_general.take_layouts(|mips, old_layout| {
+        let (mips, general) = ((0..self.raw.mip_levels).into(), vk::ImageLayout::GENERAL);
+        take_host_layouts(states, mips, general, |mips, old_layout| {
             transitions.push(
                 vk::HostImageLayoutTransitionInfoEXT::default()
                     .image(image)
                     .old_layout(old_layout)
-                    .new_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(general)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: aspect,
                         base_mip_level: mips.start,
