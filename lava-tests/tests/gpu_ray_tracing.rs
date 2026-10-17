@@ -36,8 +36,8 @@ fn supported(test: &str, feature: bool) -> bool {
     feature
 }
 
-fn target(slot: u32) -> Target {
-    Target::new(EXTENT).unwrap().bind_storage(slot)
+fn target() -> Target {
+    Target::new(EXTENT).unwrap().bind_storage().unwrap()
 }
 
 /// Lets `record` write `targets` in one submission and reads them back.
@@ -45,7 +45,7 @@ fn render_many<const N: usize>(
     gpu: &common::Gpu,
     record: impl FnOnce(&mut CommandBuffer, &[Target; N]),
 ) -> [Vec<u8>; N] {
-    let targets: [Target; N] = std::array::from_fn(|i| target(i as u32));
+    let targets: [Target; N] = std::array::from_fn(|_| target());
     let readbacks: [Buffer<u8>; N] =
         std::array::from_fn(|_| zeroed_buffer((SIZE * SIZE * 4) as usize));
     gpu.submit(|cmd| {

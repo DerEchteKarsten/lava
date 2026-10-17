@@ -23,7 +23,7 @@ use crate::{
         format,
         kind::ImageRef,
         slice::ImageView,
-        usage::{ColorAttachmentTransferDst, IsStorage, StaticUsage},
+        usage::{ColorAttachmentTransferDst, StaticUsage},
     },
     state::{Ctx, Functions},
     vkobjects::{
@@ -122,8 +122,10 @@ impl<U: StaticUsage> Swapchain<U> {
         self.images.len()
     }
 
-    /// The images are unbound; the caller binds them. The image count can change between
-    /// swapchains of one surface, e.g. with the present mode (Mailbox often needs one more).
+    /// Every image is bound in each bindless set its usage allows, at slots lava picks (its
+    /// `image(i).handle()`), which are free again once the swapchain is destroyed. The image
+    /// count can change between swapchains of one surface, e.g. with the present mode (Mailbox
+    /// often needs one more).
     /// `size` is clamped to what the surface allows right now (its capabilities are
     /// re-queried); a surface without any extent (`Surface::is_minimised`) is an error. The
     /// format is the first of `preferred` the surface has that supports `U`, else the first
@@ -237,7 +239,7 @@ impl<U: StaticUsage> Swapchain<U> {
             })
             .collect::<Result<SmallVec<[SwapchainImage; 5]>>>()?;
 
-        Ok(Self {
+        let mut swapchain = Self {
             handle,
             format: format::Dynamic(format.format),
             preferred: SmallVec::from_slice(preferred),
@@ -248,26 +250,25 @@ impl<U: StaticUsage> Swapchain<U> {
             present_mode: present_mode_index,
             sync: Mutex::new(()),
             surface: surface.shared_handle(),
-        })
-    }
-
-    /// Binds image `i` at the `i`-th of `storage_indices` of the storage set, right away. The
-    /// indices are handed to the bindless drop hook (`bindless::on_drop`) once the swapchain is
-    /// destroyed. Panics if there are fewer indices than images.
-    pub fn bind_storage(&mut self, storage_indices: impl IntoIterator<Item = u32>)
-    where
-        U: IsStorage,
-    {
-        let mut indices = storage_indices.into_iter();
-        for image in &mut self.images {
-            let index = indices.next().expect("an index per swapchain image");
-            image.handle = BindlessHandle::storage(index);
+        };
+        // On an error, dropping it frees the slots taken so far.
+        for set in [bindless::Set::Sampled, bindless::Set::Storage] {
+            let flag = match set {
+                bindless::Set::Sampled => vk::ImageUsageFlags::SAMPLED,
+                bindless::Set::Storage => vk::ImageUsageFlags::STORAGE,
+            };
+            if !usage.contains(flag) {
+                continue;
+            }
+            for image in &mut swapchain.images {
+                *set.index_mut(&mut image.handle) = bindless::allocate(set, 1)?;
+            }
+            bindless::bind_raw(
+                swapchain.images.iter().map(|image| (image.view, usage)),
+                swapchain.images.iter().map(|image| image.handle),
+            );
         }
-        let images = 0..self.images.len() as u32;
-        bindless::bind(
-            images.clone().map(|i| self.image(i)),
-            images.map(|i| self.image(i).handle),
-        );
+        Ok(swapchain)
     }
 
     /// The index of the next image, once `wait_on` is signalled. Holds the swapchain while it
@@ -288,9 +289,9 @@ impl<U: StaticUsage> Swapchain<U> {
     }
 
     /// Replaces the swapchain with one of `size` and returns the old one, which can be dropped
-    /// right away: it is destroyed once the frames and presents that may use it are done
-    /// (`epoch`). The new images are unbound (see `new`); bind them again. On an error (see
-    /// `new`) the old swapchain stays.
+    /// right away: it is destroyed, and its slots freed, once the frames and presents that may
+    /// use it are done (`epoch`). The new images are bound at other slots (see `new`). On an
+    /// error (see `new`) the old swapchain stays.
     #[validation_trace]
     pub fn recreate(&mut self, surface: &mut Surface, size: UVec2) -> Result<Swapchain<U>> {
         let _span = tracing::info_span!("Swapchain Recreation").entered();
@@ -313,7 +314,7 @@ impl<U: StaticUsage> Drop for Swapchain<U> {
             unsafe {
                 for (image, view, handle) in images {
                     forget_image(image);
-                    bindless::release(handle);
+                    bindless::free_handle(handle);
                     Ctx::device().destroy_image_view(view, None);
                 }
                 Functions::swapchain().destroy_swapchain(handle, None);

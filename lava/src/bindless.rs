@@ -1,5 +1,8 @@
-//! Global bindless descriptor sets: the application's immutable samplers (`SamplerDesc`, anisotropic with `sampler-anisotropy`), caller-indexed image descriptors, handles
-use std::sync::OnceLock;
+//! Global bindless descriptor sets: the application's immutable samplers (`SamplerDesc`, anisotropic with `sampler-anisotropy`), image descriptors at slots lava allocates (first fit, freed with their views) or in ranges the application reserves (`reserve_sampled`), handles
+use std::{
+    ops::Range,
+    sync::{Mutex, OnceLock},
+};
 
 use crate::error::{Error, Result};
 use crate::vk::{self, BorderColor, Filter, SamplerAddressMode, SamplerMipmapMode};
@@ -7,8 +10,10 @@ use bytemuck::{Pod, Zeroable};
 use lava_macros::validation_trace;
 
 use crate::{
-    pipeline::MAX_PUSH_CONSTANTS_SIZE,
+    epoch,
     image::{Dim, format::Format, slice::ImageView, usage::ImageUsage},
+    pipeline::MAX_PUSH_CONSTANTS_SIZE,
+    queue::lock,
     state::Ctx,
 };
 
@@ -16,6 +21,10 @@ use crate::{
 pub struct Bindless {
     /// Descriptors allocated in the sampled (set 0) and storage (set 1) image arrays.
     counts: [u32; 2],
+    /// Per set: its free slots.
+    free: [Mutex<Ranges>; 2],
+    /// Per set: the live ranges of `reserve_sampled`/`reserve_storage`, which `bind` writes.
+    reserved: [Mutex<Vec<Range<u32>>>; 2],
     layout: vk::PipelineLayout,
     layouts: [vk::DescriptorSetLayout; 2],
     /// Sampled images and storage images.
@@ -27,6 +36,186 @@ static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 
 /// The binding of the sampled images in set 0, after the samplers' array (binding 0).
 const SAMPLED_IMAGES_BINDING: u32 = 1;
+
+/// The most descriptors of each set, below the device's limits.
+const MAX_DESCRIPTORS: u32 = 1 << 15;
+
+/// One of the two bindless sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Set {
+    /// Set 0: sampled images.
+    Sampled = 0,
+    /// Set 1: storage images.
+    Storage = 1,
+}
+
+impl Set {
+    /// The index of `handle` in this set.
+    pub(crate) fn index_mut(self, handle: &mut BindlessHandle) -> &mut u32 {
+        match self {
+            Set::Sampled => &mut handle.descriptor_index_set0,
+            Set::Storage => &mut handle.descriptor_index_set1,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Set::Sampled => "sampled",
+            Set::Storage => "storage",
+        }
+    }
+
+    /// The handle of `index` in this set alone.
+    pub(crate) fn handle(self, index: u32) -> BindlessHandle {
+        match self {
+            Set::Sampled => BindlessHandle::sampled(index),
+            Set::Storage => BindlessHandle::storage(index),
+        }
+    }
+}
+
+/// The free slots of a set: sorted, disjoint ranges, never two adjacent ones.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Ranges {
+    free: Vec<Range<u32>>,
+}
+
+impl Ranges {
+    pub(crate) fn new(count: u32) -> Self {
+        let free = if count == 0 { Vec::new() } else { vec![0..count] };
+        Self { free }
+    }
+
+    /// The first `n` contiguous free slots (first fit), which are taken.
+    pub(crate) fn take(&mut self, n: u32) -> Option<u32> {
+        assert!(n > 0, "a slot range holds at least one slot");
+        let i = self.free.iter().position(|range| range.len() >= n as usize)?;
+        let start = self.free[i].start;
+        self.free[i].start += n;
+        if self.free[i].is_empty() {
+            self.free.remove(i);
+        }
+        Some(start)
+    }
+
+    /// Frees `range`, merging it with its neighbours. Panics if a slot of it is free already.
+    pub(crate) fn give(&mut self, range: Range<u32>) {
+        if range.is_empty() {
+            return;
+        }
+        let i = self.free.partition_point(|free| free.start < range.start);
+        let overlaps = |free: Option<&Range<u32>>| {
+            free.is_some_and(|free| free.start < range.end && range.start < free.end)
+        };
+        assert!(
+            !overlaps(i.checked_sub(1).and_then(|i| self.free.get(i))) && !overlaps(self.free.get(i)),
+            "bindless slots {range:?} are freed twice"
+        );
+        let merges_left = i > 0 && self.free[i - 1].end == range.start;
+        let merges_right = self.free.get(i).is_some_and(|next| next.start == range.end);
+        match (merges_left, merges_right) {
+            (true, true) => {
+                self.free[i - 1].end = self.free[i].end;
+                self.free.remove(i);
+            }
+            (true, false) => self.free[i - 1].end = range.end,
+            (false, true) => self.free[i].start = range.start,
+            (false, false) => self.free.insert(i, range),
+        }
+    }
+}
+
+/// Takes `n` contiguous slots of `set`, the first that are free.
+pub(crate) fn allocate(set: Set, n: u32) -> Result<u32> {
+    let bindless = Bindless::get();
+    lock(&bindless.free[set as usize]).take(n).ok_or(Error::OutOfBindlessSlots {
+        set: set.name(),
+        count: n,
+    })
+}
+
+/// Frees slots of `set` that no frame reaches any more: their view was destroyed, or their
+/// reservation dropped and retired.
+pub(crate) fn free(set: Set, range: Range<u32>) {
+    lock(&Bindless::get().free[set as usize]).give(range);
+}
+
+/// Frees the slots `Image::bind_sampled`, `bind_storage` and `bind_mips_*` put a view's handle
+/// at, once its view was destroyed.
+pub(crate) fn free_handle(handle: BindlessHandle) {
+    for (set, index) in [
+        (Set::Sampled, handle.descriptor_index_set0),
+        (Set::Storage, handle.descriptor_index_set1),
+    ] {
+        if index != NULL_HANDLE {
+            free(set, index..index + 1);
+        }
+    }
+}
+
+/// Slots of one set the application writes itself with [`bind`], e.g. one per texture asset:
+/// [`reserve_sampled`] and [`reserve_storage`] make them. Its slots are free again once it is
+/// dropped and no frame reaches them any more (`epoch`); [`bind`] refuses them right away.
+#[derive(Debug)]
+#[must_use]
+pub struct SlotRange {
+    set: Set,
+    start: u32,
+    len: u32,
+}
+
+impl SlotRange {
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Its slots' indices in their set.
+    pub fn indices(&self) -> Range<u32> {
+        self.start..self.start + self.len
+    }
+
+    /// The handle of its `i`-th slot, in its set alone. Panics past its end.
+    pub fn handle(&self, i: u32) -> BindlessHandle {
+        assert!(i < self.len, "slot {i} of a range of {}", self.len);
+        self.set.handle(self.start + i)
+    }
+}
+
+impl Drop for SlotRange {
+    fn drop(&mut self) {
+        let (set, range) = (self.set, self.indices());
+        let mut reserved = lock(&Bindless::get().reserved[set as usize]);
+        if let Some(i) = reserved.iter().position(|r| *r == range) {
+            reserved.swap_remove(i);
+        }
+        epoch::retire(move || free(set, range));
+    }
+}
+
+fn reserve(set: Set, n: u32) -> Result<SlotRange> {
+    let start = allocate(set, n)?;
+    lock(&Bindless::get().reserved[set as usize]).push(start..start + n);
+    Ok(SlotRange { set, start, len: n })
+}
+
+/// `n` contiguous slots of the sampled set for [`bind`], the first that are free:
+/// `OutOfBindlessSlots` if there are none.
+pub fn reserve_sampled(n: u32) -> Result<SlotRange> {
+    reserve(Set::Sampled, n)
+}
+
+/// `n` contiguous slots of the storage set for [`bind`] (see [`reserve_sampled`]).
+pub fn reserve_storage(n: u32) -> Result<SlotRange> {
+    reserve(Set::Storage, n)
+}
 
 /// An immutable sampler, which shaders pick by its index in `Config::samplers`
 /// (`Sample(uv, sampler)` in `bindless.slang`).
@@ -100,27 +289,6 @@ impl SamplerDesc {
     }
 }
 
-static ON_DROP: OnceLock<fn(BindlessHandle)> = OnceLock::new();
-
-/// Sets the function called with every bound handle whose view is destroyed: each handle of an
-/// image (its whole view's, then each mip's) and of a swapchain's images, once no frame can
-/// reach it any more (`epoch`), so whoever picked the indices can hand them out again. It can
-/// be set once.
-pub fn on_drop(hook: fn(BindlessHandle)) -> Result<()> {
-    ON_DROP
-        .set(hook)
-        .map_err(|_| Error::message("the bindless drop hook is already set"))
-}
-
-/// Hands `handle` to the hook unless it is unbound, right before its view is destroyed.
-pub(crate) fn release(handle: BindlessHandle) {
-    if handle != BindlessHandle::none()
-        && let Some(hook) = ON_DROP.get()
-    {
-        hook(handle);
-    }
-}
-
 pub const NULL_HANDLE: u32 = !0;
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -171,16 +339,30 @@ pub fn max_storage_images() -> u32 {
 
 /// Writes each image into the slots of the handle at the same position: the sampled set at
 /// `descriptor_index_set0` and the storage set at `descriptor_index_set1`, skipping
-/// `NULL_HANDLE`s, all in one `vkUpdateDescriptorSets`. The caller picks every index; a slot may
-/// only be rewritten while no pending command buffer uses it. Panics if an image lacks the
-/// usage of a set it is written to, an index is outside its set, or a view has two aspects (a
-/// combined depth-stencil image binds its depth-only view through `DepthSplit` views'
-/// `bind_sampled`/`bind_storage`).
+/// `NULL_HANDLE`s, all in one `vkUpdateDescriptorSets`. Every index must lie in a live
+/// [`SlotRange`] of its set; a slot may only be rewritten while no pending command buffer uses
+/// it, and the image's handle stays as it is (`Image::bind_sampled` is for that). Panics if an
+/// index lies in no reservation, an image lacks the usage of a set it is written to, or a view
+/// has two aspects (a combined depth-stencil image binds its depth-only view through
+/// `DepthSplit` views' `bind_sampled`/`bind_storage`).
 #[validation_trace]
 pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
     images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
     handles: impl IntoIterator<Item = BindlessHandle>,
 ) {
+    let bindless = Bindless::get();
+    let reserved = [&bindless.reserved[0], &bindless.reserved[1]].map(lock);
+    let handles = handles.into_iter().inspect(|handle| {
+        let indices = [handle.descriptor_index_set0, handle.descriptor_index_set1];
+        for (set, index) in indices.into_iter().enumerate() {
+            assert!(
+                index == NULL_HANDLE || reserved[set].iter().any(|r| r.contains(&index)),
+                "bindless index {index} of the {} set lies in no `SlotRange`: `bind` writes only \
+                 reserved slots (`reserve_sampled`, `reserve_storage`)",
+                [Set::Sampled, Set::Storage][set].name()
+            );
+        }
+    });
     let views = images.into_iter().map(|image| {
         let aspects = image.format().aspects();
         assert!(
@@ -276,11 +458,11 @@ impl Bindless {
             limits
                 .max_descriptor_set_update_after_bind_sampled_images
                 .min(limits.max_per_stage_descriptor_update_after_bind_sampled_images)
-                .min(10000),
+                .min(MAX_DESCRIPTORS),
             limits
                 .max_descriptor_set_update_after_bind_storage_images
                 .min(limits.max_per_stage_descriptor_update_after_bind_storage_images)
-                .min(10000),
+                .min(MAX_DESCRIPTORS),
         ];
         let bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -378,6 +560,8 @@ impl Bindless {
         BINDLESS
             .set(Self {
                 counts: desc_counts,
+                free: desc_counts.map(|count| Mutex::new(Ranges::new(count))),
+                reserved: Default::default(),
                 layout,
                 layouts,
                 sets,
@@ -447,6 +631,53 @@ impl Bindless {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slots_are_taken_first_fit() {
+        let mut ranges = Ranges::new(10);
+        assert_eq!(ranges.take(3), Some(0));
+        assert_eq!(ranges.take(1), Some(3));
+        assert_eq!(ranges.take(4), Some(4));
+        assert_eq!(ranges.take(3), None, "two slots are left");
+        ranges.give(0..3);
+        // A hole that is too small is skipped.
+        assert_eq!(ranges.take(2), Some(0));
+        assert_eq!(ranges.take(2), Some(8));
+        assert_eq!(ranges.take(1), Some(2));
+        assert_eq!(ranges.take(1), None);
+        assert_eq!(Ranges::new(0).take(1), None);
+    }
+
+    #[test]
+    fn freed_slots_merge_with_their_neighbours() {
+        let mut ranges = Ranges::new(10);
+        assert_eq!(ranges.take(10), Some(0));
+        ranges.give(2..3);
+        ranges.give(6..8);
+        ranges.give(4..5);
+        assert_eq!(ranges.free, [2..3, 4..5, 6..8]);
+        ranges.give(3..4);
+        assert_eq!(ranges.free, [2..5, 6..8]);
+        ranges.give(5..6);
+        assert_eq!(ranges.free, [2..8]);
+        ranges.give(0..2);
+        ranges.give(8..10);
+        assert_eq!(ranges, Ranges::new(10));
+        // Freed one at a time, a range of mips comes back whole.
+        assert_eq!(ranges.take(4), Some(0));
+        for slot in [2, 0, 3, 1] {
+            ranges.give(slot..slot + 1);
+        }
+        assert_eq!(ranges.take(10), Some(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "freed twice")]
+    fn freeing_a_free_slot_panics() {
+        let mut ranges = Ranges::new(10);
+        ranges.take(4);
+        ranges.give(3..5);
+    }
 
     #[test]
     fn none_handle_is_null_in_both_sets() {

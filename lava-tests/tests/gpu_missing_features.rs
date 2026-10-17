@@ -81,7 +81,7 @@ fn render(
     clear: [f32; 4],
     record: impl FnOnce(&mut CommandBuffer, &Target),
 ) -> Vec<u8> {
-    let target = Target::new(EXTENT).unwrap().bind_storage(0);
+    let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
     let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);
     gpu.submit(|cmd| {
         cmd.clear_image(target.whole_view(), clear);

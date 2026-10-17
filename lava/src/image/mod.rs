@@ -12,7 +12,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
 
 use crate::{
-    bindless::{self, BindlessHandle},
+    bindless::{self, BindlessHandle, NULL_HANDLE},
     epoch,
     image::{
         format::{Format, StaticFormat, bc_block},
@@ -385,8 +385,9 @@ impl MipViews for DepthSplitMips {
     }
 }
 
+/// Destroys a view and frees the slots its handle was bound at.
 fn release(view: vk::ImageView, handle: BindlessHandle) {
-    bindless::release(handle);
+    bindless::free_handle(handle);
     unsafe { Ctx::device().destroy_image_view(view, None) };
 }
 
@@ -566,31 +567,38 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 }
 
 impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
-    /// Binds the whole view at `index` of the sampled set, right away:
-    /// `Image::new(extent)?.bind_sampled(index)`. A combined depth-stencil image needs
-    /// [`DepthSplit`] views for it, whose depth-only view is bound.
+    /// Binds the whole view at a free slot of the sampled set, right away:
+    /// `Image::new(extent)?.bind_sampled()?`; `OutOfBindlessSlots` if there is none. The slot is
+    /// free again once the image is destroyed. A combined depth-stencil image needs
+    /// [`DepthSplit`] views for it, whose depth-only view is bound. Panics if the view is bound
+    /// in the sampled set already.
     #[validation_trace]
-    pub fn bind_sampled(mut self, index: u32) -> Self
+    pub fn bind_sampled(self) -> Result<Self>
     where
         Self: SampledImage,
     {
-        self.views.whole_handle().descriptor_index_set0 = index;
-        let view = (self.views.shader_view(), self.raw.usage.flags());
-        bindless::bind_raw([view], [BindlessHandle::sampled(index)]);
-        self
+        self.bind_whole(bindless::Set::Sampled)
     }
 
-    /// Binds the whole view at `index` of the storage set, right away. An image with both
-    /// usages can be bound in both sets: `.bind_sampled(a).bind_storage(b)`.
+    /// Binds the whole view at a free slot of the storage set, right away (see
+    /// [`Self::bind_sampled`]). An image with both usages can be bound in both sets:
+    /// `.bind_sampled()?.bind_storage()?`.
     #[validation_trace]
-    pub fn bind_storage(mut self, index: u32) -> Self
+    pub fn bind_storage(self) -> Result<Self>
     where
         Self: StorageImage,
     {
-        self.views.whole_handle().descriptor_index_set1 = index;
+        self.bind_whole(bindless::Set::Storage)
+    }
+
+    fn bind_whole(mut self, set: bindless::Set) -> Result<Self> {
+        let index = set.index_mut(self.views.whole_handle());
+        assert_eq!(*index, NULL_HANDLE, "the image is bound in that set already");
+        *index = bindless::allocate(set, 1)?;
+        let bound = set.handle(*index);
         let view = (self.views.shader_view(), self.raw.usage.flags());
-        bindless::bind_raw([view], [BindlessHandle::storage(index)]);
-        self
+        bindless::bind_raw([view], [bound]);
+        Ok(self)
     }
 }
 
@@ -603,44 +611,41 @@ impl<F: Format, U: ImageUsage, D: Dim, V: MipViews> Image<F, U, D, V> {
         self.view(view, (level..level + 1).into(), handle, layouts)
     }
 
-    /// Binds mip `i`'s view at `first + i` of the sampled (`sampled`) or the storage set.
-    fn bind_mips(mut self, first: u32, sampled: bool) -> Self {
+    /// Binds mip `i`'s view at slot `first + i` of `set`, `mip_levels` contiguous free slots.
+    fn bind_mips(mut self, set: bindless::Set) -> Result<Self> {
         let levels = 0..self.mip_levels();
+        let bound = |level| *set.index_mut(&mut self.views.mip(level).2) != NULL_HANDLE;
+        assert!(!levels.clone().any(bound), "the mips are bound in that set already");
+        let first = bindless::allocate(set, levels.len() as u32)?;
         for level in levels.clone() {
-            let handle = self.views.mip_handle_mut(level);
-            if sampled {
-                handle.descriptor_index_set0 = first + level;
-            } else {
-                handle.descriptor_index_set1 = first + level;
-            }
+            *set.index_mut(self.views.mip_handle_mut(level)) = first + level;
         }
         let usage = self.raw.usage.flags();
         bindless::bind_raw(
             levels.clone().map(|level| (self.views.mip(level).1, usage)),
-            levels.map(|level| match sampled {
-                true => BindlessHandle::sampled(first + level),
-                false => BindlessHandle::storage(first + level),
-            }),
+            levels.map(|level| set.handle(first + level)),
         );
-        self
+        Ok(self)
     }
 
-    /// Binds mip `i`'s view at `first + i` of the sampled set, right away.
+    /// Binds mip `i`'s view at slot `first + i` of the sampled set, right away, at the first
+    /// `mip_levels` contiguous free slots: a shader reaches mip `i` at the first mip's index
+    /// plus `i`. `OutOfBindlessSlots` if there are none.
     #[validation_trace]
-    pub fn bind_mips_sampled(self, first: u32) -> Self
+    pub fn bind_mips_sampled(self) -> Result<Self>
     where
         Self: SampledImage,
     {
-        self.bind_mips(first, true)
+        self.bind_mips(bindless::Set::Sampled)
     }
 
-    /// Binds mip `i`'s view at `first + i` of the storage set, right away.
+    /// Like [`Self::bind_mips_sampled`], in the storage set.
     #[validation_trace]
-    pub fn bind_mips_storage(self, first: u32) -> Self
+    pub fn bind_mips_storage(self) -> Result<Self>
     where
         Self: StorageImage,
     {
-        self.bind_mips(first, false)
+        self.bind_mips(bindless::Set::Storage)
     }
 }
 

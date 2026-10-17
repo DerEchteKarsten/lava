@@ -51,12 +51,12 @@ impl Resources {
     fn new() -> Self {
         let buffer = |len| Buffer::new(len, false).unwrap();
         Self {
-            target: Target::new(EXTENT).unwrap().bind_storage(0),
+            target: Target::new(EXTENT).unwrap().bind_storage().unwrap(),
             textures: (0..TEXTURES)
                 .map(|i| {
                     Texture::new(UVec2::splat(4))
                         .unwrap()
-                        .bind_sampled(i as u32)
+                        .bind_sampled().unwrap()
                 })
                 .collect(),
             src: buffer(256),

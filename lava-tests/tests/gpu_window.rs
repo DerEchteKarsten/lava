@@ -93,9 +93,6 @@ const FORMATS: [vk::SurfaceFormatKHR; 1] = [vk::SurfaceFormatKHR {
     color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
 }];
 
-/// The handles the bindless drop hook was called with.
-static DROPPED: std::sync::Mutex<Vec<BindlessHandle>> = std::sync::Mutex::new(Vec::new());
-
 fn run(event_loop: &ActiveEventLoop) {
     let window = create_window(event_loop, "lava test");
     let step = |name: &str| println!("test {name} ... ok");
@@ -111,7 +108,6 @@ fn run(event_loop: &ActiveEventLoop) {
         lava::init(&lava::Config::new(&PASS_MAP)).is_err(),
         "second init must fail"
     );
-    lava::bindless::on_drop(|handle| DROPPED.lock().unwrap().push(handle)).unwrap();
     step("init_with_display");
 
     let mut surface = surface_for(&window).unwrap();
@@ -121,8 +117,6 @@ fn run(event_loop: &ActiveEventLoop) {
     step("surface_reports_formats_modes_and_capabilities");
 
     let mut swapchain = Swapchain::new(&mut surface, None, Some(SIZE), &FORMATS).unwrap();
-    assert_eq!(swapchain.image(0).handle(), BindlessHandle::none());
-    swapchain.bind_storage(0..);
     assert_eq!(swapchain.size(), SIZE);
     assert!(swapchain.num_images() >= surface.capabilities().min_image_count as usize);
     assert!(
@@ -134,9 +128,11 @@ fn run(event_loop: &ActiveEventLoop) {
     let handles: Vec<_> = (0..swapchain.num_images() as u32)
         .map(|i| swapchain.image(i).handle())
         .collect();
+    // Bound in the storage set, the only one its usage allows, each image at its own slot.
     for (i, handle) in handles.iter().enumerate() {
-        assert_eq!(handle.descriptor_index_set1, i as u32);
+        assert_ne!(handle.descriptor_index_set1, lava::bindless::NULL_HANDLE);
         assert_eq!(handle.descriptor_index_set0, lava::bindless::NULL_HANDLE);
+        assert!(!handles[..i].contains(handle));
     }
     step("swapchain_creation");
 
@@ -152,28 +148,29 @@ fn run(event_loop: &ActiveEventLoop) {
     let old = swapchain.recreate(&mut surface, new_size).unwrap();
     assert_eq!(old.size(), SIZE);
     assert_eq!(swapchain.size(), new_size);
-    // Binding is left to the application: the old swapchain's slots stay in use until it is
-    // destroyed, and the image count may change.
-    assert_eq!(swapchain.image(0).handle(), BindlessHandle::none());
-    swapchain.bind_storage(16..);
-    assert_eq!(swapchain.image(0).handle().descriptor_index_set1, 16);
+    // The old swapchain's slots stay taken until it is destroyed: the new images are bound
+    // at others.
+    let new_handles: Vec<BindlessHandle> = (0..swapchain.num_images() as u32)
+        .map(|i| swapchain.image(i).handle())
+        .collect();
+    assert!(new_handles.iter().all(|handle| !handles.contains(handle)));
     present_frame(&queue, &swapchain, [0.0, 0.0, 1.0, 1.0], &mut semaphores);
     drop(old);
-    step("swapchain_recreate_is_unbound");
+    step("swapchain_recreate_binds_other_slots");
 
     // Destroyed once the frames and presents that may use it are done, which an idle device
-    // is: then its handles go to the hook.
+    // is: then its slots are free again, and the first free ones.
     lava::wait_idle().unwrap();
-    for handle in &handles {
-        assert!(DROPPED.lock().unwrap().contains(handle));
-    }
-    step("dropped_swapchains_hand_their_handles_to_the_hook");
+    let lowest = handles.iter().map(|h| h.descriptor_index_set1).min().unwrap();
+    let reserved = lava::bindless::reserve_storage(handles.len() as u32).unwrap();
+    assert_eq!(reserved.start(), lowest);
+    drop(reserved);
+    step("dropped_swapchains_free_their_slots");
 
     let second_window = create_window(event_loop, "lava test 2");
     let mut second_surface = surface_for(&second_window).unwrap();
-    let mut second_swapchain = Swapchain::new(&mut second_surface, None, Some(SIZE), &FORMATS).unwrap();
-    second_swapchain.bind_storage(8..);
-    assert_eq!(second_swapchain.image(0).handle().descriptor_index_set1, 8);
+    let second_swapchain = Swapchain::new(&mut second_surface, None, Some(SIZE), &FORMATS).unwrap();
+    assert!(!new_handles.contains(&second_swapchain.image(0).handle()));
     assert_ne!(second_surface.handle(), surface.handle());
     present_frame(
         &queue,
