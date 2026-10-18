@@ -15,8 +15,6 @@ pub(crate) struct PendingAccesses {
     pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
     pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
     pub(crate) image_writes: SmallVec<[PendingWrite<ImageAccess>; 8]>,
-    /// The timeline value of the submission being recorded.
-    pub(crate) value: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -166,10 +164,12 @@ impl PendingAccesses {
         self.image_writes.retain(|write| write.write.image != image);
     }
 
-    /// An older buffer access is only forgotten once a newer write covers its whole range; a
-    /// newer read doesn't wait for older reads, so it takes over those it covers.
+    /// Tracks the accesses of a command of the submission of timeline value `value`. An older
+    /// buffer access is only forgotten once a newer write covers its whole range; a newer read
+    /// doesn't wait for older reads, so it takes over those it covers.
     pub(crate) fn record(
         &mut self,
+        value: u64,
         image_acceses: impl Iterator<Item = ImageAccess>,
         buffer_acceses: impl Iterator<Item = BufferAccess>,
     ) {
@@ -182,8 +182,7 @@ impl PendingAccesses {
 
             if writes {
                 self.buffer_writes.retain(|a| !covers(&a.write));
-                self.buffer_writes
-                    .push(PendingWrite::new(access.clone(), self.value));
+                self.buffer_writes.push(PendingWrite::new(access.clone(), value));
                 // Its barrier waited for every structure read, and later reads run at the build
                 // stage after it.
                 let structure_write = access
@@ -203,10 +202,7 @@ impl PendingAccesses {
                     }
                     !covered
                 });
-                self.buffer_reads.push(PendingRead {
-                    read,
-                    value: self.value,
-                });
+                self.buffer_reads.push(PendingRead { read, value });
             }
         }
 
@@ -217,8 +213,7 @@ impl PendingAccesses {
 
             if writes {
                 self.image_writes.retain(|a| !same_image(&a.write));
-                self.image_writes
-                    .push(PendingWrite::new(access.clone(), self.value));
+                self.image_writes.push(PendingWrite::new(access.clone(), value));
                 self.image_reads.retain(|a| !same_image(a));
             }
             if reads {

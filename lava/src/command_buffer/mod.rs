@@ -26,7 +26,7 @@ use crate::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
     present::Present,
-    queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
+    queue::{HasCompute, HasGraphics, QueueKind, FamilyInfo},
     state::{Ctx, Functions, debug_name},
 };
 #[cfg(feature = "acceleration-structure")]
@@ -105,7 +105,6 @@ pub struct ImageUse<'a> {
 
 pub(crate) struct Recording<'p> {
     pub(crate) handle: vk::CommandBuffer,
-    pub(crate) kind: Kind,
     pub(crate) pending_accesses: &'p mut PendingAccesses,
     pub(crate) timeline: usize,
     pub(crate) value: u64,
@@ -116,8 +115,8 @@ pub(crate) struct Recording<'p> {
     /// One bit per kind (`query_bit`): one query of each kind can be active.
     pub(crate) active_queries: u32,
     /// Every barrier the tracking already counts, so a recording that never reaches the GPU is
-    /// replaced by one of just these, which keeps the tracking true.
-    pub(crate) barrier_log: Vec<Barriers>,
+    /// replaced by one of just these, which keeps the tracking true. The frame slot's, reused.
+    pub(crate) barrier_log: &'p mut Vec<Barriers>,
     /// Acquired swapchain images with the stages of their first access.
     pub(crate) acquired: SmallVec<[(vk::Image, vk::PipelineStageFlags2); 1]>,
     pub(crate) presents: SmallVec<[Present; 1]>,
@@ -1034,10 +1033,10 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         let view = image.view();
         let aspect = view.format().aspects();
         let (rec, image, to) = (&mut self.rec, view.image, D::KIND);
-        if to == rec.kind {
+        if to == rec.family.kind {
             return;
         }
-        let (from, to_index) = (rec.family.index(rec.kind), rec.family.index(to));
+        let (from, to_index) = (rec.family.index(rec.family.kind), rec.family.index(to));
         // It waits for this timeline's accesses of the image; the acquire waits for it through
         // the semaphore its submission signals.
         let pending = &rec.pending_accesses;
@@ -1054,7 +1053,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
         }
         let mut images = SmallVec::new();
-        release_states(view.states, view.mip_range, rec.kind, to, |mips, layout| {
+        release_states(view.states, view.mip_range, rec.family.kind, to, |mips, layout| {
             images.push(
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(stage)
@@ -1091,12 +1090,10 @@ impl<'p> Recording<'p> {
         pending_accesses: &'p mut PendingAccesses,
         timeline: usize,
         value: u64,
-        barrier_log: Vec<Barriers>,
+        barrier_log: &'p mut Vec<Barriers>,
     ) -> Self {
-        pending_accesses.value = value;
         Self {
             handle,
-            kind: family.kind,
             pending_accesses,
             timeline,
             value,
@@ -1164,8 +1161,11 @@ impl<'p> Recording<'p> {
             self.pipeline_barrier(barriers);
         }
 
-        self.pending_accesses
-            .record(image_acceses.map(|image| image.access), buffer_acceses);
+        (self.pending_accesses).record(
+            self.value,
+            image_acceses.map(|image| image.access),
+            buffer_acceses,
+        );
     }
 
     fn enter(&mut self, name: &'static str, pass: bool) {
@@ -1215,7 +1215,7 @@ impl<'p> Recording<'p> {
         );
         pool.record(self);
         let bits = self.family.timestamp_valid_bits;
-        assert!(bits > 0, "the {:?} family has no timestamps", self.kind);
+        assert!(bits > 0, "the {:?} family has no timestamps", self.family.kind);
         let mask = if bits >= 64 { !0 } else { (1 << bits) - 1 };
         pool.kind.valid_bits.store(mask, std::sync::atomic::Ordering::Relaxed);
         unsafe { Ctx::device().cmd_write_timestamp2(self.handle, stage, pool.handle, index) };
@@ -1227,7 +1227,7 @@ impl<'p> Recording<'p> {
             self.active_queries & bit == 0,
             "a query of this kind is already active, and queries of one kind don't nest"
         );
-        pool.kind.check_kind(self.kind);
+        pool.kind.check_kind(self.family.kind);
         pool.record(self);
         let flags = pool.kind.control_flags();
         unsafe { Ctx::device().cmd_begin_query(self.handle, pool.handle, index, flags) };

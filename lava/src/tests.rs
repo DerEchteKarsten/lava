@@ -72,7 +72,7 @@ fn flush(pending: &mut PendingAccesses, images: &[ImageUse], buffers: &[BufferAc
     if let Some(barriers) = &barriers {
         pending.made_visible(barriers);
     }
-    pending.record(images.iter().map(|i| i.access.clone()), buffers.iter().cloned());
+    pending.record(0, images.iter().map(|i| i.access.clone()), buffers.iter().cloned());
     barriers.map(|b| {
         let memory = b.memory.map_or((S::NONE, A::NONE), |m| (m.src_stage_mask, m.src_access_mask));
         (memory.0, memory.1, b.images.len())
@@ -98,13 +98,11 @@ fn buffer_hazards_wait_for_the_overlapping_accesses() {
 #[test]
 fn pending_accesses_shrink_only_when_covered_or_completed() {
     let mut pending = PendingAccesses::default();
-    pending.value = 1;
-    pending.record(iter::empty(), [write(0..100), buffer(S::TRANSFER, A::TRANSFER_WRITE, 50..60)].into_iter());
+    pending.record(1, iter::empty(), [write(0..100), buffer(S::TRANSFER, A::TRANSFER_WRITE, 50..60)].into_iter());
     assert_eq!(pending.buffer_writes.len(), 2);
-    pending.record(iter::empty(), [write(0..100)].into_iter());
+    pending.record(1, iter::empty(), [write(0..100)].into_iter());
     assert_eq!(pending.buffer_writes.len(), 1, "a covering write replaces both");
-    pending.value = 2;
-    pending.record(iter::empty(), [read(0..10)].into_iter());
+    pending.record(2, iter::empty(), [read(0..10)].into_iter());
     pending.retire(1);
     assert_eq!(pending.buffer_reads.len(), 1);
     pending.retire(2);

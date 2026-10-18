@@ -163,7 +163,7 @@ fn run(event_loop: &ActiveEventLoop) {
     submit_without_presenting(&timeline, &mut surface);
     let submission = timeline.begin().unwrap();
     let twice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        submission.submit(|cmd| cmd.present(&surface))
+        submission.submit(|cmd| cmd.present(&mut surface))
     }));
     assert!(twice.is_err(), "an image is presented by one submission");
     surface.present().unwrap();

@@ -109,6 +109,8 @@ struct Slot {
 struct Inner {
     index: usize,
     family: &'static FamilyQueues,
+    /// What its recordings know of the family.
+    info: FamilyInfo,
     queue: usize,
     slots: Box<[Mutex<Slot>]>,
 }
@@ -203,10 +205,19 @@ impl<K: QueueKind> Timeline<K> {
             timelines[queue] += 1;
             queue
         };
+        let queues = &Ctx::get().queues;
+        let info = FamilyInfo {
+            kind: K::KIND,
+            timestamp_valid_bits: family.timestamp_valid_bits,
+            image_granularity: family.image_granularity,
+            indices: [Kind::Graphics, Kind::Compute, Kind::Transfer]
+                .map(|kind| queues.family(kind).map_or(vk::QUEUE_FAMILY_IGNORED, |f| f.index)),
+        };
         Ok(Timeline {
             inner: Arc::new(Inner {
                 index,
                 family,
+                info,
                 queue,
                 slots,
             }),
@@ -319,34 +330,24 @@ impl<K: QueueKind> Submission<K> {
         let index = &INDICES[i];
         let device = Ctx::device();
         let mut slot = lock(&inner.slots[self.slot]);
+        let slot = &mut *slot;
         let mut state = lock(&index.state);
         let state = &mut *state;
         state.pending.retire(completed(i));
-        let value = index.stamp.load(Ordering::SeqCst).max(state.submitted + 1);
-        index.stamp.fetch_max(value, Ordering::SeqCst);
-        let queues = &Ctx::get().queues;
-        let family = FamilyInfo {
-            kind: K::KIND,
-            timestamp_valid_bits: inner.family.timestamp_valid_bits,
-            image_granularity: inner.family.image_granularity,
-            indices: [Kind::Graphics, Kind::Compute, Kind::Transfer]
-                .map(|kind| queues.family(kind).map_or(vk::QUEUE_FAMILY_IGNORED, |f| f.index)),
-        };
-        let log = std::mem::take(&mut slot.barrier_log);
+        // `begin` raised the stamp past the last submission's value.
+        let value = index.stamp.load(Ordering::SeqCst);
+        debug_assert!(value > state.submitted);
         let mut cmd = CommandBuffer::<K>::new(Recording::new(
             slot.cmd,
-            family,
+            inner.info,
             &mut state.pending,
             i,
             value,
-            log,
+            &mut slot.barrier_log,
         ));
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        if let Err(err) = unsafe { device.begin_command_buffer(slot.cmd, &begin_info) } {
-            slot.barrier_log = std::mem::take(&mut cmd.rec.barrier_log);
-            return Err(err.into());
-        }
+        unsafe { device.begin_command_buffer(slot.cmd, &begin_info)? };
         Bindless::bind(&slot.cmd, K::KIND);
         let prev = CALLSITE.replace(None);
         let was_recording = lifetime::RECORDING.replace(true);
@@ -367,8 +368,7 @@ impl<K: QueueKind> Submission<K> {
             })
             .collect();
         let presents: SmallVec<[_; 1]> = rec.presents.iter().map(|p| p.present).collect();
-        let family_queues: &'static FamilyQueues = inner.family;
-        let queue = &family_queues.queues[inner.queue];
+        let queue = &inner.family.queues[inner.queue];
         let submit = |cmd: vk::CommandBuffer| -> Result<()> {
             let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let waits: SmallVec<[_; 4]> = (self.waits.iter())
@@ -422,10 +422,10 @@ impl<K: QueueKind> Submission<K> {
                     // An acquired image without its acquire wait keeps its layout; the surface
                     // resets its state when it keeps it current or acquires it again.
                     let presented = |image: vk::Image| rec.presents.iter().any(|p| p.image == image);
-                    for barriers in &mut rec.barrier_log {
+                    for barriers in rec.barrier_log.iter_mut() {
                         barriers.images.retain(|b| !rec.acquired.iter().any(|&(i, _)| i == b.image && !presented(i)));
                     }
-                    for barriers in &rec.barrier_log {
+                    for barriers in rec.barrier_log.iter() {
                         rec.pipeline_barrier(barriers);
                     }
                     device.end_command_buffer(rec.handle)?;
@@ -439,15 +439,8 @@ impl<K: QueueKind> Submission<K> {
                 );
             }
         }
-        for present in &rec.presents {
-            if let Some(current) = &mut *lock(&present.current) {
-                current.presented = Some((i, value));
-            }
-        }
-        let mut log = std::mem::take(&mut rec.barrier_log);
-        log.clear();
         drop(cmd);
-        slot.barrier_log = log;
+        slot.barrier_log.clear();
         slot.signalled = value;
         state.submitted = value;
         match result {
