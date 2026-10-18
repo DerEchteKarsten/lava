@@ -6,7 +6,7 @@ use bytemuck::Pod;
 use lava_macros::validation_trace;
 
 use crate::{
-    bindless::BindlessHandle,
+    bindless::{BindlessHandle, NULL_HANDLE},
     buffer::{slice::BufferSlice, usage::BufferUsage},
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
     queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
@@ -113,6 +113,25 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
     pub fn usage_check(&self, required: vk::ImageUsageFlags) {
         self.usage.check(required);
+    }
+
+    /// Panics unless the view is bound in the sampled set if `sets` has `SAMPLED`, and in the
+    /// storage set if it has `STORAGE`: what a shader reading its handle needs.
+    #[track_caller]
+    pub fn bound_check(&self, sets: vk::ImageUsageFlags) {
+        let handle = self.handle;
+        let needed = [
+            (vk::ImageUsageFlags::SAMPLED, handle.descriptor_index_set0, "bind_sampled"),
+            (vk::ImageUsageFlags::STORAGE, handle.descriptor_index_set1, "bind_storage"),
+        ];
+        for (set, index, bind) in needed {
+            assert!(
+                !sets.contains(set) || index != NULL_HANDLE,
+                "a shader reads the view of {:?} through the {set:?} set, where it isn't bound: \
+                 call `{bind}` (or `bind_mips_*` for a mip's view) on its image",
+                self.image
+            );
+        }
     }
 
     /// The same view typed as `format` and `usage` (see `Image::cast`).
@@ -297,6 +316,8 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        check_box(&src, false, "source");
+        check_box(&dst, false, "destination");
         self.rec.flush_pending(
             [
                 src.view.access(
@@ -357,6 +378,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         let dst = dst.resolve();
         dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        check_box(&dst, true, "destination");
         check_copy_size(&dst, src.size(), "source");
         check_family(&self.rec.family, &dst, src.address(), true);
         self.rec.flush_pending(
@@ -413,6 +435,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         let src = src.resolve();
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
+        check_box(&src, true, "source");
         check_copy_size(&src, dst.size(), "destination");
         check_family(&self.rec.family, &src, dst.address(), false);
         self.rec.flush_pending(
@@ -442,6 +465,51 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                     .regions(&regions),
             )
         };
+    }
+}
+
+/// Panics unless the box lies inside its mip and, for a copy, has texels and covers whole blocks
+/// of a block-compressed format.
+#[track_caller]
+fn check_box<F: Format, U: ImageUsage, D: Dim>(
+    slice: &ImageSlice<ImageView<'_, F, U, D>>,
+    copy: bool,
+    what: &str,
+) {
+    let (offset, extent) = (D::offset_3d(slice.offset), D::extent_3d(slice.extend));
+    let mip = D::extent_3d(slice.view.extent);
+    let axes = [
+        (offset.x, extent.width, mip.width),
+        (offset.y, extent.height, mip.height),
+        (offset.z, extent.depth, mip.depth),
+    ];
+    let inside = (axes.iter()).all(|&(o, e, m)| o >= 0 && o as u64 + e as u64 <= m as u64);
+    assert!(
+        inside,
+        "the {what} box of {:?} texels at {:?} lies outside its mip of {:?}",
+        slice.extend, slice.offset, slice.view.extent
+    );
+    if !copy {
+        return;
+    }
+    assert!(
+        axes.iter().all(|&(_, e, _)| e > 0),
+        "the {what} box of {:?} texels is empty",
+        slice.extend
+    );
+    if let Some((side, _)) = bc_block(slice.view.format.vk_format()) {
+        let whole = |&(o, e, m): &(i32, u32, u32)| {
+            o as u32 % side == 0 && (e % side == 0 || o as u32 + e == m)
+        };
+        assert!(
+            axes[..2].iter().all(whole),
+            "copies of {:?} cover whole {side}x{side} blocks (or reach the mip's edge), not \
+             {:?} texels at {:?} of a mip of {:?}",
+            slice.view.format.vk_format(),
+            slice.extend,
+            slice.offset,
+            slice.view.extent
+        );
     }
 }
 

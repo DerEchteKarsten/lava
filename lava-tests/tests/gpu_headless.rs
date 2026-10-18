@@ -1,7 +1,7 @@
 //! Headless GPU tests: buffers, images, sync, command recording, queries, and golden images per pass type
 mod common;
 
-use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, buffer_with, golden::assert_golden, gpu, panic_message, zeroed_buffer};
 use glam::{IVec2, UVec2, UVec3, Vec2, Vec4};
 use lava::{
     bindless::{BindlessHandle, NULL_HANDLE, max_sampled_images, max_storage_images},
@@ -782,8 +782,196 @@ fn fill_buffer_fills_exactly_the_slice() {
 fn update_buffer_writes_one_element() {
     let mut gpu = gpu();
     let buffer = zeroed_buffer::<[u32; 2], Storage>(4);
-    gpu.submit(|cmd| cmd.update_buffer(buffer.range(2..3), &[11, 22]));
+    gpu.submit(|cmd| cmd.update_buffer(buffer.range(2..), &[11, 22]));
     assert_eq!(buffer.host(), [[0, 0], [0, 0], [11, 22], [0, 0]]);
+}
+
+// ---- argument checks -------------------------------------------------------------------------
+
+#[test]
+fn empty_and_oversized_buffers_and_images_are_errors() {
+    let _gpu = gpu();
+    assert!(Buffer::<u32, Storage>::new(0, false).is_err());
+    assert!(Buffer::<u32, Storage>::new(usize::MAX, false).is_err());
+    type Texture = Image<R8G8B8A8Unorm, Sampled>;
+    assert!(Texture::new(UVec2::new(0, 4)).is_err());
+    assert!(Texture::with_mip_levels(UVec2::new(4, 4), 0).is_err());
+    // 4x4 halves into 4x4, 2x2 and 1x1.
+    assert!(Texture::with_mip_levels(UVec2::new(4, 4), 3).is_ok());
+    assert!(Texture::with_mip_levels(UVec2::new(4, 4), 4).is_err());
+    let max = Ctx::device_properties().limits.max_image_dimension2_d;
+    assert!(Texture::new(UVec2::new(max + 1, 1)).is_err());
+}
+
+#[test]
+fn casts_keep_whole_aligned_elements() {
+    let _gpu = gpu();
+    let buffer = zeroed_buffer::<u8, Storage>(16);
+    let message = panic_message(|| buffer.byte_range(0..6).cast::<u32>());
+    assert!(message.contains("whole number"), "{message}");
+    let message = panic_message(|| buffer.byte_range(1..5).cast::<u32>());
+    assert!(message.contains("aligned"), "{message}");
+    assert_eq!(buffer.byte_range(4..12).cast::<u32>().len(), 2);
+}
+
+#[test]
+fn fills_and_updates_write_aligned_words() {
+    let mut gpu = gpu();
+    let bytes = zeroed_buffer::<u8, Storage>(16);
+    let message = panic_message(|| gpu.submit(|cmd| cmd.fill_buffer(bytes.byte_range(1..5), 0)));
+    assert!(message.contains("4-byte"), "{message}");
+    let message = panic_message(|| gpu.submit(|cmd| cmd.fill_buffer(bytes.byte_range(0..6), 0)));
+    assert!(message.contains("4-byte"), "{message}");
+    let triples = zeroed_buffer::<[u8; 3], Storage>(4);
+    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(triples.range(..), &[1; 3])));
+    assert!(message.contains("4-byte"), "{message}");
+    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(bytes.range(..0), &0)));
+    assert!(message.contains("empty"), "{message}");
+}
+
+#[test]
+fn copies_and_blits_stay_inside_their_mip() {
+    let mut gpu = gpu();
+    let image = Image::<R8G8B8A8Unorm, SampledTransferSrcTransferDst>::new(UVec2::new(8, 8)).unwrap();
+    let buffer = zeroed_buffer::<u8, Storage>(8 * 8 * 4);
+    let view = image.whole_view();
+    let outside = view.region(UVec2::new(4, 4)).offset(IVec2::new(6, 0));
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.copy_buffer_to_image(buffer.range(..), outside))
+    });
+    assert!(message.contains("outside its mip"), "{message}");
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.copy_image_to_buffer(view.region(UVec2::new(0, 4)), buffer.range(..)))
+    });
+    assert!(message.contains("empty"), "{message}");
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.blit_image(image.whole(), outside, Filter::Nearest))
+    });
+    assert!(message.contains("outside its mip"), "{message}");
+    let negative = view.region(UVec2::new(4, 4)).offset(IVec2::new(-1, 0));
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.blit_image(negative, image.whole(), Filter::Nearest))
+    });
+    assert!(message.contains("outside its mip"), "{message}");
+}
+
+#[test]
+fn block_compressed_copies_cover_whole_blocks() {
+    let mut gpu = gpu();
+    if !Ctx::features().bc_compression {
+        eprintln!("SKIPPED block_compressed_copies_cover_whole_blocks: no BC compression");
+        return;
+    }
+    let image = Image::<BC7UnormBlock, SampledTransferDst>::new(UVec2::new(8, 8)).unwrap();
+    let buffer = zeroed_buffer::<u8, Storage>(64);
+    let view = image.whole_view();
+    let message = panic_message(|| {
+        let half_block = view.region(UVec2::new(2, 4));
+        gpu.submit(|cmd| cmd.copy_buffer_to_image(buffer.range(..), half_block))
+    });
+    assert!(message.contains("whole 4x4 blocks"), "{message}");
+    gpu.submit(|cmd| cmd.copy_buffer_to_image(buffer.range(..), view.region(UVec2::new(4, 4))));
+}
+
+#[test]
+fn dispatches_stay_within_the_device_limits() {
+    let mut gpu = gpu();
+    let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
+    let max = Ctx::device_properties().limits.max_compute_work_group_count;
+    let Some(over) = max[1].checked_add(1) else {
+        eprintln!("SKIPPED dispatches_stay_within_the_device_limits: no group count is too many");
+        return;
+    };
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            let bindings =
+                TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT);
+            cmd.compute(&bindings, [1, over, 1], None)
+        })
+    });
+    assert!(message.contains("exceed"), "{message}");
+}
+
+#[test]
+fn shader_images_are_bound_in_the_sets_they_are_read_through() {
+    let _gpu = gpu();
+    let image = Image::<R8G8B8A8Unorm, SampledStorage>::new(UVec2::new(8, 8))
+        .unwrap()
+        .bind_sampled()
+        .unwrap();
+    let message = panic_message(|| {
+        TestComputeImage::push_bindings(image.whole_view(), Vec4::ONE, UVec2::ZERO, UVec2::ONE)
+    });
+    assert!(message.contains("bind_storage"), "{message}");
+}
+
+#[test]
+fn attachments_are_one_mip_at_least_as_large_as_the_rendering() {
+    let mut gpu = gpu();
+    let mips = Target::with_mip_levels(EXTENT, 2).unwrap();
+    let message = panic_message(|| Attachment::color(mips.whole_view(), None));
+    assert!(message.contains("one mip"), "{message}");
+    let target = Target::new(EXTENT).unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| drop(cmd.raster(EXTENT * 2, [Attachment::color(target.whole_view(), None)])))
+    });
+    assert!(message.contains("doesn't fit its color attachment"), "{message}");
+    let depth = Image::<D32Sfloat, DepthAttachment>::new(EXTENT / 2).unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+                .depth_attachment(depth.whole_view(), None);
+        })
+    });
+    assert!(message.contains("doesn't fit its depth attachment"), "{message}");
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)]).scissor(Scissor {
+                offset: IVec2::new(-1, 0),
+                extent: EXTENT,
+            });
+        })
+    });
+    assert!(message.contains("non-negative"), "{message}");
+}
+
+#[test]
+fn draws_of_a_rendering_access_nothing_another_writes() {
+    let mut gpu = gpu();
+    let vertices = two_triangles();
+    let bindings = bindings(&vertices);
+    let target = Target::new(EXTENT).unwrap();
+    let written = zeroed_buffer::<u32, Storage>(4);
+    let writes = [BufferAccess::write(written.range(..))];
+    let reads = [BufferAccess::read(written.range(2..3))];
+    // A draw may read what it writes itself, and other draws what nobody writes.
+    gpu.submit(|cmd| {
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&bindings, 6, 1, unculled(), Some(Accesses::buffers(&writes))))
+            .draw(&Draw::new(&bindings, 6, 1, unculled(), None))
+            .record("one writer");
+    });
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+                .draw(&Draw::new(&bindings, 6, 1, unculled(), Some(Accesses::buffers(&writes))))
+                .draw(&Draw::new(&bindings, 6, 1, unculled(), Some(Accesses::buffers(&reads))))
+                .record("hazard");
+        })
+    });
+    assert!(message.contains("draws 0 and 1"), "{message}");
+    let storage = Image::<R8G8B8A8Unorm, StorageImage>::new(UVec2::new(8, 8)).unwrap();
+    let images = [ImageUse::storage_write(storage.whole_view())];
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            let draw = Draw::new(&bindings, 6, 1, unculled(), Some(Accesses::images(&images)));
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+                .draw(&draw)
+                .draw(&draw)
+                .record("twice");
+        })
+    });
+    assert!(message.contains("of the image"), "{message}");
 }
 
 #[test]
@@ -916,6 +1104,32 @@ fn binds_take_free_slots_of_their_sets() {
 }
 
 /// Also a dropped reservation's, which `bind` refuses right away.
+/// Descriptor updates hold a mutex (the validation layer's thread safety checks would see
+/// concurrent `vkUpdateDescriptorSets`).
+#[test]
+fn binds_from_many_threads_are_serialised() {
+    let mut gpu = gpu();
+    let reserved = lava::bindless::reserve_sampled(8).unwrap();
+    let images: Vec<Vec<_>> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..4)
+            .map(|thread| {
+                let reserved = &reserved;
+                scope.spawn(move || {
+                    let images: Vec<_> = (0..8)
+                        .map(|_| Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::ONE).unwrap().bind_sampled().unwrap())
+                        .collect();
+                    let slots = (0..2).map(|i| reserved.handle(thread * 2 + i));
+                    lava::bindless::bind(images[..2].iter().map(|image| image.whole_view()), slots);
+                    images
+                })
+            })
+            .collect();
+        threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+    });
+    gpu.submit(|_| {});
+    drop(images);
+}
+
 #[test]
 fn slots_are_free_again_once_their_image_is_destroyed() {
     let _gpu = gpu();
@@ -1572,10 +1786,10 @@ fn scissor_clips_and_viewport_scales_the_draw() {
     // Scissor: the full-size picture, cut to the left half.
     let scissored = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .scissors(&[Scissor {
+            .scissor(Scissor {
                 offset: IVec2::ZERO,
                 extent: UVec2::new(SIZE / 2, SIZE),
-            }])
+            })
             .draw(&Draw::new(&bindings(&vertices), 6, 1, unculled(), None))
             .record("scissored")
     });
@@ -2553,7 +2767,10 @@ mod generated {
     #[test]
     fn extra_accesses_get_barriers_like_the_bindings() {
         let mut gpu = gpu();
-        let image = Image::<R8G8B8A8Unorm, StorageImage>::new(UVec2::new(8, 8)).unwrap();
+        let image = Image::<R8G8B8A8Unorm, StorageImage>::new(UVec2::new(8, 8))
+            .unwrap()
+            .bind_storage()
+            .unwrap();
         let buffer = zeroed_buffer::<u32, Storage>(4);
         gpu.submit(|cmd| {
             let bindings = TestComputeImage::push_bindings(

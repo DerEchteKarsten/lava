@@ -19,8 +19,10 @@ use crate::{
     error::Result,
     features::{Feature, gate},
     query::{CompactedSize, QueryPool},
+    queue::lock,
     state::{Ctx, Functions},
 };
+use std::sync::Mutex;
 
 const BUILD: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR;
 const READ: vk::AccessFlags2 = vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR;
@@ -68,6 +70,42 @@ pub struct Described {
     pub geometry: vk::AccelerationStructureGeometryKHR<'static>,
     pub primitives: u32,
     pub inputs: [Range<u64>; 3],
+}
+
+/// What an update has to keep of a geometry's last build.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Shape {
+    ty: vk::GeometryTypeKHR,
+    flags: vk::GeometryFlagsKHR,
+    primitives: u32,
+    vertex_format: vk::Format,
+    max_vertex: u32,
+    index_type: vk::IndexType,
+    transform: bool,
+}
+
+impl Shape {
+    fn of(described: &Described) -> Self {
+        let geometry = &described.geometry;
+        let mut shape = Shape {
+            ty: geometry.geometry_type,
+            flags: geometry.flags,
+            primitives: described.primitives,
+            vertex_format: vk::Format::UNDEFINED,
+            max_vertex: 0,
+            index_type: vk::IndexType::NONE_KHR,
+            transform: false,
+        };
+        if geometry.geometry_type == vk::GeometryTypeKHR::TRIANGLES {
+            // SAFETY: a triangle geometry's data is `triangles`, its addresses device addresses.
+            let triangles = unsafe { geometry.geometry.triangles };
+            shape.vertex_format = triangles.vertex_format;
+            shape.max_vertex = triangles.max_vertex;
+            shape.index_type = triangles.index_type;
+            shape.transform = unsafe { triangles.transform_data.device_address } != 0;
+        }
+        shape
+    }
 }
 
 pub trait Describe {
@@ -129,7 +167,7 @@ impl BuildFlags {
 }
 
 /// An acceleration structure and the memory it owns, which builds write through a shared
-/// reference. A TLAS that still names a dropped BLAS must not be traced once it is destroyed.
+/// reference. A TLAS that still names a dropped BLAS must not be traced ([`Instances::new`]).
 pub struct AccelerationStructure<L: Level> {
     handle: vk::AccelerationStructureKHR,
     address: u64,
@@ -138,9 +176,12 @@ pub struct AccelerationStructure<L: Level> {
     max_primitives: SmallVec<[u32; 4]>,
     build_scratch: u64,
     update_scratch: u64,
-    /// Made by `compacted`: its memory only holds the compacted structure, so it can't be built
-    /// again.
-    compacted: bool,
+    /// Made by `compacted` of this structure: its memory only holds the compacted structure, so
+    /// it can't be built again.
+    compacted_from: Option<vk::AccelerationStructureKHR>,
+    /// The geometries of the last recorded build (or compaction into it), which an update keeps;
+    /// empty before the first.
+    built: Mutex<SmallVec<[Shape; 1]>>,
     /// Dropped after the structure, so destroyed after it.
     buffer: Buffer<u8, usage::AccelerationStructureStorage>,
     _level: PhantomData<L>,
@@ -180,7 +221,7 @@ impl<L: Level> AccelerationStructure<L> {
             } else {
                 0
             },
-            false,
+            None,
         )
     }
 
@@ -190,7 +231,7 @@ impl<L: Level> AccelerationStructure<L> {
         max_primitives: SmallVec<[u32; 4]>,
         build_scratch: u64,
         update_scratch: u64,
-        compacted: bool,
+        compacted_from: Option<vk::AccelerationStructureKHR>,
     ) -> Result<Self> {
         let functions = functions()?;
         let buffer = Buffer::raw(
@@ -221,7 +262,8 @@ impl<L: Level> AccelerationStructure<L> {
             max_primitives,
             build_scratch,
             update_scratch,
-            compacted,
+            compacted_from,
+            built: Mutex::new(SmallVec::new()),
             buffer,
             _level: PhantomData,
         })
@@ -253,7 +295,7 @@ impl<L: Level> AccelerationStructure<L> {
     }
 
     /// An unbuilt structure of `size` bytes (read from a `QueryPool<CompactedSize>`) with this
-    /// one's flags, for [`CommandBuffer::compact`]. It can be updated but never built.
+    /// one's flags, for [`CommandBuffer::compact`] of this one. It can be updated but never built.
     pub fn compacted(&self, size: u64) -> Result<Self> {
         Self::create(
             size,
@@ -261,13 +303,18 @@ impl<L: Level> AccelerationStructure<L> {
             self.max_primitives.clone(),
             self.build_scratch,
             self.update_scratch,
-            true,
+            Some(self.handle),
         )
     }
 
     /// Whether it was made by `compacted`, so only `compact` and `update` write it.
     pub fn is_compacted(&self) -> bool {
-        self.compacted
+        self.compacted_from.is_some()
+    }
+
+    #[track_caller]
+    fn check_built(&self, what: &str) {
+        assert!(!lock(&self.built).is_empty(), "{what} a structure that was built before");
     }
 
     pub(crate) fn access(
@@ -346,6 +393,22 @@ impl IndexFormat for u16 {
 impl crate::sealed::Sealed for u32 {}
 impl IndexFormat for u32 {
     const TYPE: vk::IndexType = vk::IndexType::UINT32;
+}
+
+/// The bytes of a vertex format's smallest component, which vertex addresses and strides are
+/// multiples of; 1 for formats it doesn't know.
+fn component_bytes(format: vk::Format) -> u64 {
+    use vk::Format as F;
+    match format {
+        F::R32G32_SFLOAT | F::R32G32B32_SFLOAT | F::R32G32B32A32_SFLOAT => 4,
+        F::R16G16_SFLOAT
+        | F::R16G16B16A16_SFLOAT
+        | F::R16G16_SNORM
+        | F::R16G16B16A16_SNORM
+        | F::R16G16_UNORM
+        | F::R16G16B16A16_UNORM => 2,
+        _ => 1,
+    }
 }
 
 /// A row-major 3x4 transform (`VkTransformMatrixKHR`).
@@ -437,6 +500,13 @@ impl<'a> Triangles<'a> {
         index_range: Range<u64>,
     ) -> Self {
         assert!(!vertices.is_empty(), "a triangle geometry needs vertices");
+        let component = component_bytes(V::FORMAT);
+        assert!(
+            vertices.address() % component == 0 && size_of::<V>() as u64 % component == 0,
+            "the vertices' address and stride have to be multiples of the {component} bytes of a \
+             {:?} component",
+            V::FORMAT
+        );
         Self {
             data: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                 .vertex_format(V::FORMAT)
@@ -561,7 +631,7 @@ const LOW_24: u32 = (1 << 24) - 1;
 
 impl Instance {
     /// `blas` placed by `transform`, seen by every ray mask, with custom index, hit group
-    /// offset and flags 0.
+    /// offset and flags 0. It keeps nothing alive: see [`Instances::new`].
     pub fn new(blas: &Blas, transform: Affine3A) -> Self {
         Self::from_address(blas.address(), transform)
     }
@@ -626,7 +696,14 @@ pub struct Instances<'a> {
 }
 
 impl<'a> Instances<'a> {
-    pub fn new<U: BufferUsage>(instances: BufferSlice<'a, Instance, U>) -> Self {
+    /// The build input of a TLAS: `instances`, written by the host or a pass.
+    ///
+    /// # Safety
+    /// Every BLAS the instances name (by address; 0 is an inactive instance) must stay alive
+    /// while a TLAS built from them is traced. lava doesn't track them: a dropped BLAS is
+    /// destroyed once the submissions in flight at its drop are done, so rebuild the TLAS
+    /// without it before tracing again.
+    pub unsafe fn new<U: BufferUsage>(instances: BufferSlice<'a, Instance, U>) -> Self {
         assert!(
             instances.address() % 16 == 0,
             "an instance buffer's address has to be a multiple of 16"
@@ -688,9 +765,14 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         );
 
         let mut described: SmallVec<[SmallVec<[Described; 1]>; 1]> = SmallVec::new();
+        let mut shapes: SmallVec<[SmallVec<[Shape; 1]>; 1]> = SmallVec::new();
         let mut accesses: SmallVec<[BufferAccess; 8]> = SmallVec::new();
         let mut offset = 0;
-        for (structure, geometry) in builds {
+        for (i, (structure, geometry)) in builds.iter().enumerate() {
+            let same = builds[..i].iter().position(|(other, _)| other.handle == structure.handle);
+            if let Some(first) = same {
+                panic!("builds {first} and {i} of one batch write the same structure");
+            }
             let mut geometries = SmallVec::new();
             geometry.describe(&mut geometries);
             assert_eq!(
@@ -710,10 +792,24 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
                 "only a structure with `allow_update` can be updated"
             );
             assert!(
-                update || !structure.compacted,
+                update || !structure.is_compacted(),
                 "a compacted structure can't be built again: its memory only holds the \
                  compacted structure (build the one it was compacted from, or a new one)"
             );
+            let shape: SmallVec<[Shape; 1]> = geometries.iter().map(Shape::of).collect();
+            if update {
+                let built = lock(&structure.built);
+                assert!(!built.is_empty(), "an update refits a structure that was built before");
+                if let Some((g, (last, new))) =
+                    built.iter().zip(&shape).enumerate().find(|(_, (last, new))| last != new)
+                {
+                    panic!(
+                        "an update keeps everything of the last build but positions: geometry \
+                         {g} was built as {last:?}, not {new:?}"
+                    );
+                }
+            }
+            shapes.push(shape);
             let size = if update {
                 structure.update_scratch
             } else {
@@ -752,6 +848,9 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             accesses.push(every_structure_read(BUILD));
         }
         self.rec.flush_pending(std::iter::empty(), accesses.iter().cloned());
+        for ((structure, _), shape) in builds.iter().zip(shapes) {
+            *lock(&structure.built) = shape;
+        }
 
         let geometries: SmallVec<[SmallVec<[vk::AccelerationStructureGeometryKHR; 1]>; 1]> =
             described
@@ -827,6 +926,9 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             structures.iter().all(|s| s.flags.allow_compaction),
             "only structures with `allow_compaction` have a compacted size"
         );
+        for structure in structures {
+            structure.check_built("compacted sizes are of");
+        }
         let accesses: SmallVec<[_; 8]> = structures.iter().map(|s| s.access(BUILD, READ)).collect();
         self.rec.flush_pending(std::iter::empty(), accesses.iter().cloned());
         sizes.record(&self.rec);
@@ -842,7 +944,8 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         }
     }
 
-    /// Copies `src` (built, with `allow_compaction`) into `dst`, made by `src.compacted(size)`.
+    /// Copies `src` (built, with `allow_compaction`) into `dst`, made by `src.compacted(size)`;
+    /// `dst` can then be updated like `src`.
     /// `src` can be dropped right after.
     #[validation_trace]
     pub fn compact<L: Level>(
@@ -855,11 +958,13 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             "only a structure with `allow_compaction` can be compacted"
         );
         assert!(
-            dst.compacted,
-            "`compact` copies into a structure made by `compacted`"
+            dst.compacted_from == Some(src.handle),
+            "`compact` copies into a structure made by `compacted` of its source"
         );
+        src.check_built("`compact` copies");
         let accesses = [src.access(BUILD, READ), dst.access(BUILD, WRITE)];
         self.rec.flush_pending(std::iter::empty(), accesses.iter().cloned());
+        *lock(&dst.built) = lock(&src.built).clone();
         unsafe {
             command_functions().cmd_copy_acceleration_structure(
                 self.rec.handle,

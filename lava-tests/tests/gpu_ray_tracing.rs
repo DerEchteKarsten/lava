@@ -1,7 +1,7 @@
 //! GPU ray tracing tests: acceleration structure builds, refits and compaction, ray queries and ray tracing pipelines on a small scene
 mod common;
 
-use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, buffer_with, golden::assert_golden, gpu, panic_message, zeroed_buffer};
 use glam::{Affine3A, Quat, UVec2, Vec3};
 use lava::{
     buffer::{
@@ -12,9 +12,10 @@ use lava::{
     image::{Image, format::R8G8B8A8Unorm, usage::StorageTransferSrcTransferDst},
     query::QueryPool,
     state::Ctx,
+    vk,
     vkobjects::acceleration_structure::{
         Aabb, Aabbs, Blas, BlasGeometry, BuildFlags, Instance, Instances, Tlas,
-        Triangles, scratch_alignment,
+        Triangles, VertexPosition, scratch_alignment,
     },
 };
 use lava_tests::bindings::{TestRayQuery, TestRayTracing, TestWriteInstances};
@@ -175,7 +176,8 @@ fn scene(gpu: &mut common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) 
             &[(&wall_blas, wall), (&triangle_blas, triangle), (&sphere_blas, sphere)],
             scratch.range(..),
         );
-        cmd.build(&[(&tlas, Instances::new(instances.range(..)))], scratch.range(..));
+        // SAFETY: the BLASes it names outlive the traces of this test.
+        cmd.build(&[(&tlas, unsafe { Instances::new(instances.range(..)) })], scratch.range(..));
     });
     Scene {
         wall: wall_blas,
@@ -276,7 +278,8 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
             [1, 1, 1],
             None,
         );
-        cmd.build(&[(&tlas, Instances::new(written.range(..)))], scratch.range(..));
+        // SAFETY: the BLASes it names outlive the traces of this test.
+        cmd.build(&[(&tlas, unsafe { Instances::new(written.range(..)) })], scratch.range(..));
         trace_query(cmd, target, &tlas);
     });
     assert_eq!(written.host(), scene.instances.host());
@@ -316,7 +319,8 @@ fn updates_follow_moved_vertices() {
     let (old, new) = ((32, 30), (48, 30));
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.build(&[(&blas, BlasGeometry::Triangles(&geometry(&vertices)))], scratch.range(..));
-        cmd.build(&[(&tlas, Instances::new(instances.range(..)))], scratch.range(..));
+        // SAFETY: the BLASes it names outlive the traces of this test.
+        cmd.build(&[(&tlas, unsafe { Instances::new(instances.range(..)) })], scratch.range(..));
         trace_query(cmd, target, &tlas);
     });
     assert_pixel(&pixels, old.0, old.1, [255, 51, 26]);
@@ -327,7 +331,8 @@ fn updates_follow_moved_vertices() {
     }
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.update(&[(&blas, BlasGeometry::Triangles(&geometry(&vertices)))], scratch.range(..));
-        cmd.update(&[(&tlas, Instances::new(instances.range(..)))], scratch.range(..));
+        // SAFETY: the BLASes it names outlive the traces of this test.
+        cmd.update(&[(&tlas, unsafe { Instances::new(instances.range(..)) })], scratch.range(..));
         trace_query(cmd, target, &tlas);
     });
     assert_pixel(&pixels, old.0, old.1, [0, 0, 0]);
@@ -349,7 +354,8 @@ fn a_tlas_rebuilt_between_two_traces_waits_for_the_first() {
     let scratch = scratch(scene.tlas.build_scratch_size());
     let [before, after] = render_many(&mut gpu, |cmd, [first, second]| {
         trace_query(cmd, first, &scene.tlas);
-        cmd.build(&[(&scene.tlas, Instances::new(wall_only.range(..)))], scratch.range(..));
+        // SAFETY: the BLASes it names outlive the traces of this test.
+        cmd.build(&[(&scene.tlas, unsafe { Instances::new(wall_only.range(..)) })], scratch.range(..));
         trace_query(cmd, second, &scene.tlas);
     });
     assert_query_image(&before);
@@ -403,7 +409,8 @@ fn compacted_structures_trace_the_same_image() {
         for (src, dst) in [&wall, &triangle, &sphere].into_iter().zip(&compacted) {
             cmd.compact(src, dst);
         }
-        cmd.build(&[(&tlas, Instances::new(moved.range(..)))], scratch.range(..));
+        // SAFETY: the BLASes it names outlive the traces of this test.
+        cmd.build(&[(&tlas, unsafe { Instances::new(moved.range(..)) })], scratch.range(..));
         // Nothing reaches the originals any more; they go once this frame is done.
         drop((wall, triangle, sphere));
         trace_query(cmd, target, &tlas);
@@ -426,3 +433,93 @@ fn compacted_structures_trace_the_same_image() {
     assert!(rebuild.is_err(), "building a compacted structure panics");
 }
 
+
+/// A vertex whose position isn't aligned to its float components.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Unaligned([u8; 12]);
+impl VertexPosition for Unaligned {
+    const FORMAT: vk::Format = vk::Format::R32G32B32_SFLOAT;
+}
+
+#[test]
+fn geometry_addresses_are_aligned_to_their_components() {
+    let _gpu = gpu();
+    let bytes = zeroed_buffer::<u8, Storage>(64);
+    let vertices = bytes.byte_range(1..37).cast::<Unaligned>();
+    let message = panic_message(|| Triangles::new(vertices));
+    assert!(message.contains("multiples of the 4 bytes"), "{message}");
+}
+
+#[test]
+fn batches_build_each_structure_once_and_updates_keep_the_last_build() {
+    let mut gpu = gpu();
+    if !supported("batches_build_each_structure_once", Ctx::features().acceleration_structure) {
+        return;
+    }
+    let flags = BuildFlags {
+        allow_update: true,
+        allow_compaction: true,
+        ..Default::default()
+    };
+    let vertices = buffer_with::<Vec3, Storage>(&[Vec3::X, Vec3::Y, Vec3::Z, -Vec3::X, -Vec3::Y, -Vec3::Z]);
+    let two = [Triangles::new(vertices.range(..))];
+    let one = [Triangles::new(vertices.range(..3))];
+    let see_through = [Triangles::new(vertices.range(..)).opaque(false)];
+    let blas = Blas::new(&BlasGeometry::Triangles(&two), flags).unwrap();
+    let scratch = scratch(2 * blas.build_scratch_size().max(blas.update_scratch_size()));
+    let build = |cmd: &mut Cmd, geometry: &[Triangles]| {
+        cmd.build(&[(&blas, BlasGeometry::Triangles(geometry))], scratch.range(..))
+    };
+    let update = |cmd: &mut Cmd, geometry: &[Triangles]| {
+        cmd.update(&[(&blas, BlasGeometry::Triangles(geometry))], scratch.range(..))
+    };
+    let message = panic_message(|| gpu.submit(|cmd| update(cmd, &two)));
+    assert!(message.contains("built before"), "{message}");
+    gpu.submit(|cmd| build(cmd, &two));
+    for geometry in [&one[..], &see_through] {
+        let message = panic_message(|| gpu.submit(|cmd| update(cmd, geometry)));
+        assert!(message.contains("last build"), "{message}");
+    }
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            let geometry = BlasGeometry::Triangles(&two);
+            cmd.build(&[(&blas, geometry), (&blas, geometry)], scratch.range(..))
+        })
+    });
+    assert!(message.contains("same structure"), "{message}");
+    gpu.submit(|cmd| {
+        cmd.build(&[(&blas, BlasGeometry::Triangles(&two))], scratch.range(..));
+        cmd.update(&[(&blas, BlasGeometry::Triangles(&two))], scratch.range(..));
+    });
+
+    let other = Blas::new(&BlasGeometry::Triangles(&two), flags).unwrap();
+    let compacted = other.compacted(other.size()).unwrap();
+    let message = panic_message(|| gpu.submit(|cmd| cmd.compact(&blas, &compacted)));
+    assert!(message.contains("of its source"), "{message}");
+    let message = panic_message(|| gpu.submit(|cmd| cmd.compact(&other, &compacted)));
+    assert!(message.contains("built before"), "{message}");
+}
+
+#[test]
+fn traces_stay_within_the_device_limits() {
+    let mut gpu = gpu();
+    if !supported("traces_stay_within_the_device_limits", Ctx::features().ray_tracing_pipeline) {
+        return;
+    }
+    let limits = &Ctx::device_properties().limits;
+    let most = limits.max_compute_work_group_count[0] as u64 * limits.max_compute_work_group_size[0] as u64;
+    let Ok(over) = u32::try_from(most + 1) else {
+        eprintln!("SKIPPED traces_stay_within_the_device_limits: no width is too wide");
+        return;
+    };
+    let tlas = Tlas::new(1, BuildFlags::default()).unwrap();
+    let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            let bindings = TestRayTracing::push_bindings(target.whole_view(), &tlas, EXTENT).unwrap();
+            cmd.raytrace(&bindings, [over, 1, 1], None)
+        })
+    });
+    assert!(message.contains("rays"), "{message}");
+}

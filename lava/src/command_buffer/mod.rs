@@ -1,15 +1,12 @@
-//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with the present table)
+//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
 use std::{
-    fmt::Debug,
-    marker::PhantomData,
-    ops::Deref,
-    panic::AssertUnwindSafe,
-    ptr::NonNull,
-    range::Range,
-    sync::atomic::AtomicU64,
+    fmt::Debug, marker::PhantomData, ops::Deref, panic::AssertUnwindSafe, ptr::NonNull,
+    range::Range, sync::atomic::AtomicU64,
 };
 
 use crate::vk::{self, IndexType, PipelineStageFlags2 as S2};
+#[cfg(feature = "acceleration-structure")]
+use crate::vkobjects::acceleration_structure::Tlas;
 use crate::{
     bindless::Bindless,
     buffer::{
@@ -22,28 +19,26 @@ use crate::{
         kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StorageView},
     },
     pipeline::{RasterKeyRef, pass_map, pipelines},
+    present::Present,
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
-    present::Present,
-    queue::{HasCompute, HasGraphics, QueueKind, FamilyInfo},
+    queue::{FamilyInfo, HasCompute, HasGraphics, QueueKind},
     state::{Ctx, Functions, debug_name},
 };
-#[cfg(feature = "acceleration-structure")]
-use crate::vkobjects::acceleration_structure::Tlas;
 use bytemuck::{Pod, Zeroable};
-use glam::{IVec2, UVec2};
+use glam::{I64Vec2, IVec2, UVec2};
 use lava_macros::validation_trace;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 mod binding_output;
 pub(crate) mod image_state;
 pub(crate) mod pending;
 mod raster_state;
 use crate::unsized_struct::unsized_struct;
+pub use binding_output::{BindingOutput, Bindings, kind};
 use image_state::{check_states, release_states, take_checked_states};
 use pending::{PendingAccesses, all_read_access, all_write_access};
-pub use binding_output::{BindingOutput, Bindings, kind};
 pub use raster_state::*;
 
 /// A pass's access of a buffer range, made by `BufferSlice::access`.
@@ -161,7 +156,7 @@ pub struct RasterBuilder<'a, 'p, const N: usize> {
     cmd_buf: &'a mut Recording<'p>,
     extent: UVec2,
     viewport: Viewport,
-    scissors: SmallVec<[vk::Rect2D; 1]>,
+    scissor: vk::Rect2D,
     color: [Attachment<'a>; N],
     depth_format: vk::Format,
     stencil_format: vk::Format,
@@ -177,11 +172,13 @@ pub struct RasterBuilder<'a, 'p, const N: usize> {
 pub struct Attachment<'a> {
     format: vk::Format,
     view: vk::ImageView,
+    extent: UVec2,
     clear: Option<vk::ClearValue>,
     access: ImageUse<'a>,
 }
 
 impl<'a> Attachment<'a> {
+    /// Renders into `image`, a view of one mip.
     pub fn color<T: ColorTarget + 'a>(
         image: T,
         clear: Option<<T::Format as Format>::Texels>,
@@ -189,6 +186,7 @@ impl<'a> Attachment<'a> {
         let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+        one_mip(image.mip_range);
         let access = image.access(
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
@@ -203,10 +201,23 @@ impl<'a> Attachment<'a> {
         Self {
             format: image.format().vk_format(),
             view: image.view,
+            extent: image.extent,
             clear: clear.map(|e| image.format().clear_value(e).into()),
             access,
         }
     }
+}
+
+/// An attachment is one mip of an image (Vulkan's attachment views have one level).
+#[track_caller]
+fn one_mip(mips: Range<u32>) {
+    assert!(
+        mips.end - mips.start == 1,
+        "an attachment is one mip, not mips {}..{}: render into a `mip_view` of a `MipChain`, or \
+         into an image of one mip",
+        mips.start,
+        mips.end
+    );
 }
 
 unsized_struct! {
@@ -231,6 +242,57 @@ impl<'a> DrawOutput<'a> {
     fn image_accesses(&self) -> impl Iterator<Item = ImageUse<'a>> + Clone {
         let (declared, _) = declared(self.accesses, RASTER_SHADERS);
         self.bindings.sections().images().chain(declared)
+    }
+
+    fn buffer_accesses(&self) -> impl Iterator<Item = BufferAccess> + Clone + '_ {
+        let (_, declared) = declared(self.accesses, RASTER_SHADERS);
+        (self.bindings.sections().buffers())
+            .chain(self.extra().iter().cloned())
+            .chain(declared)
+    }
+}
+
+/// Panics if a draw accesses what another draw of the rendering writes: draws are ordered only
+/// by depth tests and blending, and nothing else passes between them. Attachments aren't draws'
+/// accesses, so they are left out.
+fn check_hazards<'a>(name: &str, draws: impl Iterator<Item = &'a DrawOutput<'a>> + Clone) {
+    let writes = |access: vk::AccessFlags2| access.intersects(all_write_access());
+    let hazard = |i: usize, j: usize, what: std::fmt::Arguments| -> ! {
+        panic!(
+            "draws {i} and {j} of the rendering `{name}` both access {what}, which draw {i} \
+             writes: draws of one rendering are ordered only by depth tests and blending, so \
+             record them in two renderings"
+        )
+    };
+    for (i, draw) in draws.clone().enumerate() {
+        for write in draw.buffer_accesses().filter(|b| writes(b.access)) {
+            let mut others = draws.clone().enumerate().filter(|&(j, _)| j != i);
+            if let Some((j, _)) =
+                others.find(|(_, d)| d.buffer_accesses().any(|b| b.overlaps(&write)))
+            {
+                hazard(i, j, format_args!("the addresses {:?}", write.range));
+            }
+        }
+        for write in draw
+            .image_accesses()
+            .filter(|image| writes(image.access.access))
+        {
+            let w = &write.access;
+            let overlaps = |image: ImageUse| {
+                let mips = image.access.mip_range;
+                image.access.image == w.image
+                    && mips.start < w.mip_range.end
+                    && w.mip_range.start < mips.end
+            };
+            let mut others = draws.clone().enumerate().filter(|&(j, _)| j != i);
+            if let Some((j, _)) = others.find(|(_, d)| d.image_accesses().any(overlaps)) {
+                hazard(
+                    i,
+                    j,
+                    format_args!("mips {:?} of the image {:?}", w.mip_range, w.image),
+                );
+            }
+        }
     }
 }
 
@@ -295,6 +357,26 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
+        let pass = &pass_map().passes[bindings.sections().pass];
+        let task = matches!(
+            pass.kind,
+            crate::pipeline::PassKind::RasterMesh { amp: Some(_), .. }
+        );
+        // Mesh bindings exist only past the feature's check.
+        let p = &Ctx::physical_device().mesh_shader_properties;
+        let (stage, max, total) = match task {
+            true => (
+                "task workgroups",
+                p.max_task_work_group_count,
+                p.max_task_work_group_total_count,
+            ),
+            false => (
+                "mesh workgroups",
+                p.max_mesh_work_group_count,
+                p.max_mesh_work_group_total_count,
+            ),
+        };
+        check_groups(groups, max, total as u64, stage);
         Self::with(
             bindings.erase(),
             DrawCommand::Launch(groups),
@@ -483,7 +565,8 @@ fn iter_draws<'a>(
 }
 
 impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
-    /// Depth-tests the draws against `image` (nearer = greater). `clear` resets the depth first.
+    /// Depth-tests the draws against `image`, a view of one mip (nearer = greater). `clear`
+    /// resets the depth first.
     pub fn depth_attachment<T: DepthTarget + 'a>(
         &mut self,
         image: T,
@@ -492,6 +575,8 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::DEPTH);
         image.usage_check(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT);
+        one_mip(image.mip_range);
+        fits(self.extent, image.extent, "depth");
         let format = image.format();
         self.depth_format = format.vk_format();
         if format.aspects().contains(vk::ImageAspectFlags::STENCIL) {
@@ -510,13 +595,27 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
 
     /// Replaces the default viewport, the whole render area.
     pub fn viewport(&mut self, viewport: Viewport) -> &mut Self {
+        assert!(
+            viewport.extent.cmpgt(UVec2::ZERO).all(),
+            "a viewport of extent {} has no pixels",
+            viewport.extent
+        );
         self.viewport = viewport;
         self
     }
 
-    /// Replaces the default scissor, the whole render area.
-    pub fn scissors(&mut self, scissors: &[Scissor]) -> &mut Self {
-        self.scissors = scissors.iter().map(|s| rect(s.offset, s.extent)).collect();
+    /// Replaces the default scissor, the whole render area. There is one, as there is one
+    /// viewport.
+    pub fn scissor(&mut self, scissor: Scissor) -> &mut Self {
+        let end = scissor.offset.as_i64vec2() + scissor.extent.as_i64vec2();
+        assert!(
+            scissor.offset.cmpge(IVec2::ZERO).all()
+                && end.cmple(I64Vec2::splat(i32::MAX as i64)).all(),
+            "a scissor starts at a non-negative offset and ends below 2^31, not {} texels at {}",
+            scissor.extent,
+            scissor.offset
+        );
+        self.scissor = rect(scissor.offset, scissor.extent);
         self
     }
 
@@ -553,18 +652,14 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             in_layout(depth)
         });
         let draws = iter_draws(&self.draws);
+        check_hazards(name, draws.clone());
         self.cmd_buf.flush_pending(
             draws
                 .clone()
                 .flat_map(|draw| draw.image_accesses())
                 .chain(color_accesses.iter().cloned())
                 .chain(depth_access.clone()),
-            draws.flat_map(|draw| {
-                let (_, declared) = declared(draw.accesses, RASTER_SHADERS);
-                (draw.bindings.sections().buffers())
-                    .chain(draw.extra().iter().cloned())
-                    .chain(declared)
-            }),
+            draws.flat_map(|draw| draw.buffer_accesses()),
         );
 
         let mut color_layouts = color_accesses.iter().map(|access| access.access.layout);
@@ -628,7 +723,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                     max_depth: 1.0,
                 }],
             );
-            device.cmd_set_scissor_with_count(handle, &self.scissors);
+            device.cmd_set_scissor_with_count(handle, &[self.scissor]);
         }
         let color_formats = self.color.each_ref().map(|c| c.format);
         let rendering = Rendering {
@@ -687,7 +782,14 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                     DrawCommand::Launch(_) | DrawCommand::LaunchIndirect { .. } => false,
                     _ => true,
                 };
-                draw_state.record(state.as_ref(), rendering, vertex, &mut assembly, &dynamic, handle);
+                draw_state.record(
+                    state.as_ref(),
+                    rendering,
+                    vertex,
+                    &mut assembly,
+                    &dynamic,
+                    handle,
+                );
                 state = Some(draw_state);
                 unsafe {
                     match draw.command {
@@ -701,7 +803,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                             count,
                             instances,
                         } => {
-                            address_commands().cmd_bind_index_buffer3(
+                            Functions::device_address_commands().cmd_bind_index_buffer3(
                                 handle,
                                 &vk::BindIndexBuffer3InfoKHR::default()
                                     .address_range(indices)
@@ -714,7 +816,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                             draws,
                             flags,
                             count,
-                        } => address_commands().cmd_draw_indirect2(
+                        } => Functions::device_address_commands().cmd_draw_indirect2(
                             handle,
                             &vk::DrawIndirect2InfoKHR::default()
                                 .address_range(draws)
@@ -727,7 +829,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                             count,
                             count_flags,
                             max_count,
-                        } => address_commands().cmd_draw_indirect_count2(
+                        } => Functions::device_address_commands().cmd_draw_indirect_count2(
                             handle,
                             &vk::DrawIndirectCount2InfoKHR::default()
                                 .address_range(draws)
@@ -745,7 +847,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                             draws,
                             flags,
                             count,
-                        } => address_commands().cmd_draw_mesh_tasks_indirect2(
+                        } => Functions::device_address_commands().cmd_draw_mesh_tasks_indirect2(
                             handle,
                             &vk::DrawIndirect2InfoKHR::default()
                                 .address_range(draws)
@@ -765,8 +867,26 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     }
 }
 
-fn address_commands() -> &'static crate::vk::device_address_commands::Device {
-    Functions::device_address_commands()
+#[track_caller]
+fn fits(extent: UVec2, attachment: UVec2, what: &str) {
+    assert!(
+        extent.cmple(attachment).all(),
+        "a rendering of extent {extent} doesn't fit its {what} attachment of {attachment}"
+    );
+}
+
+/// Panics unless `groups` are within the device's limits per dimension and in total.
+#[track_caller]
+fn check_groups(groups: [u32; 3], max: [u32; 3], total: u64, what: &str) {
+    assert!(
+        groups.iter().zip(max).all(|(&g, m)| g <= m),
+        "{groups:?} {what} exceed the device's {max:?}"
+    );
+    let product: u64 = groups.iter().map(|&g| g as u64).product();
+    assert!(
+        product <= total,
+        "{groups:?} {what} are {product}, more than the device's {total}"
+    );
 }
 
 fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<'_, T, U>) -> BufferAccess {
@@ -779,12 +899,19 @@ fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<'_, T, U>) 
 
 impl<'p, K: HasGraphics> CommandBuffer<'p, K> {
     /// Starts a rendering of the area `extent` into the `color` attachments, with viewport and
-    /// scissor covering it.
+    /// scissor covering it. Every attachment is at least as large.
     pub fn raster<'a, const N: usize>(
         &'a mut self,
         extent: UVec2,
         color: [Attachment<'a>; N],
     ) -> RasterBuilder<'a, 'p, N> {
+        assert!(
+            extent.cmpgt(UVec2::ZERO).all(),
+            "a rendering of extent {extent} has no pixels"
+        );
+        for attachment in &color {
+            fits(extent, attachment.extent, "color");
+        }
         RasterBuilder {
             cmd_buf: &mut self.rec,
             extent,
@@ -792,7 +919,7 @@ impl<'p, K: HasGraphics> CommandBuffer<'p, K> {
                 offset: IVec2::ZERO,
                 extent,
             },
-            scissors: smallvec![rect(IVec2::ZERO, extent)],
+            scissor: rect(IVec2::ZERO, extent),
             color,
             depth_format: vk::Format::UNDEFINED,
             stencil_format: vk::Format::UNDEFINED,
@@ -832,7 +959,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         unsafe {
             Ctx::device().cmd_bind_pipeline(rec.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
             if let Some(slice) = indirect_buffer {
-                address_commands().cmd_dispatch_indirect2(
+                Functions::device_address_commands().cmd_dispatch_indirect2(
                     rec.handle,
                     &vk::DispatchIndirect2InfoKHR::default()
                         .address_range(slice.address_range())
@@ -864,6 +991,8 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         dispatch: [u32; 3],
         accesses: Option<Accesses<'_>>,
     ) {
+        let max = Ctx::device_properties().limits.max_compute_work_group_count;
+        check_groups(dispatch, max, u64::MAX, "compute workgroups");
         self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None, accesses);
     }
 
@@ -927,6 +1056,15 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         rays: [u32; 3],
         accesses: Option<Accesses<'_>>,
     ) {
+        let limits = &Ctx::device_properties().limits;
+        let max = std::array::from_fn(|i| {
+            let size = limits.max_compute_work_group_count[i] as u64;
+            (size * limits.max_compute_work_group_size[i] as u64).min(u32::MAX as u64) as u32
+        });
+        // The bindings exist only past the feature's check.
+        let total = (Ctx::physical_device().ray_tracing_pipeline_properties)
+            .map_or(0, |p| p.max_ray_dispatch_invocation_count as u64);
+        check_groups(rays, max, total, "rays");
         self.raytrace_private::<buffer::usage::Indirect>(bindings, rays, None, accesses);
     }
 
@@ -1053,21 +1191,27 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
         }
         let mut images = SmallVec::new();
-        release_states(view.states, view.mip_range, rec.family.kind, to, |mips, layout| {
-            images.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(stage)
-                    .src_access_mask(access)
-                    .dst_stage_mask(S2::NONE)
-                    .dst_access_mask(vk::AccessFlags2::NONE)
-                    .old_layout(layout)
-                    .new_layout(layout)
-                    .src_queue_family_index(from)
-                    .dst_queue_family_index(to_index)
-                    .image(image)
-                    .subresource_range(subresource_range(aspect, mips)),
-            )
-        });
+        release_states(
+            view.states,
+            view.mip_range,
+            rec.family.kind,
+            to,
+            |mips, layout| {
+                images.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(stage)
+                        .src_access_mask(access)
+                        .dst_stage_mask(S2::NONE)
+                        .dst_access_mask(vk::AccessFlags2::NONE)
+                        .old_layout(layout)
+                        .new_layout(layout)
+                        .src_queue_family_index(from)
+                        .dst_queue_family_index(to_index)
+                        .image(image)
+                        .subresource_range(subresource_range(aspect, mips)),
+                )
+            },
+        );
         if images.is_empty() {
             return;
         }
@@ -1215,9 +1359,15 @@ impl<'p> Recording<'p> {
         );
         pool.record(self);
         let bits = self.family.timestamp_valid_bits;
-        assert!(bits > 0, "the {:?} family has no timestamps", self.family.kind);
+        assert!(
+            bits > 0,
+            "the {:?} family has no timestamps",
+            self.family.kind
+        );
         let mask = if bits >= 64 { !0 } else { (1 << bits) - 1 };
-        pool.kind.valid_bits.store(mask, std::sync::atomic::Ordering::Relaxed);
+        pool.kind
+            .valid_bits
+            .store(mask, std::sync::atomic::Ordering::Relaxed);
         unsafe { Ctx::device().cmd_write_timestamp2(self.handle, stage, pool.handle, index) };
     }
 
@@ -1444,74 +1594,92 @@ pub(crate) fn compute_barriers<'a>(
     let mut acquired = SmallVec::new();
     for image in image_acceses {
         let access = &image.access;
-        let to_stage = if access.stage.is_empty() { S2::ALL_COMMANDS } else { access.stage };
-        let to_access = if access.access.is_empty() { all } else { access.access };
-        take_checked_states(image.states, access.mip_range, access.layout, kind, |mips, old| {
-            // The first access of an acquired swapchain image waits for the acquire at its
-            // stages, which the transition then starts from.
-            let waited = old.acquired.then(|| {
-                acquired.push((access.image, to_stage));
-                to_stage
-            });
-            // Released to this family: the acquire half of the transfer.
-            if old.released_to == Some(kind)
-                && let Some(owner) = old.owner
-            {
-                acquires.push(
+        let to_stage = if access.stage.is_empty() {
+            S2::ALL_COMMANDS
+        } else {
+            access.stage
+        };
+        let to_access = if access.access.is_empty() {
+            all
+        } else {
+            access.access
+        };
+        take_checked_states(
+            image.states,
+            access.mip_range,
+            access.layout,
+            kind,
+            |mips, old| {
+                // The first access of an acquired swapchain image waits for the acquire at its
+                // stages, which the transition then starts from.
+                let waited = old.acquired.then(|| {
+                    acquired.push((access.image, to_stage));
+                    to_stage
+                });
+                // Released to this family: the acquire half of the transfer.
+                if old.released_to == Some(kind)
+                    && let Some(owner) = old.owner
+                {
+                    acquires.push(
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(S2::NONE)
+                            .src_access_mask(vk::AccessFlags2::NONE)
+                            .dst_stage_mask(to_stage)
+                            .dst_access_mask(to_access)
+                            .old_layout(old.layout)
+                            .new_layout(old.layout)
+                            .src_queue_family_index(family.index(owner))
+                            .dst_queue_family_index(family.index(kind))
+                            .image(access.image)
+                            .subresource_range(subresource_range(access.aspect, mips)),
+                    );
+                }
+                if old.layout == access.layout {
+                    return;
+                }
+                // The transition waits for the image's tracked accesses. Without any, an earlier
+                // submission may still use it, so it waits for everything.
+                let (mut src_stage, mut src_access) = (S2::NONE, vk::AccessFlags2::NONE);
+                for p in (pending.image_reads.iter())
+                    .chain(pending.image_writes.iter().map(|w| &w.write))
+                    .filter(|p| p.image == access.image)
+                {
+                    src_stage |= p.stage;
+                    src_access |= p.access;
+                }
+                let from_present = old.layout == vk::ImageLayout::PRESENT_SRC_KHR;
+                if src_stage.is_empty() || from_present {
+                    src_stage = S2::ALL_COMMANDS;
+                    src_access = if from_present {
+                        vk::AccessFlags2::NONE
+                    } else {
+                        all
+                    };
+                }
+                // The semaphore wait chains with the transition at the stages it waits at.
+                if let Some(stage) = waited {
+                    src_stage = stage;
+                    src_access = vk::AccessFlags2::NONE;
+                }
+                image_barriers.push(
                     vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(S2::NONE)
-                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .src_stage_mask(src_stage)
+                        .src_access_mask(src_access)
                         .dst_stage_mask(to_stage)
-                        .dst_access_mask(to_access)
+                        .dst_access_mask(match access.layout {
+                            vk::ImageLayout::PRESENT_SRC_KHR => vk::AccessFlags2::NONE,
+                            _ => to_access,
+                        })
                         .old_layout(old.layout)
-                        .new_layout(old.layout)
-                        .src_queue_family_index(family.index(owner))
-                        .dst_queue_family_index(family.index(kind))
+                        .new_layout(access.layout)
+                        // Not an ownership transfer (ash's default would be family 0 to 0).
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .image(access.image)
                         .subresource_range(subresource_range(access.aspect, mips)),
                 );
-            }
-            if old.layout == access.layout {
-                return;
-            }
-            // The transition waits for the image's tracked accesses. Without any, an earlier
-            // submission may still use it, so it waits for everything.
-            let (mut src_stage, mut src_access) = (S2::NONE, vk::AccessFlags2::NONE);
-            for p in (pending.image_reads.iter())
-                .chain(pending.image_writes.iter().map(|w| &w.write))
-                .filter(|p| p.image == access.image)
-            {
-                src_stage |= p.stage;
-                src_access |= p.access;
-            }
-            let from_present = old.layout == vk::ImageLayout::PRESENT_SRC_KHR;
-            if src_stage.is_empty() || from_present {
-                src_stage = S2::ALL_COMMANDS;
-                src_access = if from_present { vk::AccessFlags2::NONE } else { all };
-            }
-            // The semaphore wait chains with the transition at the stages it waits at.
-            if let Some(stage) = waited {
-                src_stage = stage;
-                src_access = vk::AccessFlags2::NONE;
-            }
-            image_barriers.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(src_stage)
-                    .src_access_mask(src_access)
-                    .dst_stage_mask(to_stage)
-                    .dst_access_mask(match access.layout {
-                        vk::ImageLayout::PRESENT_SRC_KHR => vk::AccessFlags2::NONE,
-                        _ => to_access,
-                    })
-                    .old_layout(old.layout)
-                    .new_layout(access.layout)
-                    // Not an ownership transfer (ash's default would be family 0 to 0).
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(access.image)
-                    .subresource_range(subresource_range(access.aspect, mips)),
-            );
-        });
+            },
+        );
     }
 
     let hazard = !src_stage.is_empty() || !dst_stage.is_empty();

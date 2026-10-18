@@ -176,7 +176,10 @@ impl<K: QueueKind> Timeline<K> {
             index
         };
         let slots = (0..in_flight).map(|_| -> Result<_> {
-            let info = vk::CommandPoolCreateInfo::default().queue_family_index(family.index);
+            // Its command buffer is rerecorded every submission.
+            let info = vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+                .queue_family_index(family.index);
             let pool = unsafe { device.create_command_pool(&info, None)? };
             let allocate = vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool)

@@ -6,7 +6,7 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::vk::{self};
 use bytemuck::Pod;
 use smallvec::SmallVec;
@@ -96,10 +96,13 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
     /// Like `new`, for any usage, `Dynamic` ones included.
     #[validation_trace]
     pub fn with_usage(usage: U, size: usize, cpu_writable: bool) -> Result<Self> {
-        Self::raw(usage, cpu_writable, (size * size_of::<T>()) as u64, None)
+        let num_bytes = size.checked_mul(size_of::<T>()).ok_or_else(|| {
+            Error::message(format!("{size} elements of {} bytes overflow", size_of::<T>()))
+        })?;
+        Self::raw(usage, cpu_writable, num_bytes as u64, Some(align_of::<T>() as u32))
     }
 
-    /// A buffer of `num_bytes`, aligned to `alignment` or what the device requires.
+    /// A buffer of `num_bytes` (at least 1), aligned to `alignment` or what the device requires.
     #[validation_trace]
     pub fn raw(
         usage: U,
@@ -107,6 +110,9 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         num_bytes: u64,
         alignment: Option<u32>,
     ) -> Result<Self> {
+        if num_bytes == 0 {
+            return Err(Error::message("a buffer can't be empty: Vulkan needs at least one byte"));
+        }
         let mut flags = usage.flags()
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
@@ -222,7 +228,11 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
             .expect("the host can only access mapped buffers (`is_mapped`): create it `cpu_writable`")
             .as_ptr()
             .cast::<T>();
-        debug_assert!(ptr.is_aligned());
+        assert!(
+            ptr.is_aligned(),
+            "the mapping at {ptr:?} isn't aligned to {} bytes for its elements",
+            align_of::<T>()
+        );
         ptr
     }
 
@@ -245,7 +255,10 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         self.mapped()
     }
 
+    /// The same buffer of `B`s; panics unless its size is a multiple of `B`'s and its address
+    /// aligned to `B`.
     pub fn cast<B: Copy + Pod>(self) -> Buffer<B, U> {
+        slice::cast_check::<B>(self.address, self.num_bytes);
         let usage = self.usage;
         ManuallyDrop::new(self).take(usage)
     }

@@ -137,6 +137,17 @@ impl Gpu {
     }
 }
 
+/// The message `f` panics with; fails the test if it doesn't panic.
+#[track_caller]
+pub fn panic_message<R>(f: impl FnOnce() -> R) -> String {
+    let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) else {
+        panic!("it should panic");
+    };
+    (payload.downcast_ref::<String>().cloned())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
 /// A host-readable buffer holding `data`.
 pub fn buffer_with<T: Pod, U: StaticUsage>(data: &[T]) -> Buffer<T, U> {
     let mut buffer = Buffer::new(data.len(), true).unwrap();

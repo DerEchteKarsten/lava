@@ -378,6 +378,8 @@ fn build_new_fn<'a>(
                 };
                 out.checks
                     .push(format!("{name}.usage_check(vk::ImageUsageFlags::{flags});"));
+                out.checks
+                    .push(format!("{name}.bound_check(vk::ImageUsageFlags::{flags});"));
                 out.params.push(format!("{name}: impl {traits} + 'a"));
                 out.gpu_inits.push(format!("{name}: {name}.handle()"));
                 let access = match usage {

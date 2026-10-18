@@ -376,6 +376,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included.
     #[validation_trace]
     pub fn with_params(format: F, usage: U, extent: D::Extent, mip_levels: u32) -> Result<Self> {
+        check_extent::<D>(extent, mip_levels)?;
         if bc_block(format.vk_format()).is_some() {
             #[cfg(feature = "bc-compression")]
             gate::BcCompression::check()?;
@@ -775,6 +776,33 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
         unsafe { Functions::host_image_copy().copy_memory_to_image(&info)? };
         Ok(())
     }
+}
+
+/// An image needs texels, at least one mip and no more than its largest side halves into, and
+/// no side beyond the device's limit.
+fn check_extent<D: Dim>(extent: D::Extent, mip_levels: u32) -> Result<()> {
+    let e = D::extent_3d(extent);
+    let largest = e.width.max(e.height).max(e.depth);
+    if e.width == 0 || e.height == 0 || e.depth == 0 {
+        return Err(Error::message(format!("an image of extent {extent:?} has no texels")));
+    }
+    let limits = &Ctx::device_properties().limits;
+    let max = match D::IMAGE_TYPE {
+        vk::ImageType::TYPE_3D => limits.max_image_dimension3_d,
+        _ => limits.max_image_dimension2_d,
+    };
+    if largest > max {
+        return Err(Error::message(format!(
+            "an image of extent {extent:?} is larger than the device's {max} texels per side"
+        )));
+    }
+    let most = largest.ilog2() + 1;
+    if mip_levels == 0 || mip_levels > most {
+        return Err(Error::message(format!(
+            "an image of extent {extent:?} has 1 to {most} mip levels, not {mip_levels}"
+        )));
+    }
+    Ok(())
 }
 
 /// Bytes of tightly packed texels of `extent`, in blocks of `(side, bytes)` where `texel_size`

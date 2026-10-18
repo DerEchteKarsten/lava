@@ -6,6 +6,7 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 ----find solutions----
 - Recording one image on two timelines without a `Wait` between them corrupts its tracked state undetected (both move it); so does accessing a released image without waiting for the release's submission. A debug check could remember the last timeline and value per image.
 - Host image copies (`Image::copy_from`) leave the image's owner alone; check that against `VK_EXT_host_image_copy`'s rules for images another family owns.
+- `bindless::bind` rewriting a reserved slot that a submission in flight samples is undefined behaviour (core's texture slots: placeholder, then texture). With frames in flight, one that reads the slot is always pending, so no later moment to write it avoids this. Options: make `bind` `unsafe`, or write each new descriptor to a fresh slot and have the application index through a per-frame table.
 - Replaced swapchains are destroyed by their surface at its next `acquire`, so a surface that stops acquiring keeps its old swapchains (and their bindless slots) until it is dropped.
 - Recording 64 compute dispatches costs about 7% more than before timelines (`lava-tests` recording bench, 2026-10-17, `taskset -c 2`, alternating builds: 22 vs 20.5 µs; draws, declared accesses and mesh launches at par). Not found without a profiler; `compute_barriers` and the barrier log were ruled out.
 ----intended----
@@ -32,7 +33,8 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 ## lava: ray tracing (tested by `gpu_ray_tracing`, not used by core yet)
 ----intended----
 - Binding table records hold only shader group handles: no shader record data, since shaders read everything through push constants and addresses.
-- A TLAS names its BLASes by address, which lava doesn't track: a BLAS dropped while a TLAS still names it is destroyed once the submissions in flight are done, so rebuild the TLAS before tracing it again.
+- A TLAS names its BLASes by address, which lava doesn't track: a BLAS dropped while a TLAS still names it is destroyed once the submissions in flight are done, so rebuild the TLAS before tracing it again. `Instances::new` is `unsafe` with that contract (`Instance::from_address` stays safe: `Instance`'s fields are public and passes write instances).
+- `compacted(size)` takes the compacted size on the caller's word (decided 2026-10-18): `compact` checks only that the destination was made by `compacted` of its source, which was built.
 - No indirect builds (`vkCmdBuildAccelerationStructuresIndirectKHR`): instance and primitive counts come from the host, so a GPU-culled TLAS builds every instance slot (cull with the mask or a zero transform).
 - Any acceleration structure write waits for every pending trace and TLAS build (the read of `EVERY_ACCELERATION_STRUCTURE`), also of unrelated structures.
 - Trace reads carry `MEMORY_READ` for Mesa's ANV (26.2.2): with `ACCELERATION_STRUCTURE_READ` alone, a trace after a TLAS rebuilt in the same submission (traced before it) saw stale nodes. Worth reporting to Mesa and dropping once fixed.
@@ -50,8 +52,22 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 - `Buffer::host()` hands out `&[T]` over memory a submission in flight may write, which Rust's aliasing rules don't allow (a polling loop over one slice can be hoisted). Needs an API that reads copies or volatile values.
 
 ----intended----
-- `wait_idle` waits at most 1 s for the present fences after the device went idle, then gives up on the ones that didn't signal (a present that failed before it was queued) and leaks them.
+- Dropping a `PresentSurface` waits at most 1 s for its present fences, then stops waiting for the ones that didn't signal (a present that failed before it was queued) and retires them with the swapchain.
 - Completed pending buffer writes are only folded (into one write of every address, which every later access is made visible to once) once there are more than 64; until then they stay, since a later submission still needs a barrier to see them.
+
+## lava: bugs from the second survey (2026-10-18)
+Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
+----find solutions----
+- Layout transitions and queue family acquires aren't tracked as writes, so a later read at another stage isn't ordered after the transition (SURVEY 17). Releasing one mip of a `MipChain` forgets the pending writes of the whole image (18).
+- Safe code reaches undefined behaviour: `Bindings::new` checks neither the pass kind nor the specialization constants' length (a `VkSpecializationInfo` with `dataSize` 0); `lava::destroy()` can run twice or before further use; `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 23-37).
+- `multiDrawIndirect`, `drawIndirectFirstInstance` and `depthBiasClamp` are never enabled, though `Draw::indirect` passes `buffer.len()` draws and `DepthBias::clamp` is public (38, 39).
+- Without extended dynamic state 3, line and point draws use a pipeline baked with `TRIANGLE_LIST` (`dynamicPrimitiveTopologyUnrestricted` is never queried) (40). `depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists (41). 64-bit clear values are packed as 32-bit (43).
+- `wait_for` and queries use stages and query types the waiting family doesn't support (44, 45).
+- A `Timeline` dropped after `reserve()` or an unsubmitted `begin()` holds back every later destruction for good; a failed barrier-only replay leaves a value nothing signals (64, 65). The public `reclaim()` never polls (67). `init` isn't atomic: a late failure leaks the device and every retry says "already initialised" (69).
+- A failed pipeline creation poisons the pipeline cache of its kind for every later recording (72).
+- `cmd.present` marks the image presented while recording, so `surface.present()` inside the submit closure presents on an unsignalled semaphore; a failed swapchain recreation keeps the retired swapchain (77, 78).
+- The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `BindlessHandle` (87, 88).
+- Combined depth-stencil images can't be bound into reserved slots: `bindless::bind` gets the view of both aspects (52).
 
 ## Performance
 --- find solutions ---

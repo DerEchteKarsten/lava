@@ -106,7 +106,10 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     pub fn address(&self) -> u64 {
         self.address
     }
+    /// The same range of `B`s; panics unless its size is a multiple of `B`'s and its address
+    /// aligned to `B`.
     pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B, U> {
+        cast_check::<B>(self.address, self.size);
         BufferSlice {
             address: self.address,
             size: self.size,
@@ -150,13 +153,41 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     }
 }
 
+#[track_caller]
+pub(crate) fn cast_check<B>(address: u64, size: u64) {
+    let (element, align) = (size_of::<B>() as u64, align_of::<B>() as u64);
+    assert!(
+        element != 0 && size % element == 0,
+        "{size} bytes aren't a whole number of {element}-byte elements"
+    );
+    assert!(
+        address % align == 0,
+        "address {address:#x} isn't aligned to the {align} bytes of the elements"
+    );
+}
+
+/// What fills and updates write: 4-byte aligned, whole words.
+#[track_caller]
+fn check_words(address: u64, size: u64, what: &str) {
+    assert!(
+        address % 4 == 0 && size % 4 == 0,
+        "{what} writes whole 4-byte words at 4-byte aligned addresses, not {size} bytes at {address:#x}"
+    );
+}
+
+/// `vkCmdUpdateBuffer`'s limit on the bytes of one update.
+const MAX_UPDATE: usize = 65536;
+
 impl<K: QueueKind> CommandBuffer<'_, K> {
+    /// Writes `data`, repeated, into every 4-byte word of `buffer`, whose address and size have
+    /// to be multiples of 4.
     #[validation_trace]
     pub fn fill_buffer<'a, T: Copy + Pod, U: BufferUsage>(
         &mut self,
         buffer: BufferSlice<'a, T, U>,
         data: u32,
     ) {
+        check_words(buffer.address, buffer.size, "a fill");
         self.rec.flush_pending(
             std::iter::empty(),
             std::iter::once(BufferAccess {
@@ -175,12 +206,22 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         };
     }
 
+    /// Writes `data` into the first element of `buffer`, from the command buffer itself: for
+    /// small writes (at most 64 KiB, whole 4-byte words at a 4-byte aligned address).
     #[validation_trace]
     pub fn update_buffer<'a, T: Copy + Pod, U: BufferUsage>(
         &mut self,
         buffer: BufferSlice<'a, T, U>,
         data: &T,
     ) {
+        assert!(!buffer.is_empty(), "an update writes the first element of an empty slice");
+        assert!(
+            size_of::<T>() <= MAX_UPDATE,
+            "an update writes at most {MAX_UPDATE} bytes, not {}",
+            size_of::<T>()
+        );
+        let buffer = buffer.range(..1);
+        check_words(buffer.address, buffer.size, "an update");
         self.rec.flush_pending(
             iter::empty(),
             iter::once(BufferAccess {

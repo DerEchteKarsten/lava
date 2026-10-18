@@ -24,6 +24,8 @@ pub struct Bindless {
     free: [Mutex<Ranges>; 2],
     /// The live ranges of `reserve_sampled`/`reserve_storage`, which `bind` writes.
     reserved: [Mutex<Vec<Range<u32>>>; 2],
+    /// Held for `vkUpdateDescriptorSets`, which needs its sets externally synchronised.
+    writes: Mutex<()>,
     layout: vk::PipelineLayout,
     layouts: [vk::DescriptorSetLayout; 2],
     sets: [vk::DescriptorSet; 2],
@@ -382,6 +384,7 @@ pub(crate) fn bind_raw(
                 .image_info(std::slice::from_ref(info))
         })
         .collect();
+    let _writing = lock(&bindless.writes);
     unsafe { Ctx::device().update_descriptor_sets(&writes, &[]) };
 }
 
@@ -536,6 +539,7 @@ impl Bindless {
                     Mutex::new(Ranges { free })
                 }),
                 reserved: Default::default(),
+                writes: Mutex::new(()),
                 layout,
                 layouts,
                 sets,
