@@ -72,7 +72,7 @@ fn missing(feature: &'static str) -> MissingFeature {
 
 /// Clears a fresh target to `clear`, lets `record` draw into it, and reads it back.
 fn render(
-    gpu: &common::Gpu,
+    gpu: &mut common::Gpu,
     clear: [f32; 4],
     record: impl FnOnce(&mut Cmd, &Target),
 ) -> Vec<u8> {
@@ -209,9 +209,9 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
 
 #[test]
 fn baked_polygon_modes_draw_like_dynamic_ones() {
-    let gpu = gpu_without();
+    let mut gpu = gpu_without();
     let vertices = two_triangles();
-    let pixels = render(&gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines, None))
@@ -223,9 +223,9 @@ fn baked_polygon_modes_draw_like_dynamic_ones() {
 
 #[test]
 fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
-    let gpu = gpu_without();
+    let mut gpu = gpu_without();
     let vertices = two_triangles();
-    let pixels = render(&gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -240,10 +240,10 @@ fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
 
 #[test]
 fn baked_blends_combine_and_skip() {
-    let gpu = gpu_without();
+    let mut gpu = gpu_without();
     let vertices = overlapping_triangles();
     // Green, then red added on top of it.
-    let added = render(&gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let added = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let add = RasterState::default().blend(Blend::Add);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, add, None))
@@ -251,7 +251,7 @@ fn baked_blends_combine_and_skip() {
     });
     assert_pixel(&added, 32, 40, [255, 255, 0, 255]);
     // A skipped attachment's baked write mask is empty.
-    let skipped = render(&gpu, BLUE, |cmd, target| {
+    let skipped = render(&mut gpu, BLUE, |cmd, target| {
         let skip = RasterState::default().blend(Blend::Skip);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, skip, None))
@@ -262,13 +262,13 @@ fn baked_blends_combine_and_skip() {
 
 #[test]
 fn baked_logic_ops_replace_blending() {
-    let gpu = gpu_without();
+    let mut gpu = gpu_without();
     if !Ctx::features().logic_op {
         eprintln!("SKIPPED baked_logic_ops_replace_blending: the device lacks `logic-op`");
         return;
     }
     let vertices = overlapping_triangles();
-    let pixels = render(&gpu, [1.0; 4], |cmd, target| {
+    let pixels = render(&mut gpu, [1.0; 4], |cmd, target| {
         let xor = RasterState::default().logic_op(Some(LogicOp::XOR)).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, xor, None))

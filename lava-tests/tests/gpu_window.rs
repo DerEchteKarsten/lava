@@ -54,7 +54,7 @@ fn surface_for(window: &Window) -> lava::Result<Surface> {
 
 /// Acquires, clears to `color` and presents an image; returns its handle.
 fn present_frame(
-    timeline: &Timeline<Graphics>,
+    timeline: &mut Timeline<Graphics>,
     surface: &mut Surface,
     size: glam::UVec2,
     color: [f32; 4],
@@ -73,7 +73,7 @@ fn present_frame(
 }
 
 /// Acquires an image and clears and presents it in a submission, without `surface.present()`.
-fn submit_without_presenting(timeline: &Timeline<Graphics>, surface: &mut Surface) {
+fn submit_without_presenting(timeline: &mut Timeline<Graphics>, surface: &mut Surface) {
     let submission = timeline.begin().unwrap();
     assert!(surface.acquire(SIZE).unwrap());
     submission
@@ -108,10 +108,10 @@ fn run(event_loop: &ActiveEventLoop) {
     assert_eq!(surface.format().0, vk::Format::B8G8R8A8_UNORM);
     step("surface_reports_its_format_and_modes");
 
-    let timeline = Timeline::<Graphics>::new(2).unwrap();
+    let mut timeline = Timeline::<Graphics>::new(2).unwrap();
     let mut handles = Vec::new();
     for color in [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]] {
-        handles.push(present_frame(&timeline, &mut surface, SIZE, color));
+        handles.push(present_frame(&mut timeline, &mut surface, SIZE, color));
     }
     assert_eq!(surface.size(), SIZE);
     // Bound in the storage set, the only one its usage allows.
@@ -122,14 +122,14 @@ fn run(event_loop: &ActiveEventLoop) {
     step("acquire_clear_present");
 
     let old_images = surface.num_images();
-    present_frame(&timeline, &mut surface, SIZE / 2, [1.0, 1.0, 0.0, 1.0]);
+    present_frame(&mut timeline, &mut surface, SIZE / 2, [1.0, 1.0, 0.0, 1.0]);
     assert_eq!(surface.size(), SIZE / 2);
-    let new = present_frame(&timeline, &mut surface, SIZE / 2, [1.0, 0.0, 1.0, 1.0]);
+    let new = present_frame(&mut timeline, &mut surface, SIZE / 2, [1.0, 0.0, 1.0, 1.0]);
     assert!(!handles.contains(&new), "the old swapchain's slots stay taken until it is destroyed");
     // An acquire destroys the old swapchain once nothing uses it, freeing the lowest slots.
     for _ in 0..2 {
         lava::wait_idle().unwrap();
-        present_frame(&timeline, &mut surface, SIZE / 2, [0.0, 0.0, 0.0, 1.0]);
+        present_frame(&mut timeline, &mut surface, SIZE / 2, [0.0, 0.0, 0.0, 1.0]);
     }
     let lowest = handles.iter().map(|h| h.descriptor_index_set1).min().unwrap();
     let reserved = lava::bindless::reserve_storage(old_images as u32).unwrap();
@@ -147,11 +147,11 @@ fn run(event_loop: &ActiveEventLoop) {
     surface.present().unwrap();
     assert!(surface.acquire(SIZE).unwrap());
     assert_eq!(surface.current_image().handle(), unused);
-    let drawn = present_frame(&timeline, &mut surface, SIZE, [0.0, 1.0, 1.0, 1.0]);
+    let drawn = present_frame(&mut timeline, &mut surface, SIZE, [0.0, 1.0, 1.0, 1.0]);
     assert_eq!(drawn, unused, "the next frame draws into it");
     // One a submission presented is presented by the next acquire.
-    submit_without_presenting(&timeline, &mut surface);
-    present_frame(&timeline, &mut surface, SIZE, [1.0, 1.0, 1.0, 1.0]);
+    submit_without_presenting(&mut timeline, &mut surface);
+    present_frame(&mut timeline, &mut surface, SIZE, [1.0, 1.0, 1.0, 1.0]);
     step("unused_images_stay_current");
 
     let submission = timeline.begin().unwrap();
@@ -160,29 +160,29 @@ fn run(event_loop: &ActiveEventLoop) {
         submission.submit(|cmd| cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4])))
     }));
     assert!(unpresented.is_err(), "the submission that uses the current image presents it");
-    submit_without_presenting(&timeline, &mut surface);
+    submit_without_presenting(&mut timeline, &mut surface);
     let submission = timeline.begin().unwrap();
     let twice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         submission.submit(|cmd| cmd.present(&mut surface))
     }));
     assert!(twice.is_err(), "an image is presented by one submission");
     surface.present().unwrap();
-    present_frame(&timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
+    present_frame(&mut timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
     step("misuse_panics");
 
     let modes = surface.present_modes().len();
     surface.set_present_mode(modes - 1);
-    present_frame(&timeline, &mut surface, SIZE, [1.0, 0.0, 0.0, 1.0]);
+    present_frame(&mut timeline, &mut surface, SIZE, [1.0, 0.0, 0.0, 1.0]);
     assert_eq!(surface.present_mode(), modes - 1);
     surface.set_present_mode(0);
-    present_frame(&timeline, &mut surface, SIZE, [0.0, 1.0, 0.0, 1.0]);
+    present_frame(&mut timeline, &mut surface, SIZE, [0.0, 1.0, 0.0, 1.0]);
     step("present_modes_change");
 
     let second_window = create_window(event_loop, "lava test 2");
     let mut second = surface_for(&second_window).unwrap();
     assert_ne!(second.handle(), surface.handle());
-    let other = present_frame(&timeline, &mut second, SIZE, [1.0, 1.0, 0.0, 1.0]);
-    let first = present_frame(&timeline, &mut surface, SIZE, [1.0, 0.0, 1.0, 1.0]);
+    let other = present_frame(&mut timeline, &mut second, SIZE, [1.0, 1.0, 0.0, 1.0]);
+    let first = present_frame(&mut timeline, &mut surface, SIZE, [1.0, 0.0, 1.0, 1.0]);
     assert_ne!(other, first);
     step("second_window_has_its_own_surface");
 

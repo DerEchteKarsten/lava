@@ -33,7 +33,7 @@ fn supported(test: &str, feature: bool) -> bool {
 
 /// Lets `record` write `targets` in one submission and reads them back.
 fn render_many<const N: usize>(
-    gpu: &common::Gpu,
+    gpu: &mut common::Gpu,
     record: impl FnOnce(&mut Cmd, &[Target; N]),
 ) -> [Vec<u8>; N] {
     let targets: [Target; N] =
@@ -52,7 +52,7 @@ fn render_many<const N: usize>(
     readbacks.map(|readback| readback.host().to_vec())
 }
 
-fn render(gpu: &common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> {
+fn render(gpu: &mut common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> {
     let [pixels] = render_many(gpu, |cmd, [target]| record(cmd, target));
     pixels
 }
@@ -129,7 +129,7 @@ fn scratch(size: u64) -> Buffer<u8> {
     Buffer::raw(Storage, false, size, Some(scratch_alignment() as u32)).unwrap()
 }
 
-fn scene(gpu: &common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) -> Scene {
+fn scene(gpu: &mut common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) -> Scene {
     let wall_vertices = buffer_with::<Vec3, Storage>(&[
         Vec3::new(-0.9, -0.9, 0.0),
         Vec3::new(0.9, -0.9, 0.0),
@@ -198,24 +198,24 @@ fn assert_query_image(pixels: &[u8]) {
 
 #[test]
 fn ray_queries_hit_triangles_and_aabbs_through_the_instance_mask() {
-    let gpu = gpu();
+    let mut gpu = gpu();
     if !supported("ray_queries_hit_triangles_and_aabbs", Ctx::features().ray_query) {
         return;
     }
-    let scene = scene(&gpu, BuildFlags::default(), BuildFlags::default());
-    let pixels = render(&gpu, |cmd, target| trace_query(cmd, target, &scene.tlas));
+    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
+    let pixels = render(&mut gpu, |cmd, target| trace_query(cmd, target, &scene.tlas));
     assert_query_image(&pixels);
     assert_golden("ray_query", &pixels, [SIZE, SIZE]);
 }
 
 #[test]
 fn ray_tracing_pipelines_run_every_shader_kind() {
-    let gpu = gpu();
+    let mut gpu = gpu();
     if !supported("ray_tracing_pipelines_run_every_shader_kind", Ctx::features().ray_tracing_pipeline) {
         return;
     }
-    let scene = scene(&gpu, BuildFlags::default(), BuildFlags::default());
-    let pixels = render(&gpu, |cmd, target| trace_pipeline(cmd, target, &scene.tlas));
+    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
+    let pixels = render(&mut gpu, |cmd, target| trace_pipeline(cmd, target, &scene.tlas));
     let sky = [51, 153, 77];
     assert_pixel(&pixels, BACKGROUND.0, BACKGROUND.1, sky);
     assert_pixel(&pixels, WALL.0, WALL.1, [204, 204, 204]);
@@ -229,14 +229,14 @@ fn ray_tracing_pipelines_run_every_shader_kind() {
 
 #[test]
 fn indirect_traces_read_their_size_on_the_gpu() {
-    let gpu = gpu();
+    let mut gpu = gpu();
     if !supported("indirect_traces_read_their_size_on_the_gpu", Ctx::features().ray_tracing_pipeline) {
         return;
     }
-    let scene = scene(&gpu, BuildFlags::default(), BuildFlags::default());
-    let direct = render(&gpu, |cmd, target| trace_pipeline(cmd, target, &scene.tlas));
+    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
+    let direct = render(&mut gpu, |cmd, target| trace_pipeline(cmd, target, &scene.tlas));
     let command = zeroed_buffer::<TraceRaysIndirectCommand, Indirect>(1);
-    let indirect = render(&gpu, |cmd, target| {
+    let indirect = render(&mut gpu, |cmd, target| {
         // Written in the same submission: the trace waits for the transfer.
         cmd.update_buffer(
             command.range(..),
@@ -257,15 +257,15 @@ fn indirect_traces_read_their_size_on_the_gpu() {
 
 #[test]
 fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
-    let gpu = gpu();
+    let mut gpu = gpu();
     if !supported("instances_written_by_a_pass", Ctx::features().ray_query) {
         return;
     }
-    let scene = scene(&gpu, BuildFlags::default(), BuildFlags::default());
+    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
     let written = zeroed_buffer::<Instance, Storage>(4);
     let tlas = Tlas::new(4, BuildFlags::default()).unwrap();
     let scratch = scratch(tlas.build_scratch_size());
-    let pixels = render(&gpu, |cmd, target| {
+    let pixels = render(&mut gpu, |cmd, target| {
         cmd.compute(
             &TestWriteInstances::push_bindings(
                 written.range(..),
@@ -285,7 +285,7 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
 
 #[test]
 fn updates_follow_moved_vertices() {
-    let gpu = gpu();
+    let mut gpu = gpu();
     if !supported("updates_follow_moved_vertices", Ctx::features().ray_query) {
         return;
     }
@@ -314,7 +314,7 @@ fn updates_follow_moved_vertices() {
             .unwrap(),
     );
     let (old, new) = ((32, 30), (48, 30));
-    let pixels = render(&gpu, |cmd, target| {
+    let pixels = render(&mut gpu, |cmd, target| {
         cmd.build(&[(&blas, BlasGeometry::Triangles(&geometry(&vertices)))], scratch.range(..));
         cmd.build(&[(&tlas, Instances::new(instances.range(..)))], scratch.range(..));
         trace_query(cmd, target, &tlas);
@@ -325,7 +325,7 @@ fn updates_follow_moved_vertices() {
     for vertex in vertices.host_mut() {
         vertex.x += 0.5;
     }
-    let pixels = render(&gpu, |cmd, target| {
+    let pixels = render(&mut gpu, |cmd, target| {
         cmd.update(&[(&blas, BlasGeometry::Triangles(&geometry(&vertices)))], scratch.range(..));
         cmd.update(&[(&tlas, Instances::new(instances.range(..)))], scratch.range(..));
         trace_query(cmd, target, &tlas);
@@ -336,18 +336,18 @@ fn updates_follow_moved_vertices() {
 
 #[test]
 fn a_tlas_rebuilt_between_two_traces_waits_for_the_first() {
-    let gpu = gpu();
+    let mut gpu = gpu();
     if !supported("a_tlas_rebuilt_between_two_traces", Ctx::features().ray_query) {
         return;
     }
-    let scene = scene(&gpu, BuildFlags::default(), BuildFlags::default());
+    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
     let wall_only = buffer_with::<Instance, Storage>(&instances(
         scene.wall.address(),
         scene.triangle.address(),
         scene.sphere.address(),
     )[..1]);
     let scratch = scratch(scene.tlas.build_scratch_size());
-    let [before, after] = render_many(&gpu, |cmd, [first, second]| {
+    let [before, after] = render_many(&mut gpu, |cmd, [first, second]| {
         trace_query(cmd, first, &scene.tlas);
         cmd.build(&[(&scene.tlas, Instances::new(wall_only.range(..)))], scratch.range(..));
         trace_query(cmd, second, &scene.tlas);
@@ -360,7 +360,7 @@ fn a_tlas_rebuilt_between_two_traces_waits_for_the_first() {
 
 #[test]
 fn compacted_structures_trace_the_same_image() {
-    let gpu = gpu();
+    let mut gpu = gpu();
     if !supported("compacted_structures_trace_the_same_image", Ctx::features().ray_query) {
         return;
     }
@@ -375,7 +375,7 @@ fn compacted_structures_trace_the_same_image() {
         tlas,
         instances: _,
         _inputs,
-    } = scene(&gpu, compactable, BuildFlags::default());
+    } = scene(&mut gpu, compactable, BuildFlags::default());
 
     let queried = QueryPool::compacted_sizes(3).unwrap();
     let mut sizes = [0; 3];
@@ -399,7 +399,7 @@ fn compacted_structures_trace_the_same_image() {
         c_sphere.address(),
     ));
     let scratch = scratch(tlas.build_scratch_size());
-    let pixels = render(&gpu, |cmd, target| {
+    let pixels = render(&mut gpu, |cmd, target| {
         for (src, dst) in [&wall, &triangle, &sphere].into_iter().zip(&compacted) {
             cmd.compact(src, dst);
         }

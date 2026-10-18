@@ -145,7 +145,7 @@ const FRAMES: usize = 3000;
 
 fn main() {
     lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
-    let timeline = Timeline::<Graphics>::new(2).unwrap();
+    let mut timeline = Timeline::<Graphics>::new(2).unwrap();
     let buffer = |len| Buffer::new(len, false).unwrap();
     let resources = Resources {
         target: Target::new(EXTENT).unwrap().bind_storage().unwrap(),

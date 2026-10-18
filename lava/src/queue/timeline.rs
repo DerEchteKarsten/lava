@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, LazyLock, Mutex, OnceLock,
+        LazyLock, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -36,10 +36,6 @@ pub(crate) struct Index {
 pub(crate) struct IndexState {
     pub(crate) pending: PendingAccesses,
     submitted: u64,
-    /// Submissions begun so far, which take the frame slots in turn.
-    begun: u64,
-    /// A `Submission` exists.
-    open: bool,
 }
 
 pub(crate) static INDICES: LazyLock<[Index; MAX_TIMELINES]> = LazyLock::new(|| {
@@ -112,7 +108,9 @@ struct Inner {
     /// What its recordings know of the family.
     info: FamilyInfo,
     queue: usize,
-    slots: Box<[Mutex<Slot>]>,
+    slots: Box<[Slot]>,
+    /// Submissions begun so far, which take the frame slots in turn.
+    begun: u64,
 }
 
 impl fmt::Debug for Inner {
@@ -134,7 +132,7 @@ impl Drop for Inner {
             tracing::error!(%err, "failed to wait for a dropped timeline's submissions");
         }
         for slot in &self.slots {
-            unsafe { Ctx::device().destroy_command_pool(lock(slot).pool, None) };
+            unsafe { Ctx::device().destroy_command_pool(slot.pool, None) };
         }
         lock(&index.state).pending = PendingAccesses::default();
         lock(&self.family.timelines)[self.queue] -= 1;
@@ -146,7 +144,7 @@ impl Drop for Inner {
 /// Submissions to the queue of family `K` the fewest timelines share, with `in_flight` frame
 /// slots. Dropping it waits for its submissions.
 pub struct Timeline<K: QueueKind> {
-    inner: Arc<Inner>,
+    inner: Inner,
     _kind: PhantomData<fn() -> K>,
 }
 
@@ -185,12 +183,12 @@ impl<K: QueueKind> Timeline<K> {
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1);
             let cmd = unsafe { device.allocate_command_buffers(&allocate)? }[0];
-            Ok(Mutex::new(Slot {
+            Ok(Slot {
                 pool,
                 cmd,
                 barrier_log: Vec::new(),
                 signalled: 0,
-            }))
+            })
         });
         let slots = match slots.collect::<Result<Box<[_]>>>() {
             Ok(slots) => slots,
@@ -214,13 +212,14 @@ impl<K: QueueKind> Timeline<K> {
                 .map(|kind| queues.family(kind).map_or(vk::QUEUE_FAMILY_IGNORED, |f| f.index)),
         };
         Ok(Timeline {
-            inner: Arc::new(Inner {
+            inner: Inner {
                 index,
                 family,
                 info,
                 queue,
                 slots,
-            }),
+                begun: 0,
+            },
             _kind: PhantomData,
         })
     }
@@ -231,50 +230,43 @@ impl<K: QueueKind> Timeline<K> {
         INDICES[self.inner.index].stamp.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Waits until the frame slot's last submission finished and destroys what that frees. One
-    /// submission of a timeline exists at a time.
+    /// Waits until the next frame slot's last submission finished and destroys what that frees.
+    /// The submission borrows the timeline, so it has one at a time.
     #[validation_trace]
-    pub fn begin(&self) -> Result<Submission<K>> {
-        let inner = &self.inner;
+    pub fn begin(&mut self) -> Result<Submission<'_, K>> {
+        let inner = &mut self.inner;
         let index = &INDICES[inner.index];
-        let slot = {
-            let mut state = lock(&index.state);
-            assert!(!state.open, "a timeline has one submission at a time");
-            state.open = true;
-            let slot = (state.begun % inner.slots.len() as u64) as usize;
-            state.begun += 1;
-            index.stamp.fetch_max(state.submitted + 1, Ordering::SeqCst);
-            slot
-        };
-        let submission = Submission {
-            inner: inner.clone(),
-            slot,
-            waits: SmallVec::new(),
-            _kind: PhantomData,
-        };
-        let signalled = lock(&inner.slots[slot]).signalled;
+        let slot = (inner.begun % inner.slots.len() as u64) as usize;
+        inner.begun += 1;
+        index.stamp.fetch_max(lock(&index.state).submitted + 1, Ordering::SeqCst);
+        let signalled = inner.slots[slot].signalled;
         if poll(inner.index) < signalled {
             let _span = tracing::info_span!("wait for frame slot").entered();
             wait_value(inner.index, signalled)?;
         }
         poll_all();
         lifetime::reclaim();
-        let pool = lock(&inner.slots[slot]).pool;
+        let pool = inner.slots[slot].pool;
         unsafe { Ctx::device().reset_command_pool(pool, vk::CommandPoolResetFlags::empty())? };
-        Ok(submission)
+        Ok(Submission {
+            inner,
+            slot,
+            waits: SmallVec::new(),
+            _kind: PhantomData,
+        })
     }
 }
 
-/// A begun submission: its frame slot is free.
+/// A begun submission of a timeline, which it borrows: its frame slot is free.
 #[must_use]
-pub struct Submission<K: QueueKind> {
-    inner: Arc<Inner>,
+pub struct Submission<'t, K: QueueKind> {
+    inner: &'t mut Inner,
     slot: usize,
     waits: SmallVec<[(usize, u64, vk::PipelineStageFlags2); 2]>,
     _kind: PhantomData<fn() -> K>,
 }
 
-impl<K: QueueKind> fmt::Debug for Submission<K> {
+impl<K: QueueKind> fmt::Debug for Submission<'_, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Submission")
             .field("timeline", &self.inner)
@@ -283,13 +275,7 @@ impl<K: QueueKind> fmt::Debug for Submission<K> {
     }
 }
 
-impl<K: QueueKind> Drop for Submission<K> {
-    fn drop(&mut self) {
-        lock(&INDICES[self.inner.index].state).open = false;
-    }
-}
-
-impl<K: QueueKind> Submission<K> {
+impl<K: QueueKind> Submission<'_, K> {
     /// Its frame slot, which per-frame resources (rings, query pools) index by.
     pub fn slot(&self) -> usize {
         self.slot
@@ -325,12 +311,11 @@ impl<K: QueueKind> Submission<K> {
     /// then its panic continues or its error is returned.
     #[validation_trace]
     pub fn submit(self, record: impl FnOnce(&mut CommandBuffer<K>)) -> Result<Wait> {
-        let inner = &self.inner;
+        let inner = self.inner;
         let i = inner.index;
         let index = &INDICES[i];
         let device = Ctx::device();
-        let mut slot = lock(&inner.slots[self.slot]);
-        let slot = &mut *slot;
+        let slot = &mut inner.slots[self.slot];
         let mut state = lock(&index.state);
         let state = &mut *state;
         state.pending.retire(completed(i));

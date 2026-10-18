@@ -91,6 +91,12 @@ impl std::ops::Deref for GpuGuard {
     }
 }
 
+impl std::ops::DerefMut for GpuGuard {
+    fn deref_mut(&mut self) -> &mut Gpu {
+        &mut self.0
+    }
+}
+
 impl Drop for GpuGuard {
     fn drop(&mut self) {
         let errors = take_validation_errors();
@@ -115,12 +121,12 @@ pub fn gpu() -> GpuGuard {
 
 impl Gpu {
     /// Records one command buffer, submits it, and waits until the GPU has executed it.
-    pub fn submit(&self, record: impl FnOnce(&mut Cmd)) -> Wait {
+    pub fn submit(&mut self, record: impl FnOnce(&mut Cmd)) -> Wait {
         self.submit_after(&[], record)
     }
 
     /// Like [`Self::submit`], after `waits` of other timelines.
-    pub fn submit_after(&self, waits: &[Wait], record: impl FnOnce(&mut Cmd)) -> Wait {
+    pub fn submit_after(&mut self, waits: &[Wait], record: impl FnOnce(&mut Cmd)) -> Wait {
         let mut submission = self.timeline.begin().unwrap();
         for &wait in waits {
             submission.wait_for(wait);
