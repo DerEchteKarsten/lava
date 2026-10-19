@@ -201,7 +201,12 @@ impl Ranges {
 
 /// The first `n` contiguous free image slots.
 pub(crate) fn allocate(n: u32) -> Result<u32> {
-    lock(&Bindless::get().free).take(n).ok_or(Error::OutOfBindlessSlots { heap: "image", count: n })
+    lock(&Bindless::get().free)
+        .take(n)
+        .ok_or(Error::OutOfBindlessSlots {
+            heap: "image",
+            count: n,
+        })
 }
 
 /// Frees image slots no frame reaches any more.
@@ -270,7 +275,11 @@ impl<K: Allocatable> Drop for SlotRange<K> {
 pub fn reserve<K: Allocatable>(n: u32) -> Result<SlotRange<K>> {
     let start = allocate(n * K::WIDTH)?;
     lock(&Bindless::get().reserved).push(start..start + n * K::WIDTH);
-    Ok(SlotRange { start, len: n, kind: PhantomData })
+    Ok(SlotRange {
+        start,
+        len: n,
+        kind: PhantomData,
+    })
 }
 
 /// How a [`Sampler`] filters and addresses an image. [`SamplerDesc::new`] (and `Default`)
@@ -655,7 +664,8 @@ impl<K: HandleKind> ImageHandle<K> {
 impl ImageHandle {
     /// The same handle as `K`, if it has `K`'s descriptors.
     pub(crate) fn narrow<K: Allocatable>(self) -> Option<ImageHandle<K>> {
-        let has = (!K::SAMPLED || self.sampled_slot().is_some()) && (!K::STORAGE || self.storage_slot().is_some());
+        let has = (!K::SAMPLED || self.sampled_slot().is_some())
+            && (!K::STORAGE || self.storage_slot().is_some());
         (has && !self.is_null()).then(|| ImageHandle::from_bits(self.bits))
     }
 }
@@ -663,7 +673,10 @@ impl ImageHandle {
 impl<K: Allocatable> ImageHandle<K> {
     /// The handle of `K`'s descriptors from `slot` on.
     pub(crate) fn new(slot: u32) -> Self {
-        assert!(slot + K::WIDTH - 1 <= SLOT, "image slot {slot} doesn't fit a handle");
+        assert!(
+            slot + K::WIDTH - 1 <= SLOT,
+            "image slot {slot} doesn't fit a handle"
+        );
         Self::from_bits(slot | K::BITS)
     }
 }
@@ -720,14 +733,17 @@ pub fn bind<'a, F: Format, U: ImageUsage, D: Dim, K: Allocatable>(
     let handles = handles.into_iter().inspect(|handle| {
         if let Some(slots) = handle.slots() {
             assert!(
-                reserved.iter().any(|r| r.start <= slots.start && slots.end <= r.end),
+                reserved
+                    .iter()
+                    .any(|r| r.start <= slots.start && slots.end <= r.end),
                 "bindless slots {slots:?} lie in no `SlotRange`: `bind` writes only reserved \
                  slots (`reserve`)"
             );
         }
     });
     let images = images.into_iter().map(|image| image.shader_image());
-    bind_raw(images, handles.map(ImageHandle::erase), true).expect("writing image descriptors failed");
+    bind_raw(images, handles.map(ImageHandle::erase), true)
+        .expect("writing image descriptors failed");
 }
 
 /// [`bind`] for any slots: writes the descriptors into the heap right away, or with `queued`
@@ -743,8 +759,16 @@ pub(crate) fn bind_raw(
     let mut targets: SmallVec<[(ShaderImage, vk::DescriptorType, u32); 8]> = SmallVec::new();
     for (image, handle) in images.into_iter().zip(handles) {
         let descriptors = [
-            (handle.sampled_slot(), vk::ImageUsageFlags::SAMPLED, vk::DescriptorType::SAMPLED_IMAGE),
-            (handle.storage_slot(), vk::ImageUsageFlags::STORAGE, vk::DescriptorType::STORAGE_IMAGE),
+            (
+                handle.sampled_slot(),
+                vk::ImageUsageFlags::SAMPLED,
+                vk::DescriptorType::SAMPLED_IMAGE,
+            ),
+            (
+                handle.storage_slot(),
+                vk::ImageUsageFlags::STORAGE,
+                vk::DescriptorType::STORAGE_IMAGE,
+            ),
         ];
         for (slot, usage, ty) in descriptors {
             let Some(slot) = slot else { continue };
@@ -800,7 +824,11 @@ pub(crate) fn bind_raw(
     let functions = Functions::descriptor_heap();
     if !queued {
         let ranges: SmallVec<[_; 8]> = (targets.iter())
-            .map(|&(.., slot)| bindless.resource_heap.host_range(layout.offset(slot), layout.stride))
+            .map(|&(.., slot)| {
+                bindless
+                    .resource_heap
+                    .host_range(layout.offset(slot), layout.stride)
+            })
             .collect();
         unsafe { functions.write_resource_descriptors(&resources, &ranges)? };
         return Ok(());
