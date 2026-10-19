@@ -6,7 +6,7 @@ use glam::{Affine3A, Quat, UVec2, Vec3};
 use lava::{
     buffer::Buffer,
     command_buffer::TraceRaysIndirectCommand,
-    image::{Image, format::R8G8B8A8Unorm, usage::StorageTransferSrcTransferDst},
+    image::{Image, format::R8G8B8A8Unorm, usage::usage},
     query::QueryPool,
     state::Ctx,
     vk,
@@ -20,7 +20,7 @@ use lava_tests::bindings::{TestRayQuery, TestRayTracing, TestWriteInstances};
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
 
-type Target = Image<R8G8B8A8Unorm, StorageTransferSrcTransferDst>;
+type Target = Image<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>;
 
 fn supported(test: &str, feature: bool) -> bool {
     if !feature {

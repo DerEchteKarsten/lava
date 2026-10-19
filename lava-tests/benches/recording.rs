@@ -10,7 +10,7 @@ use lava::{
     image::{
         Image,
         format::R8G8B8A8Unorm,
-        usage::{ColorAttachmentStorageTransferSrcTransferDst, SampledTransferDst},
+        usage::usage,
     },
     queue::{Graphics, Timeline},
     state::Ctx,
@@ -24,8 +24,8 @@ const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
 const TEXTURES: usize = 64;
 
-type Target = Image<R8G8B8A8Unorm, ColorAttachmentStorageTransferSrcTransferDst>;
-type Texture = Image<R8G8B8A8Unorm, SampledTransferDst>;
+type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Storage, TransferSrc, TransferDst]>;
+type Texture = Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>;
 
 struct Resources {
     target: Target,

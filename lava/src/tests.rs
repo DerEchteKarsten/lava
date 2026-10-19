@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, image states, the slot allocator, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
+//! lava's unit tests: the barrier tracking, image states, image usage types, the slot allocator, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
 use std::{iter, sync::atomic::AtomicU64};
 
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
@@ -11,6 +11,7 @@ use crate::{
         pending::PendingAccesses,
     },
     features::{DeviceFacts, FeatureChain, Features},
+    image::usage::{ImageUsage, StaticUsage, Usage, usage},
     queue::{FamilyInfo, Kind},
     vkobjects::physical_device::{QueueFamily, pick_queue_families},
 };
@@ -161,6 +162,23 @@ fn ownership_moves_through_release_and_acquire() {
     assert_eq!((acquire.src_queue_family_index, acquire.dst_queue_family_index), (1, 0));
     assert!(barriers.images.is_empty(), "same layout");
     assert_eq!(ImageState::load(&access.states[0]).owner, Some(Kind::Graphics));
+}
+
+#[test]
+fn usages_are_their_flags_in_any_order() {
+    use vk::ImageUsageFlags as U;
+    fn same<T>(_: T, _: T) {}
+    same(<usage![TransferDst, Sampled]>::default(), <usage![Sampled, TransferDst]>::default());
+    same(<usage![Storage]>::default(), Usage::<false, false, false, true, false, false, false>);
+    assert_eq!(<usage![TransferDst, Sampled]>::VK, U::SAMPLED | U::TRANSFER_DST);
+    assert_eq!(
+        <usage![ColorAttachment, Storage, TransferSrc, TransferDst]>::default().flags(),
+        U::COLOR_ATTACHMENT | U::STORAGE | U::TRANSFER_SRC | U::TRANSFER_DST
+    );
+    assert_eq!(<usage![DepthAttachment, Sampled]>::VK, U::DEPTH_STENCIL_ATTACHMENT | U::SAMPLED);
+    #[cfg(feature = "host-image-copy")]
+    assert_eq!(<usage![HostCopy, Sampled]>::VK, U::SAMPLED | U::HOST_TRANSFER_EXT);
+    assert_eq!(format!("{:?}", <usage![TransferSrc]>::default()), "Usage(TRANSFER_SRC)");
 }
 
 #[test]

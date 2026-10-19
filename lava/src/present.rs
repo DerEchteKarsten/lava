@@ -23,7 +23,7 @@ use crate::{
     image::{
         D2, format,
         slice::ImageView,
-        usage::{ColorAttachmentTransferDst, StaticUsage},
+        usage::{StaticUsage, usage},
     },
     lifetime::{self, Stamp, latest_stamp},
     queue::{
@@ -115,7 +115,7 @@ impl Swapchain {
 /// set `U` allows. A frame acquires an image, records into [`Self::current_image`] in a
 /// submission that ends with `cmd.present(&surface)`, and presents it. An image no submission
 /// used stays current for the next frame.
-pub struct PresentSurface<U: StaticUsage = ColorAttachmentTransferDst> {
+pub struct PresentSurface<U: StaticUsage = usage![ColorAttachment, TransferDst]> {
     surface: vk::SurfaceKHR,
     format: vk::SurfaceFormatKHR,
     present_modes: SmallVec<[(vk::PresentModeKHR, &'static str); 4]>,

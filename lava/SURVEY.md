@@ -367,11 +367,6 @@ listed in `STATE.md`. Done items are removed.
    `first`, UI buffers per slot, and an unsynchronised readback. **Direction:**
    - `PerFrame<Buffer<T>>` whose `host_mut(&submission)` ties writes to the waited slot;
    - a growable stream buffer and a typed `Readback<T>`.
-8. **95 image usage marker types**, with names like
-   `ColorAttachmentSampledStorageHostCopyTransferSrcTransferDst`, and each new flag (transient,
-   input attachment) doubles them. **Direction:** const-generic flags for images. *2026-10-19:*
-   buffers have no usage parameter any more: every buffer gets every usage, which made no
-   measurable difference.
 9. **Errors are mostly `Message(String)`.**
    - Out-of-date, minimised, surface lost, device lost, unsupported and invalid argument
      can't be matched.
@@ -667,8 +662,7 @@ with this survey. Still wrong:
 - **rustdoc:** `features::gate` is ambiguous between function and module (`features.rs:93`); the
   link to `watch` is unresolved (`lava-build-slang/src/lib.rs:31`); the links to `Instance`
   (`lib.rs:24-26`) and `Compute` (`queue/mod.rs:35-39`) break without their features.
-- **Module docs:** `image/usage.rs`'s says usages map to bindless sets, which `bind_raw` decides;
-  `tests.rs`'s omits the `unsized_struct!` test; `lifetime.rs`'s "in drop order" holds for one
+- **Module docs:** `tests.rs`'s omits the `unsized_struct!` test; `lifetime.rs`'s "in drop order" holds for one
   reclaimer only.
 - **Scope observers:** `observer.rs` and CLAUDE.md say what `on_enter` records comes before a
   pass's barriers, but `compute`, `raytrace` and renderings flush the barriers before

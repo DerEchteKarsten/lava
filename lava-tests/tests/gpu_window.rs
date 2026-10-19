@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use lava::{
     bindless::{self, ImageHandle, Storage},
-    image::{format::ClearValue, usage::ColorAttachmentStorageTransferDst},
+    image::{format::ClearValue, usage::usage},
     present::PresentSurface,
     queue::{Graphics, Timeline},
     state::raw_vulkan as vk,
@@ -22,7 +22,7 @@ use winit::{
 
 const SIZE: glam::UVec2 = glam::UVec2::new(256, 256);
 
-type Surface = PresentSurface<ColorAttachmentStorageTransferDst>;
+type Surface = PresentSurface<usage![ColorAttachment, Storage, TransferDst]>;
 
 /// The swapchain format the tests ask for (the images are storage images too).
 const FORMATS: [vk::SurfaceFormatKHR; 1] = [vk::SurfaceFormatKHR {

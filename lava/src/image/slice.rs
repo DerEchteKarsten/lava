@@ -410,15 +410,15 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// view:
     /// ```compile_fail
     /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer, queue::Graphics};
-    /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::TransferSrc};
-    /// fn copy(cmd: &mut CommandBuffer<Graphics>, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
+    /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::usage};
+    /// fn copy(cmd: &mut CommandBuffer<Graphics>, view: ImageView<R8G8B8A8Unorm, usage![TransferSrc]>, dst: BufferSlice<u8>) {
     ///     cmd.copy_image_to_buffer(view, dst);
     /// }
     /// ```
     /// ```
     /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer, queue::Graphics};
-    /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::TransferSrc};
-    /// fn copy(cmd: &mut CommandBuffer<Graphics>, view: ImageView<R8G8B8A8Unorm, TransferSrc>, dst: BufferSlice<u8>) {
+    /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::usage};
+    /// fn copy(cmd: &mut CommandBuffer<Graphics>, view: ImageView<R8G8B8A8Unorm, usage![TransferSrc]>, dst: BufferSlice<u8>) {
     ///     cmd.copy_image_to_buffer(view.whole(), dst);
     /// }
     /// ```

@@ -266,7 +266,7 @@ macro_rules! features {
 }
 
 features! {
-    /// `VK_EXT_host_image_copy` on `rebar` memory: `Image::copy_from` and the `*HostCopy` usages.
+    /// `VK_EXT_host_image_copy` on `rebar` memory: `Image::copy_from` and the usages with `HostCopy`.
     host_image_copy: "host-image-copy" / "assert-host-image-copy" => HostImageCopy,
     /// `VK_EXT_mesh_shader` with task shaders: mesh passes.
     mesh_shader: "mesh-shader" / "assert-mesh-shader" => MeshShader,

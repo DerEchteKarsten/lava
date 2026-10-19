@@ -14,7 +14,7 @@ use lava::{
     image::{
         Image,
         format::{BC7UnormBlock, R8G8B8A8Unorm},
-        usage::{ColorAttachmentStorageTransferSrcTransferDst, Sampled, SampledHostCopy},
+        usage::usage,
     },
     memory::memory_report,
     query::{QueryPipelineStatisticFlags as Statistics, QueryPool, Timestamp, counters},
@@ -26,7 +26,7 @@ use lava_tests::bindings::{TestMesh, TestRaster, TestVertex};
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
 
-type Target = Image<R8G8B8A8Unorm, ColorAttachmentStorageTransferSrcTransferDst>;
+type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Storage, TransferSrc, TransferDst]>;
 
 fn disabled() -> Features {
     Features {
@@ -189,11 +189,11 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
     let heap = &memory_report().heaps[0];
     assert_eq!(heap.usage, Err(missing("memory-budget")));
     assert!(matches!(
-        Image::<R8G8B8A8Unorm, SampledHostCopy>::new(EXTENT),
+        Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy]>::new(EXTENT),
         Err(Error::MissingFeature(m)) if m == missing("host-image-copy")
     ));
     assert!(matches!(
-        Image::<BC7UnormBlock, Sampled>::new(EXTENT),
+        Image::<BC7UnormBlock, usage![Sampled]>::new(EXTENT),
         Err(Error::MissingFeature(m)) if m == missing("bc-compression")
     ));
     let state = RasterState::<1>::default();
