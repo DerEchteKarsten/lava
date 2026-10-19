@@ -39,10 +39,6 @@ pub struct Bindless {
     /// Descriptors `bind` wrote for reserved slots, by byte offset in the resource heap, which
     /// the next submission of a timeline with shaders copies there before its commands.
     queued: Mutex<Queued>,
-    /// Boxed, so `mapping_info` can point at them; read only through it.
-    #[allow(dead_code)]
-    mappings: Box<[vk::DescriptorSetAndBindingMappingEXT<'static>; 3]>,
-    mapping_info: vk::ShaderDescriptorSetAndBindingMappingInfoEXT<'static>,
 }
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
@@ -159,6 +155,20 @@ impl Set {
         }
     }
 
+    /// The heap index of the set's first slot.
+    fn base(self) -> u32 {
+        self as u32 * Bindless::get().images.count
+    }
+
+    /// The set of heap index `index`, if it lies in one.
+    fn of(index: u32) -> Option<Set> {
+        match index / Bindless::get().images.count {
+            0 => Some(Set::Sampled),
+            1 => Some(Set::Storage),
+            _ => None,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Set::Sampled => "sampled",
@@ -234,19 +244,23 @@ impl Ranges {
     }
 }
 
+/// `n` contiguous free slots of `set`, as indices into the resource heap, which shaders index
+/// from 0: the storage images follow the sampled ones.
 pub(crate) fn allocate(set: Set, n: u32) -> Result<u32> {
     let bindless = Bindless::get();
-    lock(&bindless.free[set as usize])
+    let start = lock(&bindless.free[set as usize])
         .take(n)
         .ok_or(Error::OutOfBindlessSlots {
             set: set.name(),
             count: n,
-        })
+        })?;
+    Ok(set.base() + start)
 }
 
 /// Frees slots no frame reaches any more.
 pub(crate) fn free(set: Set, range: Range<u32>) {
-    lock(&Bindless::get().free[set as usize]).give(range);
+    let base = set.base();
+    lock(&Bindless::get().free[set as usize]).give(range.start - base..range.end - base);
 }
 
 /// Frees the slots of a destroyed image's handle.
@@ -307,7 +321,7 @@ impl Drop for SlotRange {
         drop(reserved);
         // Nothing reads them any more, and a later copy could overwrite the slots' next owner.
         let layout = &bindless.images;
-        let bytes = layout.offset(set as u32, range.start)..layout.offset(set as u32, range.end);
+        let bytes = layout.offset(0, range.start)..layout.offset(0, range.end);
         lock(&bindless.queued).retain(|offset, _| !bytes.contains(offset));
         lifetime::retire(move || free(set, range));
     }
@@ -650,10 +664,9 @@ pub(crate) fn bind_raw(
                 set.name()
             );
             assert!(
-                index < layout.count,
-                "bindless index {index} is outside the {} set of {} descriptors",
+                Set::of(index) == Some(set),
+                "bindless index {index} is outside the {} set",
                 set.name(),
-                layout.count
             );
             targets.push((image, set, index));
         }
@@ -698,7 +711,7 @@ pub(crate) fn bind_raw(
                 .data((info as *const vk::ImageDescriptorInfoEXT).cast())
         })
         .collect();
-    let offset = |set: Set, index: u32| layout.offset(set as u32, index);
+    let offset = |_: Set, index: u32| layout.offset(0, index);
     let functions = Functions::descriptor_heap();
     if !queued {
         let ranges: SmallVec<[_; 8]> = (targets.iter())
@@ -735,13 +748,6 @@ impl Bindless {
             .expect("bindless resources have not been initialized")
     }
 
-    /// The mappings of `bindless.slang`'s set and binding declarations to the heaps, which every
-    /// shader stage gets.
-    pub(crate) fn mapping_info() -> &'static vk::ShaderDescriptorSetAndBindingMappingInfoEXT<'static>
-    {
-        &Self::get().mapping_info
-    }
-
     pub(crate) fn init() -> Result<()> {
         let p = &Ctx::physical_device().descriptor_heap_properties;
         let images = HeapLayout::new(
@@ -765,31 +771,6 @@ impl Bindless {
         );
         let resource_heap = Heap::new(&images, p.resource_heap_alignment)?;
         let sampler_heap = Heap::new(&samplers, p.sampler_heap_alignment)?;
-        // Each array of `bindless.slang` at a constant offset, indexed by its slot.
-        let mapping = |set, binding, offset: u64, stride: u64| {
-            let constant_offset = vk::DescriptorMappingSourceConstantOffsetEXT {
-                heap_offset: offset.try_into().expect("heap offsets fit 32 bits"),
-                heap_array_stride: stride as u32,
-                p_embedded_sampler: std::ptr::null(),
-                sampler_heap_offset: 0,
-                sampler_heap_array_stride: 0,
-            };
-            vk::DescriptorSetAndBindingMappingEXT::default()
-                .descriptor_set(set)
-                .first_binding(binding)
-                .binding_count(1)
-                .resource_mask(vk::SpirvResourceTypeFlagsEXT::ALL)
-                .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_CONSTANT_OFFSET)
-                .source_data(vk::DescriptorMappingSourceDataEXT { constant_offset })
-        };
-        let mappings = Box::new([
-            mapping(0, 0, 0, samplers.stride),
-            mapping(0, 1, images.offset(Set::Sampled as u32, 0), images.stride),
-            mapping(1, 0, images.offset(Set::Storage as u32, 0), images.stride),
-        ]);
-        let mapping_info = vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default()
-            .mapping_count(mappings.len() as u32)
-            .p_mappings(mappings.as_ptr());
         BINDLESS
             .set(Self {
                 free: [Ranges::all(images.count), Ranges::all(images.count)].map(Mutex::new),
@@ -800,8 +781,6 @@ impl Bindless {
                 resource_heap,
                 sampler_heap,
                 queued: Mutex::new(BTreeMap::new()),
-                mappings,
-                mapping_info,
             })
             .map_err(|_| Error::message("bindless resources were already initialized"))?;
         Ok(())
@@ -880,11 +859,9 @@ impl Bindless {
     pub(crate) fn requeue(queued: Queued) {
         let s = Self::get();
         let reserved = [&s.reserved[0], &s.reserved[1]].map(lock);
-        let region = s.images.offset(1, 0);
         let live = |offset: u64| {
-            let set = (offset / region) as usize;
-            let index = ((offset % region) / s.images.stride) as u32;
-            reserved[set].iter().any(|range| range.contains(&index))
+            let index = (offset / s.images.stride) as u32;
+            Set::of(index).is_some_and(|set| reserved[set as usize].iter().any(|range| range.contains(&index)))
         };
         let mut queue = lock(&s.queued);
         for (offset, descriptor) in queued.into_iter().filter(|&(offset, _)| live(offset)) {

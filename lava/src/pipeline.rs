@@ -10,7 +10,6 @@ use hashbrown::{Equivalent, HashMap};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
-    bindless::Bindless,
     command_buffer::{Baked, ColorComponentFlags, Dynamic},
     error::{Error, Result},
     features::Features,
@@ -612,22 +611,18 @@ pub(crate) fn heap_flags() -> vk::PipelineCreateFlags2CreateInfoKHR<'static> {
     vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PIPELINE_CREATE_2_DESCRIPTOR_HEAP_EXT)
 }
 
-/// A stage of `entry`, with the mappings of `bindless.slang`'s declarations to the heaps.
+/// A stage of `entry`.
 fn make_shader_stage<'a>(
     entry: &'a str,
     stage: vk::ShaderStageFlags,
     module: vk::ShaderModule,
     constants: &'a vk::SpecializationInfo<'a>,
 ) -> vk::PipelineShaderStageCreateInfo<'a> {
-    let mut info = vk::PipelineShaderStageCreateInfo::default()
+    vk::PipelineShaderStageCreateInfo::default()
         .stage(stage)
         .module(module)
         .name(CStr::from_bytes_with_nul(entry.as_bytes()).unwrap())
-        .specialization_info(constants);
-    // `push_next` takes `&mut`, which the stages can't share; the mappings live as long as lava.
-    let mappings: *const vk::ShaderDescriptorSetAndBindingMappingInfoEXT = Bindless::mapping_info();
-    info.p_next = mappings.cast();
-    info
+        .specialization_info(constants)
 }
 
 fn create_raster_pipeline(

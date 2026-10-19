@@ -60,13 +60,6 @@ const CLOCK_TYPE: &str = "Clock";
 const CLOCK_STRIPE_WORDS: usize = 8;
 const CLOCK_TICK_BITS: u32 = 40;
 
-/// (name, binding, set) of lava's bindless descriptors, the only descriptors a pass may have.
-const LAVA_DESCRIPTORS: [(&str, u32, u32); 4] = [
-    ("SamplerHeap", 0, 0),
-    ("SamplerCmpHeap", 0, 0),
-    ("TextureHeap", 1, 0),
-    ("RWTextureHeap", 0, 1),
-];
 
 fn field_name(f: &VariableLayout) -> &str {
     f.variable()
@@ -615,17 +608,13 @@ use lava::pipeline::*;
                 if matches!(category, Cat::PushConstantBuffer | Cat::SpecializationConstant) {
                     continue;
                 }
+                // The descriptor heaps shaders index aren't parameters.
                 let name = p.variable().and_then(|v| v.checked_name()).unwrap_or("?");
-                let lava = LAVA_DESCRIPTORS.iter().any(|&(lava, binding, set)| {
-                    name == lava && p.binding_index() == binding && p.binding_space() == set
-                });
-                if !lava {
-                    panic!(
-                        "{source}: global parameter `{name}` ({category:?}): a pass has no descriptors or \
-                         uniforms of its own; reach resources through push-constant handles (`Img`, \
-                         `Buf`, `MutBuf`, `Accel`) instead"
-                    );
-                }
+                panic!(
+                    "{source}: global parameter `{name}` ({category:?}): a pass has no descriptors or \
+                     uniforms of its own; reach resources through push-constant handles (`Img`, \
+                     `Buf`, `MutBuf`, `Accel`) instead"
+                );
             }
 
             let spirv = passes_dir.join(format!("{pass_name}.spv"));

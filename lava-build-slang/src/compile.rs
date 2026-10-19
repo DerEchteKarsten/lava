@@ -37,7 +37,9 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
     let mut compiler = slang::CompilerOptions::default()
         .optimization(optimization)
         .vulkan_use_entry_point_name(true)
-        .matrix_layout_column(true);
+        .matrix_layout_column(true)
+        // Shaders index lava's descriptor heaps directly (`SPV_EXT_descriptor_heap`).
+        .capability(global.find_capability("spvDescriptorHeapEXT"));
     for (name, value) in options.defines {
         compiler = compiler.macro_define(name, value);
     }

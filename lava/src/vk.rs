@@ -1,4 +1,4 @@
-//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands`, `VK_EXT_descriptor_heap` and `VK_EXT_depth_clamp_control`, their types and their device functions
+//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands`, `VK_EXT_descriptor_heap`, `VK_KHR_shader_untyped_pointers` and `VK_EXT_depth_clamp_control`, their types and their device functions
 
 use core::ffi::{CStr, c_void};
 use core::marker::PhantomData;
@@ -64,14 +64,12 @@ mod values {
     pub const RESOURCE_DESCRIPTOR_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_002);
     pub const BIND_HEAP_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_003);
     pub const PUSH_DATA_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_004);
-    pub const DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT: StructureType =
-        StructureType::from_raw(1_000_135_005);
-    pub const SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT: StructureType =
-        StructureType::from_raw(1_000_135_006);
     pub const PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT: StructureType =
         StructureType::from_raw(1_000_135_008);
     pub const PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT: StructureType =
         StructureType::from_raw(1_000_135_009);
+    pub const PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR: StructureType =
+        StructureType::from_raw(1_000_387_000);
 }
 pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
     values::DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT;
@@ -87,32 +85,6 @@ pub const ACCESS_2_SAMPLER_HEAP_READ_EXT: AccessFlags2 = AccessFlags2::from_raw(
 pub const ACCESS_2_RESOURCE_HEAP_READ_EXT: AccessFlags2 =
     AccessFlags2::from_raw(0x400_0000_0000_0000);
 
-/// `VkSpirvResourceTypeFlagBitsEXT`: which shader resource declarations a mapping covers.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SpirvResourceTypeFlagsEXT(Flags);
-ash::vk_bitflags_wrapped!(SpirvResourceTypeFlagsEXT, Flags);
-impl SpirvResourceTypeFlagsEXT {
-    pub const ALL: Self = Self(0x7FFF_FFFF);
-    pub const SAMPLER: Self = Self(0b1);
-    pub const SAMPLED_IMAGE: Self = Self(0b10);
-    pub const READ_ONLY_IMAGE: Self = Self(0b100);
-    pub const READ_WRITE_IMAGE: Self = Self(0b1000);
-}
-impl core::fmt::Debug for SpirvResourceTypeFlagsEXT {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "SpirvResourceTypeFlagsEXT({:#x})", self.0)
-    }
-}
-
-/// `VkDescriptorMappingSourceEXT`: where a mapped shader binding finds its descriptor.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
-pub struct DescriptorMappingSourceEXT(i32);
-impl DescriptorMappingSourceEXT {
-    pub const HEAP_WITH_CONSTANT_OFFSET: Self = Self(0);
-}
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct HostAddressRangeEXT {
@@ -125,32 +97,6 @@ pub struct HostAddressRangeEXT {
 pub struct HostAddressRangeConstEXT {
     pub address: *const c_void,
     pub size: usize,
-}
-
-/// `VkDescriptorMappingSourceConstantOffsetEXT`: descriptors at `heap_offset` plus the binding's
-/// array index times `heap_array_stride`.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct DescriptorMappingSourceConstantOffsetEXT {
-    pub heap_offset: u32,
-    pub heap_array_stride: u32,
-    pub p_embedded_sampler: *const SamplerCreateInfo<'static>,
-    pub sampler_heap_offset: u32,
-    pub sampler_heap_array_stride: u32,
-}
-
-/// `VkDescriptorMappingSourceDataEXT`, with only the member lava uses; `_size` gives it the
-/// union's size (its largest member, `VkDescriptorMappingSourceIndirectIndexEXT`, is 56 bytes).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub union DescriptorMappingSourceDataEXT {
-    pub constant_offset: DescriptorMappingSourceConstantOffsetEXT,
-    _size: [u64; 7],
-}
-impl core::fmt::Debug for DescriptorMappingSourceDataEXT {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("DescriptorMappingSourceDataEXT")
-    }
 }
 
 #[repr(C)]
@@ -304,6 +250,14 @@ tagged! {
 unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceDescriptorHeapFeaturesEXT<'_> {}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceDescriptorHeapFeaturesEXT<'_> {}
 tagged! {
+    PhysicalDeviceShaderUntypedPointersFeaturesKHR =
+        PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR, *mut c_void {
+        shader_untyped_pointers: Bool32,
+    }
+}
+unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceShaderUntypedPointersFeaturesKHR<'_> {}
+unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceShaderUntypedPointersFeaturesKHR<'_> {}
+tagged! {
     PhysicalDeviceDescriptorHeapPropertiesEXT =
         PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT, *mut c_void {
         sampler_heap_alignment: DeviceSize,
@@ -357,26 +311,6 @@ tagged! {
         data: HostAddressRangeConstEXT,
     }
 }
-tagged! {
-    /// Maps the bindings `first_binding..first_binding + binding_count` of `descriptor_set` to
-    /// a heap.
-    DescriptorSetAndBindingMappingEXT = DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT, *const c_void {
-        descriptor_set: u32,
-        first_binding: u32,
-        binding_count: u32,
-        resource_mask: SpirvResourceTypeFlagsEXT,
-        source: DescriptorMappingSourceEXT,
-        source_data: DescriptorMappingSourceDataEXT,
-    }
-}
-tagged! {
-    ShaderDescriptorSetAndBindingMappingInfoEXT =
-        SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT, *const c_void {
-        mapping_count: u32,
-        p_mappings: *const DescriptorSetAndBindingMappingEXT<'a>,
-    }
-}
-unsafe impl ExtendsPipelineShaderStageCreateInfo for ShaderDescriptorSetAndBindingMappingInfoEXT<'_> {}
 
 macro_rules! with_regions {
     ($(#[$attr:meta])* $name:ident = $s_type:ident, $region:ident { $($field:ident: $ty:ty),* }) => {
@@ -704,6 +638,13 @@ pub mod descriptor_heap {
         cmd_bind_resource_heap(bind_resource_heap, BindHeapInfoEXT) = "vkCmdBindResourceHeapEXT";
         cmd_push_data(push_data, PushDataInfoEXT) = "vkCmdPushDataEXT";
     }
+}
+
+/// `VK_KHR_shader_untyped_pointers`, which shaders that index the descriptor heaps declare.
+pub mod shader_untyped_pointers {
+    use super::CStr;
+
+    pub const NAME: &CStr = c"VK_KHR_shader_untyped_pointers";
 }
 
 /// `VK_EXT_depth_clamp_control`: a depth clamp range other than the viewport's.

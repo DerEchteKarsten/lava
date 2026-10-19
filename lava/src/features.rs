@@ -516,8 +516,11 @@ impl Features {
     }
 }
 
-pub(crate) const LAVA_EXTENSIONS: [&CStr; 2] =
-    [crate::vk::device_address_commands::NAME, crate::vk::descriptor_heap::NAME];
+pub(crate) const LAVA_EXTENSIONS: [&CStr; 3] = [
+    crate::vk::device_address_commands::NAME,
+    crate::vk::descriptor_heap::NAME,
+    crate::vk::shader_untyped_pointers::NAME,
+];
 
 /// What [`FeatureChain::optional`] needs to know of the device besides its feature structs.
 #[derive(Clone, Copy)]
@@ -540,6 +543,7 @@ pub(crate) struct FeatureChain {
     vk13: vk::PhysicalDeviceVulkan13Features<'static>,
     address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
     descriptor_heap: vk::PhysicalDeviceDescriptorHeapFeaturesEXT<'static>,
+    untyped_pointers: vk::PhysicalDeviceShaderUntypedPointersFeaturesKHR<'static>,
     dynamic_state2: vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT<'static>,
     dynamic_state3: vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static>,
     lines: vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static>,
@@ -579,6 +583,7 @@ impl FeatureChain {
             vk13,
             address_commands,
             descriptor_heap,
+            untyped_pointers,
             dynamic_state2,
             dynamic_state3,
             lines,
@@ -607,6 +612,7 @@ impl FeatureChain {
             vk13,
             address_commands,
             descriptor_heap,
+            untyped_pointers,
             dynamic_state2,
             dynamic_state3,
             lines,
@@ -638,6 +644,7 @@ impl FeatureChain {
         push_if! {
             crate::vk::device_address_commands::NAME => address_commands,
             crate::vk::descriptor_heap::NAME => descriptor_heap,
+            crate::vk::shader_untyped_pointers::NAME => untyped_pointers,
             ash::ext::extended_dynamic_state2::NAME => dynamic_state2,
             ash::ext::extended_dynamic_state3::NAME => dynamic_state3,
             ash::khr::line_rasterization::NAME => lines,
@@ -667,9 +674,6 @@ impl FeatureChain {
             ("fragmentStoresAndAtomics", c.fragment_stores_and_atomics),
             ("vertexPipelineStoresAndAtomics", c.vertex_pipeline_stores_and_atomics),
             ("shaderDrawParameters", v11.shader_draw_parameters),
-            ("runtimeDescriptorArray", v12.runtime_descriptor_array),
-            ("shaderSampledImageArrayNonUniformIndexing", v12.shader_sampled_image_array_non_uniform_indexing),
-            ("shaderStorageImageArrayNonUniformIndexing", v12.shader_storage_image_array_non_uniform_indexing),
             ("bufferDeviceAddress", v12.buffer_device_address),
             ("timelineSemaphore", v12.timeline_semaphore),
             ("drawIndirectCount", v12.draw_indirect_count),
@@ -683,6 +687,7 @@ impl FeatureChain {
             ("shaderDemoteToHelperInvocation", v13.shader_demote_to_helper_invocation),
             ("deviceAddressCommands", self.address_commands.device_address_commands),
             ("descriptorHeap", self.descriptor_heap.descriptor_heap),
+            ("shaderUntypedPointers", self.untyped_pointers.shader_untyped_pointers),
         ];
         let bits = bits.into_iter().filter(|(_, bit)| *bit != vk::TRUE);
         extensions.chain(bits.map(|(name, _)| name.to_owned())).collect()
@@ -801,9 +806,6 @@ impl FeatureChain {
             .vertex_pipeline_stores_and_atomics(true);
         chain.vk11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
         chain.vk12 = vk::PhysicalDeviceVulkan12Features::default()
-            .runtime_descriptor_array(true)
-            .shader_sampled_image_array_non_uniform_indexing(true)
-            .shader_storage_image_array_non_uniform_indexing(true)
             .buffer_device_address(true)
             .timeline_semaphore(true)
             .draw_indirect_count(true)
@@ -818,6 +820,7 @@ impl FeatureChain {
             .shader_demote_to_helper_invocation(true);
         chain.address_commands.device_address_commands = vk::TRUE;
         chain.descriptor_heap.descriptor_heap = vk::TRUE;
+        chain.untyped_pointers.shader_untyped_pointers = vk::TRUE;
         let FeatureChain {
             core: c,
             vk11: v11,

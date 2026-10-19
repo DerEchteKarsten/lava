@@ -1087,7 +1087,8 @@ fn binds_take_free_slots_of_their_sets() {
     assert!(s.descriptor_index_set0 < max_sampled_images());
     assert_eq!(s.descriptor_index_set1, NULL_HANDLE);
     assert_eq!(st.descriptor_index_set0, NULL_HANDLE);
-    assert!(st.descriptor_index_set1 < max_storage_images());
+    // Storage slots follow the sampled ones in the resource heap.
+    assert!((max_sampled_images()..max_sampled_images() + max_storage_images()).contains(&st.descriptor_index_set1));
     assert_ne!(b.descriptor_index_set0, s.descriptor_index_set0, "one image per slot");
     assert_ne!(b.descriptor_index_set1, st.descriptor_index_set1);
     assert_eq!(unbound.handle(), BindlessHandle::none());
