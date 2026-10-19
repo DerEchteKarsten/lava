@@ -1,4 +1,4 @@
-//! Typed GPU buffers backed by gpu-allocator memory, each with every usage an application can ask for, their host access (`host`, `host_mut`, `host_ptr`), casts, and their destruction once no frame can reach them
+//! Typed GPU buffers backed by gpu-allocator memory, each with every usage lava's commands need, their host access (`host`, `host_mut`, `host_ptr`), casts, and their destruction once no frame can reach them
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -26,14 +26,12 @@ use crate::{
 
 pub mod slice;
 
-/// The usages of every buffer an application creates, so any buffer can be bound as anything
-/// (`handle()` included). Giving them all made no measurable difference against one usage per
-/// buffer (2026-10-19, Arc B390 with Mesa's ANV: the same memory requirements for every
-/// buffer, the same benchmark view and recording times).
+/// The usages of every buffer an application creates: everything lava's commands bind a buffer
+/// as (lava binds no vertex or uniform buffers). Giving every buffer every usage made no
+/// measurable difference against one usage per buffer (2026-10-19, Arc B390 with Mesa's ANV:
+/// the same memory requirements for every buffer, the same benchmark view and recording times).
 pub const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
-        | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
-        | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
