@@ -87,7 +87,14 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 ## Ideas
 
 ### Direct heap access from Slang (2026-10-19)
-`bindless.slang` could index `ResourceDescriptorHeap`/`SamplerDescriptorHeap` (capability `spvDescriptorHeapEXT`) instead of declaring sets and bindings, which drops the mappings (`Bindless::mapping_info`), the runtime arrays and the indexing features, and makes indexing non-uniform by default. It needs a Slang SDK with PRs #10177 and #11798, slang-rs 0.1.0's bindgen built against it, and `VK_KHR_shader_untyped_pointers` enabled. It would also allow a one-`u32` `BindlessHandle` with the same index in both regions (SURVEY API 7), which changes `Img`'s layout in every engine struct, so it is its own decision.
+`bindless.slang` could index `ResourceDescriptorHeap`/`SamplerDescriptorHeap` instead of declaring sets and bindings, which drops the mappings (`Bindless::mapping_info`), the runtime arrays and probably the indexing features. The Slang SDK lava uses (2026.17) already does it: with `.capability(global.find_capability("spvDescriptorHeapEXT"))` in `compile::session` it emits `SPV_EXT_descriptor_heap` (`ResourceHeapEXT`/`SamplerHeapEXT` built-ins, untyped access chains, which pass `spirv-val`); without it, it falls back to hidden descriptor arrays at set 2. Probed 2026-10-19; nothing was run on the GPU. Still to do or check:
+- enable `VK_KHR_shader_untyped_pointers` (`shaderUntypedPointers`, new structs in `vk.rs`);
+- check whether non-uniform heap indices still need `NonUniformResourceIndex` (Slang added no decoration for a push-constant index);
+- make lava's slot stride match the shader's, `OpConstantSizeOfEXT` of the descriptor type (on the Arc B390 sizes equal alignments);
+- store storage handles as absolute heap indices (`count + i`), since the shader indexes the whole resource heap from 0;
+- check RenderDoc and Nsight with the new SPIR-V.
+
+It would also allow a one-`u32` `BindlessHandle` with the same index in both regions (SURVEY API 7), which changes `Img`'s layout in every engine struct, so it is its own decision.
 
 ### Multi-pass hardware counter captures (2026-10-15)
 `QueryPool::performance` refuses selections that need more than one counter pass, since a frame is submitted once. A tool capture could record one frame's command buffer once and submit it once per pass with `VkPerformanceQuerySubmitInfoKHR.counterPassIndex` (with the per-pass resets the extension asks for), reading each pass's counters from the same pool. It needs a submission path that replays a recorded command buffer, which `Submission` doesn't have.

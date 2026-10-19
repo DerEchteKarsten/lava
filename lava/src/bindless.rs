@@ -14,7 +14,12 @@ use smallvec::SmallVec;
 
 use crate::{
     buffer::Buffer,
-    image::{Dim, format::Format, slice::{ImageView, single_aspect}, usage::ImageUsage},
+    image::{
+        Dim,
+        format::Format,
+        slice::{ImageView, single_aspect},
+        usage::ImageUsage,
+    },
     lifetime,
     queue::{Kind, lock},
     state::{Ctx, Functions},
@@ -178,14 +183,21 @@ pub(crate) struct Ranges {
 
 impl Ranges {
     fn all(count: u32) -> Self {
-        let free = if count == 0 { Vec::new() } else { vec![0..count] };
+        let free = if count == 0 {
+            Vec::new()
+        } else {
+            vec![0..count]
+        };
         Ranges { free }
     }
 
     /// The first `n` contiguous free slots (first fit), which are taken.
     pub(crate) fn take(&mut self, n: u32) -> Option<u32> {
         assert!(n > 0, "a slot range holds at least one slot");
-        let i = self.free.iter().position(|range| range.len() >= n as usize)?;
+        let i = self
+            .free
+            .iter()
+            .position(|range| range.len() >= n as usize)?;
         let start = self.free[i].start;
         self.free[i].start += n;
         if self.free[i].is_empty() {
@@ -204,7 +216,8 @@ impl Ranges {
             free.is_some_and(|free| free.start < range.end && range.start < free.end)
         };
         assert!(
-            !overlaps(i.checked_sub(1).and_then(|i| self.free.get(i))) && !overlaps(self.free.get(i)),
+            !overlaps(i.checked_sub(1).and_then(|i| self.free.get(i)))
+                && !overlaps(self.free.get(i)),
             "bindless slots {range:?} are freed twice"
         );
         let merges_left = i > 0 && self.free[i - 1].end == range.start;
@@ -223,10 +236,12 @@ impl Ranges {
 
 pub(crate) fn allocate(set: Set, n: u32) -> Result<u32> {
     let bindless = Bindless::get();
-    lock(&bindless.free[set as usize]).take(n).ok_or(Error::OutOfBindlessSlots {
-        set: set.name(),
-        count: n,
-    })
+    lock(&bindless.free[set as usize])
+        .take(n)
+        .ok_or(Error::OutOfBindlessSlots {
+            set: set.name(),
+            count: n,
+        })
 }
 
 /// Frees slots no frame reaches any more.
@@ -461,16 +476,21 @@ impl Sampler {
     #[validation_trace]
     pub fn new(desc: &SamplerDesc) -> Result<Self> {
         let bindless = Bindless::get();
-        let index = lock(&bindless.free_samplers).take(1).ok_or(Error::OutOfBindlessSlots {
-            set: "sampler",
-            count: 1,
-        })?;
+        let index = lock(&bindless.free_samplers)
+            .take(1)
+            .ok_or(Error::OutOfBindlessSlots {
+                set: "sampler",
+                count: 1,
+            })?;
         // From here on `Drop` frees the slot.
         let sampler = Sampler { index };
         let layout = &bindless.samplers;
-        let range = bindless.sampler_heap.host_range(layout.offset(0, index), layout.stride);
+        let range = bindless
+            .sampler_heap
+            .host_range(layout.offset(0, index), layout.stride);
         desc.with_create_info(|info| unsafe {
-            Functions::descriptor_heap().write_sampler_descriptors(std::slice::from_ref(info), &[range])
+            Functions::descriptor_heap()
+                .write_sampler_descriptors(std::slice::from_ref(info), &[range])
         })??;
         Ok(sampler)
     }
@@ -616,7 +636,10 @@ pub(crate) fn bind_raw(
     for (image, handle) in images.into_iter().zip(handles) {
         let indices = [handle.descriptor_index_set0, handle.descriptor_index_set1];
         let usages = [vk::ImageUsageFlags::SAMPLED, vk::ImageUsageFlags::STORAGE];
-        for (set, (index, usage)) in [Set::Sampled, Set::Storage].into_iter().zip(indices.into_iter().zip(usages)) {
+        for (set, (index, usage)) in [Set::Sampled, Set::Storage]
+            .into_iter()
+            .zip(indices.into_iter().zip(usages))
+        {
             if index == NULL_HANDLE {
                 continue;
             }
@@ -679,7 +702,11 @@ pub(crate) fn bind_raw(
     let functions = Functions::descriptor_heap();
     if !queued {
         let ranges: SmallVec<[_; 8]> = (targets.iter())
-            .map(|&(_, set, index)| bindless.resource_heap.host_range(offset(set, index), layout.stride))
+            .map(|&(_, set, index)| {
+                bindless
+                    .resource_heap
+                    .host_range(offset(set, index), layout.stride)
+            })
             .collect();
         unsafe { functions.write_resource_descriptors(&resources, &ranges)? };
         return Ok(());
@@ -710,7 +737,8 @@ impl Bindless {
 
     /// The mappings of `bindless.slang`'s set and binding declarations to the heaps, which every
     /// shader stage gets.
-    pub(crate) fn mapping_info() -> &'static vk::ShaderDescriptorSetAndBindingMappingInfoEXT<'static> {
+    pub(crate) fn mapping_info() -> &'static vk::ShaderDescriptorSetAndBindingMappingInfoEXT<'static>
+    {
         &Self::get().mapping_info
     }
 
@@ -722,7 +750,8 @@ impl Bindless {
             2,
             MAX_DESCRIPTORS,
             p.min_resource_heap_reserved_range,
-            p.image_descriptor_alignment.max(p.buffer_descriptor_alignment),
+            p.image_descriptor_alignment
+                .max(p.buffer_descriptor_alignment),
             p.max_resource_heap_size,
         );
         let samplers = HeapLayout::new(
@@ -837,7 +866,12 @@ impl Bindless {
                 Functions::device_address_commands().cmd_update_memory(cmd, &range, flags, bytes)
             };
         }
-        barrier(S::TRANSFER, A::TRANSFER_WRITE, S::ALL_COMMANDS, vk::ACCESS_2_RESOURCE_HEAP_READ_EXT);
+        barrier(
+            S::TRANSFER,
+            A::TRANSFER_WRITE,
+            S::ALL_COMMANDS,
+            vk::ACCESS_2_RESOURCE_HEAP_READ_EXT,
+        );
         queued
     }
 
