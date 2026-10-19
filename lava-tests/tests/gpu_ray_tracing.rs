@@ -4,7 +4,7 @@ mod common;
 use common::{Cmd, buffer_with, golden::assert_golden, gpu, panic_message, zeroed_buffer};
 use glam::{Affine3A, Quat, UVec2, Vec3};
 use lava::{
-    buffer::Buffer,
+    buffer::{Buffer, Gpu, Readback, Upload},
     command_buffer::TraceRaysIndirectCommand,
     image::{Image, format::R8G8B8A8Unorm, usage::usage},
     query::QueryPool,
@@ -36,7 +36,7 @@ fn render_many<const N: usize>(
 ) -> [Vec<u8>; N] {
     let targets: [Target; N] =
         std::array::from_fn(|_| Target::new(EXTENT).unwrap().bind_storage().unwrap());
-    let readbacks: [Buffer<u8>; N] =
+    let readbacks: [Buffer<u8, Readback>; N] =
         std::array::from_fn(|_| zeroed_buffer((SIZE * SIZE * 4) as usize));
     gpu.submit(|cmd| {
         for target in &targets {
@@ -47,7 +47,7 @@ fn render_many<const N: usize>(
             cmd.copy_image_to_buffer(target.whole(), readback.range(..));
         }
     });
-    readbacks.map(|readback| readback.host().to_vec())
+    readbacks.map(|mut readback| readback.host().to_vec())
 }
 
 fn render(gpu: &mut common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> {
@@ -101,8 +101,8 @@ struct Scene {
     triangle: Blas,
     sphere: Blas,
     tlas: Tlas,
-    instances: Buffer<Instance>,
-    _inputs: (Buffer<Vec3>, Buffer<u16>, Buffer<Vec3>, Buffer<Aabb>),
+    instances: Buffer<Instance, Upload>,
+    _inputs: (Buffer<Vec3, Upload>, Buffer<u16, Upload>, Buffer<Vec3, Upload>, Buffer<Aabb, Upload>),
 }
 
 fn place(scale: f32, position: Vec3) -> Affine3A {
@@ -124,7 +124,7 @@ fn instances(wall: u64, triangle: u64, sphere: u64) -> [Instance; 4] {
 }
 
 fn scratch(size: u64) -> Buffer<u8> {
-    Buffer::raw(false, size, Some(scratch_alignment() as u32)).unwrap()
+    Buffer::raw(Gpu, size, Some(scratch_alignment() as u32)).unwrap()
 }
 
 fn scene(gpu: &mut common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) -> Scene {
@@ -260,8 +260,8 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
     if !supported("instances_written_by_a_pass", Ctx::features().ray_query) {
         return;
     }
-    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
-    let written = zeroed_buffer::<Instance>(4);
+    let mut scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
+    let mut written = zeroed_buffer::<Instance>(4);
     let tlas = Tlas::new(4, BuildFlags::default()).unwrap();
     let scratch = scratch(tlas.build_scratch_size());
     let pixels = render(&mut gpu, |cmd, target| {
@@ -298,7 +298,7 @@ fn updates_follow_moved_vertices() {
         Vec3::new(0.3, -0.3, 0.0),
         Vec3::new(0.0, 0.3, 0.0),
     ]);
-    fn geometry(vertices: &Buffer<Vec3>) -> [Triangles<'_>; 1] {
+    fn geometry(vertices: &Buffer<Vec3, Upload>) -> [Triangles<'_>; 1] {
         [Triangles::new(vertices.range(..))]
     }
     let blas = Blas::new(&BlasGeometry::Triangles(&geometry(&vertices)), updatable).unwrap();

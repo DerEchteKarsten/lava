@@ -11,13 +11,6 @@ listed in `STATE.md`. Done items are removed.
 
 ## 2. Bugs
 
-16. **Host access depends on the device.** *Open again (2026-10-17):* the `cpu_writable` host-access flag was removed, so host access works on every mapped buffer (`is_mapped()`). Core's `variables` is `cpu_writable`, so it no longer hits this. With `rebar`, every buffer is mapped
-    (`buffer/mod.rs:141-145`).
-    - So host access to a buffer not created `cpu_writable` works with ReBAR and panics on a
-      discrete GPU without it (core's `variables` used to be such a buffer).
-    - `host()` returns `&[T]` over memory the GPU may be writing, which is UB under Rust's
-      aliasing rules (a polling loop can be hoisted).
-
 ### Barrier tracking (2026-10-18)
 17. **Layout transitions and acquires aren't tracked as writes** (`command_buffer/mod.rs:1593-1632`,
     `pending.rs:209-231`). A transition happens before its own barrier's destination stages only.
@@ -188,11 +181,7 @@ listed in `STATE.md`. Done items are removed.
 69. **`init` isn't atomic** (`lib.rs:126-134`). `STATE` and `FUNCTIONS` are set before bindless,
     counter and pipeline init can fail (a heap allocation, a pass needing a compiled-out
     feature), so the device leaks and every retry says "already initialised".
-70. **Disabling `rebar` with `assert-host-image-copy` passes** (`state.rs:220-227, 370`,
-    `features.rs:416-438`): `consistent()` then drops host image copy while it is compiled as
-    asserted. Check `required.missing_from(&features)` on the final features.
-71. **Failed creations leak.** A failed `bind_buffer_memory` leaks the buffer and allocation
-    (`buffer/mod.rs:177-179`); a failed command pool leaks the earlier slots' pools
+71. **Failed creations leak.** A failed command pool leaks the earlier slots' pools
     (`timeline.rs:178-202`); a failure part-way through bindless init leaks the resource heap.
 72. **A failed pipeline creation poisons the cache for every pass of its kind**
     (`pipeline.rs:479-497`): `must` panics under the write guard, and every later `unwrap()` panics.
@@ -321,17 +310,9 @@ listed in `STATE.md`. Done items are removed.
   each value compiles a pipeline mid-frame.
 
 ### Memory
-- **There is no readback memory.** The only host-visible location is `CpuToGpu` (write-combined).
-  That fits core's headless readback taking about 10 ms for 3.7 MB. Add `GpuToCpu` (cached).
-- **With ReBAR, every buffer goes into the BAR heap,** scratch included, and spills silently to
-  system memory when it fills. The SBT is host-visible too.
-- **No staging path.** Without `host_image_copy`, which lava only enables on ReBAR devices,
-  textures, the font atlas and previews can't be uploaded, so core's UI can't start on such a
-  device. Buffers suffer too *(plausible on discrete GPUs)*: every mesh, instance ring and
-  material is `cpu_writable` (engine `assets/mod.rs:64`), so without ReBAR the GPU reads all
-  geometry from system memory each frame.
-- **Allocator settings are fixed.** Per-allocation logging is on, blocks are 256 MiB, and every
-  allocation is named "buffer" or "ImageMemory" (`state.rs:195-204`).
+- **Allocator settings are fixed.** Blocks start at 64 MiB of device memory and 16 MiB of
+  host-visible memory and double to 256 and 64 MiB, and every allocation is named "buffer" or
+  "ImageMemory" (`state.rs`).
 
 ### Other
 - **The ANV `MEMORY_READ` workaround on trace reads applies to every vendor.** Gate it on
@@ -358,15 +339,11 @@ listed in `STATE.md`. Done items are removed.
      layer.
    - **Direction:** `lava::init(Config) -> Result<DeviceInfo>`, with `DeviceInfo` reporting
      supported vs enabled features, limits, subgroup, mesh and ray tracing properties.
-5. **Memory is chosen by `cpu_writable: bool` plus the device.** **Direction:** a location type
-   (`Device`, `Upload`, `Readback`, `DeviceMapped`) where host access exists only on mapped
-   locations, plus an uploader (a staging ring recycled by epoch, with host copy as the fast
-   path).
 6. **Per-frame resources are a convention.** A `Timeline` owns its frame slots
    (`Submission::slot()`), but core builds per-frame rings four ways: instance offsets, gizmo
-   `first`, UI buffers per slot, and an unsynchronised readback. **Direction:**
-   - `PerFrame<Buffer<T>>` whose `host_mut(&submission)` ties writes to the waited slot;
-   - a growable stream buffer and a typed `Readback<T>`.
+   `first`, UI buffers per slot, and the cull `variables` readback per slot. **Direction:**
+   - `PerFrame<Buffer<T, Upload>>` whose `host_mut(&submission)` ties writes to the waited slot;
+   - a growable stream buffer.
 9. **Errors are mostly `Message(String)`.**
    - Out-of-date, minimised, surface lost, device lost, unsupported and invalid argument
      can't be matched.
@@ -598,7 +575,7 @@ Small things, by file; none changes behaviour.
   `create_raster_pipeline` builds `create_info` in two steps, sets defaults and passes vertex
   states to mesh pipelines (`:671-850`); `Error::message(&format!(..))` (`:239`).
 - **features and vk:** `has()` guards on bits of structs only linked when present are redundant
-  (`features.rs:693-780`); `let rebar = self.rebar; let _ = rebar;` (`:417-418`); `#[allow(unused_mut)]`
+  (`features.rs:693-780`); `#[allow(unused_mut)]`
   looks dead (`:459`); `unlink!` guards a reuse no path makes, while `query` returns `p_next`s into
   its old stack (`:592-618`); missing feature docs on all but the first field of each group
   (`:328-353`). `vk.rs`: `DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT` is defined in `values` and
@@ -771,7 +748,7 @@ Each was checked by grep over lava-tests and `lava/src/tests.rs`.
   acceleration structure transforms, `Instance::flags`, building from a different geometry.
 - **Presenting:** dropping a surface with a current image, the format fallback, the "must
   present it" panic.
-- **Host access:** `host_ptr`, `is_mapped`, non-`cpu_writable` buffers.
+- **Host access:** `host_ptr`; `Shared` memory where the device lacks `rebar` (only its error).
 - **Validation:** GPU-assisted validation is never on, so bindless indices, layouts and buffer
   address bounds go unchecked. `unsized_struct!`'s test needs no GPU and could run under Miri
   once.

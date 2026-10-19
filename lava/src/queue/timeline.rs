@@ -1,8 +1,9 @@
-//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight, and the submission of their recordings
+//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight, and the submission of their recordings (queued uploads first), with the snapshot of their submitted buffer writes that host access checks
 use std::{
     fmt,
     marker::PhantomData,
     panic::AssertUnwindSafe,
+    range::Range,
     sync::{
         LazyLock, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -15,6 +16,7 @@ use smallvec::SmallVec;
 
 use crate::{
     bindless::Bindless,
+    buffer::upload::{self, StagingRing},
     command_buffer::{Barriers, CommandBuffer, Recording, pending::PendingAccesses},
     error::{Error, Result},
     lifetime,
@@ -30,6 +32,10 @@ pub(crate) struct Index {
     pub(crate) stamp: AtomicU64,
     completed: AtomicU64,
     pub(crate) state: Mutex<IndexState>,
+    /// The buffer writes of its submissions that hadn't completed when the last one was
+    /// submitted, with their values: what host access checks (`Buffer::host`). A copy of
+    /// `state`'s, so the check never waits for a recording.
+    pub(crate) writes: Mutex<Vec<(Range<u64>, u64)>>,
 }
 
 #[derive(Default)]
@@ -44,6 +50,7 @@ pub(crate) static INDICES: LazyLock<[Index; MAX_TIMELINES]> = LazyLock::new(|| {
         stamp: AtomicU64::new(0),
         completed: AtomicU64::new(0),
         state: Mutex::default(),
+        writes: Mutex::default(),
     })
 });
 
@@ -99,6 +106,7 @@ struct Slot {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     barrier_log: Vec<Barriers>,
+    staging: StagingRing,
     signalled: u64,
 }
 
@@ -135,6 +143,7 @@ impl Drop for Inner {
             unsafe { Ctx::device().destroy_command_pool(slot.pool, None) };
         }
         lock(&index.state).pending = PendingAccesses::default();
+        lock(&index.writes).clear();
         lock(&self.family.timelines)[self.queue] -= 1;
         lock(&LIVE)[self.index] = false;
         lifetime::reclaim();
@@ -190,6 +199,7 @@ impl<K: QueueKind> Timeline<K> {
                 pool,
                 cmd,
                 barrier_log: Vec::new(),
+                staging: StagingRing::default(),
                 signalled: 0,
             })
         });
@@ -249,6 +259,7 @@ impl<K: QueueKind> Timeline<K> {
         }
         poll_all();
         lifetime::reclaim();
+        inner.slots[slot].staging.reset();
         let pool = inner.slots[slot].pool;
         unsafe { Ctx::device().reset_command_pool(pool, vk::CommandPoolResetFlags::empty())? };
         Ok(Submission {
@@ -332,6 +343,7 @@ impl<K: QueueKind> Submission<'_, K> {
             i,
             value,
             &mut slot.barrier_log,
+            &mut slot.staging,
         ));
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -342,6 +354,8 @@ impl<K: QueueKind> Submission<'_, K> {
             Kind::Transfer => Default::default(),
             _ => Bindless::flush_queued(slot.cmd),
         };
+        // Queued writes of buffers and images, ordered after the timeline's earlier commands.
+        upload::flush(&mut cmd);
         let prev = CALLSITE.replace(None);
         let was_recording = lifetime::RECORDING.replace(true);
         let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| record(&mut cmd)));
@@ -407,6 +421,7 @@ impl<K: QueueKind> Submission<'_, K> {
                     .map_err(Err)
             }
         };
+        upload::finish(i, value, result.is_ok());
         if result.is_err() {
             Bindless::requeue(queued);
             let replayed = (|| -> Result<()> {
@@ -437,6 +452,16 @@ impl<K: QueueKind> Submission<'_, K> {
         slot.barrier_log.clear();
         slot.signalled = value;
         state.submitted = value;
+        {
+            let done = completed(i);
+            let mut writes = lock(&index.writes);
+            writes.clear();
+            writes.extend(
+                (state.pending.buffer_writes.iter())
+                    .filter(|w| w.value > done)
+                    .map(|w| (w.write.range, w.value)),
+            );
+        }
         match result {
             Ok(()) => Ok(Wait {
                 timeline: i as u8,

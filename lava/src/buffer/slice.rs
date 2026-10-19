@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 use std::iter;
 
 use crate::{
-    buffer::Buffer,
+    buffer::{Buffer, Memory},
     command_buffer::{BufferAccess, CommandBuffer},
     queue::QueueKind,
     state::Functions,
@@ -56,7 +56,7 @@ fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
     }
 }
 
-impl<T: Copy + Pod> Buffer<T> {
+impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
     pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
         new_slice(index, self.address, self.size())
     }
@@ -66,6 +66,14 @@ impl<T: Copy + Pod> Buffer<T> {
 }
 
 impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
+    /// The `size` bytes at `address`, which the caller keeps alive for `'a`.
+    pub(crate) fn new(address: u64, size: u64) -> Self {
+        BufferSlice {
+            address,
+            size,
+            _marker: PhantomData,
+        }
+    }
     /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`].
     pub fn access(
         &self,
@@ -153,7 +161,7 @@ fn check_words(address: u64, size: u64, what: &str) {
 }
 
 /// `vkCmdUpdateBuffer`'s limit on the bytes of one update.
-const MAX_UPDATE: usize = 65536;
+pub(crate) const MAX_UPDATE: usize = 65536;
 
 impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Writes `data`, repeated, into every 4-byte word of `buffer`, whose address and size have

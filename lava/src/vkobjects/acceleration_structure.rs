@@ -8,7 +8,7 @@ use lava_macros::validation_trace;
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
-    buffer::{Buffer, slice::BufferSlice},
+    buffer::{Buffer, Gpu, slice::BufferSlice},
     command_buffer::{BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE},
     lifetime,
     queue::HasCompute,
@@ -232,7 +232,7 @@ impl<L: Level> AccelerationStructure<L> {
         let functions = functions()?;
         let buffer = Buffer::with_flags(
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-            false,
+            Gpu,
             round_up(size, STRUCTURE_ALIGNMENT),
             Some(STRUCTURE_ALIGNMENT as u32),
         )?;

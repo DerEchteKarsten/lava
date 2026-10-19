@@ -53,12 +53,18 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - `lava::init` takes one `PassMap`, so an application and a library on lava can't both bring passes; `BindingOutput` names its pass by index into that map.
 - The generated-binding tests need real buffers and images (`BufferSlice` and `ImageView` have no public constructor), so they run in `gpu_headless` instead of as unit tests.
 
+## lava: buffer memory and uploads (memory locations, 2026-10-19)
+----intended----
+- Host writes racing GPU reads aren't checked: `host_mut` on an `Upload` or `Shared` range a frame in flight still reads is a logic race, not undefined behaviour, and per-frame data takes one range per frame slot by convention (the instance, gizmo and UI rings). SURVEY 4.6 (`PerFrame<Buffer<T, Upload>>`) would make it a type.
+- The host-access check (`host`, `host_mut`, `try_host`) sees the declared buffer writes of submitted recordings: not writes a pass makes through an address it doesn't declare in `Accesses` (core's shader clocks), and not writes recorded but not submitted yet (the `&mut` borrow keeps new recordings off the buffer, so only another thread's recording begun before the borrow could still reach it). `read_into` and `get` copy without checking. It reads each timeline's snapshot of its submissions' writes (`Index::writes`), never their pending accesses, so it never waits for a recording.
+- Queued writes (`Buffer::write`, `from_slice`, `Image::upload`) are copied by the next submission of any timeline; another timeline sees them only after a `Wait` on it. Image uploads wait for a timeline of the family that owns the image (graphics while nobody does), so they never hand an image to another family.
+
+----future work----
+- Every `Buffer::write`/`Image::upload` creates its own staging buffer (a `vkCreateBuffer` and an allocation per write; core writes one per material change). A shared staging arena, reset like the per-slot `cmd.upload` rings, would batch them. The per-slot rings never shrink.
+- `Shared` needs `rebar`, which needs a device-local host-visible heap of more than 500 MiB; on a discrete GPU without ReBAR the 256 MiB BAR window would still serve small buffers. `Location::shared_or_upload` falls back to `Upload` there.
+
 ## lava: bugs from the publishing survey (2026-10-14)
 Found in a read-only review; details and directions are in `lava/SURVEY.md` section 2. The rest were fixed on 2026-10-16.
-----find solutions----
-- Host access depends on the device (SURVEY bug 16): it works on every mapped buffer (`is_mapped()`), and with `rebar` every buffer is mapped, so `host()` on a buffer not created `cpu_writable` works with ReBAR and panics on a discrete GPU without it. Core's `variables` is `cpu_writable`.
-- `Buffer::host()` hands out `&[T]` over memory a submission in flight may write, which Rust's aliasing rules don't allow (a polling loop over one slice can be hoisted). Needs an API that reads copies or volatile values.
-
 ----intended----
 - Dropping a `PresentSurface` waits at most 1 s for its present fences, then stops waiting for the ones that didn't signal (a present that failed before it was queued) and retires them with the swapchain.
 - Completed pending buffer writes are only folded (into one write of every address, which every later access is made visible to once) once there are more than 64; until then they stay, since a later submission still needs a barrier to see them.
@@ -86,6 +92,9 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 (hot reload is a debug feature anyways)
 
 ## Ideas
+
+### Transient attachments (2026-10-19)
+Image memory is always `GpuOnly`; images have no memory type parameter. Their only other useful memory is lazily allocated memory for attachments that never leave a rendering (depth of a single pass, MSAA targets once lava has them), which tilers never back with memory. It belongs in the usage set: a `Transient` flag of `Usage` (`TRANSIENT_ATTACHMENT`, allowed only with attachment flags and without sampled, storage or transfer ones), whose images allocate from `LAZILY_ALLOCATED` memory where the device has it.
 
 ### Multi-pass hardware counter captures (2026-10-15)
 `QueryPool::performance` refuses selections that need more than one counter pass, since a frame is submitted once. A tool capture could record one frame's command buffer once and submit it once per pass with `VkPerformanceQuerySubmitInfoKHR.counterPassIndex` (with the per-pass resets the extension asks for), reading each pass's counters from the same pool. It needs a submission path that replays a recorded command buffer, which `Submission` doesn't have.

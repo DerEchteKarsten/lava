@@ -266,7 +266,7 @@ macro_rules! features {
 }
 
 features! {
-    /// `VK_EXT_host_image_copy` on `rebar` memory: `Image::copy_from` and the usages with `HostCopy`.
+    /// `VK_EXT_host_image_copy`: `Image::copy_from` and the usages with `HostCopy`.
     host_image_copy: "host-image-copy" / "assert-host-image-copy" => HostImageCopy,
     /// `VK_EXT_mesh_shader` with task shaders: mesh passes.
     mesh_shader: "mesh-shader" / "assert-mesh-shader" => MeshShader,
@@ -417,10 +417,7 @@ impl Features {
     /// `self` without the features whose prerequisites it lacks.
     #[allow(unused_mut)]
     pub(crate) fn consistent(mut self) -> Features {
-        let rebar = self.rebar;
-        let _ = rebar;
         set! { self:
-            "host-image-copy" => host_image_copy = self.host_image_copy && rebar,
             "ray-query" => ray_query = self.ray_query && self.acceleration_structure,
             "ray-tracing-pipeline" => ray_tracing_pipeline =
                 self.ray_tracing_pipeline && self.acceleration_structure,

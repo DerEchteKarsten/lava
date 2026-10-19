@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use bytemuck::Pod;
 use lava::{
     bindless::{Sampler, SamplerDesc, SamplerHandle},
-    buffer::Buffer,
+    buffer::{Buffer, HostVisible, Readback, Upload},
     command_buffer::CommandBuffer,
     queue::{Graphics, Timeline, Wait},
 };
@@ -162,14 +162,19 @@ pub fn panic_message<R>(f: impl FnOnce() -> R) -> String {
         .unwrap_or_default()
 }
 
-/// A host-readable buffer holding `data`.
-pub fn buffer_with<T: Pod>(data: &[T]) -> Buffer<T> {
-    let mut buffer = Buffer::new(data.len(), true).unwrap();
+/// A buffer in `memory` holding `data`.
+pub fn buffer_in<T: Pod, M: HostVisible>(memory: M, data: &[T]) -> Buffer<T, M> {
+    let mut buffer = Buffer::with_memory(memory, data.len()).unwrap();
     buffer.host_mut().copy_from_slice(data);
     buffer
 }
 
-/// A host-readable buffer of `len` zeroed elements.
-pub fn zeroed_buffer<T: Pod>(len: usize) -> Buffer<T> {
-    buffer_with(&vec![T::zeroed(); len])
+/// An `Upload` buffer holding `data`, for what the GPU reads.
+pub fn buffer_with<T: Pod>(data: &[T]) -> Buffer<T, Upload> {
+    buffer_in(Upload, data)
+}
+
+/// A `Readback` buffer of `len` zeroed elements, for what the GPU writes.
+pub fn zeroed_buffer<T: Pod>(len: usize) -> Buffer<T, Readback> {
+    buffer_in(Readback, &vec![T::zeroed(); len])
 }

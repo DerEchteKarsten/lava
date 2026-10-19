@@ -1,4 +1,4 @@
-//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`), type erasure, and their destruction once no frame can reach them
+//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`; staged ones are `upload` in `buffer/upload.rs`), type erasure, and their destruction once no frame can reach them
 use std::{
     mem::{self, ManuallyDrop},
     range::Range,
@@ -111,7 +111,8 @@ pub trait MipViews: Views {
 pub struct Single {
     view: vk::ImageView,
     handle: ImageHandle,
-    state: AtomicU64,
+    /// Boxed, so a queued upload reaches it while the image moves (`Image::upload`).
+    state: Box<AtomicU64>,
 }
 
 /// The whole view plus a view, handle and layout per mip, for images whose mips the GPU
@@ -140,11 +141,11 @@ impl Views for Single {
         Ok(Single {
             view: raw.create_view((0..raw.mip_levels).into())?,
             handle: ImageHandle::NULL,
-            state: undefined(),
+            state: Box::new(undefined()),
         })
     }
     fn whole(&self) -> (vk::ImageView, ImageHandle, &[AtomicU64]) {
-        (self.view, self.handle, std::slice::from_ref(&self.state))
+        (self.view, self.handle, std::slice::from_ref(&*self.state))
     }
     fn whole_handle(&mut self) -> &mut ImageHandle {
         &mut self.handle
@@ -229,6 +230,13 @@ pub struct Image<F: Format, U: ImageUsage, D: Dim = D2, V: Views = Single> {
     // Dropped in this order: the views and their handles first, then the image.
     views: V,
     raw: RawImage<F, U, D>,
+}
+
+impl<F: Format, U: ImageUsage, D: Dim, V: Views> Drop for Image<F, U, D, V> {
+    fn drop(&mut self) {
+        // Before its states go with its views.
+        crate::buffer::upload::forget_image(self.raw.image);
+    }
 }
 
 impl<F: Format, U: ImageUsage, D: Dim, V: Views> crate::sealed::Sealed for Image<F, U, D, V> {}
@@ -419,9 +427,12 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             (self.raw.format.vk_format(), self.raw.usage.flags()),
             (format.vk_format(), usage.flags()),
         );
-        let mut raw = ManuallyDrop::new(self.raw);
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so its views and image move out once.
+        let (views, raw) = unsafe { (std::ptr::read(&this.views), std::ptr::read(&this.raw)) };
+        let mut raw = ManuallyDrop::new(raw);
         Image {
-            views: self.views,
+            views,
             raw: RawImage {
                 image: raw.image,
                 allocation: mem::take(&mut raw.allocation),

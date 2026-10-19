@@ -1,11 +1,11 @@
-//! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`), the functions that need them return `MissingFeature`, and draw state the device can't set dynamically is baked into pipelines and renders the same
+//! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`, `rebar` too), the functions that need them return `MissingFeature`, uploads go through staging buffers, and draw state the device can't set dynamically is baked into pipelines and renders the same
 mod common;
 
-use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     Error, Features,
-    buffer::Buffer,
+    buffer::{Buffer, Location, Shared},
     command_buffer::{
         Attachment, BindingOutput, Blend, CullModeFlags, Draw, LogicOp, PolygonMode,
         RasterState, kind,
@@ -30,6 +30,7 @@ type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Storage, TransferSrc,
 
 fn disabled() -> Features {
     Features {
+        rebar: true,
         mesh_shader: true,
         mesh_shader_queries: true,
         acceleration_structure: true,
@@ -77,7 +78,7 @@ fn render(
     record: impl FnOnce(&mut Cmd, &Target),
 ) -> Vec<u8> {
     let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
-    let readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
+    let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
     gpu.submit(|cmd| {
         cmd.clear_image(target.whole_view(), clear);
         record(cmd, &target);
@@ -112,7 +113,7 @@ const YELLOW: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
 /// The same two triangles as `gpu_headless`: one front-facing in the left half, one
 /// back-facing yellow one in the right half.
 fn two_triangles() -> Buffer<TestVertex> {
-    buffer_with(&[
+    Buffer::from_slice(&[
         vertex(-0.5, -0.8, 0.5, RED),
         vertex(-0.1, 0.8, 0.5, GREEN),
         vertex(-0.9, 0.8, 0.5, BLUE),
@@ -120,11 +121,12 @@ fn two_triangles() -> Buffer<TestVertex> {
         vertex(0.1, 0.8, 0.5, YELLOW),
         vertex(0.9, 0.8, 0.5, YELLOW),
     ])
+    .unwrap()
 }
 
 /// A far green triangle and a near red one in front of it, drawn in that order.
 fn overlapping_triangles() -> Buffer<TestVertex> {
-    buffer_with(&[
+    Buffer::from_slice(&[
         vertex(0.0, -0.8, 0.8, GREEN),
         vertex(0.8, 0.8, 0.8, GREEN),
         vertex(-0.8, 0.8, 0.8, GREEN),
@@ -132,6 +134,7 @@ fn overlapping_triangles() -> Buffer<TestVertex> {
         vertex(0.8, 0.8, 0.2, RED),
         vertex(-0.8, 0.8, 0.2, RED),
     ])
+    .unwrap()
 }
 
 fn bindings(
@@ -196,6 +199,11 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
         Image::<BC7UnormBlock, usage![Sampled]>::new(EXTENT),
         Err(Error::MissingFeature(m)) if m == missing("bc-compression")
     ));
+    assert!(matches!(
+        Buffer::<u32, Shared>::shared(4),
+        Err(Error::MissingFeature(m)) if m == missing("rebar")
+    ));
+    assert_eq!(Location::shared_or_upload(), Location::Upload);
     let state = RasterState::<1>::default();
     assert_eq!(
         state.clone().line_width(2.0).err(),
@@ -205,6 +213,24 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
         state.depth_bounds(Some([0.0, 0.5])).err(),
         Some(missing("depth-bounds"))
     );
+}
+
+/// Without `rebar` or host image copies, buffers and images are filled through staging buffers.
+#[test]
+fn uploads_need_neither_rebar_nor_host_image_copies() {
+    let mut gpu = gpu_without();
+    let data: Vec<u32> = (0..256).collect();
+    let buffer = Buffer::from_slice(&data).unwrap();
+    let texels: Vec<u8> = (0..16 * 4).map(|i| i as u8).collect();
+    let image = Image::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::new(UVec2::new(4, 4)).unwrap();
+    image.upload(0, &texels).unwrap();
+    let (mut buffer_out, mut image_out) = (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u8>(texels.len()));
+    gpu.submit(|cmd| {
+        cmd.copy_buffer(buffer.range(..), buffer_out.range(..));
+        cmd.copy_image_to_buffer(image.whole_view().whole(), image_out.range(..));
+    });
+    assert_eq!(buffer_out.host(), data);
+    assert_eq!(image_out.host(), texels);
 }
 
 #[test]

@@ -1,11 +1,11 @@
-//! Headless GPU tests: buffers, images, sync, command recording, queries, and golden images per pass type
+//! Headless GPU tests: buffers (memory locations, host access, uploads), images, sync, command recording, queries, and golden images per pass type
 mod common;
 
 use common::{Cmd, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer};
 use glam::{IVec2, UVec2, UVec3, UVec4, Vec2, Vec4};
 use lava::{
     bindless::{self, Combined, ImageHandle, Sampler, SamplerDesc, SamplerHandle, max_image_slots},
-    buffer::Buffer,
+    buffer::{Buffer, Dynamic, Location, Memory, Readback, Shared, Upload},
     command_buffer::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
         BufferAccess, ColorComponentFlags, CompareOp, CullModeFlags,
@@ -43,7 +43,7 @@ type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Storage, TransferSrc,
 /// Clears a fresh target to opaque black, lets `record` draw into it, and reads it back.
 fn render(gpu: &mut common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> {
     let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
-    let readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
+    let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
     gpu.submit(|cmd| {
         cmd.clear_image(target.whole_view(), [0.0, 0.0, 0.0, 1.0]);
         record(cmd, &target);
@@ -85,7 +85,7 @@ const YELLOW: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
 /// Two triangles: a front-facing one (clockwise on screen) in the left half with one colour
 /// per corner, and a back-facing yellow one in the right half.
 fn two_triangles() -> Buffer<TestVertex> {
-    buffer_with(&[
+    Buffer::from_slice(&[
         vertex(-0.5, -0.8, 0.5, RED),
         vertex(-0.1, 0.8, 0.5, GREEN),
         vertex(-0.9, 0.8, 0.5, BLUE),
@@ -93,6 +93,7 @@ fn two_triangles() -> Buffer<TestVertex> {
         vertex(0.1, 0.8, 0.5, YELLOW),
         vertex(0.9, 0.8, 0.5, YELLOW),
     ])
+    .unwrap()
 }
 
 /// A pixel well inside the left (front-facing) and the right (back-facing) triangle.
@@ -151,7 +152,7 @@ fn context_exposes_the_graphics_queue_family() {
 #[test]
 fn buffer_has_the_requested_size() {
     let _gpu = gpu();
-    let buffer = Buffer::<[u32; 3]>::new(5, true).unwrap();
+    let buffer = Buffer::<[u32; 3]>::new(5).unwrap();
     assert_eq!(buffer.len(), 5);
     assert_eq!(buffer.size(), 60);
     assert_eq!(buffer.range(..).len(), 5);
@@ -160,28 +161,196 @@ fn buffer_has_the_requested_size() {
 }
 
 #[test]
-fn host_writes_are_visible_through_slices_and_indexing() {
+fn host_writes_are_visible_through_slices_and_copies() {
     let _gpu = gpu();
-    let mut buffer = Buffer::<u32>::new(8, true).unwrap();
+    let mut buffer = Buffer::<u32, Upload>::upload(8).unwrap();
     buffer.host_mut().copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    buffer[0] = 10;
+    buffer.host_mut()[0] = 10;
     buffer.host_mut()[4..6].copy_from_slice(&[50, 60]);
 
     assert_eq!(buffer.host(), [10, 2, 3, 4, 50, 60, 7, 8]);
-    assert_eq!(buffer[5], 60);
+    assert_eq!(buffer.get(5), 60);
+    let mut out = [0; 3];
+    buffer.read_into(&mut out);
+    assert_eq!(out, [10, 2, 3]);
     assert_eq!(buffer.byte_range(4..8).cast::<u32>().len(), 1);
 
     let halves = buffer.cast::<[u32; 2]>();
     assert_eq!(halves.len(), 4);
-    assert_eq!(halves[2], [50, 60]);
+    assert_eq!(halves.get(2), [50, 60]);
+    assert_eq!(halves.erase().location(), Location::Upload);
 }
 
 #[test]
-#[should_panic(expected = "out of bounds")]
-fn indexing_past_the_buffer_panics() {
+#[should_panic(expected = "element 4 of a buffer of 4")]
+fn reading_past_the_buffer_panics() {
     let _gpu = gpu();
-    let buffer = Buffer::<u32>::new(4, true).unwrap();
-    let _ = buffer[4];
+    let buffer = Buffer::<u32, Readback>::readback(4).unwrap();
+    let _ = buffer.get(4);
+}
+
+// ---- memory locations, host access and uploads ------------------------------------------------
+
+#[test]
+fn from_slice_round_trips_through_a_readback_copy() {
+    let mut gpu = gpu();
+    let data: Vec<u32> = (0..1000).collect();
+    let buffer = Buffer::from_slice(&data).unwrap();
+    assert_eq!(buffer.location(), Location::Gpu);
+    let mut readback = zeroed_buffer::<u32>(data.len());
+    gpu.submit(|cmd| cmd.copy_buffer(buffer.range(..), readback.range(..)));
+    assert_eq!(readback.host(), data);
+}
+
+#[test]
+fn writes_land_in_submission_order() {
+    let mut gpu = gpu();
+    let buffer = Buffer::<u32>::new(4).unwrap();
+    let (mut first, mut second) = (zeroed_buffer::<u32>(4), zeroed_buffer::<u32>(4));
+    buffer.write(0, &[1, 2, 3, 4]).unwrap();
+    // Dropped with a write queued, which goes with it.
+    let dropped = Buffer::<u32>::new(4).unwrap();
+    dropped.write(0, &[5; 4]).unwrap();
+    drop(dropped);
+    let submission = gpu.timeline.begin().unwrap();
+    let copied = submission
+        .submit(|cmd| cmd.copy_buffer(buffer.range(..), first.range(..)))
+        .unwrap();
+    // Queued while the first submission may still read the buffer.
+    buffer.write(2, &[30, 40]).unwrap();
+    gpu.submit(|cmd| cmd.copy_buffer(buffer.range(..), second.range(..)));
+    copied.block().unwrap();
+    assert_eq!(first.host(), [1, 2, 3, 4]);
+    assert_eq!(second.host(), [1, 2, 30, 40]);
+    assert!(panic_message(|| buffer.write(3, &[0, 0])).contains("writing 2 elements at 3"));
+}
+
+#[test]
+fn uploads_in_a_recording_use_updates_or_the_staging_ring() {
+    let mut gpu = gpu();
+    let small: Vec<u32> = (0..100).collect();
+    // 160 KB: more than an update takes.
+    let len = 40_000;
+    let buffer = Buffer::<u32>::new(len).unwrap();
+    let mut readback = zeroed_buffer::<u32>(len);
+    // Three frames on two frame slots: the third reuses the first one's staging memory.
+    for frame in 0..3u32 {
+        let large: Vec<u32> = (0..len as u32).map(|i| i * 3 + frame).collect();
+        gpu.submit(|cmd| {
+            cmd.upload(buffer.range(..), &large).unwrap();
+            cmd.upload(buffer.range(..small.len()), &small).unwrap();
+            cmd.copy_buffer(buffer.range(..), readback.range(..));
+        });
+        let host = readback.host();
+        assert_eq!(host[..small.len()], small, "frame {frame}");
+        assert_eq!(host[small.len()..], large[small.len()..], "frame {frame}");
+    }
+    // Not whole words: staged too.
+    let bytes = Buffer::<u8>::new(8).unwrap();
+    let mut out = zeroed_buffer::<u8>(8);
+    gpu.submit(|cmd| {
+        cmd.upload(bytes.range(1..), &[7, 8, 9]).unwrap();
+        cmd.copy_buffer(bytes.range(..), out.range(..));
+    });
+    assert_eq!(out.host()[1..4], [7, 8, 9]);
+}
+
+#[test]
+fn image_uploads_are_copied_before_the_next_submission() {
+    let mut gpu = gpu();
+    // The texture of `indexed_draw_samples_a_bindless_texture`.
+    let texels: Vec<u8> = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]].concat();
+    let texture = Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::new(2, 2))
+        .unwrap()
+        .bind_sampled()
+        .unwrap();
+    assert!(texture.upload(0, &texels[..12]).is_err(), "one whole mip");
+    assert!(texture.upload(1, &texels).is_err(), "it has one mip");
+    texture.upload(0, &texels).unwrap();
+    // Dropped with an upload queued, which goes with it.
+    let dropped = Image::<R8G8B8A8Unorm, usage![TransferDst]>::new(UVec2::new(2, 2)).unwrap();
+    dropped.upload(0, &texels).unwrap();
+    drop(dropped);
+
+    let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
+        position: Vec2::new(x, y),
+        uv: Vec2::new(u, v),
+    };
+    let vertices = Buffer::from_slice(&[
+        corner(-0.5, -0.5, 0.0, 0.0),
+        corner(0.5, -0.5, 1.0, 0.0),
+        corner(0.5, 0.5, 1.0, 1.0),
+        corner(-0.5, 0.5, 0.0, 1.0),
+    ])
+    .unwrap();
+    let indices = Buffer::from_slice(&[0u32, 1, 2, 0, 2, 3]).unwrap();
+    let pixels = render(&mut gpu, |cmd, target| {
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::indexed(
+                &TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), nearest()),
+                indices.range(..),
+                1,
+                RasterState::default(),
+                None,
+            ))
+            .record("textured")
+    });
+    assert_golden("raster_textured", &pixels, [SIZE, SIZE]);
+}
+
+#[test]
+fn host_access_waits_for_gpu_writes_in_flight() {
+    let mut gpu = gpu();
+    // Long enough to still run when the host looks: 512 MiB of fills, then a copy after them.
+    let large = Buffer::<u32>::new(16 << 20).unwrap();
+    let mut readback = zeroed_buffer::<u32>(4);
+    let submission = gpu.timeline.begin().unwrap();
+    let done = submission
+        .submit(|cmd| {
+            for value in 0..8 {
+                cmd.fill_buffer(large.range(..), value);
+            }
+            cmd.copy_buffer(large.range(..4), readback.range(..));
+            // Not submitted yet: the host may look, and the borrow keeps it from being
+            // recorded again.
+            assert_eq!(readback.host(), [0; 4]);
+        })
+        .unwrap();
+    assert!(readback.try_host().is_none());
+    let message = panic_message(|| readback.host_mut()[0] = 1);
+    assert!(message.contains("the GPU may still write this buffer"), "{message}");
+    // Reads of other buffers don't wait.
+    let mut other = zeroed_buffer::<u32>(4);
+    assert_eq!(other.host(), [0; 4]);
+    done.block().unwrap();
+    assert_eq!(readback.try_host(), Some(&[7; 4][..]));
+}
+
+#[test]
+fn dynamic_locations_check_host_access_at_runtime() {
+    let _gpu = gpu();
+    let mut gpu_only = Buffer::<u32>::new(4).unwrap().erase();
+    assert_eq!(gpu_only.memory(), Dynamic(Location::Gpu));
+    let message = panic_message(|| gpu_only.host().len());
+    assert!(message.contains("can't access a buffer of Gpu memory"), "{message}");
+    let mut either = Buffer::<u32, Dynamic>::with_memory(Dynamic(Location::shared_or_upload()), 4).unwrap();
+    either.host_mut().copy_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(either.get(3), 4);
+}
+
+#[test]
+fn shared_memory_is_device_local_and_mapped() {
+    let mut gpu = gpu();
+    if !Ctx::features().rebar {
+        let shared = Buffer::<u32, Shared>::shared(4);
+        assert!(matches!(shared, Err(lava::Error::MissingFeature(m)) if m.feature == "rebar"));
+        eprintln!("SKIPPED shared_memory_is_device_local_and_mapped: no rebar");
+        return;
+    }
+    let mut shared = Buffer::<u32, Shared>::shared(4).unwrap();
+    shared.host_mut().copy_from_slice(&[1, 2, 3, 4]);
+    gpu.submit(|cmd| cmd.fill_buffer(shared.range(2..), 9));
+    assert_eq!(shared.host(), [1, 2, 9, 9]);
 }
 
 // ---- timelines and lifetimes -----------------------------------------------------------------
@@ -196,7 +365,7 @@ fn more_threads_than_queues_submit_in_parallel() {
         for value in 0..threads as u32 {
             let barrier = &barrier;
             scope.spawn(move || {
-                let buffer = zeroed_buffer::<u32>(4);
+                let mut buffer = zeroed_buffer::<u32>(4);
                 let mut timeline = Timeline::<Graphics>::new(2).unwrap();
                 barrier.wait();
                 let submission = timeline.begin().unwrap();
@@ -214,7 +383,7 @@ fn more_threads_than_queues_submit_in_parallel() {
 #[test]
 fn frame_slots_cycle_and_what_a_submission_used_lives_until_it_is_done() {
     let mut gpu = gpu();
-    let buffer = zeroed_buffer::<u32>(4);
+    let mut buffer = zeroed_buffer::<u32>(4);
     let mut slots = Vec::new();
     let mut last = None;
     for value in 1..=4 {
@@ -271,7 +440,7 @@ fn a_recording_thread_runs_no_destructors() {
     let image =
         Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
     drop(image);
-    let buffer = zeroed_buffer::<u32>(4);
+    let mut buffer = zeroed_buffer::<u32>(4);
     gpu.submit(|cmd| {
         lava::reclaim();
         cmd.fill_buffer(buffer.range(..), 1);
@@ -283,7 +452,7 @@ fn a_recording_thread_runs_no_destructors() {
 fn a_submission_waits_for_another_timelines() {
     let mut gpu = gpu();
     let mut other = Timeline::<Graphics>::new(2).unwrap();
-    let (src, dst) = (zeroed_buffer::<u32>(4), zeroed_buffer::<u32>(4));
+    let (src, mut dst) = (zeroed_buffer::<u32>(4), zeroed_buffer::<u32>(4));
     let own = gpu.submit(|_| {});
     // Neither submission is waited for on the host before the second is made.
     let filled = (other.begin().unwrap())
@@ -373,7 +542,7 @@ fn a_compute_image_is_released_to_graphics() {
             cmd.release::<Graphics>(image.whole_view());
         })
         .unwrap();
-    let readback = zeroed_buffer::<u8>(8 * 8 * 4);
+    let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
     gpu.submit_after(&[written], |cmd| {
         cmd.copy_image_to_buffer(image.whole(), readback.range(..))
     });
@@ -401,7 +570,7 @@ fn images_go_to_the_transfer_family_and_back() {
             cmd.release::<Graphics>(image.whole_view());
         })
         .unwrap();
-    let readback = zeroed_buffer::<u8>(8 * 8 * 4);
+    let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
     let drawn = gpu.submit_after(&[uploaded], |cmd| {
         cmd.copy_image_to_buffer(image.whole(), readback.range(..));
         cmd.clear_image(image.whole_view(), [0.0, 1.0, 0.0, 1.0]);
@@ -751,7 +920,7 @@ fn occlusion_queries_count_the_samples_of_a_draw() {
 #[test]
 fn fill_buffer_fills_exactly_the_slice() {
     let mut gpu = gpu();
-    let buffer = zeroed_buffer::<u32>(8);
+    let mut buffer = zeroed_buffer::<u32>(8);
     gpu.submit(|cmd| cmd.fill_buffer(buffer.range(2..6), 0xDEAD_BEEF));
     assert_eq!(
         buffer.host(),
@@ -771,7 +940,7 @@ fn fill_buffer_fills_exactly_the_slice() {
 #[test]
 fn update_buffer_writes_one_element() {
     let mut gpu = gpu();
-    let buffer = zeroed_buffer::<[u32; 2]>(4);
+    let mut buffer = zeroed_buffer::<[u32; 2]>(4);
     gpu.submit(|cmd| cmd.update_buffer(buffer.range(2..), &[11, 22]));
     assert_eq!(buffer.host(), [[0, 0], [0, 0], [11, 22], [0, 0]]);
 }
@@ -781,8 +950,8 @@ fn update_buffer_writes_one_element() {
 #[test]
 fn empty_and_oversized_buffers_and_images_are_errors() {
     let _gpu = gpu();
-    assert!(Buffer::<u32>::new(0, false).is_err());
-    assert!(Buffer::<u32>::new(usize::MAX, false).is_err());
+    assert!(Buffer::<u32>::new(0).is_err());
+    assert!(Buffer::<u32>::new(usize::MAX).is_err());
     type Texture = Image<R8G8B8A8Unorm, usage![Sampled]>;
     assert!(Texture::new(UVec2::new(0, 4)).is_err());
     assert!(Texture::with_mip_levels(UVec2::new(4, 4), 0).is_err());
@@ -968,7 +1137,7 @@ fn draws_of_a_rendering_access_nothing_another_writes() {
 fn copy_buffer_copies_the_source_slice_to_the_destination_offset() {
     let mut gpu = gpu();
     let src = buffer_with::<u32>(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    let dst = zeroed_buffer::<u32>(8);
+    let mut dst = zeroed_buffer::<u32>(8);
     gpu.submit(|cmd| cmd.copy_buffer(src.range(1..4), dst.range(5..)));
     assert_eq!(dst.host(), [0, 0, 0, 0, 0, 2, 3, 4]);
 }
@@ -977,7 +1146,7 @@ fn copy_buffer_copies_the_source_slice_to_the_destination_offset() {
 fn copy_buffer_regions_copies_each_region() {
     let mut gpu = gpu();
     let src = buffer_with::<u32>(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    let dst = zeroed_buffer::<u32>(8);
+    let mut dst = zeroed_buffer::<u32>(8);
     let regions = [
         (src.range(0..2), dst.range(6..)),
         (src.range(7..8), dst.range(0..1)),
@@ -991,7 +1160,7 @@ fn copy_buffer_regions_copies_each_region() {
 fn partially_overlapping_writes_are_synchronised_with_later_reads() {
     let mut gpu = gpu();
     let buffer = zeroed_buffer::<u32>(16);
-    let copy = zeroed_buffer::<u32>(16);
+    let mut copy = zeroed_buffer::<u32>(16);
     gpu.submit(|cmd| {
         cmd.fill_buffer(buffer.range(..), 1);
         cmd.fill_buffer(buffer.range(4..8), 2);
@@ -1208,7 +1377,7 @@ fn sample(
     reference: f32,
     reads: Accesses,
 ) -> [Vec4; 3] {
-    let out = zeroed_buffer::<Vec4>(3);
+    let mut out = zeroed_buffer::<Vec4>(3);
     gpu.submit(|cmd| {
         let bindings =
             TestSample::push_bindings(out.range(..), first, second, compare, slot, uv, reference);
@@ -1232,8 +1401,8 @@ fn reserved_slots_are_rewritten_between_frames_in_flight() {
     let red = solid(&mut gpu, [1.0, 0.0, 0.0, 1.0]);
     let green = solid(&mut gpu, [0.0, 1.0, 0.0, 1.0]);
     let slot = bindless::reserve::<bindless::Sampled>(1).unwrap();
-    let outs = [zeroed_buffer::<Vec4>(3), zeroed_buffer::<Vec4>(3)];
-    let frame = |gpu: &mut common::Gpu, image: &Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>, out: &Buffer<Vec4>| {
+    let mut outs = [zeroed_buffer::<Vec4>(3), zeroed_buffer::<Vec4>(3)];
+    let frame = |gpu: &mut common::Gpu, image: &Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>, out: &Buffer<Vec4, Readback>| {
         bindless::bind([image.whole_view()], [slot.handle(0)]);
         let reads = [ImageUse::sampled_read(image.whole_view())];
         let submission = gpu.timeline.begin().unwrap();
@@ -1372,7 +1541,7 @@ fn run_combined(
         cmd.clear_image(storage.whole_view(), [0.0, 1.0, 0.0, 1.0]);
     });
     let levels = chain.mip_levels();
-    let out = zeroed_buffer::<Vec4>(3 + levels as usize);
+    let mut out = zeroed_buffer::<Vec4>(3 + levels as usize);
     let mut reads = vec![
         ImageUse::sampled_read(sampled.whole_view()),
         ImageUse::storage_read(storage.whole_view()),
@@ -1399,7 +1568,7 @@ fn run_combined(
 
 /// Every texel of a 4x4 image.
 fn texels(gpu: &mut common::Gpu, image: &Combinable) -> Vec<[u8; 4]> {
-    let readback = zeroed_buffer::<[u8; 4]>(16);
+    let mut readback = zeroed_buffer::<[u8; 4]>(16);
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
     readback.host().to_vec()
 }
@@ -1462,7 +1631,7 @@ fn push_data_fills_all_256_bytes() {
     const _: () = assert!(size_of::<lava_tests::bindings::CTestPushDataBindings>() == 256);
     let values: [UVec4; 15] = std::array::from_fn(|i| UVec4::splat(i as u32) + UVec4::new(0, 100, 200, 300));
     let last = UVec2::new(7, 11);
-    let out = zeroed_buffer::<UVec4>(16);
+    let mut out = zeroed_buffer::<UVec4>(16);
     gpu.submit(|cmd| {
         cmd.compute(&TestPushData::push_bindings(values, out.range(..), last), [1, 1, 1], None)
     });
@@ -1475,7 +1644,7 @@ fn clear_image_sets_every_texel() {
     let mut gpu = gpu();
     let image =
         Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
-    let readback = zeroed_buffer::<u8>(8 * 8 * 4);
+    let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
     gpu.submit(|cmd| {
         cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.5, 1.0]);
         cmd.copy_image_to_buffer(image.whole(), readback.range(..));
@@ -1495,7 +1664,7 @@ fn buffer_to_image_and_back_round_trips() {
     let upload = buffer_with::<u8>(&data);
     let image =
         Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
-    let readback = zeroed_buffer::<u8>(data.len());
+    let mut readback = zeroed_buffer::<u8>(data.len());
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), image.whole());
         cmd.copy_image_to_buffer(image.whole(), readback.range(..));
@@ -1510,7 +1679,7 @@ fn image_region_copies_address_the_sub_rectangle() {
     let upload = buffer_with::<u8>(&data);
     let image =
         Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
-    let readback = zeroed_buffer::<u8>(3 * 2 * 4);
+    let mut readback = zeroed_buffer::<u8>(3 * 2 * 4);
     let region = image
         .whole_view()
         .region(UVec2::new(3, 2))
@@ -1537,7 +1706,7 @@ fn blit_copies_between_offset_regions() {
     let upload = buffer_with::<u8>(&data);
     let src = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
     let dst = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
-    let readback = zeroed_buffer::<u8>(data.len());
+    let mut readback = zeroed_buffer::<u8>(data.len());
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), src.whole());
         cmd.clear_image(dst.whole_view(), [0.0, 0.0, 0.0, 1.0]);
@@ -1578,7 +1747,7 @@ fn blit_scales_between_differently_sized_regions() {
     let upload = buffer_with::<u8>(&data);
     let src = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(2, 2)).unwrap();
     let dst = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
-    let readback = zeroed_buffer::<u8>(8 * 8 * 4);
+    let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), src.whole());
         cmd.blit_image(src.whole(), dst.whole(), Filter::Nearest);
@@ -1603,13 +1772,13 @@ fn host_copy_uploads_a_mip_level() {
     let data = pattern(8, 8);
 
     if !Ctx::features().host_image_copy {
-        // Host image copies need host-visible device memory.
+        // The device lacks `VK_EXT_host_image_copy`.
         assert!(image.copy_from(&data, 0).is_err());
         return;
     }
 
     image.copy_from(&data, 0).unwrap();
-    let readback = zeroed_buffer::<u8>(data.len());
+    let mut readback = zeroed_buffer::<u8>(data.len());
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
     assert_eq!(readback.host(), data);
 
@@ -1657,7 +1826,7 @@ fn host_copy_writes_only_the_region() {
             .is_err()
     );
 
-    let readback = zeroed_buffer::<u8>(data.len());
+    let mut readback = zeroed_buffer::<u8>(data.len());
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
     let readback = readback.host();
     for (y, x) in (0..8).flat_map(|y| (0..8).map(move |x| (y, x))) {
@@ -1761,7 +1930,7 @@ fn compute_pass_reads_and_writes_buffers() {
     let mut gpu = gpu();
     let input: Vec<u32> = (1..=100).collect();
     let src = buffer_with::<u32>(&input);
-    let dst = buffer_with::<u32>(&[u32::MAX; 100]);
+    let mut dst = buffer_with::<u32>(&[u32::MAX; 100]);
     gpu.submit(|cmd| {
         cmd.compute(
             &TestComputeBuffer::push_bindings(src.range(..), dst.range(..), 90, 3),
@@ -1791,7 +1960,7 @@ fn clock_regions_count_every_subgroup_once() {
     }
     const INVOCATIONS: usize = 256;
     let mut clocks = zeroed_buffer::<TestClocks>(1);
-    let out = zeroed_buffer::<u32>(INVOCATIONS);
+    let mut out = zeroed_buffer::<u32>(INVOCATIONS);
     gpu.submit(|cmd| {
         cmd.compute(
             &TestClock::push_bindings(clocks.address(), out.range(..)).unwrap(),
@@ -1819,7 +1988,7 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
     let mut gpu = gpu();
     let src = zeroed_buffer::<u32>(64);
     let dst = zeroed_buffer::<u32>(64);
-    let copy = zeroed_buffer::<u32>(64);
+    let mut copy = zeroed_buffer::<u32>(64);
     gpu.submit(|cmd| {
         cmd.fill_buffer(src.range(..), 5);
         cmd.compute(
@@ -1837,7 +2006,7 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
 #[test]
 fn specialization_constants_pick_the_pipeline() {
     let mut gpu = gpu();
-    let (a, b) = (
+    let (mut a, mut b) = (
         zeroed_buffer::<u32>(8),
         zeroed_buffer::<u32>(8),
     );
@@ -1845,7 +2014,7 @@ fn specialization_constants_pick_the_pipeline() {
         Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap(),
         Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap(),
     );
-    let pixels = zeroed_buffer::<u8>((SIZE * SIZE * 4 * 2) as usize);
+    let mut pixels = zeroed_buffer::<u8>((SIZE * SIZE * 4 * 2) as usize);
     let half = (SIZE * SIZE * 4) as usize;
     gpu.submit(|cmd| {
         let groups = [SIZE / 8, SIZE / 8, 1];
@@ -1883,8 +2052,8 @@ fn specialization_constants_pick_the_pipeline() {
 
 // ---- raster passes ---------------------------------------------------------------------------
 
-fn bindings(
-    vertices: &Buffer<TestVertex>,
+fn bindings<M: Memory>(
+    vertices: &Buffer<TestVertex, M>,
 ) -> impl std::ops::Deref<Target = BindingOutput<'_, kind::RasterVertex>> {
     TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
 }
@@ -2122,7 +2291,7 @@ fn scissor_clips_and_viewport_scales_the_draw() {
 
 /// A near green triangle drawn before a far red one covering the same area.
 fn overlapping_triangles() -> Buffer<TestVertex> {
-    buffer_with(&[
+    Buffer::from_slice(&[
         vertex(0.0, -0.8, 0.8, GREEN),
         vertex(0.8, 0.8, 0.8, GREEN),
         vertex(-0.8, 0.8, 0.8, GREEN),
@@ -2130,6 +2299,7 @@ fn overlapping_triangles() -> Buffer<TestVertex> {
         vertex(0.8, 0.8, 0.2, RED),
         vertex(-0.8, 0.8, 0.2, RED),
     ])
+    .unwrap()
 }
 
 #[test]
@@ -2206,7 +2376,7 @@ fn skipped_attachment_keeps_its_content() {
     }
     let vertices = overlapping_triangles();
     let second = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
-    let readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
+    let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(
             EXTENT,
@@ -2368,7 +2538,7 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
         .unwrap()
         .bind_sampled()
         .unwrap();
-    let out = zeroed_buffer::<f32>((SIZE * SIZE) as usize);
+    let mut out = zeroed_buffer::<f32>((SIZE * SIZE) as usize);
     render(&mut gpu, |cmd, target| {
         let left = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -2381,7 +2551,7 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
             None,
         );
     });
-    let depth_at = |(x, y): (u32, u32)| out.host()[(y * SIZE + x) as usize];
+    let mut depth_at = |(x, y): (u32, u32)| out.host()[(y * SIZE + x) as usize];
     assert_eq!(depth_at(IN_LEFT), 0.5);
     assert_eq!(depth_at(IN_RIGHT), 0.25);
 
@@ -2761,7 +2931,7 @@ fn a_mip_is_drawn_while_another_is_sampled() {
         corner(-1.0, 1.0),
     ]);
     let indices = buffer_with::<u32>(&[0, 1, 2, 0, 2, 3]);
-    let readback = zeroed_buffer::<u8>(8 * 8 * 4);
+    let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
 
     gpu.submit(|cmd| {
         cmd.clear_image(chain.mip_view(0), [0.0, 1.0, 0.0, 1.0]);
@@ -2803,9 +2973,9 @@ fn volumes_are_uploaded_sampled_and_copied() {
     let target = Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(size.truncate())
         .unwrap()
         .bind_storage().unwrap();
-    let whole = zeroed_buffer::<u8>(texels.len());
-    let slice = zeroed_buffer::<u8>(4 * 4 * 4);
-    let mip = zeroed_buffer::<u8>(2 * 2 * 4);
+    let mut whole = zeroed_buffer::<u8>(texels.len());
+    let mut slice = zeroed_buffer::<u8>(4 * 4 * 4);
+    let mut mip = zeroed_buffer::<u8>(2 * 2 * 4);
 
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), volume.mip_view(0).whole());

@@ -443,14 +443,18 @@ impl Ctx {
             physical_device: physical_device.handel,
             debug_settings: {
                 let mut settings = AllocatorDebugSettings::default();
-                settings.log_allocations = true;
-                settings.log_frees = true;
+                settings.log_allocations = false;
+                settings.log_frees = false;
                 settings.log_leaks_on_shutdown = false;
                 settings.log_memory_information = true;
                 settings
             },
             buffer_device_address: true,
-            allocation_sizes: AllocationSizes::new(256, if features.rebar { 256 } else { 16 }),
+            // In bytes: blocks start at 64 MiB of device memory and 16 MiB of host-visible
+            // memory and double with every block that didn't fit an allocation, to 256 and 64.
+            allocation_sizes: AllocationSizes::new(64 << 20, 16 << 20)
+                .with_max_device_memblock_size(256 << 20)
+                .with_max_host_memblock_size(64 << 20),
         })?;
 
         FUNCTIONS

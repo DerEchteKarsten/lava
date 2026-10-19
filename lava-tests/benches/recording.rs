@@ -145,7 +145,7 @@ const FRAMES: usize = 3000;
 fn main() {
     lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
     let mut timeline = Timeline::<Graphics>::new(2).unwrap();
-    let buffer = |len| Buffer::new(len, false).unwrap();
+    let buffer = |len| Buffer::new(len).unwrap();
     let resources = Resources {
         sampler: Sampler::new(&SamplerDesc::new()).unwrap(),
         target: Target::new(EXTENT).unwrap().bind_storage().unwrap(),
@@ -159,11 +159,11 @@ fn main() {
         src: buffer(256),
         dst: (0..16).map(|_| buffer(256)).collect(),
         out: buffer(256),
-        vertices: Buffer::new(6, false).unwrap(),
+        vertices: Buffer::new(6).unwrap(),
         textured: (0..TEXTURES)
-            .map(|_| Buffer::new(4, false).unwrap())
+            .map(|_| Buffer::new(4).unwrap())
             .collect(),
-        indices: Buffer::new(6, false).unwrap(),
+        indices: Buffer::new(6).unwrap(),
     };
 
     let mut scenarios: Vec<(&str, fn(&mut CommandBuffer<Graphics>, &Resources))> = vec![

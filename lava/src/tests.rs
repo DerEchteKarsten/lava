@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, image states, image usage types, the slot allocator, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
 use std::{iter, sync::atomic::AtomicU64};
 
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
@@ -354,4 +354,59 @@ fn unsized_structs_read_back_every_field_and_section() {
     assert!(unsized_.nothing().is_empty());
     assert_eq!(unsized_.halves(), [6]);
     assert_eq!(size_of_val(unsized_), size_of_val(&sized));
+}
+
+#[test]
+fn locations_allocate_from_their_memory_types() {
+    use crate::buffer::{Dynamic, Location, Memory};
+    use gpu_allocator::MemoryLocation as M;
+    use vk::MemoryPropertyFlags as P;
+    let mut properties = vk::PhysicalDeviceMemoryProperties {
+        memory_type_count: 4,
+        ..Default::default()
+    };
+    // Device-local, the BAR window, system memory, cached system memory.
+    let flags = [
+        P::DEVICE_LOCAL,
+        P::DEVICE_LOCAL | P::HOST_VISIBLE | P::HOST_COHERENT,
+        P::HOST_VISIBLE | P::HOST_COHERENT,
+        P::HOST_VISIBLE | P::HOST_COHERENT | P::HOST_CACHED,
+    ];
+    for (i, flags) in flags.into_iter().enumerate() {
+        properties.memory_types[i].property_flags = flags;
+    }
+    assert_eq!(Location::Gpu.allocator_location(), M::GpuOnly);
+    assert_eq!(Location::Upload.allocator_location(), M::CpuToGpu);
+    assert_eq!(Location::Shared.allocator_location(), M::CpuToGpu);
+    assert_eq!(Location::Readback.allocator_location(), M::GpuToCpu);
+    for location in [Location::Gpu, Location::Upload, Location::Readback] {
+        assert_eq!(location.memory_type_bits(0b1111, &properties), 0b1111, "{location:?}");
+    }
+    assert_eq!(Location::Shared.memory_type_bits(0b1111, &properties), 0b0010, "only device-local and host-visible");
+    assert_eq!(Location::Shared.memory_type_bits(0b1101, &properties), 0, "fails rather than spill");
+    assert!(!Location::Gpu.host_visible() && Location::Readback.host_visible());
+    Dynamic(Location::Upload).host_check();
+    assert!(std::panic::catch_unwind(|| Dynamic(Location::Gpu).host_check()).is_err());
+}
+
+#[test]
+fn host_access_waits_for_overlapping_incomplete_writes() {
+    use crate::command_buffer::{EVERY_ACCELERATION_STRUCTURE, EVERY_BUFFER, pending::incomplete_write};
+    let writes = [((0..16).into(), 3), ((16..32).into(), 5), (EVERY_BUFFER, 0), (EVERY_ACCELERATION_STRUCTURE, 9)];
+    let scan = |range: std::ops::Range<u64>, completed| incomplete_write(writes.iter().copied(), range.into(), completed);
+    assert_eq!(scan(0..64, 0), Some(5), "the latest overlapping value");
+    assert_eq!(scan(8..12, 2), Some(3));
+    assert_eq!(scan(8..12, 3), None, "completed");
+    assert_eq!(scan(32..64, 0), None, "touching isn't overlapping");
+    assert_eq!(scan(16..20, 4), Some(5));
+}
+
+#[test]
+fn host_image_copy_needs_no_rebar() {
+    let mut features = Features::from_bits(iter::repeat(true));
+    features.rebar = false;
+    let consistent = features.consistent();
+    #[cfg(feature = "host-image-copy")]
+    assert!(consistent.host_image_copy);
+    let _ = consistent;
 }

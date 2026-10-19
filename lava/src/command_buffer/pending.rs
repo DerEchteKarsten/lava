@@ -1,4 +1,6 @@
-//! The accesses later commands may have to wait for: what a timeline's submissions read and wrote, each write with what barriers already made it visible to, how recording a command adds to them, and how they shrink once the GPU finished them or a resource is destroyed
+//! The accesses later commands may have to wait for: what a timeline's submissions read and wrote, each write with what barriers already made it visible to, how recording a command adds to them, and how they shrink once the GPU finished them or a resource is destroyed, and the scan host access makes for incomplete writes of a buffer
+
+use std::range::Range;
 
 use crate::vk;
 use smallvec::SmallVec;
@@ -230,6 +232,22 @@ impl PendingAccesses {
             }
         }
     }
+}
+
+/// The latest value of the `writes` (ranges with the values of their submissions) that
+/// overlap `range` and that `completed` doesn't cover. `EVERY_BUFFER` overlaps every range but
+/// only ever holds completed writes; `EVERY_ACCELERATION_STRUCTURE` is empty.
+pub(crate) fn incomplete_write(
+    writes: impl Iterator<Item = (Range<u64>, u64)>,
+    range: Range<u64>,
+    completed: u64,
+) -> Option<u64> {
+    writes
+        .filter(|(write, value)| {
+            *value > completed && write.start.max(range.start) < write.end.min(range.end)
+        })
+        .map(|(_, value)| value)
+        .max()
 }
 
 pub(crate) fn all_write_access() -> vk::AccessFlags2 {
