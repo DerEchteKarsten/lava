@@ -47,6 +47,8 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - Ray tracing's triangle facing against lava's clockwise front faces is unverified (the tests cull nothing).
 
 ## lava: passes from lava-build-slang (lava's Slang frontend)
+----find solutions----
+- A pass that loads 8-bit integers through a buffer pointer needs `storage-8bit` (VUID-RuntimeSpirv-storageBuffer8BitAccess-06328; 16-bit ones probably `storage-16bit`, unchecked), but Slang declares only `Int8` for it, no `StorageBuffer8BitAccess`, so lava-build-slang gates it on `shader-int8` alone and the application has to assert the storage feature itself. The validation layer reports it only since lava enables `shaderUntypedPointers` (2026-10-19; the engine's meshlet triangle indices, now `assert-storage-8bit`). Reading the pass's loads (an `OpLoad` of an 8-bit type from `PhysicalStorageBuffer`) would let it gate them.
 ----intended----
 - `lava::init` takes one `PassMap`, so an application and a library on lava can't both bring passes; `BindingOutput` names its pass by index into that map.
 - The generated-binding tests need real buffers and images (`BufferSlice` and `ImageView` have no public constructor), so they run in `gpu_headless` instead of as unit tests.
