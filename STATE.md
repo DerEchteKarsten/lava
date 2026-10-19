@@ -6,7 +6,6 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 ----find solutions----
 - Recording one image on two timelines without a `Wait` between them corrupts its tracked state undetected (both move it); so does accessing a released image without waiting for the release's submission. A debug check could remember the last timeline and value per image.
 - Host image copies (`Image::copy_from`) leave the image's owner alone; check that against `VK_EXT_host_image_copy`'s rules for images another family owns.
-- `bindless::bind` rewriting a reserved slot that a submission in flight samples is undefined behaviour (core's texture slots: placeholder, then texture). With frames in flight, one that reads the slot is always pending, so no later moment to write it avoids this. Options: make `bind` `unsafe`, or write each new descriptor to a fresh slot and have the application index through a per-frame table.
 - Replaced swapchains are destroyed by their surface at its next `acquire`, so a surface that stops acquiring keeps its old swapchains (and their bindless slots) until it is dropped.
 - Recording 64 compute dispatches costs about 7% more than before timelines (`lava-tests` recording bench, 2026-10-17, `taskset -c 2`, alternating builds: 22 vs 20.5 µs; draws, declared accesses and mesh launches at par). Not found without a profiler; `compute_barriers` and the barrier log were ruled out.
 ----intended----
@@ -20,8 +19,6 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - `VkSwapchainPresentModesCreateInfoEXT` names only the swapchain's own mode, so a present-mode change recreates the swapchain.
 
 ## lava: optional features (cargo features `X` / `assert-X`, 2026-10-17)
-----find solutions----
-- `vkCmdDispatch(): ... 144 bytes were never set with vkCmdPushConstants` (a validation warning) on the engine's headless `render` of sponza, at `core/src/render/render.rs:802`: passes push only their own struct, and the rest of the range is never set.
 ----intended----
 - `PassKind` and the `kind::*` markers stay compiled whatever the features: they describe the pass map. A pass map whose SPIR-V needs a compiled-out feature fails at `init`, and its generated bindings don't compile.
 - `line-stipple` is one feature for every line mode the device has (default lines need `strictLines` and stippled rectangular lines), so a device with stippled Bresenham but not stippled smooth lines has no stippling at all.
@@ -29,6 +26,16 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - With `assert-present-fences` but no display, `Ctx::features().present_fences` is false while the code assumes fences; nothing presents headless, so nothing reads it.
 - The engine-facing `Gated` setters of `RasterState` check the capability whatever the value (`polygon_mode(FILL)` needs `fill-mode-non-solid` too).
 - Baked draw state can make many pipelines per pass on devices without the dynamic state (the 16-pipeline warning then names the pass); `dynamic-*` without `assert-` keeps that possible.
+
+## lava: descriptor heaps (`VK_EXT_descriptor_heap`, required since 2026-10-19)
+----find solutions----
+- Whether RenderDoc can capture an application on descriptor heaps is unchecked (none is installed here); Nsight Graphics 2026.2 can. lava can't fall back to descriptor sets.
+- `gpu_window` hung twice on 2026-10-19 in `vkAcquireNextImageKHR` (timeout `u64::MAX`) at its resize step (`a_new_size_recreates_the_swapchain_and_frees_the_old_slots`), once on the commit before the heaps and once after, then passed: probably while the compositor didn't show the test window. A finite acquire timeout would make it fail instead of hang.
+----intended----
+- A submission that copies queued `bind` rewrites waits once at its start for every earlier command of its queue, so batch rewrites. Another timeline sees a rewrite only after a `Wait` on that submission, and a submission of another timeline must not read a slot while it is rewritten (the same rule as shared images).
+- The heaps are `CpuToGpu` buffers, on a discrete GPU without ReBAR inside the 256 MiB BAR window (a few MiB: 4 MiB of image descriptors and 128 KiB of samplers on Intel). If a driver warns about host-visible heaps, make them device-local and copy every write the way `bind` copies rewrites.
+- `runtimeDescriptorArray` and non-uniform image array indexing stay required: `bindless.slang` still declares runtime arrays indexed with `NonUniformResourceIndex`, whose SPIR-V capabilities need them (direct heap access, see Ideas, would drop them).
+- Samplers aren't deduplicated: equal descriptions take a slot each (32 bytes on Intel).
 
 ## lava: ray tracing (tested by `gpu_ray_tracing`, not used by core yet)
 ----intended----
@@ -67,7 +74,6 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 - A failed pipeline creation poisons the pipeline cache of its kind for every later recording (72).
 - `cmd.present` marks the image presented while recording, so `surface.present()` inside the submit closure presents on an unsignalled semaphore; a failed swapchain recreation keeps the retired swapchain (77, 78).
 - The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `BindlessHandle` (87, 88).
-- Combined depth-stencil images can't be bound into reserved slots: `bindless::bind` gets the view of both aspects (52).
 
 ## Performance
 --- find solutions ---
@@ -79,6 +85,9 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 (hot reload is a debug feature anyways)
 
 ## Ideas
+
+### Direct heap access from Slang (2026-10-19)
+`bindless.slang` could index `ResourceDescriptorHeap`/`SamplerDescriptorHeap` (capability `spvDescriptorHeapEXT`) instead of declaring sets and bindings, which drops the mappings (`Bindless::mapping_info`), the runtime arrays and the indexing features, and makes indexing non-uniform by default. It needs a Slang SDK with PRs #10177 and #11798, slang-rs 0.1.0's bindgen built against it, and `VK_KHR_shader_untyped_pointers` enabled. It would also allow a one-`u32` `BindlessHandle` with the same index in both regions (SURVEY API 7), which changes `Img`'s layout in every engine struct, so it is its own decision.
 
 ### Multi-pass hardware counter captures (2026-10-15)
 `QueryPool::performance` refuses selections that need more than one counter pass, since a frame is submitted once. A tool capture could record one frame's command buffer once and submit it once per pass with `VkPerformanceQuerySubmitInfoKHR.counterPassIndex` (with the per-pass resets the extension asks for), reading each pass's counters from the same pool. It needs a submission path that replays a recorded command buffer, which `Submission` doesn't have.

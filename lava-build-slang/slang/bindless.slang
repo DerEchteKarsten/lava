@@ -1,11 +1,19 @@
 #pragma once
-// The application's samplers (`lava::Config::samplers`), then the sampled images.
+// lava maps these declarations to its descriptor heaps: the sampler heap (`lava::bindless::Sampler`,
+// both arrays alias it), then the resource heap's sampled and storage images.
 [vk::binding(0, 0)] SamplerState SamplerHeap[];
+[vk::binding(0, 0)] SamplerComparisonState SamplerCmpHeap[];
 [vk::binding(1, 0)] __DynamicResource TextureHeap[];
 [vk::binding(0, 1)] __DynamicResource RWTextureHeap[];
 
 /// Index of an unset bindless slot; matches `lava::bindless::NULL_HANDLE`.
 public static const uint32_t NULL_HANDLE = 0xFFFFFFFF;
+
+/// A sampler the application created (`lava::bindless::Sampler`), by its slot in the sampler
+/// heap: lava's `SamplerHandle`.
+public struct Sampler {
+    public uint32_t index;
+}
 
 
 public struct Img<E : ITexelElement, Shape : __ITextureShape, let U : int> {
@@ -20,12 +28,21 @@ public extension Img<E, Shape, 0> {
     [ForceInline] public E Load(vector<uint, Shape.dimensions> p) {
         return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>()[p];
     }
-    [ForceInline] public E Sample(vector<float, Shape.dimensions> uv, uint sampler = 0) {
-        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().Sample(SamplerHeap[sampler], uv);
+    [ForceInline] public E Sample(Sampler sampler, vector<float, Shape.dimensions> uv) {
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().Sample(SamplerHeap[NonUniformResourceIndex(sampler.index)], uv);
     }
     /// Sample at an explicit mip level, which compute shaders need.
-    [ForceInline] public E SampleLevel(vector<float, Shape.dimensions> uv, float level, uint sampler = 0) {
-        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().SampleLevel(SamplerHeap[sampler], uv, level);
+    [ForceInline] public E SampleLevel(Sampler sampler, vector<float, Shape.dimensions> uv, float level) {
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().SampleLevel(SamplerHeap[NonUniformResourceIndex(sampler.index)], uv, level);
+    }
+    /// With a comparison sampler (`SamplerDesc::compare`): the filtered share of texels that
+    /// pass `reference op texel` (percentage-closer filtering).
+    [ForceInline] public float SampleCmp(Sampler sampler, vector<float, Shape.dimensions> uv, float reference) {
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().SampleCmp(SamplerCmpHeap[NonUniformResourceIndex(sampler.index)], uv, reference);
+    }
+    /// `SampleCmp` at mip 0, which compute shaders need.
+    [ForceInline] public float SampleCmpLevelZero(Sampler sampler, vector<float, Shape.dimensions> uv, float reference) {
+        return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<T>().SampleCmpLevelZero(SamplerCmpHeap[NonUniformResourceIndex(sampler.index)], uv, reference);
     }
 }
 
@@ -123,9 +140,9 @@ public struct DynImg<E : ITexelElement = float4> {
     }
 
     /// Filtered sample for sampled images, nearest texel for storage images.
-    public E Sample(float2 uv, uint sampler = 0) {
+    public E Sample(Sampler sampler, float2 uv) {
         if (SampledIndex != NULL_HANDLE) {
-            return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<Sampled>().Sample(SamplerHeap[sampler], uv);
+            return TextureHeap[NonUniformResourceIndex(SampledIndex)].asOpaqueDescriptor<Sampled>().Sample(SamplerHeap[NonUniformResourceIndex(sampler.index)], uv);
         } else if (StorageIndex != NULL_HANDLE) {
             let image = RWTextureHeap[NonUniformResourceIndex(StorageIndex)].asOpaqueDescriptor<Storage>();
             uint width;

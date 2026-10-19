@@ -60,6 +60,7 @@ default = [
     "depth-clip-control",
     "logic-op",
     "sampler-anisotropy",
+    "sampler-minmax",
     "conservative-rasterization",
     "provoking-vertex",
     "rectangular-lines",
@@ -136,6 +137,8 @@ logic-op = []
 assert-logic-op = ["logic-op"]
 sampler-anisotropy = []
 assert-sampler-anisotropy = ["sampler-anisotropy"]
+sampler-minmax = []
+assert-sampler-minmax = ["sampler-minmax"]
 conservative-rasterization = []
 assert-conservative-rasterization = ["conservative-rasterization"]
 provoking-vertex = []

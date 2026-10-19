@@ -129,19 +129,10 @@ listed in `STATE.md`. Done items are removed.
     early.
 48. **Overlapping copy regions pass** *(plausible)* (`buffer/slice.rs:253-288`), and `src.len()`
     truncates a range that isn't a whole number of elements.
-49. **Unsupported device extensions are chained.** `properties2` always chains the ray tracing,
-    acceleration structure and mesh shader property structs (`state.rs:259-275`), and
-    `Vulkan13Features` is chained without checking `apiVersion` (`state.rs:228-358`,
-    `features.rs:653-686`). README promises a "Vulkan 1.4 driver"; nothing checks 1.3 or 1.4.
-50. **`maxPushConstantsSize >= 256` is a bare assert in bindless init** (`bindless.rs:489-490`),
-    not a device requirement, so a device with 128 bytes is picked and init panics.
-51. **Sampler anisotropy isn't checked** against `maxSamplerAnisotropy` or `>= 1`
-    (`bindless.rs:416-421`).
-52. **Combined depth-stencil images can't be bound into reserved slots** (`bindless.rs:325-333`).
-    `bind` takes `ImageView`, which carries the view of both aspects, never the depth-only one, so
-    its own advice ("bind through `DepthSplit` views") can't be followed. Conversely,
-    `bind_sampled` of a `Single` image of `Dynamic(D24_UNORM_S8_UINT)` binds both aspects
-    unchecked: `bind_raw` doesn't check what `format.rs:124-125` says `bind` checks.
+49. **Unsupported device extensions are chained.** *Partly fixed 2026-10-19:* `properties2` chains
+    only the property structs of extensions the device has, and devices below Vulkan 1.4 are
+    rejected. `Vulkan13Features` is still chained into the feature query of every device,
+    including those then rejected (`features.rs:653-686`).
 53. **Image commands miss format checks.**
     - `blit_image` (`image/slice.rs:308-367`) doesn't check `BLIT_SRC`/`BLIT_DST`, linear
       filtering support, integer formats with linear filtering, mixed signedness, or overlap.
@@ -178,8 +169,7 @@ listed in `STATE.md`. Done items are removed.
 62. **`VK_KHR_device_address_commands`'s dependencies aren't enabled** *(plausible)*
     (`state.rs` `LAVA_EXTENSIONS`): if it depends on something core only in 1.4, a 1.3 driver
     needs it enabled.
-63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`, and sampler
-    indices lack `NonUniformResourceIndex`, which a sampler from vertex data needs.
+63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`.
 
 ### Timelines, lifetimes and init (2026-10-18)
 64. **A `Timeline` dropped after `reserve()` or an unsubmitted `begin()` stops every destruction**
@@ -196,15 +186,14 @@ listed in `STATE.md`. Done items are removed.
     under the lock and run outside it, so two threads can run a view's and its image's destructors
     together or swapped.
 69. **`init` isn't atomic** (`lib.rs:126-134`). `STATE` and `FUNCTIONS` are set before bindless,
-    counter and pipeline init can fail (a sampler needing anisotropy, a pass needing a
-    compiled-out feature), so the device leaks and every retry says "already initialised".
+    counter and pipeline init can fail (a heap allocation, a pass needing a compiled-out
+    feature), so the device leaks and every retry says "already initialised".
 70. **Disabling `rebar` with `assert-host-image-copy` passes** (`state.rs:220-227, 370`,
     `features.rs:416-438`): `consistent()` then drops host image copy while it is compiled as
     asserted. Check `required.missing_from(&features)` on the final features.
 71. **Failed creations leak.** A failed `bind_buffer_memory` leaks the buffer and allocation
     (`buffer/mod.rs:177-179`); a failed command pool leaks the earlier slots' pools
-    (`timeline.rs:178-202`); the immutable samplers are never stored or destroyed, and a failure
-    part-way through bindless init leaks earlier objects (`bindless.rs:400-424, 595-605`).
+    (`timeline.rs:178-202`); a failure part-way through bindless init leaks the resource heap.
 72. **A failed pipeline creation poisons the cache for every pass of its kind**
     (`pipeline.rs:479-497`): `must` panics under the write guard, and every later `unwrap()` panics.
 73. **Hot reload can build from a destroyed module** (`pipeline.rs:229-307`): `cached` copies the
@@ -321,8 +310,7 @@ listed in `STATE.md`. Done items are removed.
   (`raster_state.rs:370-412`); a stencil change makes 8 calls where front equals back
   (`:640-648`); `unsized_struct!` accessors walk every earlier section (`unsized_struct.rs:12-28`);
   specialized ray tracing lookups take the read lock two or three times (`pipeline.rs:371-384`);
-  `Stamp::is_done` polls every timeline even when cached values suffice (`lifetime.rs:14-18`);
-  `bind_raw` builds two `Vec`s per descriptor (`bindless.rs:372-388`).
+  `Stamp::is_done` polls every timeline even when cached values suffice (`lifetime.rs:14-18`).
 - **`Features::of_spirv` copies each module and runs twice per pass** (`features.rs:189-225`,
   `pipeline.rs:158-179`); capabilities come first, so it can stop early.
 - **`acquire` queries surface capabilities every frame** *(plausible)* (`present.rs:331-335`), an
@@ -353,9 +341,6 @@ listed in `STATE.md`. Done items are removed.
   `DriverId::INTEL_OPEN_SOURCE_MESA` (`acceleration_structure.rs:25-32`).
 - **The debug callback works for every message.** It enables VERBOSE and INFO and formats each
   message before `tracing` filters it.
-- **Descriptor heaps or descriptor buffers** would turn `bind` into a memcpy. They would remove
-  the pool, the update-after-bind flags and the per-command-buffer binds of two sets, and make
-  user samplers and buffer descriptors cheap.
 - **Shader builds.** Each pass has its own Slang session, compiled serially, and there is never
   debug info, so no source-level shader debugging. `Shaders::optimization` exists now; core
   doesn't call it.
@@ -367,8 +352,8 @@ listed in `STATE.md`. Done items are removed.
 2. **`push_bindings` is positional** (15 arguments for `BvhCull`), so swapping two
    `BufferSlice<u32>`s or two `Mat4`s compiles. Generate a struct with named fields, with
    specialization constants as fields too (that removes `IncompleteX`).
-3. **`Config` lacks settings.** `lava::init(&Config)` has passes, display, validation, samplers
-   and disabled features.
+3. **`Config` lacks settings.** `lava::init(&Config)` has passes, display, validation and
+   disabled features.
    - **Missing settings:** app name and version, device choice (ranked by capability, user
      override, presentation support), extra extensions and a pNext hook, validation settings
      and queue counts.
@@ -402,8 +387,7 @@ listed in `STATE.md`. Done items are removed.
    - **Direction:** typed `#[non_exhaustive]` variants, and the rule "panic for programmer
      errors, `Err` for device and environment".
    - *2026-10-18, against that rule:* host copies return `Err` for a wrong mip, region or data
-     length while GPU copies panic (`image/mod.rs:674, 683-702`); `reserve_sampled(0)` and empty
-     `Config::samplers` panic (`bindless.rs:164-204, 401`); `init` returns `Result` but SPIR-V,
+     length while GPU copies panic (`image/mod.rs:674, 683-702`); `reserve_sampled(0)` panics; `init` returns `Result` but SPIR-V,
      module and pipeline failures panic through `must` (`pipeline.rs:157-225`); statistics
      without `mesh-shader-queries` return `Message`, not `MissingFeature` (`query/mod.rs:319-335`);
      `performance(0, ..)` takes the profiling lock for good before panicking (`:156, 384-402`).
@@ -425,8 +409,7 @@ listed in `STATE.md`. Done items are removed.
 12. **Shader facts are mirrored by hand.** Workgroup sizes appear as `div_ceil(8)` and
     `div_ceil(64)`, and constants like `MESHLET_STRIDE`, `INSTANCE_FLAG_BITS` and the overflow
     bits are copied. Generate `Pass::WORKGROUP_SIZE` with a `compute_threads(extent)`, and export
-    marked Slang constants. Shaders also pick `DEFAULT_SAMPLERS` by the magic index 2, with no
-    named constants and no documented order (`bindless.rs:225-253`).
+    marked Slang constants.
 13. **Indirect commands need byte gymnastics.** Core uses
     `byte_range(offset_of!..).cast::<MeshletDraw>()` and a 16→12-byte cast. Add field projection,
     and let indirect draws take any `T` that starts with the command, using its stride.
@@ -509,8 +492,6 @@ listed in `STATE.md`. Done items are removed.
     `X::zeroed()` of a generated struct names slot 0, core's first texture.
 24. **`bind` zips two iterators** (2026-10-18, `bindless.rs:308-345`): a length mismatch binds less
     silently, and core collects a `Vec` per frame to line them up. Take pairs and assert.
-    `SamplerDesc` has a `#[cfg]`'d public field and no `Default`, so struct literals break when the
-    feature flips (`:208-220`).
 25. **Presenting takes raw Vulkan** (2026-10-18, `present.rs:170-174, 269-281`):
     `PresentSurface::new` takes `vk::SurfaceFormatKHR`s and silently falls back to any format,
     and present modes are a `usize` into a per-device list with lava-owned strings, so a saved
@@ -556,7 +537,6 @@ listed in `STATE.md`. Done items are removed.
     generation.
   - **Memory:** transient (lazily allocated) attachments, aliasing in shared memory blocks,
     sparse residency, external memory interop.
-- **Samplers:** compare samplers for PCF, min/max reduction for depth pyramids.
 - **Slang coverage:**
   - **Types:** `half` and 16-bit ints (panic today, though float16 is enabled), 64-bit scalars
     and `bool` vectors, non-square matrices (no glam type), `float3x3` layout vs `Mat3`
@@ -690,8 +670,7 @@ CLAUDE.md, the `//!` line of `command_buffer/mod.rs` and STATE.md's `wait_idle` 
 with this survey. Still wrong:
 - **README:** "a draw's raster state is dynamic state, so pipelines depend only on the shaders,
   their constants and the attachment formats" (`README.md:10`) is stale since extended dynamic
-  state became optional; "every image sits in one of two global descriptor arrays" (`:5`) ignores
-  unbound images; "Vulkan 1.4 driver" (`:25`) is unchecked (bug 49).
+  state became optional.
 - **lava-build-slang README:** it doesn't say the application needs glam and bytemuck with
   `derive`, or that hot reload needs lava-build-slang as a normal dependency too. Pass discovery
   isn't recursive while `rerun-if-changed` is. `build.rs`'s comment implies `-lslang` is avoided,
@@ -699,8 +678,7 @@ with this survey. Still wrong:
 - **rustdoc:** `features::gate` is ambiguous between function and module (`features.rs:93`); the
   link to `watch` is unresolved (`lava-build-slang/src/lib.rs:31`); the links to `Instance`
   (`lib.rs:24-26`) and `Compute` (`queue/mod.rs:35-39`) break without their features.
-- **Module docs:** `bindless.rs`'s `//!` ends in a dangling ", handles" and omits the pipeline
-  layout; `image/usage.rs`'s says usages map to bindless sets, which `bind_raw` decides;
+- **Module docs:** `image/usage.rs`'s says usages map to bindless sets, which `bind_raw` decides;
   `tests.rs`'s omits the `unsized_struct!` test; `lifetime.rs`'s "in drop order" holds for one
   reclaimer only.
 - **Scope observers:** `observer.rs` and CLAUDE.md say what `on_enter` records comes before a
@@ -732,8 +710,6 @@ with this survey. Still wrong:
   buffer and nothing is asserted. Sync validation doesn't track buffer device addresses, so the
   "validation reports the missing barrier" premises at `:999-1001` and `:1523-1525` hold only as
   data checks *(plausible)*.
-- `binds_from_many_threads_are_serialised` (`:1109-1131`): the validation layer exempts
-  update-after-bind sets from its thread checks *(plausible)*, so it passes without the mutex.
 - The slot test's "taken until no frame reaches it" (`:1147`) passes because `bind()` doesn't poll.
 - The "submit in parallel" test (`:200-221`) checks results, not concurrency.
 - Bare `catch_unwind(..).is_err()` without the message passes on any panic (`:441-453, 1094-1103,
@@ -798,8 +774,8 @@ Each was checked by grep over lava-tests and `lava/src/tests.rs`.
 - **Slang shapes:** `MutTex2D`, `Image2D`, `DynImg`, handles or `Accel` inside structs behind a
   `Buf`; struct merging, padding and naming in codegen; the hand-copied constants
   (`MAX_PUSH_CONSTANTS_SIZE`, the clock constants) against lava and `profile.slang`.
-- **Bindless:** `OutOfBindlessSlots`, `Config::samplers` and samplers past index 0, anisotropy,
-  `Ranges::give`'s double-free panic, `bind` refusing an unreserved or dropped slot.
+- **Bindless:** `OutOfBindlessSlots`, `Ranges::give`'s double-free panic, `bind` refusing an
+  unreserved or dropped slot.
 - **Features:** `Features::consistent`, `without`/`missing_from`, `extensions()` agreeing with
   `optional()`, the cargo names in `SPIRV_CAPABILITIES`; the disabled ray tracing and
   performance paths in `gpu_missing_features`.

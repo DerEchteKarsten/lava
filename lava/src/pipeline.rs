@@ -21,7 +21,8 @@ use crate::command_buffer::{Blend, effective_write_mask};
 #[cfg(feature = "ray-tracing-pipeline")]
 use crate::vkobjects::rt_pipeline::RaytracingPipeline;
 
-/// The range of the shared pipeline layout; Vulkan 1.4 guarantees 256 bytes.
+/// The most bytes of push data a pass pushes; lava picks only devices with as much
+/// (`maxPushDataSize`).
 pub const MAX_PUSH_CONSTANTS_SIZE: usize = 256;
 
 /// Every pass of the application (the generated `PASS_MAP`).
@@ -524,9 +525,10 @@ fn create_compute_pipeline(
         .map_entries(pass.constants)
         .data(constants);
     let stage = make_shader_stage(entry, vk::ShaderStageFlags::COMPUTE, module, &info);
+    let mut flags = heap_flags();
     let create_info = vk::ComputePipelineCreateInfo::default()
-        .layout(Bindless::layout())
-        .stage(stage);
+        .stage(stage)
+        .push_next(&mut flags);
     let pipeline = unsafe {
         Ctx::device()
             .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
@@ -602,20 +604,30 @@ fn create_raytracing_pipeline(
         );
     }
     let counts = [1, miss.len(), hit.len(), callable.len()].map(|n| n as u32);
-    RaytracingPipeline::new(Bindless::layout(), &stages, &groups, counts, max_recursion)
+    RaytracingPipeline::new(&stages, &groups, counts, max_recursion)
 }
 
+/// Every pipeline reads the descriptor heaps and has no layout.
+pub(crate) fn heap_flags() -> vk::PipelineCreateFlags2CreateInfoKHR<'static> {
+    vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PIPELINE_CREATE_2_DESCRIPTOR_HEAP_EXT)
+}
+
+/// A stage of `entry`, with the mappings of `bindless.slang`'s declarations to the heaps.
 fn make_shader_stage<'a>(
     entry: &'a str,
     stage: vk::ShaderStageFlags,
     module: vk::ShaderModule,
     constants: &'a vk::SpecializationInfo<'a>,
 ) -> vk::PipelineShaderStageCreateInfo<'a> {
-    vk::PipelineShaderStageCreateInfo::default()
+    let mut info = vk::PipelineShaderStageCreateInfo::default()
         .stage(stage)
         .module(module)
         .name(CStr::from_bytes_with_nul(entry.as_bytes()).unwrap())
-        .specialization_info(constants)
+        .specialization_info(constants);
+    // `push_next` takes `&mut`, which the stages can't share; the mappings live as long as lava.
+    let mappings: *const vk::ShaderDescriptorSetAndBindingMappingInfoEXT = Bindless::mapping_info();
+    info.p_next = mappings.cast();
+    info
 }
 
 fn create_raster_pipeline(
@@ -837,9 +849,10 @@ fn create_raster_pipeline(
     }
     let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default();
 
+    let mut flags = heap_flags();
     create_info = create_info
         .stages(&stages)
-        .layout(Bindless::layout())
+        .push_next(&mut flags)
         .dynamic_state(&dynamic_state)
         .multisample_state(&multisampling)
         .color_blend_state(&color_blend_state)

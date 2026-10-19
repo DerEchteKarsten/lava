@@ -4,6 +4,7 @@ use std::{hint::black_box, time::Instant};
 
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
+    bindless::{Sampler, SamplerDesc},
     buffer::{
         Buffer,
         usage::{Index, Storage},
@@ -32,6 +33,7 @@ type Texture = Image<R8G8B8A8Unorm, SampledTransferDst>;
 struct Resources {
     target: Target,
     textures: Vec<Texture>,
+    sampler: Sampler,
     src: Buffer<u32, Storage>,
     dst: Vec<Buffer<u32, Storage>>,
     out: Buffer<u32, Storage>,
@@ -84,7 +86,7 @@ fn compute(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
 /// 8 renderings of 8 indexed draws, each with a vertex buffer, a texture and two declared ones.
 fn many_draws(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     let draw = |i: usize| {
-        TestRasterTextured::push_bindings(r.textured[i].range(..), r.textures[i].whole_view(), 0)
+        TestRasterTextured::push_bindings(r.textured[i].range(..), r.textures[i].whole_view(), r.sampler.handle())
     };
     let textures = |d: usize| {
         [(d + 1) % TEXTURES, (d + 32) % TEXTURES]
@@ -148,6 +150,7 @@ fn main() {
     let mut timeline = Timeline::<Graphics>::new(2).unwrap();
     let buffer = |len| Buffer::new(len, false).unwrap();
     let resources = Resources {
+        sampler: Sampler::new(&SamplerDesc::new()).unwrap(),
         target: Target::new(EXTENT).unwrap().bind_storage().unwrap(),
         textures: (0..TEXTURES)
             .map(|_| {

@@ -8,7 +8,6 @@ use crate::vk::{self, IndexType, PipelineStageFlags2 as S2};
 #[cfg(feature = "acceleration-structure")]
 use crate::vkobjects::acceleration_structure::Tlas;
 use crate::{
-    bindless::Bindless,
     buffer::{
         self,
         slice::BufferSlice,
@@ -18,7 +17,7 @@ use crate::{
         format::Format,
         kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StorageView},
     },
-    pipeline::{RasterKeyRef, pass_map, pipelines},
+    pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterKeyRef, pass_map, pipelines},
     present::Present,
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
@@ -1274,15 +1273,19 @@ impl<'p> Recording<'p> {
         if constants.is_empty() {
             return;
         }
-        unsafe {
-            Ctx::device().cmd_push_constants(
-                self.handle,
-                Bindless::layout(),
-                vk::ShaderStageFlags::ALL,
-                0,
-                constants,
-            )
+        // Push data comes in whole words.
+        let mut padded = [0u8; MAX_PUSH_CONSTANTS_SIZE];
+        let data = if constants.len() % 4 == 0 {
+            constants
+        } else {
+            padded[..constants.len()].copy_from_slice(constants);
+            &padded[..constants.len().next_multiple_of(4)]
         };
+        let info = vk::PushDataInfoEXT::default().data(vk::HostAddressRangeConstEXT {
+            address: data.as_ptr().cast(),
+            size: data.len(),
+        });
+        unsafe { Functions::descriptor_heap().cmd_push_data(self.handle, &info) };
     }
 
     /// Records the barriers a command with these accesses needs and tracks its accesses.

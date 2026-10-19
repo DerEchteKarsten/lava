@@ -1,8 +1,8 @@
-//! Sealed marker traits that commands, bindless binds and generated bindings bound by: what a view can be used as (`SampledView`, `ColorTarget`, `TransferSrcView`, ...; regions are an `ImageSlice` of one) and which images shaders can bind (`SampledImage`, `StorageImage`, through `ShaderViews`)
+//! Sealed marker traits that commands, bindless binds and generated bindings bound by: what a view can be used as (`SampledView`, `ColorTarget`, `TransferSrcView`, ...; regions are an `ImageSlice` of one) and which images shaders can bind (`SampledImage`, `StorageImage`)
 use crate::image::{
-    DepthSplit, DepthSplitMips, Image, PerMip, Single, Views,
+    Image, Views,
     dim::{D2, Dim},
-    format::{ColorAspect, CombinedDepthStencil, DepthAspect, Format, SingleAspect},
+    format::{ColorAspect, DepthAspect, Format},
     slice::ImageView,
     usage::{
         ImageUsage, IsColorAttachment, IsDepthAttachment, IsSampled, IsStorage, IsTransferDst,
@@ -65,32 +65,11 @@ impl<F: Format + ColorAspect, U: IsTransferDst, D: Dim> TransferDstView
 {
 }
 
-/// Views that give shaders one aspect of `F`: [`Single`] and [`PerMip`] for a format of one
-/// aspect, [`DepthSplit`] and [`DepthSplitMips`] for a combined depth-stencil one.
-pub trait ShaderViews<F: Format>: Views {}
-impl<F: Format + SingleAspect> ShaderViews<F> for Single {}
-impl<F: Format + SingleAspect> ShaderViews<F> for PerMip {}
-impl<F: Format + CombinedDepthStencil> ShaderViews<F> for DepthSplit {}
-impl<F: Format + CombinedDepthStencil> ShaderViews<F> for DepthSplitMips {}
-
-/// An image that can be bound in the sampled set: a sampled usage and views that show shaders
-/// one aspect. A combined depth-stencil image needs [`DepthSplit`] views:
-/// ```
-/// # use lava::image::{D2, DepthSplit, Image, format::D32SfloatS8Uint, usage::DepthAttachmentSampled};
-/// fn bind(image: Image<D32SfloatS8Uint, DepthAttachmentSampled, D2, DepthSplit>) {
-///     let _ = image.bind_sampled();
-/// }
-/// ```
-/// ```compile_fail
-/// # use lava::image::{Image, format::D32SfloatS8Uint, usage::DepthAttachmentSampled};
-/// fn bind(image: Image<D32SfloatS8Uint, DepthAttachmentSampled>) {
-///     let _ = image.bind_sampled();
-/// }
-/// ```
+/// An image that can be bound in the sampled set. Shaders see one aspect: depth for a combined
+/// depth-stencil format.
 pub trait SampledImage: crate::sealed::Sealed {}
-impl<F: Format, U: IsSampled, D: Dim, V: ShaderViews<F>> SampledImage for Image<F, U, D, V> {}
+impl<F: Format, U: IsSampled, D: Dim, V: Views> SampledImage for Image<F, U, D, V> {}
 
-/// An image that can be bound in the storage set: a storage usage and views that show shaders
-/// one aspect.
+/// An image that can be bound in the storage set.
 pub trait StorageImage: crate::sealed::Sealed {}
-impl<F: Format, U: IsStorage, D: Dim, V: ShaderViews<F>> StorageImage for Image<F, U, D, V> {}
+impl<F: Format, U: IsStorage, D: Dim, V: Views> StorageImage for Image<F, U, D, V> {}

@@ -52,6 +52,8 @@ pub struct PhysicalDevice {
     pub properties: vk::PhysicalDeviceProperties,
     pub mesh_shader_properties: vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>,
     pub vk12_properties: vk::PhysicalDeviceVulkan12Properties<'static>,
+    /// Zeroed on a device without `VK_EXT_descriptor_heap`, which lava never picks.
+    pub descriptor_heap_properties: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
     pub queue_families: Vec<QueueFamily>,
     pub supported_extensions: Vec<String>,
     /// The optional features it has, which lava enables if it picks it.

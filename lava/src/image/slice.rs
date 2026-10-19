@@ -43,6 +43,8 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         self.image
     }
 
+    /// Its `VkImageView`, which only images with an attachment usage have (null otherwise):
+    /// descriptors are written without one.
     pub fn view(&self) -> vk::ImageView {
         self.view
     }

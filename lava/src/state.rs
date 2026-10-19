@@ -8,11 +8,8 @@ use std::{
 };
 
 use crate::error::{Error, Result};
-use ash::{
-    Device, Entry,
-    ext::debug_utils,
-    vk::{self, Handle, make_api_version},
-};
+use crate::vk::{self, Handle, make_api_version};
+use ash::{Device, Entry, ext::debug_utils};
 use gpu_allocator::{
     AllocationSizes, AllocatorDebugSettings,
     vulkan::{Allocator, AllocatorCreateDesc},
@@ -24,6 +21,7 @@ use std::ffi::{CStr, CString};
 use crate::features::{Loader, gate, load, loaded};
 use crate::{
     Config,
+    pipeline::MAX_PUSH_CONSTANTS_SIZE,
     features::{DeviceFacts, FeatureChain, Features, LAVA_EXTENSIONS},
     queue::{
         Kind,
@@ -261,17 +259,29 @@ impl Ctx {
                 let mut acc_properties =
                     vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
                 let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
-                let mut properties2 = vk::PhysicalDeviceProperties2::default()
-                    .push_next(&mut rt_pipeline_properties)
-                    .push_next(&mut acc_properties)
-                    .push_next(&mut mesh_shader_properties)
-                    .push_next(&mut vk12_properties);
+                let mut heap_properties = vk::PhysicalDeviceDescriptorHeapPropertiesEXT::default();
+                // Only the structs of extensions the device has.
+                let mut properties2 =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut vk12_properties);
+                if has(ash::khr::ray_tracing_pipeline::NAME) {
+                    properties2 = properties2.push_next(&mut rt_pipeline_properties);
+                }
+                if has(ash::khr::acceleration_structure::NAME) {
+                    properties2 = properties2.push_next(&mut acc_properties);
+                }
+                if has(ash::ext::mesh_shader::NAME) {
+                    properties2 = properties2.push_next(&mut mesh_shader_properties);
+                }
+                if has(vk::descriptor_heap::NAME) {
+                    properties2 = properties2.push_next(&mut heap_properties);
+                }
                 unsafe { instance.get_physical_device_properties2(handel, &mut properties2) };
                 // Detach them from the chain on this stack.
                 mesh_shader_properties.p_next = std::ptr::null_mut();
                 vk12_properties.p_next = std::ptr::null_mut();
                 rt_pipeline_properties.p_next = std::ptr::null_mut();
                 acc_properties.p_next = std::ptr::null_mut();
+                heap_properties.p_next = std::ptr::null_mut();
                 let _ = (&rt_pipeline_properties, &acc_properties);
 
                 let mem_properties =
@@ -295,10 +305,18 @@ impl Ctx {
                     dedicated_transfer: families.as_ref().is_some_and(|f| f.transfer.is_some()),
                 };
                 let supported_features = chain.optional(&has, facts);
-                let lava_missing = chain.lava_missing(&has);
+                let mut lava_missing = chain.lava_missing(&has);
+                if properties.api_version < make_api_version(0, 1, 4, 0) {
+                    lava_missing.push("Vulkan 1.4".into());
+                }
+                let push_data = MAX_PUSH_CONSTANTS_SIZE as u64;
+                if has(vk::descriptor_heap::NAME) && heap_properties.max_push_data_size < push_data {
+                    lava_missing.push(format!("{push_data} bytes of push data (maxPushDataSize)"));
+                }
                 Ok(PhysicalDevice {
                     properties,
                     mesh_shader_properties,
+                    descriptor_heap_properties: heap_properties,
                     vk12_properties,
                     mem_properties,
                     handel,
@@ -473,6 +491,7 @@ impl Ctx {
                 device_address_commands: crate::vk::device_address_commands::Device::new(
                     &instance, &device,
                 ),
+                descriptor_heap: crate::vk::descriptor_heap::Device::new(&instance, &device),
                 swapchain: ash::khr::swapchain::Device::new(&instance, &device),
                 instance,
                 entry,
@@ -594,6 +613,7 @@ pub struct Functions {
     line_rasterization: ash::khr::line_rasterization::Device,
     depth_clamp_control: crate::vk::depth_clamp_control::Device,
     device_address_commands: crate::vk::device_address_commands::Device,
+    descriptor_heap: crate::vk::descriptor_heap::Device,
     entry: ash::Entry,
     swapchain: ash::khr::swapchain::Device,
     surface: Option<ash::khr::surface::Instance>,
@@ -636,6 +656,9 @@ impl Functions {
     }
     pub(crate) fn device_address_commands() -> &'static crate::vk::device_address_commands::Device {
         &get().device_address_commands
+    }
+    pub(crate) fn descriptor_heap() -> &'static crate::vk::descriptor_heap::Device {
+        &get().descriptor_heap
     }
     pub(crate) fn dynamic_state2() -> &'static ash::ext::extended_dynamic_state2::Device {
         &get().dynamic_state2

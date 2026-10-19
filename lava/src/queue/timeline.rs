@@ -336,7 +336,12 @@ impl<K: QueueKind> Submission<'_, K> {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(slot.cmd, &begin_info)? };
-        Bindless::bind(&slot.cmd, K::KIND);
+        Bindless::bind(slot.cmd, K::KIND);
+        // Rewrites of reserved slots, ordered after the queue's earlier commands.
+        let queued = match K::KIND {
+            Kind::Transfer => Default::default(),
+            _ => Bindless::flush_queued(slot.cmd),
+        };
         let prev = CALLSITE.replace(None);
         let was_recording = lifetime::RECORDING.replace(true);
         let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| record(&mut cmd)));
@@ -403,6 +408,7 @@ impl<K: QueueKind> Submission<'_, K> {
             }
         };
         if result.is_err() {
+            Bindless::requeue(queued);
             let replayed = (|| -> Result<()> {
                 unsafe {
                     device.reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())?;

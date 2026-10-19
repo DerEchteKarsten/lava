@@ -16,14 +16,18 @@
 //!
 //! # Shader contract
 //! What every frontend's shaders and generated code must match:
-//! - Descriptor set 0: binding 0 holds the immutable samplers ([`Config::samplers`], by index),
-//!   binding 1 the bindless sampled images; set 1, binding 0 the bindless storage images. Passes
-//!   have no other descriptors.
-//! - One push-constant range over all stages, [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes; a pass
-//!   pushes its own struct from offset 0. Specialization constants have no size limit.
+//! - Descriptors live in two heaps (`VK_EXT_descriptor_heap`), which shaders reach through set
+//!   and binding declarations lava maps to them: set 0, binding 0 is the sampler heap's array of
+//!   [`bindless::Sampler`]s; set 0, binding 1 the sampled images and set 1, binding 0 the storage
+//!   images of the resource heap. Passes have no other descriptors.
+//! - Push data: a pass pushes its own struct from offset 0, at most
+//!   [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes, read as `[[vk::push_constant]]`.
+//!   Specialization constants have no size limit.
 //! - Shaders see [`bindless::BindlessHandle`] (two `u32` indices, sampled then storage,
-//!   [`bindless::NULL_HANDLE`] for none) and [`vkobjects::acceleration_structure::Instance`]
-//!   (`VkAccelerationStructureInstanceKHR`); a TLAS is a `u64` device address.
+//!   [`bindless::NULL_HANDLE`] for none), [`bindless::SamplerHandle`] (a `u32` index; there are
+//!   no samplers but the ones the application creates) and
+//!   [`vkobjects::acceleration_structure::Instance`] (`VkAccelerationStructureInstanceKHR`); a
+//!   TLAS is a `u64` device address.
 //! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) has
 //!   bindings [`features::Gated`] by it.
 //!
@@ -91,7 +95,7 @@ macro_rules! include_passes {
 }
 
 #[derive(Clone, Copy)]
-pub struct Config<'a> {
+pub struct Config {
     /// The `PASS_MAP` of [`include_passes!`].
     pub passes: &'static pipeline::PassMap,
     /// The display to create [`present::PresentSurface`]s for; `None` runs headless.
@@ -100,21 +104,18 @@ pub struct Config<'a> {
     pub validation: bool,
     /// GPU-assisted validation on top of `validation`.
     pub gpu_assisted_validation: bool,
-    /// The immutable samplers shaders pick by index; at least one.
-    pub samplers: &'a [bindless::SamplerDesc],
     /// Optional features lava leaves off even where the device has them (not asserted ones).
     pub disabled: Features,
 }
 
-impl Config<'static> {
-    /// Headless, without validation, with [`bindless::DEFAULT_SAMPLERS`] and no disabled features.
+impl Config {
+    /// Headless, without validation and with no disabled features.
     pub fn new(passes: &'static pipeline::PassMap) -> Self {
         Self {
             passes,
             display: None,
             validation: false,
             gpu_assisted_validation: false,
-            samplers: &bindless::DEFAULT_SAMPLERS,
             disabled: Features::DEFAULT,
         }
     }
@@ -126,7 +127,7 @@ impl Config<'static> {
 pub fn init(config: &Config) -> Result<()> {
     Ctx::init(config)?;
     let _ = pipeline::PASS_MAP.set(config.passes);
-    Bindless::init(config.samplers)?;
+    Bindless::init()?;
     #[cfg(feature = "performance-query")]
     query::counters::init()?;
     pipeline::init()?;
@@ -146,14 +147,15 @@ pub fn wait_idle() -> Result<()> {
     Ok(())
 }
 
-/// Waits for the device, then destroys everything dropped so far and the bindless sets; drop the
-/// timelines first.
+/// Waits for the device, then destroys everything dropped so far and the descriptor heaps; drop
+/// the timelines first.
 #[track_caller]
 pub fn destroy() {
     CALLSITE.set(Some(Location::caller().clone()));
     if let Err(err) = wait_idle() {
         tracing::error!(%err, "failed to wait for the device before destroying lava");
     }
+    Bindless::destroy();
     loop {
         let destroy = queue::lock(&lifetime::RETIRED).pop_front();
         match destroy {
@@ -161,5 +163,4 @@ pub fn destroy() {
             None => break,
         }
     }
-    Bindless::destroy();
 }

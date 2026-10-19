@@ -7,6 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use bytemuck::Pod;
 use lava::{
+    bindless::{Sampler, SamplerDesc, SamplerHandle},
     buffer::{Buffer, usage::StaticUsage},
     command_buffer::CommandBuffer,
     queue::{Graphics, Timeline, Wait},
@@ -74,12 +75,25 @@ static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
         ..lava::Config::new(&lava_tests::bindings::PASS_MAP)
     };
     lava::init(&config).expect(
-        "headless lava init failed; the GPU tests need a Vulkan 1.4 GPU and the Khronos validation layer",
+        "headless lava init failed; the GPU tests need a Vulkan 1.4 GPU with VK_EXT_descriptor_heap and the Khronos validation layer",
     );
+    let nearest = SamplerDesc::new()
+        .filter(lava::vk::Filter::NEAREST)
+        .mipmap_mode(lava::vk::SamplerMipmapMode::NEAREST)
+        .address_mode(lava::vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .border_color(lava::vk::BorderColor::FLOAT_OPAQUE_WHITE);
+    let _ = NEAREST.set(Sampler::new(&nearest).unwrap());
     Mutex::new(Gpu {
         timeline: Timeline::new(2).unwrap(),
     })
 });
+
+static NEAREST: OnceLock<Sampler> = OnceLock::new();
+
+/// A sampler of the nearest texel and mip, clamped to a white border; after the first `gpu()`.
+pub fn nearest() -> SamplerHandle {
+    NEAREST.get().expect("`gpu()` creates the samplers").handle()
+}
 
 /// Exclusive access to the GPU for one test; fails it on validation errors when dropped.
 pub struct GpuGuard(MutexGuard<'static, Gpu>);

@@ -17,7 +17,6 @@ impl RaytracingPipeline {
     /// `groups` are in binding table order: one raygen, then `counts[1]` miss, `counts[2]` hit
     /// and `counts[3]` callable groups.
     pub(crate) fn new(
-        layout: vk::PipelineLayout,
         stages: &[vk::PipelineShaderStageCreateInfo],
         groups: &[vk::RayTracingShaderGroupCreateInfoKHR],
         counts: [u32; 4],
@@ -32,8 +31,9 @@ impl RaytracingPipeline {
                 properties.max_ray_recursion_depth
             )));
         }
+        let mut flags = crate::pipeline::heap_flags();
         let info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .layout(layout)
+            .push_next(&mut flags)
             .stages(stages)
             .groups(groups)
             .max_pipeline_ray_recursion_depth(max_recursion);

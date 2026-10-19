@@ -47,10 +47,13 @@ const BUFFER_TYPES: [&str; 2] = ["Buf", "MutBuf"];
 const HANDLE_TYPES: [&str; 2] = ["Img", "DynImg"];
 const ACCEL_TYPES: [&str; 1] = ["Accel"];
 /// (Slang name, Rust path) of the Slang structs that mirror a lava type.
-const MIRRORED_TYPES: [(&str, &str); 1] = [(
-    "AccelerationStructureInstance",
-    "lava::vkobjects::acceleration_structure::Instance",
-)];
+const MIRRORED_TYPES: [(&str, &str); 2] = [
+    (
+        "AccelerationStructureInstance",
+        "lava::vkobjects::acceleration_structure::Instance",
+    ),
+    ("Sampler", "lava::bindless::SamplerHandle"),
+];
 
 const CLOCK_TYPE: &str = "Clock";
 /// Copies of `CLOCK_STRIPE_WORDS` and `CLOCK_TICK_BITS` in `slang/profile.slang`.
@@ -58,8 +61,9 @@ const CLOCK_STRIPE_WORDS: usize = 8;
 const CLOCK_TICK_BITS: u32 = 40;
 
 /// (name, binding, set) of lava's bindless descriptors, the only descriptors a pass may have.
-const LAVA_DESCRIPTORS: [(&str, u32, u32); 3] = [
+const LAVA_DESCRIPTORS: [(&str, u32, u32); 4] = [
     ("SamplerHeap", 0, 0),
+    ("SamplerCmpHeap", 0, 0),
     ("TextureHeap", 1, 0),
     ("RWTextureHeap", 0, 1),
 ];

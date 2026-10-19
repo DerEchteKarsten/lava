@@ -2,7 +2,7 @@
 
 A Vulkan abstraction for Rust that keeps Vulkan's model but takes its bookkeeping off your hands:
 
-- **Bindless resources.** Every image sits in one of two global descriptor arrays, at slots lava allocates, and shaders reach buffers through device addresses. Passes have no descriptor sets of their own.
+- **Bindless resources.** Every image you bind for shaders sits in one global descriptor heap (`VK_EXT_descriptor_heap`) at slots lava allocates, samplers are runtime objects in the sampler heap, and shaders reach buffers through device addresses. Passes have no descriptor sets or pipeline layouts.
 - **Automatic barriers.** Commands know what they read and write, so lava records the barriers and layout transitions between them, per image and buffer range.
 - **Typed passes generated from shaders.** `lava-build-slang` compiles your Slang passes in your build script and generates a Rust function per pass whose arguments are the pass's push constants: buffer slices, image views, plain values. A wrong buffer or image type doesn't compile.
 - **Timelines.** Work is submitted on up to eight timelines (graphics, and async compute and transfer where the device has them), ordered across them with waits, with image ownership transfers recorded on request. Presenting needs no semaphores of your own: the swapchain image's acquire and present follow from what your submission does with it.
@@ -22,7 +22,7 @@ lava is young (0.x) and is developed alongside a game engine. Expect breaking ch
 ## Requirements
 
 - Rust 1.96 or newer.
-- A Vulkan 1.4 driver with `VK_KHR_device_address_commands`. `lava::init` names whatever a GPU lacks.
+- A Vulkan 1.4 driver with `VK_KHR_device_address_commands` and `VK_EXT_descriptor_heap` (Mesa 26.2, NVIDIA 610). `lava::init` names whatever a GPU lacks.
 - Everything else is optional (`lava::Features`: mesh shaders, ray tracing, BC textures, extended dynamic state, …), and each optional feature is two cargo features:
   - `X` (all of them are default) compiles it, and lava checks the device where it is used. Functions that need it return `lava::features::Gated` values: `Result`s with `MissingFeature`. That includes the generated bindings of a pass whose SPIR-V needs it.
   - `assert-X` makes `lava::init` refuse a device without it. The checks go, and those functions return their value directly.

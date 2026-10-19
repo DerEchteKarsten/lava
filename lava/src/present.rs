@@ -417,10 +417,16 @@ impl<U: StaticUsage> PresentSurface<U> {
                             *set.index_mut(&mut image.handle) = index;
                             indices.push(index);
                         }
-                        bindless::bind_raw(
-                            swapchain.images.iter().map(|image| (image.view, usage)),
-                            indices.into_iter().map(|index| set.handle(index)),
-                        );
+                        let format = self.format.format;
+                        let images = swapchain.images.iter().map(|image| bindless::ShaderImage {
+                            image: image.image,
+                            format,
+                            aspects: vk::ImageAspectFlags::COLOR,
+                            view_type: vk::ImageViewType::TYPE_2D,
+                            mips: (0..1).into(),
+                            usage,
+                        });
+                        bindless::bind_raw(images, indices.into_iter().map(|index| set.handle(index)), false)?;
                     }
                     Ok(())
                 })();

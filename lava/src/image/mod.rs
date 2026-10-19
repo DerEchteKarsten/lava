@@ -1,6 +1,5 @@
-//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (plus depth-only views for depth-stencil formats, `DepthSplit`), host uploads (`host-image-copy`), type erasure, and their destruction once no frame can reach them
+//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`), type erasure, and their destruction once no frame can reach them
 use std::{
-    iter,
     mem::{self, ManuallyDrop},
     range::Range,
     sync::atomic::AtomicU64,
@@ -32,8 +31,8 @@ pub mod usage;
 
 pub use dim::{D2, D3, Dim};
 pub use kind::{
-    ColorTarget, DepthTarget, ImageRef, SampledImage, SampledView, ShaderViews, StorageImage,
-    StorageView, TransferDstView, TransferSrcView,
+    ColorTarget, DepthTarget, ImageRef, SampledImage, SampledView, StorageImage, StorageView,
+    TransferDstView, TransferSrcView,
 };
 
 /// The `vk::Image` and its memory. It has no public constructor, so only lava implements
@@ -49,17 +48,20 @@ pub struct RawImage<F: Format, U: ImageUsage, D: Dim> {
 }
 
 impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
-    fn create_view(
-        &self,
-        mips: Range<u32>,
-        aspect_mask: vk::ImageAspectFlags,
-    ) -> Result<vk::ImageView> {
+    /// A view of `mips` over every aspect where renderings need one (attachment usages), else
+    /// null: descriptors are written from a view's description, without a view object.
+    fn create_view(&self, mips: Range<u32>) -> Result<vk::ImageView> {
+        let attachment =
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        if !self.usage.flags().intersects(attachment) {
+            return Ok(vk::ImageView::null());
+        }
         let info = vk::ImageViewCreateInfo::default()
             .image(self.image)
             .view_type(D::VIEW_TYPE)
             .format(self.format.vk_format())
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask,
+                aspect_mask: self.format.aspects(),
                 base_mip_level: mips.start,
                 level_count: mips.end - mips.start,
                 base_array_layer: 0,
@@ -82,28 +84,24 @@ impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
     }
 }
 
-/// What an image keeps per view: [`Single`], [`PerMip`], or for a combined depth-stencil format
-/// [`DepthSplit`] and [`DepthSplitMips`].
+/// What an image keeps per view: [`Single`] or [`PerMip`].
 pub trait Views: crate::sealed::Sealed + std::fmt::Debug + Send + Sync + 'static + Sized {
     #[doc(hidden)]
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self>;
-    /// The view over every mip and aspect, its handle and the states it covers.
+    /// The view over every mip and aspect (null without attachment usage), its handle and the
+    /// states it covers.
     #[doc(hidden)]
     fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]);
     #[doc(hidden)]
     fn whole_handle(&mut self) -> &mut BindlessHandle;
-    /// The view descriptors get: the whole view, or the depth-only one of split views.
-    #[doc(hidden)]
-    fn shader_view(&self) -> vk::ImageView {
-        self.whole().0
-    }
 }
 
-/// Views with one view per mip besides the whole one: [`PerMip`] and [`DepthSplitMips`].
+/// Views with one view per mip besides the whole one: [`PerMip`].
 pub trait MipViews: Views {
-    /// Mip `level`'s view over every aspect, the one descriptors get, its handle and state.
+    /// Mip `level`'s view over every aspect (null without attachment usage), its handle and
+    /// state.
     #[doc(hidden)]
-    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU64);
+    fn mip(&self, level: u32) -> (vk::ImageView, BindlessHandle, &AtomicU64);
     #[doc(hidden)]
     fn mip_handle_mut(&mut self, level: u32) -> &mut BindlessHandle;
 }
@@ -132,23 +130,6 @@ struct MipView {
     handle: BindlessHandle,
 }
 
-/// [`Single`] for a combined depth-stencil format, plus the depth-only view shaders read (a
-/// shader view can't have both aspects).
-#[derive(Debug)]
-pub struct DepthSplit {
-    views: Single,
-    shader: vk::ImageView,
-}
-
-/// [`PerMip`] for a combined depth-stencil format, plus depth-only views of the whole image and
-/// each mip for shaders.
-#[derive(Debug)]
-pub struct DepthSplitMips {
-    views: PerMip,
-    shader: vk::ImageView,
-    mip_shaders: Box<[vk::ImageView]>,
-}
-
 fn undefined() -> AtomicU64 {
     ImageState::UNDEFINED.atomic()
 }
@@ -156,9 +137,8 @@ fn undefined() -> AtomicU64 {
 impl crate::sealed::Sealed for Single {}
 impl Views for Single {
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
-        let aspects = raw.format.aspects();
         Ok(Single {
-            view: raw.create_view((0..raw.mip_levels).into(), aspects)?,
+            view: raw.create_view((0..raw.mip_levels).into())?,
             handle: BindlessHandle::none(),
             state: undefined(),
         })
@@ -174,7 +154,6 @@ impl Views for Single {
 impl crate::sealed::Sealed for PerMip {}
 impl Views for PerMip {
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
-        let aspects = raw.format.aspects();
         // Built up front, so `Drop` destroys whatever was created before an error.
         let mut views = PerMip {
             view: vk::ImageView::null(),
@@ -182,10 +161,10 @@ impl Views for PerMip {
             mips: Box::new([]),
             layouts: (0..raw.mip_levels).map(|_| undefined()).collect(),
         };
-        views.view = raw.create_view((0..raw.mip_levels).into(), aspects)?;
+        views.view = raw.create_view((0..raw.mip_levels).into())?;
         let mut mips = Vec::with_capacity(raw.mip_levels as usize);
         for mip in 0..raw.mip_levels {
-            match raw.create_view((mip..mip + 1).into(), aspects) {
+            match raw.create_view((mip..mip + 1).into()) {
                 Ok(view) => mips.push(MipView {
                     view,
                     handle: BindlessHandle::none(),
@@ -208,99 +187,20 @@ impl Views for PerMip {
 }
 
 impl MipViews for PerMip {
-    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU64) {
+    fn mip(&self, level: u32) -> (vk::ImageView, BindlessHandle, &AtomicU64) {
         let mip = &self.mips[level as usize];
-        (
-            mip.view,
-            mip.view,
-            mip.handle,
-            &self.layouts[level as usize],
-        )
+        (mip.view, mip.handle, &self.layouts[level as usize])
     }
     fn mip_handle_mut(&mut self, level: u32) -> &mut BindlessHandle {
         &mut self.mips[level as usize].handle
     }
 }
 
-fn check_depth_stencil<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<()> {
-    let aspects = raw.format.aspects();
-    if aspects.contains(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) {
-        return Ok(());
-    }
-    Err(Error::message(format!(
-        "split depth views are for combined depth-stencil formats, not {:?}; use `Single` or `PerMip`",
-        raw.format.vk_format()
-    )))
-}
-
-impl crate::sealed::Sealed for DepthSplit {}
-impl Views for DepthSplit {
-    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
-        check_depth_stencil(raw)?;
-        let views = Single::create(raw)?;
-        let shader = raw.create_view((0..raw.mip_levels).into(), vk::ImageAspectFlags::DEPTH)?;
-        Ok(DepthSplit { views, shader })
-    }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
-        self.views.whole()
-    }
-    fn whole_handle(&mut self) -> &mut BindlessHandle {
-        self.views.whole_handle()
-    }
-    fn shader_view(&self) -> vk::ImageView {
-        self.shader
-    }
-}
-
-impl crate::sealed::Sealed for DepthSplitMips {}
-impl Views for DepthSplitMips {
-    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
-        check_depth_stencil(raw)?;
-        // Built up front, so `Drop` destroys whatever was created before an error.
-        let mut views = DepthSplitMips {
-            views: PerMip::create(raw)?,
-            shader: vk::ImageView::null(),
-            mip_shaders: Box::new([]),
-        };
-        let depth = vk::ImageAspectFlags::DEPTH;
-        views.shader = raw.create_view((0..raw.mip_levels).into(), depth)?;
-        let mut mips = Vec::with_capacity(raw.mip_levels as usize);
-        for mip in 0..raw.mip_levels {
-            match raw.create_view((mip..mip + 1).into(), depth) {
-                Ok(view) => mips.push(view),
-                Err(err) => {
-                    views.mip_shaders = mips.into();
-                    return Err(err);
-                }
-            }
-        }
-        views.mip_shaders = mips.into();
-        Ok(views)
-    }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
-        self.views.whole()
-    }
-    fn whole_handle(&mut self) -> &mut BindlessHandle {
-        self.views.whole_handle()
-    }
-    fn shader_view(&self) -> vk::ImageView {
-        self.shader
-    }
-}
-
-impl MipViews for DepthSplitMips {
-    fn mip(&self, level: u32) -> (vk::ImageView, vk::ImageView, BindlessHandle, &AtomicU64) {
-        let (view, _, handle, layout) = self.views.mip(level);
-        (view, self.mip_shaders[level as usize], handle, layout)
-    }
-    fn mip_handle_mut(&mut self, level: u32) -> &mut BindlessHandle {
-        self.views.mip_handle_mut(level)
-    }
-}
-
 fn release(view: vk::ImageView, handle: BindlessHandle) {
     bindless::free_handle(handle);
-    unsafe { Ctx::device().destroy_image_view(view, None) };
+    if view != vk::ImageView::null() {
+        unsafe { Ctx::device().destroy_image_view(view, None) };
+    }
 }
 
 impl Drop for Single {
@@ -319,27 +219,6 @@ impl Drop for PerMip {
                 release(mip.view, mip.handle);
             }
         });
-    }
-}
-
-/// The wrapped views release the handles.
-fn destroy_views(views: impl IntoIterator<Item = vk::ImageView>) {
-    for view in views {
-        unsafe { Ctx::device().destroy_image_view(view, None) };
-    }
-}
-
-impl Drop for DepthSplit {
-    fn drop(&mut self) {
-        let shader = self.shader;
-        lifetime::retire(move || destroy_views([shader]));
-    }
-}
-
-impl Drop for DepthSplitMips {
-    fn drop(&mut self) {
-        let (shader, mips) = (self.shader, mem::take(&mut self.mip_shaders));
-        lifetime::retire(move || destroy_views(iter::once(shader).chain(mips)));
     }
 }
 
@@ -585,8 +464,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         assert_eq!(*index, NULL_HANDLE, "the image is bound in that set already");
         *index = bindless::allocate(set, 1)?;
         let bound = set.handle(*index);
-        let view = (self.views.shader_view(), self.raw.usage.flags());
-        bindless::bind_raw([view], [bound]);
+        bindless::bind_raw([self.whole_view().shader_image()], [bound], false)?;
         Ok(self)
     }
 }
@@ -594,24 +472,24 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 impl<F: Format, U: ImageUsage, D: Dim, V: MipViews> Image<F, U, D, V> {
     /// The view of mip `level` alone, sized `mip_extent(level)`.
     pub fn mip_view(&self, level: u32) -> ImageView<'_, F, U, D> {
-        let (view, _, handle, state) = self.views.mip(level);
+        let (view, handle, state) = self.views.mip(level);
         let states = std::slice::from_ref(state);
         self.view(view, (level..level + 1).into(), handle, states)
     }
 
     fn bind_mips(mut self, set: bindless::Set) -> Result<Self> {
         let levels = 0..self.mip_levels();
-        let bound = |level| *set.index_mut(&mut self.views.mip(level).2) != NULL_HANDLE;
+        let bound = |level| *set.index_mut(&mut self.views.mip(level).1) != NULL_HANDLE;
         assert!(!levels.clone().any(bound), "the mips are bound in that set already");
         let first = bindless::allocate(set, levels.len() as u32)?;
         for level in levels.clone() {
             *set.index_mut(self.views.mip_handle_mut(level)) = first + level;
         }
-        let usage = self.raw.usage.flags();
         bindless::bind_raw(
-            levels.clone().map(|level| (self.views.mip(level).1, usage)),
+            levels.clone().map(|level| self.mip_view(level).shader_image()),
             levels.map(|level| set.handle(first + level)),
-        );
+            false,
+        )?;
         Ok(self)
     }
 

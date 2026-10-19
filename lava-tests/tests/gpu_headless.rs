@@ -1,10 +1,13 @@
 //! Headless GPU tests: buffers, images, sync, command recording, queries, and golden images per pass type
 mod common;
 
-use common::{Cmd, buffer_with, golden::assert_golden, gpu, panic_message, zeroed_buffer};
-use glam::{IVec2, UVec2, UVec3, Vec2, Vec4};
+use common::{Cmd, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer};
+use glam::{IVec2, UVec2, UVec3, UVec4, Vec2, Vec4};
 use lava::{
-    bindless::{BindlessHandle, NULL_HANDLE, max_sampled_images, max_storage_images},
+    bindless::{
+        BindlessHandle, NULL_HANDLE, Sampler, SamplerDesc, SamplerHandle, max_sampled_images,
+        max_storage_images,
+    },
     buffer::{
         Buffer,
         usage::{Index, Indirect, Storage},
@@ -17,8 +20,8 @@ use lava::{
         Viewport, kind,
     },
     image::{
-        D2, D3, DepthSplit, Image, MipChain,
-        format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm},
+        D3, Image, MipChain,
+        format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, R32Sfloat},
         slice::Filter,
         usage::{
             ColorAttachmentSampledTransferSrcTransferDst,
@@ -38,8 +41,8 @@ use lava::{
 };
 use lava_tests::bindings::{
     PASS_MAP, TestClock, TestClocks, TestComputeBuffer, TestComputeImage, TestComputeVolume,
-    TestConstants, TestMesh, TestRaster, TestRasterTextured, TestSampleDepth, TestTexturedVertex,
-    TestVertex,
+    TestConstants, TestMesh, TestPushData, TestRaster, TestRasterTextured, TestSample,
+    TestSampleDepth, TestTexturedVertex, TestVertex,
 };
 
 // ---- helpers ---------------------------------------------------------------------------------
@@ -1053,9 +1056,15 @@ fn mip_chains_have_a_view_and_handle_per_mip() {
         assert_eq!((range.base_mip_level, range.level_count), (level, 1));
         assert_eq!(view.extent(), chain.mip_extent(level));
         assert_eq!(view.handle(), BindlessHandle::storage(first + level));
-        assert_ne!(view.view(), whole.view());
+        // Descriptors are written without views: only attachments have them.
+        assert_eq!(view.view(), lava::vk::ImageView::null());
     }
     assert_eq!(chain.mip_view(2).whole().extend, UVec2::new(4, 2));
+    let targets = MipChain::<R8G8B8A8Unorm, ColorAttachmentSampledTransferSrcTransferDst>::with_mip_levels(UVec2::new(16, 8), 2)
+        .unwrap();
+    let views = [targets.whole_view().view(), targets.mip_view(0).view(), targets.mip_view(1).view()];
+    assert!(!views.contains(&lava::vk::ImageView::null()));
+    assert!(views[0] != views[1] && views[1] != views[2]);
 }
 
 #[test]
@@ -1103,33 +1112,7 @@ fn binds_take_free_slots_of_their_sets() {
     assert!(std::panic::catch_unwind(|| reserved.handle(4)).is_err());
 }
 
-/// Also a dropped reservation's, which `bind` refuses right away.
-/// Descriptor updates hold a mutex (the validation layer's thread safety checks would see
-/// concurrent `vkUpdateDescriptorSets`).
-#[test]
-fn binds_from_many_threads_are_serialised() {
-    let mut gpu = gpu();
-    let reserved = lava::bindless::reserve_sampled(8).unwrap();
-    let images: Vec<Vec<_>> = std::thread::scope(|scope| {
-        let threads: Vec<_> = (0..4)
-            .map(|thread| {
-                let reserved = &reserved;
-                scope.spawn(move || {
-                    let images: Vec<_> = (0..8)
-                        .map(|_| Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::ONE).unwrap().bind_sampled().unwrap())
-                        .collect();
-                    let slots = (0..2).map(|i| reserved.handle(thread * 2 + i));
-                    lava::bindless::bind(images[..2].iter().map(|image| image.whole_view()), slots);
-                    images
-                })
-            })
-            .collect();
-        threads.into_iter().map(|thread| thread.join().unwrap()).collect()
-    });
-    gpu.submit(|_| {});
-    drop(images);
-}
-
+/// Also a dropped reservation's slots, which `bind` refuses right away.
 #[test]
 fn slots_are_free_again_once_their_image_is_destroyed() {
     let _gpu = gpu();
@@ -1175,6 +1158,160 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
     assert!(written.is_err());
     lava::wait_idle().unwrap();
     assert_eq!(lava::bindless::reserve_storage(3).unwrap().start(), start);
+}
+
+const NO_SAMPLER: SamplerHandle = SamplerHandle { index: NULL_HANDLE };
+
+/// What `TestSample` reads at `uv` of sampled slot `slot` through `samplers`, the last a
+/// comparison against `reference` unless it is `NO_SAMPLER`.
+fn sample(
+    gpu: &mut common::Gpu,
+    slot: u32,
+    [first, second, compare]: [SamplerHandle; 3],
+    uv: Vec2,
+    reference: f32,
+    reads: Accesses,
+) -> [Vec4; 3] {
+    let out = zeroed_buffer::<Vec4, Storage>(3);
+    gpu.submit(|cmd| {
+        let bindings =
+            TestSample::push_bindings(out.range(..), first, second, compare, slot, uv, reference);
+        cmd.compute(&bindings, [1, 1, 1], Some(reads));
+    });
+    out.host().try_into().unwrap()
+}
+
+/// A 1x1 sampled image of `color`.
+fn solid(gpu: &mut common::Gpu, color: [f32; 4]) -> Image<R8G8B8A8Unorm, SampledTransferDst> {
+    let image = Image::new(UVec2::ONE).unwrap();
+    gpu.submit(|cmd| cmd.clear_image(image.whole_view(), color));
+    image
+}
+
+/// `bind` into a reserved slot reaches the heap in submission order: a frame still in flight
+/// reads the old image, the next one the new image.
+#[test]
+fn reserved_slots_are_rewritten_between_frames_in_flight() {
+    let mut gpu = gpu();
+    let red = solid(&mut gpu, [1.0, 0.0, 0.0, 1.0]);
+    let green = solid(&mut gpu, [0.0, 1.0, 0.0, 1.0]);
+    let slot = lava::bindless::reserve_sampled(1).unwrap();
+    let outs = [zeroed_buffer::<Vec4, Storage>(3), zeroed_buffer::<Vec4, Storage>(3)];
+    let frame = |gpu: &mut common::Gpu, image: &Image<R8G8B8A8Unorm, SampledTransferDst>, out: &Buffer<Vec4, Storage>| {
+        lava::bindless::bind([image.whole_view()], [slot.handle(0)]);
+        let reads = [ImageUse::sampled_read(image.whole_view())];
+        let submission = gpu.timeline.begin().unwrap();
+        submission
+            .submit(|cmd| {
+                let bindings = TestSample::push_bindings(
+                    out.range(..),
+                    nearest(),
+                    nearest(),
+                    NO_SAMPLER,
+                    slot.start(),
+                    Vec2::splat(0.5),
+                    0.0,
+                );
+                cmd.compute(&bindings, [1, 1, 1], Some(Accesses::images(&reads)));
+            })
+            .unwrap()
+    };
+    let first = frame(&mut gpu, &red, &outs[0]);
+    let second = frame(&mut gpu, &green, &outs[1]);
+    second.block().unwrap();
+    assert!(first.is_done());
+    assert_eq!(outs[0].host()[0], Vec4::new(1.0, 0.0, 0.0, 1.0));
+    assert_eq!(outs[1].host()[0], Vec4::new(0.0, 1.0, 0.0, 1.0));
+}
+
+/// Samplers are runtime objects: two in one pass, each with its filter, and a dropped one's
+/// slot is taken until no frame reaches it.
+#[test]
+fn samplers_filter_by_their_description_and_free_their_slots() {
+    let mut gpu = gpu();
+    // Black, then white.
+    let texels = buffer_with::<[u8; 4], Storage>(&[[0, 0, 0, 255], [255, 255, 255, 255]]);
+    let image = Image::<R8G8B8A8Unorm, SampledTransferDst>::new(UVec2::new(2, 1))
+        .unwrap()
+        .bind_sampled()
+        .unwrap();
+    gpu.submit(|cmd| cmd.copy_buffer_to_image(texels.range(..), image.whole_view().whole()));
+    let linear = Sampler::new(
+        &SamplerDesc::new().address_mode(lava::vk::SamplerAddressMode::CLAMP_TO_EDGE),
+    )
+    .unwrap();
+    let reads = [ImageUse::sampled_read(image.whole_view())];
+    // A quarter of the way from the first texel's centre to the second's.
+    let uv = Vec2::new(0.375, 0.5);
+    let slot = image.handle().descriptor_index_set0;
+    let samplers = [nearest(), linear.handle(), NO_SAMPLER];
+    let [near, filtered, _] = sample(&mut gpu, slot, samplers, uv, 0.0, Accesses::images(&reads));
+    assert_eq!(near.x, 0.0);
+    assert!((filtered.x - 0.25).abs() < 0.01, "linear filtering gave {}", filtered.x);
+
+    if Ctx::features().sampler_anisotropy {
+        let max = Ctx::device_properties().limits.max_sampler_anisotropy;
+        for ratio in [0.5, max + 1.0] {
+            assert!(Sampler::new(&SamplerDesc::new().max_anisotropy(ratio)).is_err());
+        }
+        Sampler::new(&SamplerDesc::new().max_anisotropy(max)).unwrap();
+    }
+
+    lava::wait_idle().unwrap();
+    let desc = SamplerDesc::new();
+    let dropped = Sampler::new(&desc).unwrap();
+    let index = dropped.handle();
+    drop(dropped);
+    let next = Sampler::new(&desc).unwrap();
+    assert_ne!(next.handle(), index, "taken until no frame reaches it");
+    lava::wait_idle().unwrap();
+    assert_eq!(Sampler::new(&desc).unwrap().handle(), index);
+}
+
+/// A min or max reduction sampler returns the extreme of the texels it filters.
+#[test]
+fn reduction_samplers_return_the_extremes() {
+    let mut gpu = gpu();
+    if !Ctx::features().sampler_minmax {
+        eprintln!("SKIPPED reduction_samplers_return_the_extremes: no sampler-minmax");
+        return;
+    }
+    let texels = buffer_with::<f32, Storage>(&[0.1, 0.2, 0.3, 0.4]);
+    let image = Image::<R32Sfloat, SampledTransferDst>::new(UVec2::new(2, 2))
+        .unwrap()
+        .bind_sampled()
+        .unwrap();
+    gpu.submit(|cmd| cmd.copy_buffer_to_image(texels.range(..), image.whole_view().whole()));
+    let reduce = |mode| {
+        let desc = SamplerDesc::new()
+            .address_mode(lava::vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .reduction(mode);
+        Sampler::new(&desc).unwrap()
+    };
+    use lava::vk::SamplerReductionMode as Mode;
+    let (min, max) = (reduce(Mode::MIN), reduce(Mode::MAX));
+    let reads = [ImageUse::sampled_read(image.whole_view())];
+    let slot = image.handle().descriptor_index_set0;
+    let samplers = [min.handle(), max.handle(), NO_SAMPLER];
+    // The centre, where all four texels weigh the same.
+    let [low, high, _] =
+        sample(&mut gpu, slot, samplers, Vec2::splat(0.5), 0.0, Accesses::images(&reads));
+    assert_eq!((low.x, high.x), (0.1, 0.4));
+}
+
+/// A pass can push all of `MAX_PUSH_CONSTANTS_SIZE`.
+#[test]
+fn push_data_fills_all_256_bytes() {
+    let mut gpu = gpu();
+    const _: () = assert!(size_of::<lava_tests::bindings::CTestPushDataBindings>() == 256);
+    let values: [UVec4; 15] = std::array::from_fn(|i| UVec4::splat(i as u32) + UVec4::new(0, 100, 200, 300));
+    let last = UVec2::new(7, 11);
+    let out = zeroed_buffer::<UVec4, Storage>(16);
+    gpu.submit(|cmd| {
+        cmd.compute(&TestPushData::push_bindings(values, out.range(..), last), [1, 1, 1], None)
+    });
+    assert_eq!(&out.host()[..15], &values);
+    assert_eq!(out.host()[15], UVec4::new(7, 11, 0, 0));
 }
 
 #[test]
@@ -2065,14 +2202,16 @@ fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
     assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, BLACK);
 }
 
-/// Drawn to through the view of both aspects, sampled through the depth-only one.
+/// Drawn to over both aspects, sampled as depth, also through a reserved slot and a comparison
+/// sampler.
 #[test]
-fn split_depth_stencil_views_are_drawn_to_and_sampled() {
+fn combined_depth_stencil_images_are_sampled_as_depth() {
     let mut gpu = gpu();
     let vertices = two_triangles();
-    let depth = Image::<D32SfloatS8Uint, DepthAttachmentSampled, D2, DepthSplit>::new(EXTENT)
+    let depth = Image::<D32SfloatS8Uint, DepthAttachmentSampled>::new(EXTENT)
         .unwrap()
-        .bind_sampled().unwrap();
+        .bind_sampled()
+        .unwrap();
     let out = zeroed_buffer::<f32, Storage>((SIZE * SIZE) as usize);
     render(&mut gpu, |cmd, target| {
         let left = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
@@ -2090,12 +2229,24 @@ fn split_depth_stencil_views_are_drawn_to_and_sampled() {
     assert_eq!(depth_at(IN_LEFT), 0.5);
     assert_eq!(depth_at(IN_RIGHT), 0.25);
 
-    // Bound directly, the view of both aspects is refused.
     let slot = lava::bindless::reserve_sampled(1).unwrap();
-    let refused = std::panic::catch_unwind(|| {
-        lava::bindless::bind([depth.whole_view()], [slot.handle(0)])
-    });
-    assert!(refused.is_err(), "shaders read one aspect");
+    lava::bindless::bind([depth.whole_view()], [slot.handle(0)]);
+    let less = Sampler::new(
+        &SamplerDesc::new()
+            .filter(lava::vk::Filter::NEAREST)
+            .compare(CompareOp::LESS),
+    )
+    .unwrap();
+    let samplers = [nearest(), nearest(), less.handle()];
+    let uv = |(x, y): (u32, u32)| (Vec2::new(x as f32, y as f32) + 0.5) / SIZE as f32;
+    let reads = [ImageUse::sampled_read(depth.whole_view())];
+    let at = |gpu: &mut common::Gpu, texel, reference| {
+        sample(gpu, slot.start(), samplers, uv(texel), reference, Accesses::images(&reads))
+    };
+    let [read, _, compared] = at(&mut gpu, IN_LEFT, 0.4);
+    assert_eq!((read.x, compared.x), (0.5, 1.0), "0.4 < 0.5");
+    let [read, _, compared] = at(&mut gpu, IN_RIGHT, 0.4);
+    assert_eq!((read.x, compared.x), (0.25, 0.0), "0.4 >= 0.25");
 }
 
 #[test]
@@ -2337,7 +2488,7 @@ fn indexed_draw_samples_a_bindless_texture() {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
                 &// Sampler 0 is nearest-neighbour.
-                TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), 0),
+                TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), nearest()),
                 indices.range(..),
                 1,
                 RasterState::default(),
@@ -2357,7 +2508,7 @@ fn indexed_draw_samples_a_bindless_texture() {
     let half = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
-                &TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), 0),
+                &TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), nearest()),
                 indices.range(..3),
                 1,
                 RasterState::default(),
@@ -2415,7 +2566,7 @@ fn bound_textures_are_sampled_from_their_slots() {
         for (quad, texture) in quads.iter().zip(&textures) {
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
                 .draw(&Draw::indexed(
-                    &TestRasterTextured::push_bindings(quad.range(..), texture.whole_view(), 0),
+                    &TestRasterTextured::push_bindings(quad.range(..), texture.whole_view(), nearest()),
                     indices.range(..),
                     1,
                     RasterState::default(),
@@ -2463,7 +2614,7 @@ fn a_mip_is_drawn_while_another_is_sampled() {
             [Attachment::color(chain.mip_view(1), Some([0.0; 4]))],
         )
         .draw(&Draw::indexed(
-            &TestRasterTextured::push_bindings(quad.range(..), chain.mip_view(0), 0),
+            &TestRasterTextured::push_bindings(quad.range(..), chain.mip_view(0), nearest()),
             indices.range(..),
             1,
             RasterState::default(),
@@ -2593,7 +2744,7 @@ fn host_copy_uploads_block_compressed_mips() {
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
-                &TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), 0),
+                &TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), nearest()),
                 indices.range(..),
                 1,
                 RasterState::default(),

@@ -1,4 +1,4 @@
-//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands` and `VK_EXT_depth_clamp_control`, their types and their device functions
+//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands`, `VK_EXT_descriptor_heap` and `VK_EXT_depth_clamp_control`, their types and their device functions
 
 use core::ffi::{CStr, c_void};
 use core::marker::PhantomData;
@@ -60,9 +60,98 @@ mod values {
         StructureType::from_raw(1_000_582_000);
     pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
         DynamicState::from_raw(1_000_582_000);
+    pub const IMAGE_DESCRIPTOR_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_001);
+    pub const RESOURCE_DESCRIPTOR_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_002);
+    pub const BIND_HEAP_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_003);
+    pub const PUSH_DATA_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_004);
+    pub const DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT: StructureType =
+        StructureType::from_raw(1_000_135_005);
+    pub const SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT: StructureType =
+        StructureType::from_raw(1_000_135_006);
+    pub const PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT: StructureType =
+        StructureType::from_raw(1_000_135_008);
+    pub const PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT: StructureType =
+        StructureType::from_raw(1_000_135_009);
 }
 pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
     values::DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT;
+
+/// `VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT`: the pipeline reads the descriptor heaps.
+pub const PIPELINE_CREATE_2_DESCRIPTOR_HEAP_EXT: PipelineCreateFlags2KHR =
+    PipelineCreateFlags2KHR::from_raw(0x10_0000_0000);
+/// `VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT`.
+pub const BUFFER_USAGE_DESCRIPTOR_HEAP_EXT: BufferUsageFlags = BufferUsageFlags::from_raw(0x1000_0000);
+/// `VK_ACCESS_2_SAMPLER_HEAP_READ_BIT_EXT`.
+pub const ACCESS_2_SAMPLER_HEAP_READ_EXT: AccessFlags2 = AccessFlags2::from_raw(0x200_0000_0000_0000);
+/// `VK_ACCESS_2_RESOURCE_HEAP_READ_BIT_EXT`.
+pub const ACCESS_2_RESOURCE_HEAP_READ_EXT: AccessFlags2 =
+    AccessFlags2::from_raw(0x400_0000_0000_0000);
+
+/// `VkSpirvResourceTypeFlagBitsEXT`: which shader resource declarations a mapping covers.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpirvResourceTypeFlagsEXT(Flags);
+ash::vk_bitflags_wrapped!(SpirvResourceTypeFlagsEXT, Flags);
+impl SpirvResourceTypeFlagsEXT {
+    pub const ALL: Self = Self(0x7FFF_FFFF);
+    pub const SAMPLER: Self = Self(0b1);
+    pub const SAMPLED_IMAGE: Self = Self(0b10);
+    pub const READ_ONLY_IMAGE: Self = Self(0b100);
+    pub const READ_WRITE_IMAGE: Self = Self(0b1000);
+}
+impl core::fmt::Debug for SpirvResourceTypeFlagsEXT {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "SpirvResourceTypeFlagsEXT({:#x})", self.0)
+    }
+}
+
+/// `VkDescriptorMappingSourceEXT`: where a mapped shader binding finds its descriptor.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
+pub struct DescriptorMappingSourceEXT(i32);
+impl DescriptorMappingSourceEXT {
+    pub const HEAP_WITH_CONSTANT_OFFSET: Self = Self(0);
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct HostAddressRangeEXT {
+    pub address: *mut c_void,
+    pub size: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct HostAddressRangeConstEXT {
+    pub address: *const c_void,
+    pub size: usize,
+}
+
+/// `VkDescriptorMappingSourceConstantOffsetEXT`: descriptors at `heap_offset` plus the binding's
+/// array index times `heap_array_stride`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct DescriptorMappingSourceConstantOffsetEXT {
+    pub heap_offset: u32,
+    pub heap_array_stride: u32,
+    pub p_embedded_sampler: *const SamplerCreateInfo<'static>,
+    pub sampler_heap_offset: u32,
+    pub sampler_heap_array_stride: u32,
+}
+
+/// `VkDescriptorMappingSourceDataEXT`, with only the member lava uses; `_size` gives it the
+/// union's size (its largest member, `VkDescriptorMappingSourceIndirectIndexEXT`, is 56 bytes).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union DescriptorMappingSourceDataEXT {
+    pub constant_offset: DescriptorMappingSourceConstantOffsetEXT,
+    _size: [u64; 7],
+}
+impl core::fmt::Debug for DescriptorMappingSourceDataEXT {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DescriptorMappingSourceDataEXT")
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
@@ -110,12 +199,11 @@ macro_rules! tagged {
         impl Default for $name<'_> {
             #[inline]
             fn default() -> Self {
-                Self {
-                    s_type: values::$s_type,
-                    p_next: core::ptr::null_mut(),
-                    $($field: Default::default(),)*
-                    _marker: PhantomData,
-                }
+                // SAFETY: every field is a C value (integers, flags, pointers, unions of them)
+                // for which all zeroes are valid.
+                let mut s: Self = unsafe { core::mem::zeroed() };
+                s.s_type = values::$s_type;
+                s
             }
         }
         unsafe impl TaggedStructure for $name<'_> {
@@ -206,6 +294,89 @@ tagged! {
 }
 unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
+tagged! {
+    PhysicalDeviceDescriptorHeapFeaturesEXT =
+        PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT, *mut c_void {
+        descriptor_heap: Bool32,
+        descriptor_heap_capture_replay: Bool32,
+    }
+}
+unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceDescriptorHeapFeaturesEXT<'_> {}
+unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceDescriptorHeapFeaturesEXT<'_> {}
+tagged! {
+    PhysicalDeviceDescriptorHeapPropertiesEXT =
+        PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT, *mut c_void {
+        sampler_heap_alignment: DeviceSize,
+        resource_heap_alignment: DeviceSize,
+        max_sampler_heap_size: DeviceSize,
+        max_resource_heap_size: DeviceSize,
+        min_sampler_heap_reserved_range: DeviceSize,
+        min_sampler_heap_reserved_range_with_embedded: DeviceSize,
+        min_resource_heap_reserved_range: DeviceSize,
+        sampler_descriptor_size: DeviceSize,
+        image_descriptor_size: DeviceSize,
+        buffer_descriptor_size: DeviceSize,
+        sampler_descriptor_alignment: DeviceSize,
+        image_descriptor_alignment: DeviceSize,
+        buffer_descriptor_alignment: DeviceSize,
+        max_push_data_size: DeviceSize,
+        image_capture_replay_opaque_data_size: usize,
+        max_descriptor_heap_embedded_samplers: u32,
+        sampler_ycbcr_conversion_count: u32,
+        sparse_descriptor_heaps: Bool32,
+        protected_descriptor_heaps: Bool32,
+    }
+}
+unsafe impl ExtendsPhysicalDeviceProperties2 for PhysicalDeviceDescriptorHeapPropertiesEXT<'_> {}
+tagged! {
+    /// One image descriptor: the view it shows shaders, in `layout`.
+    ImageDescriptorInfoEXT = IMAGE_DESCRIPTOR_INFO_EXT, *const c_void {
+        p_view: *const ImageViewCreateInfo<'a>,
+        layout: ImageLayout,
+    }
+}
+tagged! {
+    /// `data` is `VkResourceDescriptorDataEXT`, a union of pointers: for image types the
+    /// `ImageDescriptorInfoEXT`.
+    ResourceDescriptorInfoEXT = RESOURCE_DESCRIPTOR_INFO_EXT, *const c_void {
+        ty: DescriptorType,
+        data: *const c_void,
+    }
+}
+tagged! {
+    /// A heap's address range, with the implementation's reserved range inside it.
+    BindHeapInfoEXT = BIND_HEAP_INFO_EXT, *const c_void {
+        heap_range: DeviceAddressRangeKHR,
+        reserved_range_offset: DeviceSize,
+        reserved_range_size: DeviceSize,
+    }
+}
+tagged! {
+    PushDataInfoEXT = PUSH_DATA_INFO_EXT, *const c_void {
+        offset: u32,
+        data: HostAddressRangeConstEXT,
+    }
+}
+tagged! {
+    /// Maps the bindings `first_binding..first_binding + binding_count` of `descriptor_set` to
+    /// a heap.
+    DescriptorSetAndBindingMappingEXT = DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT, *const c_void {
+        descriptor_set: u32,
+        first_binding: u32,
+        binding_count: u32,
+        resource_mask: SpirvResourceTypeFlagsEXT,
+        source: DescriptorMappingSourceEXT,
+        source_data: DescriptorMappingSourceDataEXT,
+    }
+}
+tagged! {
+    ShaderDescriptorSetAndBindingMappingInfoEXT =
+        SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT, *const c_void {
+        mapping_count: u32,
+        p_mappings: *const DescriptorSetAndBindingMappingEXT<'a>,
+    }
+}
+unsafe impl ExtendsPipelineShaderStageCreateInfo for ShaderDescriptorSetAndBindingMappingInfoEXT<'_> {}
 
 macro_rules! with_regions {
     ($(#[$attr:meta])* $name:ident = $s_type:ident, $region:ident { $($field:ident: $ty:ty),* }) => {
@@ -433,6 +604,105 @@ pub mod device_address_commands {
             unsafe { f(self.handle, create_info, callbacks, &mut structure) }
                 .result_with_success(structure)
         }
+    }
+}
+
+/// `VK_EXT_descriptor_heap`: descriptors written into memory lava owns, the two heaps bound per
+/// command buffer, and push data.
+pub mod descriptor_heap {
+    use super::*;
+
+    pub const NAME: &CStr = c"VK_EXT_descriptor_heap";
+
+    type WriteSamplers = unsafe extern "system" fn(
+        super::Device,
+        u32,
+        *const SamplerCreateInfo<'_>,
+        *const HostAddressRangeEXT,
+    ) -> Result;
+    type WriteResources = unsafe extern "system" fn(
+        super::Device,
+        u32,
+        *const ResourceDescriptorInfoEXT<'_>,
+        *const HostAddressRangeEXT,
+    ) -> Result;
+    type CmdInfo<T> = unsafe extern "system" fn(CommandBuffer, *const T);
+
+    #[derive(Clone)]
+    pub struct Device {
+        handle: super::Device,
+        write_sampler_descriptors: Option<WriteSamplers>,
+        write_resource_descriptors: Option<WriteResources>,
+        bind_sampler_heap: Option<CmdInfo<BindHeapInfoEXT<'static>>>,
+        bind_resource_heap: Option<CmdInfo<BindHeapInfoEXT<'static>>>,
+        push_data: Option<CmdInfo<PushDataInfoEXT<'static>>>,
+    }
+
+    impl Device {
+        pub fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
+            let handle = device.handle();
+            macro_rules! load {
+                ($name:literal) => {
+                    super::load(instance, handle, $name)
+                };
+            }
+            Self {
+                handle,
+                write_sampler_descriptors: load!(c"vkWriteSamplerDescriptorsEXT"),
+                write_resource_descriptors: load!(c"vkWriteResourceDescriptorsEXT"),
+                bind_sampler_heap: load!(c"vkCmdBindSamplerHeapEXT"),
+                bind_resource_heap: load!(c"vkCmdBindResourceHeapEXT"),
+                push_data: load!(c"vkCmdPushDataEXT"),
+            }
+        }
+
+        /// Writes the descriptor of `samplers[i]` to `descriptors[i]`.
+        #[inline]
+        pub unsafe fn write_sampler_descriptors(
+            &self,
+            samplers: &[SamplerCreateInfo<'_>],
+            descriptors: &[HostAddressRangeEXT],
+        ) -> ash::prelude::VkResult<()> {
+            assert_eq!(samplers.len(), descriptors.len());
+            let f = (self.write_sampler_descriptors)
+                .unwrap_or_else(|| missing("vkWriteSamplerDescriptorsEXT"));
+            let n = samplers.len() as u32;
+            unsafe { f(self.handle, n, samplers.as_ptr(), descriptors.as_ptr()) }.result()
+        }
+
+        /// Writes the descriptor of `resources[i]` to `descriptors[i]`.
+        #[inline]
+        pub unsafe fn write_resource_descriptors(
+            &self,
+            resources: &[ResourceDescriptorInfoEXT<'_>],
+            descriptors: &[HostAddressRangeEXT],
+        ) -> ash::prelude::VkResult<()> {
+            assert_eq!(resources.len(), descriptors.len());
+            let f = (self.write_resource_descriptors)
+                .unwrap_or_else(|| missing("vkWriteResourceDescriptorsEXT"));
+            let n = resources.len() as u32;
+            unsafe { f(self.handle, n, resources.as_ptr(), descriptors.as_ptr()) }.result()
+        }
+    }
+
+    macro_rules! info_commands {
+        ($($method:ident($field:ident, $info:ident) = $vk_name:literal;)*) => {
+            impl Device {
+                $(
+                    #[doc = concat!("`", $vk_name, "`.")]
+                    #[inline]
+                    pub unsafe fn $method(&self, command_buffer: CommandBuffer, info: &$info<'_>) {
+                        let f = self.$field.unwrap_or_else(|| missing($vk_name));
+                        unsafe { f(command_buffer, (info as *const $info<'_>).cast()) }
+                    }
+                )*
+            }
+        };
+    }
+    info_commands! {
+        cmd_bind_sampler_heap(bind_sampler_heap, BindHeapInfoEXT) = "vkCmdBindSamplerHeapEXT";
+        cmd_bind_resource_heap(bind_resource_heap, BindHeapInfoEXT) = "vkCmdBindResourceHeapEXT";
+        cmd_push_data(push_data, PushDataInfoEXT) = "vkCmdPushDataEXT";
     }
 }
 

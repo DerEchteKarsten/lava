@@ -1,10 +1,10 @@
-//! lava's unit tests: the barrier tracking, image states, the slot allocator, feature detection, queue family picking and the layouts the GPU reads
+//! lava's unit tests: the barrier tracking, image states, the slot allocator, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
 use std::{iter, sync::atomic::AtomicU64};
 
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
 
 use crate::{
-    bindless::Ranges,
+    bindless::{HeapLayout, Ranges},
     command_buffer::{
         BufferAccess, ImageAccess, ImageUse, compute_barriers,
         image_state::{ImageState, check_states, release_states, take_checked_states},
@@ -176,6 +176,27 @@ fn bindless_slots_are_first_fit_and_freed_ranges_merge() {
     }
     ranges.give(3..7);
     assert_eq!(ranges.take(10), Some(0), "freed one at a time, the slots merged back");
+}
+
+#[test]
+fn heaps_hold_their_regions_then_the_reserved_range() {
+    // Intel's resource heap: 64-byte descriptors, nothing reserved, 2 GiB at most.
+    let heap = HeapLayout::new(64, 64, 2, 1 << 15, 0, 64, 1 << 31);
+    assert_eq!((heap.stride, heap.count), (64, 1 << 15));
+    assert_eq!(heap.offset(1, 0), 64 << 15, "the second region follows the first");
+    assert_eq!(heap.offset(1, 3), (64 << 15) + 3 * 64);
+    assert_eq!((heap.reserved_offset, heap.size), (2 * (64 << 15), 2 * (64 << 15)));
+
+    // Strides round up to the descriptor alignment, the reserved range to its own.
+    let heap = HeapLayout::new(48, 32, 2, 10, 100, 512, 1 << 20);
+    assert_eq!((heap.stride, heap.count), (64, 10));
+    assert_eq!((heap.reserved_offset, heap.size), (1536, 1636));
+
+    // A small heap holds fewer descriptors, so the padding and reserved range still fit.
+    let heap = HeapLayout::new(64, 64, 2, 1 << 15, 1000, 256, 1 << 16);
+    assert_eq!(heap.count, 502);
+    assert_eq!(heap.reserved_offset % 256, 0);
+    assert!(heap.reserved_offset >= heap.offset(2, 0) && heap.size <= 1 << 16);
 }
 
 #[test]

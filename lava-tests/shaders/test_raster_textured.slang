@@ -9,8 +9,7 @@ struct TestTexturedVertex {
 struct TestRasterTexturedBindings {
     Buf<TestTexturedVertex> vertices;
     Tex2D<float4> tex;
-    // Index into lava's immutable sampler heap.
-    uint sampler_index;
+    Sampler sampler;
 }
 
 [[vk::push_constant]] TestRasterTexturedBindings b;
@@ -31,5 +30,5 @@ TestTexturedVSOutput test_raster_textured_vertex(uint index: SV_VertexID) {
 
 [shader("fragment")]
 float4 test_raster_textured_fragment(in TestTexturedVSOutput input) : SV_Target {
-    return float4(b.tex.Sample(input.uv, b.sampler_index).rgb, 1.0);
+    return float4(b.tex.Sample(b.sampler, input.uv).rgb, 1.0);
 }
