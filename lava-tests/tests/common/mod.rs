@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use bytemuck::Pod;
 use lava::{
     bindless::{Sampler, SamplerDesc, SamplerHandle},
-    buffer::{Buffer, usage::StaticUsage},
+    buffer::Buffer,
     command_buffer::CommandBuffer,
     queue::{Graphics, Timeline, Wait},
 };
@@ -163,13 +163,13 @@ pub fn panic_message<R>(f: impl FnOnce() -> R) -> String {
 }
 
 /// A host-readable buffer holding `data`.
-pub fn buffer_with<T: Pod, U: StaticUsage>(data: &[T]) -> Buffer<T, U> {
+pub fn buffer_with<T: Pod>(data: &[T]) -> Buffer<T> {
     let mut buffer = Buffer::new(data.len(), true).unwrap();
     buffer.host_mut().copy_from_slice(data);
     buffer
 }
 
 /// A host-readable buffer of `len` zeroed elements.
-pub fn zeroed_buffer<T: Pod, U: StaticUsage>(len: usize) -> Buffer<T, U> {
+pub fn zeroed_buffer<T: Pod>(len: usize) -> Buffer<T> {
     buffer_with(&vec![T::zeroed(); len])
 }

@@ -2,7 +2,7 @@
 use crate::vk;
 
 use crate::{
-    buffer::{Buffer, usage},
+    buffer::Buffer,
     error::{Error, Result},
     features::{Feature, gate},
     state::{Ctx, Functions},
@@ -72,8 +72,8 @@ impl RaytracingPipeline {
                     group_count as usize * handle_size,
                 )?
             };
-            let mut buffer = Buffer::raw(
-                usage::ShaderBindingTable,
+            let mut buffer = Buffer::with_flags(
+                vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
                 true,
                 layout.size.max(1),
                 Some(properties.shader_group_base_alignment),
@@ -143,7 +143,7 @@ pub(crate) fn sbt_layout(
 
 /// The handle of every group of a pipeline; groups carry no shader record data.
 pub struct ShaderBindingTable {
-    _buffer: Buffer<u8, usage::ShaderBindingTable>,
+    _buffer: Buffer<u8>,
     /// The raygen, miss, hit and callable regions; an empty one is all zeros.
     pub(crate) regions: [vk::StridedDeviceAddressRegionKHR; 4],
 }

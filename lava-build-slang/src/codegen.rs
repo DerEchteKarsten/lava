@@ -309,7 +309,6 @@ fn reject_nested_handles(field: &str, t: &TypeLayout, source: &str) {
 }
 
 struct NewFn {
-    generics: Vec<String>,
     params: Vec<String>,
     gpu_inits: Vec<String>,
     buffer_accesses: Vec<String>,
@@ -324,7 +323,6 @@ fn build_new_fn<'a>(
     stage: &str,
 ) -> NewFn {
     let mut out = NewFn {
-        generics: Vec::new(),
         params: Vec::new(),
         gpu_inits: Vec::new(),
         buffer_accesses: Vec::new(),
@@ -397,19 +395,9 @@ fn build_new_fn<'a>(
                 ));
             }
             FieldKind::Buffer => {
-                let suffix: String = name
-                    .split('_')
-                    .filter(|part| !part.is_empty())
-                    .map(capitalize_first)
-                    .collect();
                 let ptr = t.field_by_index(0).unwrap().checked_type_layout().unwrap();
                 let inner = rust_type(ptr.checked_element_type_layout().unwrap(), structs);
-                let ty = format!("BufferSlice<'a, {inner}, U{suffix}>");
-                out.generics
-                    .push(format!("U{suffix}: buffer::usage::IsStorage"));
-                out.checks.push(format!(
-                    "{name}.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);"
-                ));
+                let ty = format!("BufferSlice<'a, {inner}>");
                 out.params.push(format!("{name}: {ty}"));
                 out.gpu_inits.push(format!("{name}: {name}.address()"));
                 let access = if type_name(t) == "MutBuf" {
@@ -457,18 +445,9 @@ struct Pipelines {
     raster: usize,
 }
 
-/// `<'a, U…>`; `lifetime` adds the `'a` the views, slices and result share.
-fn fn_generics(new: &NewFn, lifetime: bool) -> String {
-    let mut generics: Vec<String> = Vec::new();
-    if lifetime {
-        generics.push("'a".to_string());
-    }
-    generics.extend(new.generics.iter().cloned());
-    if generics.is_empty() {
-        String::new()
-    } else {
-        format!("<{}>", generics.join(", "))
-    }
+/// `<'a>`, the lifetime the views, slices and result share, where `lifetime` asks for it.
+fn fn_generics(lifetime: bool) -> &'static str {
+    if lifetime { "<'a>" } else { "" }
 }
 
 fn capitalize_first(s: &str) -> String {
@@ -528,8 +507,6 @@ use lava::buffer::slice::*;
 use lava::image::format::*;
 #[allow(unused_imports)]
 use lava::image::slice::*;
-#[allow(unused_imports)]
-use lava::buffer;
 #[allow(unused_imports)]
 use lava::image;
 #[allow(unused_imports)]
@@ -939,7 +916,7 @@ impl {pass_name} {{
     }}
 }}
 "#,
-                generics = fn_generics(&push, true),
+                generics = fn_generics(true),
                 params = push.params.join(", "),
                 checks = push.checks.join("\n        "),
             ));
@@ -1000,7 +977,7 @@ impl<'a> {incomplete}<'a> {{
 }}
 "#,
                     fields = fields.join("\n"),
-                    generics = fn_generics(&new, false),
+                    generics = fn_generics(false),
                     params = new.params.join(", "),
                     checks = new.checks.join("\n        "),
                     gpu_inits = new.gpu_inits.join(", "),

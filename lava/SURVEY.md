@@ -374,11 +374,9 @@ listed in `STATE.md`. Done items are removed.
    so a handle can be one `u32`.
 8. **95 image usage marker types**, with names like
    `ColorAttachmentSampledStorageHostCopyTransferSrcTransferDst`, and each new flag (transient,
-   input attachment) doubles them. **Direction:** const-generic flags for images. For buffers
-   the parameter only switches `address_flags`, so consider dropping it, after the same
-   benchmark as for the transfer flags. *2026-10-18:* `IsUniform` and `IsVertex` bound nothing
-   in lava, lava-build-slang, lava-tests or core, and lava binds no vertex or uniform buffers,
-   so 24 of the 31 buffer usage types exist for two unused flags.
+   input attachment) doubles them. **Direction:** const-generic flags for images. *2026-10-19:*
+   buffers have no usage parameter any more: every buffer gets every usage, which made no
+   measurable difference.
 9. **Errors are mostly `Message(String)`.**
    - Out-of-date, minimised, surface lost, device lost, unsupported and invalid argument
      can't be matched.
@@ -404,8 +402,6 @@ listed in `STATE.md`. Done items are removed.
     - The viewport target is typed like the swapchain image, so it lacks SAMPLED, and the UI
       reads it through a storage load, which is several times slower on Intel.
     - Bound combinations repeat (`HasTexels<[f32; 4]> + ColorAspect, IsColorAttachment + IsStorage`).
-    - *2026-10-18:* there is no way back from a `DynamicBuffer` to a static usage
-      (`buffer/mod.rs:260-270`), while images have a checked `cast`.
 12. **Shader facts are mirrored by hand.** Workgroup sizes appear as `div_ceil(8)` and
     `div_ceil(64)`, and constants like `MESHLET_STRIDE`, `INSTANCE_FLAG_BITS` and the overflow
     bits are copied. Generate `Pass::WORKGROUP_SIZE` with a `compute_threads(extent)`, and export
@@ -757,8 +753,8 @@ Each was checked by grep over lava-tests and `lava/src/tests.rs`.
   partial release of a `MipChain`; two timelines of one family sharing an image; the fold into
   `EVERY_BUFFER` above 64 writes; `forget` on destruction; the `ATTACHMENT_OPTIMAL` vs `GENERAL`
   choice; `make_visible` merging; the swapchain's acquire wait stage; `take_host_layouts`.
-- **Runtime-typed resources:** `format::Dynamic`, `usage::Dynamic`, `with_params`,
-  `Buffer::with_usage`, `DynamicBuffer`, the `aspect_check`/`texel_check`/`usage_check` panics,
+- **Runtime-typed resources:** `format::Dynamic`, `usage::Dynamic`, `with_params`, the
+  `aspect_check`/`texel_check`/`usage_check` panics,
   the clear-value assert and `cast_check`. Pure parts (`expected_data_len`, `mip_extent`,
   `region_fits`, `cast_check`, the format table's sizes) could be unit tests.
 - **Images:** `DepthSplitMips`, 64-bit and unusual clears, linear blits on formats without linear

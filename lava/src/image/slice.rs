@@ -7,7 +7,7 @@ use lava_macros::validation_trace;
 
 use crate::{
     bindless::{BindlessHandle, NULL_HANDLE},
-    buffer::{slice::BufferSlice, usage::BufferUsage},
+    buffer::slice::BufferSlice,
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
     queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
     image::{
@@ -372,9 +372,9 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
 impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Copies the tightly packed texels of `src` into the box `dst`.
     #[validation_trace]
-    pub fn copy_buffer_to_image<T: Copy + Pod, BU: BufferUsage, I: TransferDstView>(
+    pub fn copy_buffer_to_image<T: Copy + Pod, I: TransferDstView>(
         &mut self,
-        src: BufferSlice<'_, T, BU>,
+        src: BufferSlice<'_, T>,
         dst: ImageSlice<I>,
     ) {
         let dst = dst.resolve();
@@ -429,10 +429,10 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// }
     /// ```
     #[validation_trace]
-    pub fn copy_image_to_buffer<I: TransferSrcView, T: Copy + Pod, BU: BufferUsage>(
+    pub fn copy_image_to_buffer<I: TransferSrcView, T: Copy + Pod>(
         &mut self,
         src: ImageSlice<I>,
-        dst: BufferSlice<'_, T, BU>,
+        dst: BufferSlice<'_, T>,
     ) {
         let src = src.resolve();
         src.view.aspect_check(vk::ImageAspectFlags::COLOR);

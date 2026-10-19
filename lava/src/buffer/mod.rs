@@ -1,4 +1,4 @@
-//! Typed, usage-tagged GPU buffers backed by gpu-allocator memory, their host access (`host`, `host_mut`, `host_ptr`), type erasure, and their destruction once no frame can reach them
+//! Typed GPU buffers backed by gpu-allocator memory, each with every usage an application can ask for, their host access (`host`, `host_mut`, `host_ptr`), casts, and their destruction once no frame can reach them
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -17,10 +17,7 @@ use gpu_allocator::{
 use lava_macros::validation_trace;
 
 use crate::{
-    buffer::{
-        slice::BufferSlice,
-        usage::{BufferUsage, StaticUsage, Storage},
-    },
+    buffer::slice::BufferSlice,
     lifetime,
     command_buffer::BufferAccess,
     queue::{lock, timeline::INDICES},
@@ -28,37 +25,43 @@ use crate::{
 };
 
 pub mod slice;
-pub mod usage;
 
-/// A buffer of `T`s (`u8` when untyped). A static usage type is checked at compile time, a
-/// `usage::Dynamic` value at runtime.
+/// The usages of every buffer an application creates, so any buffer can be bound as anything
+/// (`handle()` included). Giving them all made no measurable difference against one usage per
+/// buffer (2026-10-19, Arc B390 with Mesa's ANV: the same memory requirements for every
+/// buffer, the same benchmark view and recording times).
+pub const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+        | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
+        | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
+);
+
+/// A buffer of `T`s (`u8` when untyped).
 #[derive(Debug)]
-pub struct Buffer<T: Copy + Pod, U: BufferUsage = Storage> {
+pub struct Buffer<T: Copy + Pod> {
     pub(crate) handle: vk::Buffer,
     address: u64,
     num_bytes: u64,
     allocation: Allocation,
-    usage: U,
     _type_marker: PhantomData<T>,
 }
 
-/// A buffer of bytes whose usage is a runtime value (`Buffer::erase`).
-pub type DynamicBuffer = Buffer<u8, usage::Dynamic>;
-
-impl<T: Copy + Pod, U: BufferUsage> Index<usize> for Buffer<T, U> {
+impl<T: Copy + Pod> Index<usize> for Buffer<T> {
     type Output = T;
     fn index(&self, index: usize) -> &T {
         &self.host()[index]
     }
 }
 
-impl<T: Copy + Pod, U: BufferUsage> IndexMut<usize> for Buffer<T, U> {
+impl<T: Copy + Pod> IndexMut<usize> for Buffer<T> {
     fn index_mut(&mut self, index: usize) -> &mut T {
         &mut self.host_mut()[index]
     }
 }
 
-impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
+impl<T: Copy + Pod> Drop for Buffer<T> {
     fn drop(&mut self) {
         let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
         let range = self.address..self.address + self.num_bytes;
@@ -77,35 +80,34 @@ impl<T: Copy + Pod, U: BufferUsage> Drop for Buffer<T, U> {
     }
 }
 
-impl<'a, T: Copy + Pod, U: BufferUsage> Into<BufferSlice<'a, T, U>> for &'a Buffer<T, U> {
-    fn into(self) -> BufferSlice<'a, T, U> {
+impl<'a, T: Copy + Pod> Into<BufferSlice<'a, T>> for &'a Buffer<T> {
+    fn into(self) -> BufferSlice<'a, T> {
         self.range(..)
     }
 }
 
-impl<T: Copy + Pod, U: StaticUsage> Buffer<T, U> {
+impl<T: Copy + Pod> Buffer<T> {
     /// A buffer of `size` elements; `cpu_writable` ones are mapped on every device, the others
     /// only with `rebar`.
     #[validation_trace]
     pub fn new(size: usize, cpu_writable: bool) -> Result<Self> {
-        Self::with_usage(U::default(), size, cpu_writable)
-    }
-}
-
-impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
-    /// Like `new`, for any usage, `Dynamic` ones included.
-    #[validation_trace]
-    pub fn with_usage(usage: U, size: usize, cpu_writable: bool) -> Result<Self> {
         let num_bytes = size.checked_mul(size_of::<T>()).ok_or_else(|| {
             Error::message(format!("{size} elements of {} bytes overflow", size_of::<T>()))
         })?;
-        Self::raw(usage, cpu_writable, num_bytes as u64, Some(align_of::<T>() as u32))
+        Self::raw(cpu_writable, num_bytes as u64, Some(align_of::<T>() as u32))
     }
 
     /// A buffer of `num_bytes` (at least 1), aligned to `alignment` or what the device requires.
     #[validation_trace]
-    pub fn raw(
-        usage: U,
+    pub fn raw(cpu_writable: bool, num_bytes: u64, alignment: Option<u32>) -> Result<Self> {
+        Self::with_flags(USAGE, cpu_writable, num_bytes, alignment)
+    }
+
+    /// A buffer of lava's own with `usage` instead of [`USAGE`] (a shader binding table, an
+    /// acceleration structure's memory, a descriptor heap). Its slices must not reach commands
+    /// that take address flags, which claim storage usage (`BufferSlice::address_flags`).
+    pub(crate) fn with_flags(
+        usage: vk::BufferUsageFlags,
         cpu_writable: bool,
         num_bytes: u64,
         alignment: Option<u32>,
@@ -113,7 +115,7 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         if num_bytes == 0 {
             return Err(Error::message("a buffer can't be empty: Vulkan needs at least one byte"));
         }
-        let mut flags = usage.flags()
+        let mut flags = usage
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
@@ -181,7 +183,6 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         let address = unsafe { Ctx::device().get_buffer_device_address(&addr_info) };
         Ok(Self {
             _type_marker: PhantomData,
-            usage,
             address,
             num_bytes,
             allocation: allocation,
@@ -206,19 +207,10 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
         (self.size() / size_of::<T>() as u64) as usize
     }
 
-    pub fn usage(&self) -> U {
-        self.usage
-    }
-
     /// Whether the host can access it: it was created `cpu_writable`, or the device has
     /// `rebar`.
     pub fn is_mapped(&self) -> bool {
         self.allocation.mapped_ptr().is_some()
-    }
-
-    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
-    pub fn usage_check(&self, required: vk::BufferUsageFlags) {
-        self.usage.check(required);
     }
 
     fn mapped(&self) -> *mut T {
@@ -257,26 +249,15 @@ impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
 
     /// The same buffer of `B`s; panics unless its size is a multiple of `B`'s and its address
     /// aligned to `B`.
-    pub fn cast<B: Copy + Pod>(self) -> Buffer<B, U> {
+    pub fn cast<B: Copy + Pod>(self) -> Buffer<B> {
         slice::cast_check::<B>(self.address, self.num_bytes);
-        let usage = self.usage;
-        ManuallyDrop::new(self).take(usage)
-    }
-
-    /// The same buffer as bytes with its usage as a runtime value.
-    pub fn erase(self) -> DynamicBuffer {
-        let usage = usage::Dynamic(self.usage.flags());
-        ManuallyDrop::new(self).take(usage)
-    }
-
-    /// Leaves `self` without memory, so `self` must not be dropped.
-    fn take<B: Copy + Pod, NU: BufferUsage>(&mut self, usage: NU) -> Buffer<B, NU> {
+        // `self` is left without memory and never dropped.
+        let mut this = ManuallyDrop::new(self);
         Buffer {
-            handle: self.handle,
-            address: self.address,
-            allocation: mem::take(&mut self.allocation),
-            num_bytes: self.num_bytes,
-            usage,
+            handle: this.handle,
+            address: this.address,
+            allocation: mem::take(&mut this.allocation),
+            num_bytes: this.num_bytes,
             _type_marker: PhantomData,
         }
     }

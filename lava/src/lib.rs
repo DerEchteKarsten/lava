@@ -56,8 +56,8 @@ pub use crate::vk::Pipeline as VkPipeline;
 pub use crate::vk::Result as VkResult;
 pub use crate::vk::ShaderModule as VkShaderModule;
 pub use crate::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
-/// What `format::Dynamic`, `image::usage::Dynamic` and `buffer::usage::Dynamic` hold.
-pub use crate::vk::{BufferUsageFlags, Format as VkFormat, ImageUsageFlags};
+/// What `format::Dynamic` and `image::usage::Dynamic` hold.
+pub use crate::vk::{Format as VkFormat, ImageUsageFlags};
 
 pub mod bindless;
 pub mod buffer;

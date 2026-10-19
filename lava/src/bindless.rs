@@ -13,7 +13,7 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    buffer::{Buffer, usage},
+    buffer::Buffer,
     image::{Dim, format::Format, slice::{ImageView, single_aspect}, usage::ImageUsage},
     lifetime,
     queue::{Kind, lock},
@@ -102,7 +102,7 @@ impl HeapLayout {
 #[derive(Debug)]
 struct Heap {
     /// Taken by `Bindless::destroy`.
-    buffer: Mutex<Option<Buffer<u8, usage::Dynamic>>>,
+    buffer: Mutex<Option<Buffer<u8>>>,
     mapped: NonNull<u8>,
     bind: vk::BindHeapInfoEXT<'static>,
 }
@@ -113,8 +113,8 @@ unsafe impl Sync for Heap {}
 
 impl Heap {
     fn new(layout: &HeapLayout, alignment: u64) -> Result<Self> {
-        let usage = usage::Dynamic(vk::BUFFER_USAGE_DESCRIPTOR_HEAP_EXT);
-        let buffer = Buffer::raw(usage, true, layout.size.max(1), Some(alignment as u32))?;
+        let usage = vk::BUFFER_USAGE_DESCRIPTOR_HEAP_EXT;
+        let buffer = Buffer::with_flags(usage, true, layout.size.max(1), Some(alignment as u32))?;
         let mapped = NonNull::new(buffer.host_ptr()).expect("a mapping isn't null");
         // Slots never written read as zeroes rather than whatever the memory held.
         unsafe { mapped.write_bytes(0, layout.size as usize) };

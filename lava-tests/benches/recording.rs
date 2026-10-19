@@ -5,10 +5,7 @@ use std::{hint::black_box, time::Instant};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     bindless::{Sampler, SamplerDesc},
-    buffer::{
-        Buffer,
-        usage::{Index, Storage},
-    },
+    buffer::Buffer,
     command_buffer::{Accesses, Attachment, CommandBuffer, Draw, ImageUse, RasterState},
     image::{
         Image,
@@ -34,12 +31,12 @@ struct Resources {
     target: Target,
     textures: Vec<Texture>,
     sampler: Sampler,
-    src: Buffer<u32, Storage>,
-    dst: Vec<Buffer<u32, Storage>>,
-    out: Buffer<u32, Storage>,
-    vertices: Buffer<TestVertex, Storage>,
-    textured: Vec<Buffer<TestTexturedVertex, Storage>>,
-    indices: Buffer<u32, Index>,
+    src: Buffer<u32>,
+    dst: Vec<Buffer<u32>>,
+    out: Buffer<u32>,
+    vertices: Buffer<TestVertex>,
+    textured: Vec<Buffer<TestTexturedVertex>>,
+    indices: Buffer<u32>,
 }
 
 /// 64 compute passes: 32 with two buffers, 16 with specialization constants that name a buffer

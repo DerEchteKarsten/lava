@@ -90,7 +90,7 @@ fn main() {
 
 ```rust
 use lava::{
-    buffer::{Buffer, usage::Storage},
+    buffer::Buffer,
     queue::{Graphics, Timeline},
 };
 
@@ -102,7 +102,7 @@ use bindings::{Double, PASS_MAP};
 fn main() -> lava::Result<()> {
     lava::init(&lava::Config::new(&PASS_MAP))?;
 
-    let mut values = Buffer::<u32, Storage>::new(256, true)?;
+    let mut values = Buffer::<u32>::new(256, true)?;
     values.host_mut().iter_mut().enumerate().for_each(|(i, v)| *v = i as u32);
 
     let mut timeline = Timeline::<Graphics>::new(2)?;

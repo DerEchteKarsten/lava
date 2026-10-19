@@ -10,31 +10,26 @@ use smallvec::SmallVec;
 use std::iter;
 
 use crate::{
-    buffer::{
-        Buffer,
-        usage::{BufferUsage, Storage},
-    },
+    buffer::Buffer,
     command_buffer::{BufferAccess, CommandBuffer},
     queue::QueueKind,
     state::Functions,
 };
 
-/// A range of a buffer as the GPU sees it: an address, a size and the usage. It borrows the
-/// buffer but gives no host access, so copies of it alias nothing.
+/// A range of a buffer as the GPU sees it: an address and a size. It borrows the buffer but
+/// gives no host access, so copies of it alias nothing.
 #[derive(Copy, Clone, Debug)]
-pub struct BufferSlice<'a, T: Copy + Pod, U: BufferUsage = Storage> {
+pub struct BufferSlice<'a, T: Copy + Pod> {
     pub(crate) address: u64,
     pub(crate) size: u64,
-    pub(crate) usage: U,
     pub(crate) _marker: PhantomData<&'a [T]>,
 }
 
-fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
-    usage: U,
+fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
     index: R,
     address: u64,
     size: u64,
-) -> BufferSlice<'a, T, U> {
+) -> BufferSlice<'a, T> {
     let element = size_of::<T>() as u64;
     let start_offset = match index.start_bound() {
         std::ops::Bound::Unbounded => 0,
@@ -57,21 +52,20 @@ fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>, U: BufferUsage>(
     BufferSlice {
         address: address + start_offset,
         size: end_offset - start_offset,
-        usage,
         _marker: PhantomData,
     }
 }
 
-impl<T: Copy + Pod, U: BufferUsage> Buffer<T, U> {
-    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T, U> {
-        new_slice(self.usage(), index, self.address, self.size())
+impl<T: Copy + Pod> Buffer<T> {
+    pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
+        new_slice(index, self.address, self.size())
     }
-    pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, u8, U> {
-        new_slice::<u8, R, U>(self.usage(), index, self.address, self.size())
+    pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, u8> {
+        new_slice::<u8, R>(index, self.address, self.size())
     }
 }
 
-impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
+impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`].
     pub fn access(
         &self,
@@ -88,11 +82,11 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     pub fn get_range(&self) -> Range<u64> {
         (self.address..(self.address + self.size)).into()
     }
-    pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T, U> {
-        new_slice(self.usage, index, self.address, self.size)
+    pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
+        new_slice(index, self.address, self.size)
     }
-    pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, u8, U> {
-        new_slice::<u8, R, U>(self.usage, index, self.address, self.size)
+    pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, u8> {
+        new_slice::<u8, R>(index, self.address, self.size)
     }
     pub fn len(&self) -> usize {
         self.size as usize / size_of::<T>()
@@ -108,21 +102,13 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
     }
     /// The same range of `B`s; panics unless its size is a multiple of `B`'s and its address
     /// aligned to `B`.
-    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B, U> {
+    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B> {
         cast_check::<B>(self.address, self.size);
         BufferSlice {
             address: self.address,
             size: self.size,
-            usage: self.usage,
             _marker: PhantomData,
         }
-    }
-    pub fn usage(&self) -> U {
-        self.usage
-    }
-    /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
-    pub fn usage_check(&self, required: vk::BufferUsageFlags) {
-        self.usage.check(required);
     }
     pub(crate) fn address_range(&self) -> vk::DeviceAddressRangeKHR {
         vk::DeviceAddressRangeKHR {
@@ -137,19 +123,10 @@ impl<'a, T: Copy + Pod, U: BufferUsage> BufferSlice<'a, T, U> {
             stride: size_of::<T>() as u64,
         }
     }
-    /// Whether the range's memory has storage usage (it is this buffer's alone), and fully
-    /// bound (lava has no sparse memory).
+    /// The range's memory has storage usage, as every application buffer has (`USAGE`), and
+    /// is fully bound (lava has no sparse memory).
     pub(crate) fn address_flags(&self) -> vk::AddressCommandFlagsKHR {
-        let storage = if self
-            .usage
-            .flags()
-            .contains(vk::BufferUsageFlags::STORAGE_BUFFER)
-        {
-            vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE
-        } else {
-            vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
-        };
-        storage | vk::AddressCommandFlagsKHR::FULLY_BOUND
+        vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE | vk::AddressCommandFlagsKHR::FULLY_BOUND
     }
 }
 
@@ -182,9 +159,9 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Writes `data`, repeated, into every 4-byte word of `buffer`, whose address and size have
     /// to be multiples of 4.
     #[validation_trace]
-    pub fn fill_buffer<'a, T: Copy + Pod, U: BufferUsage>(
+    pub fn fill_buffer<'a, T: Copy + Pod>(
         &mut self,
-        buffer: BufferSlice<'a, T, U>,
+        buffer: BufferSlice<'a, T>,
         data: u32,
     ) {
         check_words(buffer.address, buffer.size, "a fill");
@@ -209,9 +186,9 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Writes `data` into the first element of `buffer`, from the command buffer itself: for
     /// small writes (at most 64 KiB, whole 4-byte words at a 4-byte aligned address).
     #[validation_trace]
-    pub fn update_buffer<'a, T: Copy + Pod, U: BufferUsage>(
+    pub fn update_buffer<'a, T: Copy + Pod>(
         &mut self,
-        buffer: BufferSlice<'a, T, U>,
+        buffer: BufferSlice<'a, T>,
         data: &T,
     ) {
         assert!(!buffer.is_empty(), "an update writes the first element of an empty slice");
@@ -241,18 +218,18 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     }
     /// Copies `src` to the start of `dst`, which must be at least as long.
     #[validation_trace]
-    pub fn copy_buffer<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
+    pub fn copy_buffer<'a, T: Copy + Pod>(
         &mut self,
-        src: BufferSlice<'a, T, U>,
-        dst: BufferSlice<'a, T, U2>,
+        src: BufferSlice<'a, T>,
+        dst: BufferSlice<'a, T>,
     ) {
         self.copy_buffer_regions(&[(src, dst)]);
     }
     /// One `copy_buffer` per pair, in one command.
     #[validation_trace]
-    pub fn copy_buffer_regions<'a, T: Copy + Pod, U: BufferUsage, U2: BufferUsage>(
+    pub fn copy_buffer_regions<'a, T: Copy + Pod>(
         &mut self,
-        regions: &[(BufferSlice<'a, T, U>, BufferSlice<'a, T, U2>)],
+        regions: &[(BufferSlice<'a, T>, BufferSlice<'a, T>)],
     ) {
         let accesses = regions
             .iter()

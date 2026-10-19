@@ -5,7 +5,7 @@ use common::{Cmd, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     Error, Features,
-    buffer::{Buffer, usage::Storage},
+    buffer::Buffer,
     command_buffer::{
         Attachment, BindingOutput, Blend, CullModeFlags, Draw, LogicOp, PolygonMode,
         RasterState, kind,
@@ -77,7 +77,7 @@ fn render(
     record: impl FnOnce(&mut Cmd, &Target),
 ) -> Vec<u8> {
     let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
-    let readback = zeroed_buffer::<u8, Storage>((SIZE * SIZE * 4) as usize);
+    let readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
     gpu.submit(|cmd| {
         cmd.clear_image(target.whole_view(), clear);
         record(cmd, &target);

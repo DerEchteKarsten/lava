@@ -4,10 +4,7 @@ mod common;
 use common::{Cmd, buffer_with, golden::assert_golden, gpu, panic_message, zeroed_buffer};
 use glam::{Affine3A, Quat, UVec2, Vec3};
 use lava::{
-    buffer::{
-        Buffer,
-        usage::{Indirect, Storage},
-    },
+    buffer::Buffer,
     command_buffer::TraceRaysIndirectCommand,
     image::{Image, format::R8G8B8A8Unorm, usage::StorageTransferSrcTransferDst},
     query::QueryPool,
@@ -127,23 +124,23 @@ fn instances(wall: u64, triangle: u64, sphere: u64) -> [Instance; 4] {
 }
 
 fn scratch(size: u64) -> Buffer<u8> {
-    Buffer::raw(Storage, false, size, Some(scratch_alignment() as u32)).unwrap()
+    Buffer::raw(false, size, Some(scratch_alignment() as u32)).unwrap()
 }
 
 fn scene(gpu: &mut common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) -> Scene {
-    let wall_vertices = buffer_with::<Vec3, Storage>(&[
+    let wall_vertices = buffer_with::<Vec3>(&[
         Vec3::new(-0.9, -0.9, 0.0),
         Vec3::new(0.9, -0.9, 0.0),
         Vec3::new(0.9, 0.9, 0.0),
         Vec3::new(-0.9, 0.9, 0.0),
     ]);
-    let wall_indices = buffer_with::<u16, Storage>(&[0, 1, 2, 0, 2, 3]);
-    let triangle_vertices = buffer_with::<Vec3, Storage>(&[
+    let wall_indices = buffer_with::<u16>(&[0, 1, 2, 0, 2, 3]);
+    let triangle_vertices = buffer_with::<Vec3>(&[
         Vec3::new(-0.3, -0.3, 0.0),
         Vec3::new(0.3, -0.3, 0.0),
         Vec3::new(0.0, 0.3, 0.0),
     ]);
-    let boxes = buffer_with::<Aabb, Storage>(&[Aabb {
+    let boxes = buffer_with::<Aabb>(&[Aabb {
         min: Vec3::splat(-1.0),
         max: Vec3::splat(1.0),
     }]);
@@ -159,7 +156,7 @@ fn scene(gpu: &mut common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) 
         Blas::new(&triangle, blas_flags).unwrap(),
         Blas::new(&sphere, blas_flags).unwrap(),
     );
-    let instances = buffer_with::<Instance, Storage>(&instances(
+    let instances = buffer_with::<Instance>(&instances(
         wall_blas.address(),
         triangle_blas.address(),
         sphere_blas.address(),
@@ -237,7 +234,7 @@ fn indirect_traces_read_their_size_on_the_gpu() {
     }
     let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
     let direct = render(&mut gpu, |cmd, target| trace_pipeline(cmd, target, &scene.tlas));
-    let command = zeroed_buffer::<TraceRaysIndirectCommand, Indirect>(1);
+    let command = zeroed_buffer::<TraceRaysIndirectCommand>(1);
     let indirect = render(&mut gpu, |cmd, target| {
         // Written in the same submission: the trace waits for the transfer.
         cmd.update_buffer(
@@ -264,7 +261,7 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
         return;
     }
     let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
-    let written = zeroed_buffer::<Instance, Storage>(4);
+    let written = zeroed_buffer::<Instance>(4);
     let tlas = Tlas::new(4, BuildFlags::default()).unwrap();
     let scratch = scratch(tlas.build_scratch_size());
     let pixels = render(&mut gpu, |cmd, target| {
@@ -296,7 +293,7 @@ fn updates_follow_moved_vertices() {
         allow_update: true,
         ..Default::default()
     };
-    let mut vertices = buffer_with::<Vec3, Storage>(&[
+    let mut vertices = buffer_with::<Vec3>(&[
         Vec3::new(-0.3, -0.3, 0.0),
         Vec3::new(0.3, -0.3, 0.0),
         Vec3::new(0.0, 0.3, 0.0),
@@ -306,7 +303,7 @@ fn updates_follow_moved_vertices() {
     }
     let blas = Blas::new(&BlasGeometry::Triangles(&geometry(&vertices)), updatable).unwrap();
     assert!(blas.update_scratch_size() > 0);
-    let instances = buffer_with::<Instance, Storage>(&[
+    let instances = buffer_with::<Instance>(&[
         Instance::new(&blas, Affine3A::IDENTITY).custom_index(1),
     ]);
     let tlas = Tlas::new(1, updatable).unwrap();
@@ -346,7 +343,7 @@ fn a_tlas_rebuilt_between_two_traces_waits_for_the_first() {
         return;
     }
     let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
-    let wall_only = buffer_with::<Instance, Storage>(&instances(
+    let wall_only = buffer_with::<Instance>(&instances(
         scene.wall.address(),
         scene.triangle.address(),
         scene.sphere.address(),
@@ -399,7 +396,7 @@ fn compacted_structures_trace_the_same_image() {
         sphere.compacted(sizes[2]).unwrap(),
     ];
     let [c_wall, c_triangle, c_sphere] = &compacted;
-    let moved = buffer_with::<Instance, Storage>(&instances(
+    let moved = buffer_with::<Instance>(&instances(
         c_wall.address(),
         c_triangle.address(),
         c_sphere.address(),
@@ -420,7 +417,7 @@ fn compacted_structures_trace_the_same_image() {
 
     // A compacted structure only has its compacted size, which a build could write past.
     assert!(compacted.iter().all(|c| c.is_compacted()));
-    let boxes = buffer_with::<Aabb, Storage>(&[Aabb {
+    let boxes = buffer_with::<Aabb>(&[Aabb {
         min: Vec3::splat(-1.0),
         max: Vec3::splat(1.0),
     }]);
@@ -445,7 +442,7 @@ impl VertexPosition for Unaligned {
 #[test]
 fn geometry_addresses_are_aligned_to_their_components() {
     let _gpu = gpu();
-    let bytes = zeroed_buffer::<u8, Storage>(64);
+    let bytes = zeroed_buffer::<u8>(64);
     let vertices = bytes.byte_range(1..37).cast::<Unaligned>();
     let message = panic_message(|| Triangles::new(vertices));
     assert!(message.contains("multiples of the 4 bytes"), "{message}");
@@ -462,7 +459,7 @@ fn batches_build_each_structure_once_and_updates_keep_the_last_build() {
         allow_compaction: true,
         ..Default::default()
     };
-    let vertices = buffer_with::<Vec3, Storage>(&[Vec3::X, Vec3::Y, Vec3::Z, -Vec3::X, -Vec3::Y, -Vec3::Z]);
+    let vertices = buffer_with::<Vec3>(&[Vec3::X, Vec3::Y, Vec3::Z, -Vec3::X, -Vec3::Y, -Vec3::Z]);
     let two = [Triangles::new(vertices.range(..))];
     let one = [Triangles::new(vertices.range(..3))];
     let see_through = [Triangles::new(vertices.range(..)).opaque(false)];

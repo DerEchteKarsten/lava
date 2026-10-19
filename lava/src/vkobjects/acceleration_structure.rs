@@ -8,11 +8,7 @@ use lava_macros::validation_trace;
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
-    buffer::{
-        Buffer,
-        slice::BufferSlice,
-        usage::{self, BufferUsage, IsStorage},
-    },
+    buffer::{Buffer, slice::BufferSlice},
     command_buffer::{BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE},
     lifetime,
     queue::HasCompute,
@@ -183,7 +179,7 @@ pub struct AccelerationStructure<L: Level> {
     /// empty before the first.
     built: Mutex<SmallVec<[Shape; 1]>>,
     /// Dropped after the structure, so destroyed after it.
-    buffer: Buffer<u8, usage::AccelerationStructureStorage>,
+    buffer: Buffer<u8>,
     _level: PhantomData<L>,
 }
 
@@ -234,16 +230,19 @@ impl<L: Level> AccelerationStructure<L> {
         compacted_from: Option<vk::AccelerationStructureKHR>,
     ) -> Result<Self> {
         let functions = functions()?;
-        let buffer = Buffer::raw(
-            usage::AccelerationStructureStorage,
+        let buffer = Buffer::with_flags(
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
             false,
             round_up(size, STRUCTURE_ALIGNMENT),
             Some(STRUCTURE_ALIGNMENT as u32),
         )?;
-        let range = buffer.range(..);
+        // The buffer has no storage usage.
         let create_info = vk::AccelerationStructureCreateInfo2KHR::default()
-            .address_range(range.address_range())
-            .address_flags(range.address_flags())
+            .address_range(buffer.range(..).address_range())
+            .address_flags(
+                vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
+                    | vk::AddressCommandFlagsKHR::FULLY_BOUND,
+            )
             .ty(L::TY);
         let handle = unsafe {
             Functions::device_address_commands()
@@ -459,7 +458,7 @@ pub struct Triangles<'a> {
 }
 
 impl<'a> Triangles<'a> {
-    pub fn new<V: VertexPosition, U: BufferUsage>(vertices: BufferSlice<'a, V, U>) -> Self {
+    pub fn new<V: VertexPosition>(vertices: BufferSlice<'a, V>) -> Self {
         assert!(
             vertices.len() % 3 == 0,
             "{} vertices don't make triangles",
@@ -474,9 +473,9 @@ impl<'a> Triangles<'a> {
         )
     }
 
-    pub fn indexed<V: VertexPosition, I: IndexFormat, U: BufferUsage, UI: BufferUsage>(
-        vertices: BufferSlice<'a, V, U>,
-        indices: BufferSlice<'a, I, UI>,
+    pub fn indexed<V: VertexPosition, I: IndexFormat>(
+        vertices: BufferSlice<'a, V>,
+        indices: BufferSlice<'a, I>,
     ) -> Self {
         assert!(
             indices.len() % 3 == 0,
@@ -492,8 +491,8 @@ impl<'a> Triangles<'a> {
         )
     }
 
-    fn with_indices<V: VertexPosition, U: BufferUsage>(
-        vertices: BufferSlice<'a, V, U>,
+    fn with_indices<V: VertexPosition>(
+        vertices: BufferSlice<'a, V>,
         index_type: vk::IndexType,
         index_address: u64,
         primitives: u32,
@@ -524,9 +523,9 @@ impl<'a> Triangles<'a> {
 
     /// Transforms the vertices by the first matrix of `transform`, whose address has to be a
     /// multiple of 16.
-    pub fn transform<U: BufferUsage>(
+    pub fn transform(
         mut self,
-        transform: BufferSlice<'a, TransformMatrix, U>,
+        transform: BufferSlice<'a, TransformMatrix>,
     ) -> Self {
         assert!(!transform.is_empty(), "the transform slice is empty");
         assert!(
@@ -556,7 +555,7 @@ pub struct Aabbs<'a> {
 }
 
 impl<'a> Aabbs<'a> {
-    pub fn new<U: BufferUsage>(boxes: BufferSlice<'a, Aabb, U>) -> Self {
+    pub fn new(boxes: BufferSlice<'a, Aabb>) -> Self {
         assert!(
             boxes.address() % 8 == 0,
             "an AABB buffer's address has to be a multiple of 8"
@@ -703,7 +702,7 @@ impl<'a> Instances<'a> {
     /// while a TLAS built from them is traced. lava doesn't track them: a dropped BLAS is
     /// destroyed once the submissions in flight at its drop are done, so rebuild the TLAS
     /// without it before tracing again.
-    pub unsafe fn new<U: BufferUsage>(instances: BufferSlice<'a, Instance, U>) -> Self {
+    pub unsafe fn new(instances: BufferSlice<'a, Instance>) -> Self {
         assert!(
             instances.address() % 16 == 0,
             "an instance buffer's address has to be a multiple of 16"
@@ -732,10 +731,10 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     /// `build_scratch_size()` of `scratch` after the previous one's. `scratch`'s address has to
     /// be a multiple of [`scratch_alignment`].
     #[validation_trace]
-    pub fn build<L: Level, U: IsStorage>(
+    pub fn build<L: Level>(
         &mut self,
         builds: &[(&AccelerationStructure<L>, L::Geometry<'_>)],
-        scratch: BufferSlice<'_, u8, U>,
+        scratch: BufferSlice<'_, u8>,
     ) {
         self.record_builds(builds, scratch, false);
     }
@@ -743,21 +742,20 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     /// Refits every structure in place for its geometry, which has the primitive counts of its
     /// last build. Needs `allow_update`; the scratch is laid out by `update_scratch_size()`.
     #[validation_trace]
-    pub fn update<L: Level, U: IsStorage>(
+    pub fn update<L: Level>(
         &mut self,
         updates: &[(&AccelerationStructure<L>, L::Geometry<'_>)],
-        scratch: BufferSlice<'_, u8, U>,
+        scratch: BufferSlice<'_, u8>,
     ) {
         self.record_builds(updates, scratch, true);
     }
 
-    fn record_builds<L: Level, U: IsStorage>(
+    fn record_builds<L: Level>(
         &mut self,
         builds: &[(&AccelerationStructure<L>, L::Geometry<'_>)],
-        scratch: BufferSlice<'_, u8, U>,
+        scratch: BufferSlice<'_, u8>,
         update: bool,
     ) {
-        scratch.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
         let alignment = scratch_alignment();
         assert!(
             scratch.address() % alignment == 0,

@@ -8,11 +8,7 @@ use crate::vk::{self, IndexType, PipelineStageFlags2 as S2};
 #[cfg(feature = "acceleration-structure")]
 use crate::vkobjects::acceleration_structure::Tlas;
 use crate::{
-    buffer::{
-        self,
-        slice::BufferSlice,
-        usage::{IsIndex, IsIndirect},
-    },
+    buffer::slice::BufferSlice,
     image::{
         format::Format,
         kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StorageView},
@@ -387,14 +383,13 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
 }
 
 impl<'a, const N: usize> Draw<'a, N, 1> {
-    pub fn indexed<IDX: IsIndex>(
+    pub fn indexed(
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        index_buffer: BufferSlice<'a, u32, IDX>,
+        index_buffer: BufferSlice<'a, u32>,
         instances: u32,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
-        index_buffer.usage_check(vk::BufferUsageFlags::INDEX_BUFFER);
         let index_access = index_buffer.access(
             vk::PipelineStageFlags2::INDEX_INPUT,
             vk::AccessFlags2::INDEX_READ,
@@ -408,9 +403,9 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         Self::with(bindings.erase(), command, [index_access], state, accesses)
     }
 
-    pub fn indirect<IND: IsIndirect>(
+    pub fn indirect(
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
+        buffer: BufferSlice<'a, DrawIndirectCommand>,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
@@ -430,9 +425,9 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
 
     /// Launches the task (or, without a task shader, mesh) workgroup counts in `buffer`.
     #[cfg(feature = "mesh-shader")]
-    pub fn launch_indirect<IND: IsIndirect>(
+    pub fn launch_indirect(
         bindings: &'a BindingOutput<'a, kind::RasterMesh>,
-        buffer: BufferSlice<'a, DispatchIndirectCommand, IND>,
+        buffer: BufferSlice<'a, DispatchIndirectCommand>,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
@@ -452,10 +447,10 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
 }
 
 impl<'a, const N: usize> Draw<'a, N, 2> {
-    pub fn indirect_count<IND: IsIndirect, CNT: IsIndirect>(
+    pub fn indirect_count(
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        buffer: BufferSlice<'a, DrawIndirectCommand, IND>,
-        count_buffer: BufferSlice<'a, u32, CNT>,
+        buffer: BufferSlice<'a, DrawIndirectCommand>,
+        count_buffer: BufferSlice<'a, u32>,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
@@ -888,8 +883,7 @@ fn check_groups(groups: [u32; 3], max: [u32; 3], total: u64, what: &str) {
     );
 }
 
-fn indirect_access<T: Copy + Pod, U: IsIndirect>(buffer: BufferSlice<'_, T, U>) -> BufferAccess {
-    buffer.usage_check(vk::BufferUsageFlags::INDIRECT_BUFFER);
+fn indirect_access<T: Copy + Pod>(buffer: BufferSlice<'_, T>) -> BufferAccess {
     buffer.access(
         vk::PipelineStageFlags2::DRAW_INDIRECT,
         vk::AccessFlags2::INDIRECT_COMMAND_READ,
@@ -932,11 +926,11 @@ impl<'p, K: HasGraphics> CommandBuffer<'p, K> {
 }
 
 impl<K: HasCompute> CommandBuffer<'_, K> {
-    fn compute_private<IND: IsIndirect>(
+    fn compute_private(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
         dispatch: [u32; 3],
-        indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand, IND>>,
+        indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand>>,
         accesses: Option<Accesses<'_>>,
     ) {
         let sections = bindings.sections();
@@ -973,10 +967,10 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
 
     /// Like [`Self::compute`], with the workgroup counts read from `buffer` on the GPU.
     #[validation_trace]
-    pub fn compute_indirect<IND: IsIndirect>(
+    pub fn compute_indirect(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
-        buffer: BufferSlice<'_, DispatchIndirectCommand, IND>,
+        buffer: BufferSlice<'_, DispatchIndirectCommand>,
         accesses: Option<Accesses<'_>>,
     ) {
         self.compute_private(bindings, [0, 0, 0], Some(buffer), accesses);
@@ -992,15 +986,15 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     ) {
         let max = Ctx::device_properties().limits.max_compute_work_group_count;
         check_groups(dispatch, max, u64::MAX, "compute workgroups");
-        self.compute_private::<buffer::usage::Indirect>(bindings, dispatch, None, accesses);
+        self.compute_private(bindings, dispatch, None, accesses);
     }
 
     #[cfg(feature = "ray-tracing-pipeline")]
-    fn raytrace_private<IND: IsIndirect>(
+    fn raytrace_private(
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
         rays: [u32; 3],
-        indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand, IND>>,
+        indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand>>,
         accesses: Option<Accesses<'_>>,
     ) {
         let sections = bindings.sections();
@@ -1064,16 +1058,16 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         let total = (Ctx::physical_device().ray_tracing_pipeline_properties)
             .map_or(0, |p| p.max_ray_dispatch_invocation_count as u64);
         check_groups(rays, max, total, "rays");
-        self.raytrace_private::<buffer::usage::Indirect>(bindings, rays, None, accesses);
+        self.raytrace_private(bindings, rays, None, accesses);
     }
 
     /// Like [`Self::raytrace`], with the ray counts read from `buffer` on the GPU.
     #[cfg(feature = "ray-tracing-pipeline")]
     #[validation_trace]
-    pub fn raytrace_indirect<IND: IsIndirect>(
+    pub fn raytrace_indirect(
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
-        buffer: BufferSlice<'_, TraceRaysIndirectCommand, IND>,
+        buffer: BufferSlice<'_, TraceRaysIndirectCommand>,
         accesses: Option<Accesses<'_>>,
     ) {
         self.raytrace_private(bindings, [0, 0, 0], Some(buffer), accesses);
@@ -1491,16 +1485,12 @@ impl<'a> ImageUse<'a> {
 /// The buffer accesses of [`Accesses`]; the command sets the stage.
 impl BufferAccess {
     /// The pass reads `buffer` through a pointer (`Buf`).
-    pub fn read<V: Copy + Pod, U: buffer::usage::IsStorage>(buffer: BufferSlice<'_, V, U>) -> Self {
-        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
+    pub fn read<V: Copy + Pod>(buffer: BufferSlice<'_, V>) -> Self {
         buffer.access(S2::NONE, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
     /// The pass reads and writes `buffer` through a pointer (`MutBuf`).
-    pub fn write<V: Copy + Pod, U: buffer::usage::IsStorage>(
-        buffer: BufferSlice<'_, V, U>,
-    ) -> Self {
-        buffer.usage_check(vk::BufferUsageFlags::STORAGE_BUFFER);
+    pub fn write<V: Copy + Pod>(buffer: BufferSlice<'_, V>) -> Self {
         let access = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
         buffer.access(S2::NONE, access)
     }
