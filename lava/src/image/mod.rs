@@ -11,7 +11,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
 
 use crate::{
-    bindless::{self, BindlessHandle, NULL_HANDLE},
+    bindless::{self, Allocatable, Combined, ImageHandle, Sampled, Storage},
     command_buffer::image_state::ImageState,
     image::{
         format::{Format, StaticFormat, bc_block},
@@ -91,9 +91,9 @@ pub trait Views: crate::sealed::Sealed + std::fmt::Debug + Send + Sync + 'static
     /// The view over every mip and aspect (null without attachment usage), its handle and the
     /// states it covers.
     #[doc(hidden)]
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]);
+    fn whole(&self) -> (vk::ImageView, ImageHandle, &[AtomicU64]);
     #[doc(hidden)]
-    fn whole_handle(&mut self) -> &mut BindlessHandle;
+    fn whole_handle(&mut self) -> &mut ImageHandle;
 }
 
 /// Views with one view per mip besides the whole one: [`PerMip`].
@@ -101,16 +101,16 @@ pub trait MipViews: Views {
     /// Mip `level`'s view over every aspect (null without attachment usage), its handle and
     /// state.
     #[doc(hidden)]
-    fn mip(&self, level: u32) -> (vk::ImageView, BindlessHandle, &AtomicU64);
+    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle, &AtomicU64);
     #[doc(hidden)]
-    fn mip_handle_mut(&mut self, level: u32) -> &mut BindlessHandle;
+    fn mip_handle_mut(&mut self, level: u32) -> &mut ImageHandle;
 }
 
 /// One view, handle and layout for all mips: render targets and textures.
 #[derive(Debug)]
 pub struct Single {
     view: vk::ImageView,
-    handle: BindlessHandle,
+    handle: ImageHandle,
     state: AtomicU64,
 }
 
@@ -119,7 +119,7 @@ pub struct Single {
 #[derive(Debug)]
 pub struct PerMip {
     view: vk::ImageView,
-    handle: BindlessHandle,
+    handle: ImageHandle,
     mips: Box<[MipView]>,
     layouts: Box<[AtomicU64]>,
 }
@@ -127,7 +127,7 @@ pub struct PerMip {
 #[derive(Debug)]
 struct MipView {
     view: vk::ImageView,
-    handle: BindlessHandle,
+    handle: ImageHandle,
 }
 
 fn undefined() -> AtomicU64 {
@@ -139,14 +139,14 @@ impl Views for Single {
     fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
         Ok(Single {
             view: raw.create_view((0..raw.mip_levels).into())?,
-            handle: BindlessHandle::none(),
+            handle: ImageHandle::NULL,
             state: undefined(),
         })
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
+    fn whole(&self) -> (vk::ImageView, ImageHandle, &[AtomicU64]) {
         (self.view, self.handle, std::slice::from_ref(&self.state))
     }
-    fn whole_handle(&mut self) -> &mut BindlessHandle {
+    fn whole_handle(&mut self) -> &mut ImageHandle {
         &mut self.handle
     }
 }
@@ -157,7 +157,7 @@ impl Views for PerMip {
         // Built up front, so `Drop` destroys whatever was created before an error.
         let mut views = PerMip {
             view: vk::ImageView::null(),
-            handle: BindlessHandle::none(),
+            handle: ImageHandle::NULL,
             mips: Box::new([]),
             layouts: (0..raw.mip_levels).map(|_| undefined()).collect(),
         };
@@ -167,7 +167,7 @@ impl Views for PerMip {
             match raw.create_view((mip..mip + 1).into()) {
                 Ok(view) => mips.push(MipView {
                     view,
-                    handle: BindlessHandle::none(),
+                    handle: ImageHandle::NULL,
                 }),
                 Err(err) => {
                     views.mips = mips.into();
@@ -178,25 +178,25 @@ impl Views for PerMip {
         views.mips = mips.into();
         Ok(views)
     }
-    fn whole(&self) -> (vk::ImageView, BindlessHandle, &[AtomicU64]) {
+    fn whole(&self) -> (vk::ImageView, ImageHandle, &[AtomicU64]) {
         (self.view, self.handle, &self.layouts)
     }
-    fn whole_handle(&mut self) -> &mut BindlessHandle {
+    fn whole_handle(&mut self) -> &mut ImageHandle {
         &mut self.handle
     }
 }
 
 impl MipViews for PerMip {
-    fn mip(&self, level: u32) -> (vk::ImageView, BindlessHandle, &AtomicU64) {
+    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle, &AtomicU64) {
         let mip = &self.mips[level as usize];
         (mip.view, mip.handle, &self.layouts[level as usize])
     }
-    fn mip_handle_mut(&mut self, level: u32) -> &mut BindlessHandle {
+    fn mip_handle_mut(&mut self, level: u32) -> &mut ImageHandle {
         &mut self.mips[level as usize].handle
     }
 }
 
-fn release(view: vk::ImageView, handle: BindlessHandle) {
+fn release(view: vk::ImageView, handle: ImageHandle) {
     bindless::free_handle(handle);
     if view != vk::ImageView::null() {
         unsafe { Ctx::device().destroy_image_view(view, None) };
@@ -364,9 +364,11 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         self.raw.usage
     }
 
-    /// The whole view's handle.
-    pub fn handle(&self) -> BindlessHandle {
-        self.views.whole().1
+    /// The whole view's handle as `K`; panics unless it is bound with `K`'s descriptors (see
+    /// [`ImageView::handle`]).
+    #[track_caller]
+    pub fn handle<K: Allocatable>(&self) -> ImageHandle<K> {
+        self.whole_view().handle()
     }
 
     /// Panics unless the format has the `required` aspects; does nothing for a static format.
@@ -394,7 +396,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         &'a self,
         view: vk::ImageView,
         mip_range: Range<u32>,
-        handle: BindlessHandle,
+        handle: ImageHandle,
         states: &'a [AtomicU64],
     ) -> ImageView<'a, F, U, D> {
         ImageView {
@@ -440,30 +442,41 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 }
 
 impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
-    /// Binds the whole view at a free slot of the sampled set right away, freed once the image
-    /// is destroyed. Panics if it is bound there already.
+    /// Binds the whole view's sampled descriptor at a free slot right away, freed once the
+    /// image is destroyed. Panics if it is bound already: a view is bound once.
     #[validation_trace]
     pub fn bind_sampled(self) -> Result<Self>
     where
         Self: SampledImage,
     {
-        self.bind_whole(bindless::Set::Sampled)
+        self.bind_whole::<Sampled>()
     }
 
-    /// Like [`Self::bind_sampled`], in the storage set.
+    /// Like [`Self::bind_sampled`], its storage descriptor.
     #[validation_trace]
     pub fn bind_storage(self) -> Result<Self>
     where
         Self: StorageImage,
     {
-        self.bind_whole(bindless::Set::Storage)
+        self.bind_whole::<Storage>()
     }
 
-    fn bind_whole(mut self, set: bindless::Set) -> Result<Self> {
-        let index = set.index_mut(self.views.whole_handle());
-        assert_eq!(*index, NULL_HANDLE, "the image is bound in that set already");
-        *index = bindless::allocate(set, 1)?;
-        let bound = set.handle(*index);
+    /// Like [`Self::bind_sampled`], its sampled descriptor and, in the next slot, its storage
+    /// descriptor, which a shader that reads through the sampler and writes as storage needs
+    /// (`MutTex2D`).
+    #[validation_trace]
+    pub fn bind_combined(self) -> Result<Self>
+    where
+        Self: SampledImage + StorageImage,
+    {
+        self.bind_whole::<Combined>()
+    }
+
+    fn bind_whole<K: Allocatable>(mut self) -> Result<Self> {
+        let handle = self.views.whole_handle();
+        assert!(handle.is_null(), "the image is bound already ({handle:?}): bind it once, with `bind_combined` for both descriptors");
+        *handle = ImageHandle::<K>::new(bindless::allocate(K::WIDTH)?).erase();
+        let bound = *handle;
         bindless::bind_raw([self.whole_view().shader_image()], [bound], false)?;
         Ok(self)
     }
@@ -477,39 +490,51 @@ impl<F: Format, U: ImageUsage, D: Dim, V: MipViews> Image<F, U, D, V> {
         self.view(view, (level..level + 1).into(), handle, states)
     }
 
-    fn bind_mips(mut self, set: bindless::Set) -> Result<Self> {
+    fn bind_mips<K: Allocatable>(mut self) -> Result<Self> {
         let levels = 0..self.mip_levels();
-        let bound = |level| *set.index_mut(&mut self.views.mip(level).1) != NULL_HANDLE;
-        assert!(!levels.clone().any(bound), "the mips are bound in that set already");
-        let first = bindless::allocate(set, levels.len() as u32)?;
+        assert!(
+            levels.clone().all(|level| self.views.mip(level).1.is_null()),
+            "the mips are bound already: bind them once, with `bind_mips_combined` for both descriptors"
+        );
+        let first = bindless::allocate(levels.len() as u32 * K::WIDTH)?;
         for level in levels.clone() {
-            *set.index_mut(self.views.mip_handle_mut(level)) = first + level;
+            *self.views.mip_handle_mut(level) = ImageHandle::<K>::new(first + level * K::WIDTH).erase();
         }
         bindless::bind_raw(
             levels.clone().map(|level| self.mip_view(level).shader_image()),
-            levels.map(|level| set.handle(first + level)),
+            levels.map(|level| self.views.mip(level).1),
             false,
         )?;
         Ok(self)
     }
 
-    /// Binds mip `i`'s view at slot `first + i` of the sampled set right away, `first` being
-    /// the start of the first `mip_levels` contiguous free slots.
+    /// Binds each mip's view's sampled descriptor right away, all in one block of contiguous
+    /// free slots: mip `i`'s handle is mip 0's [`ImageHandle::mip`]`(i)`.
     #[validation_trace]
     pub fn bind_mips_sampled(self) -> Result<Self>
     where
         Self: SampledImage,
     {
-        self.bind_mips(bindless::Set::Sampled)
+        self.bind_mips::<Sampled>()
     }
 
-    /// Like [`Self::bind_mips_sampled`], in the storage set.
+    /// Like [`Self::bind_mips_sampled`], their storage descriptors.
     #[validation_trace]
     pub fn bind_mips_storage(self) -> Result<Self>
     where
         Self: StorageImage,
     {
-        self.bind_mips(bindless::Set::Storage)
+        self.bind_mips::<Storage>()
+    }
+
+    /// Like [`Self::bind_mips_sampled`], each mip's sampled and storage descriptor
+    /// ([`Self::bind_combined`]), the pairs one after another.
+    #[validation_trace]
+    pub fn bind_mips_combined(self) -> Result<Self>
+    where
+        Self: SampledImage + StorageImage,
+    {
+        self.bind_mips::<Combined>()
     }
 }
 

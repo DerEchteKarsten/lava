@@ -4,7 +4,7 @@ mod common;
 use std::process::ExitCode;
 
 use lava::{
-    bindless::{BindlessHandle, NULL_HANDLE},
+    bindless::{self, ImageHandle, Storage},
     image::{format::ClearValue, usage::ColorAttachmentStorageTransferDst},
     present::PresentSurface,
     queue::{Graphics, Timeline},
@@ -58,7 +58,7 @@ fn present_frame(
     surface: &mut Surface,
     size: glam::UVec2,
     color: [f32; 4],
-) -> BindlessHandle {
+) -> ImageHandle<Storage> {
     let submission = timeline.begin().unwrap();
     assert!(surface.acquire(size).unwrap(), "the window has an extent");
     let handle = surface.current_image().handle();
@@ -114,10 +114,10 @@ fn run(event_loop: &ActiveEventLoop) {
         handles.push(present_frame(&mut timeline, &mut surface, SIZE, color));
     }
     assert_eq!(surface.size(), SIZE);
-    // Bound in the storage set, the only one its usage allows.
+    // Bound as storage, the only descriptor its usage allows.
     for handle in &handles {
-        assert_ne!(handle.descriptor_index_set1, NULL_HANDLE);
-        assert_eq!(handle.descriptor_index_set0, NULL_HANDLE);
+        assert!(handle.storage_slot().is_some());
+        assert_eq!(handle.sampled_slot(), None);
     }
     step("acquire_clear_present");
 
@@ -131,9 +131,9 @@ fn run(event_loop: &ActiveEventLoop) {
         lava::wait_idle().unwrap();
         present_frame(&mut timeline, &mut surface, SIZE / 2, [0.0, 0.0, 0.0, 1.0]);
     }
-    let lowest = handles.iter().map(|h| h.descriptor_index_set1).min().unwrap();
-    let reserved = lava::bindless::reserve_storage(old_images as u32).unwrap();
-    assert_eq!(reserved.start(), lowest);
+    let lowest = handles.iter().map(|h| h.storage_slot().unwrap()).min().unwrap();
+    let reserved = bindless::reserve::<Storage>(old_images as u32).unwrap();
+    assert_eq!(reserved.slots().start, lowest);
     drop(reserved);
     step("a_new_size_recreates_the_swapchain_and_frees_the_old_slots");
 
@@ -143,10 +143,10 @@ fn run(event_loop: &ActiveEventLoop) {
 
     // An image no submission used stays current, through `present` too.
     assert!(surface.acquire(SIZE).unwrap());
-    let unused = surface.current_image().handle();
+    let unused = surface.current_image().handle::<Storage>();
     surface.present().unwrap();
     assert!(surface.acquire(SIZE).unwrap());
-    assert_eq!(surface.current_image().handle(), unused);
+    assert_eq!(surface.current_image().handle::<Storage>(), unused);
     let drawn = present_frame(&mut timeline, &mut surface, SIZE, [0.0, 1.0, 1.0, 1.0]);
     assert_eq!(drawn, unused, "the next frame draws into it");
     // One a submission presented is presented by the next acquire.

@@ -1,6 +1,7 @@
-//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`): image descriptors at slots lava allocates (first fit, freed with their images) or in ranges the application reserves (`reserve_sampled`, rewritten in submission order by `bind`), runtime `Sampler`s in the sampler heap, and the mappings that point shaders' set and binding declarations at both heaps
+//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, freed with their images) or in ranges the application reserves (`reserve`, rewritten in submission order by `bind`), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap
 use std::{
     collections::BTreeMap,
+    marker::PhantomData,
     ops::Range,
     ptr::NonNull,
     sync::{Mutex, OnceLock},
@@ -27,12 +28,12 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Bindless {
-    /// The resource heap: sampled images, then storage images, then the reserved range.
+    /// The resource heap: image descriptors, then the reserved range.
     images: HeapLayout,
     samplers: HeapLayout,
-    free: [Mutex<Ranges>; 2],
-    /// The live ranges of `reserve_sampled`/`reserve_storage`, which `bind` writes.
-    reserved: [Mutex<Vec<Range<u32>>>; 2],
+    free: Mutex<Ranges>,
+    /// The live slot ranges of `reserve`, which `bind` writes.
+    reserved: Mutex<Vec<Range<u32>>>,
     free_samplers: Mutex<Ranges>,
     resource_heap: Heap,
     sampler_heap: Heap,
@@ -43,8 +44,8 @@ pub struct Bindless {
 
 static BINDLESS: OnceLock<Bindless> = OnceLock::new();
 
-/// The most image descriptors of each region.
-const MAX_DESCRIPTORS: u32 = 1 << 15;
+/// The most image descriptors.
+const MAX_IMAGE_SLOTS: u32 = 1 << 16;
 /// The most samplers.
 const MAX_SAMPLERS: u32 = 1 << 12;
 
@@ -54,9 +55,10 @@ pub(crate) type Queued = BTreeMap<u64, SmallVec<[u8; 64]>>;
 /// The most bytes one `vkCmdUpdateMemoryKHR` writes.
 const MAX_UPDATE: usize = 65536;
 
-/// Where a heap keeps its descriptors: `regions` arrays of `count` descriptors `stride` bytes
-/// apart from offset 0, then the implementation's reserved range from `reserved_offset` to
-/// `size`.
+/// Where a heap keeps its descriptors: `count` descriptors `stride` bytes apart from offset 0,
+/// then the implementation's reserved range from `reserved_offset` to `size`. The stride is what
+/// shaders index the heap by: `OpConstantSizeOfEXT` of the descriptor type, its size aligned to
+/// its alignment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HeapLayout {
     pub(crate) stride: u64,
@@ -66,13 +68,11 @@ pub(crate) struct HeapLayout {
 }
 
 impl HeapLayout {
-    /// `regions` arrays of at most `max_count` descriptors of `size` bytes each, aligned to
-    /// `alignment`, then `reserved` bytes at a multiple of `reserved_alignment`, all within
-    /// `max_size`.
+    /// At most `max_count` descriptors of `size` bytes each, aligned to `alignment`, then
+    /// `reserved` bytes at a multiple of `reserved_alignment`, all within `max_size`.
     pub(crate) fn new(
         size: u64,
         alignment: u64,
-        regions: u32,
         max_count: u32,
         reserved: u64,
         reserved_alignment: u64,
@@ -82,9 +82,8 @@ impl HeapLayout {
         let reserved_alignment = reserved_alignment.max(1);
         // Room for the reserved range and the padding before it.
         let room = max_size.saturating_sub(reserved + reserved_alignment - 1);
-        let count = (room / (regions as u64 * stride)).min(max_count as u64) as u32;
-        let reserved_offset =
-            (regions as u64 * count as u64 * stride).next_multiple_of(reserved_alignment);
+        let count = (room / stride).min(max_count as u64) as u32;
+        let reserved_offset = (count as u64 * stride).next_multiple_of(reserved_alignment);
         Self {
             stride,
             count,
@@ -93,9 +92,9 @@ impl HeapLayout {
         }
     }
 
-    /// The byte offset of descriptor `index` of region `region`.
-    pub(crate) fn offset(&self, region: u32, index: u32) -> u64 {
-        (region as u64 * self.count as u64 + index as u64) * self.stride
+    /// The byte offset of descriptor `index`.
+    pub(crate) fn offset(&self, index: u32) -> u64 {
+        index as u64 * self.stride
     }
 }
 
@@ -141,51 +140,7 @@ impl Heap {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Set {
-    Sampled = 0,
-    Storage = 1,
-}
-
-impl Set {
-    pub(crate) fn index_mut(self, handle: &mut BindlessHandle) -> &mut u32 {
-        match self {
-            Set::Sampled => &mut handle.descriptor_index_set0,
-            Set::Storage => &mut handle.descriptor_index_set1,
-        }
-    }
-
-    /// The heap index of the set's first slot.
-    fn base(self) -> u32 {
-        self as u32 * Bindless::get().images.count
-    }
-
-    /// The set of heap index `index`, if it lies in one.
-    fn of(index: u32) -> Option<Set> {
-        match index / Bindless::get().images.count {
-            0 => Some(Set::Sampled),
-            1 => Some(Set::Storage),
-            _ => None,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Set::Sampled => "sampled",
-            Set::Storage => "storage",
-        }
-    }
-
-    /// The handle of `index` in this set alone.
-    pub(crate) fn handle(self, index: u32) -> BindlessHandle {
-        match self {
-            Set::Sampled => BindlessHandle::sampled(index),
-            Set::Storage => BindlessHandle::storage(index),
-        }
-    }
-}
-
-/// The free slots of a set: sorted, disjoint ranges, never two adjacent ones.
+/// The free slots of a heap: sorted, disjoint ranges, never two adjacent ones.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Ranges {
     free: Vec<Range<u32>>,
@@ -244,53 +199,36 @@ impl Ranges {
     }
 }
 
-/// `n` contiguous free slots of `set`, as indices into the resource heap, which shaders index
-/// from 0: the storage images follow the sampled ones.
-pub(crate) fn allocate(set: Set, n: u32) -> Result<u32> {
-    let bindless = Bindless::get();
-    let start = lock(&bindless.free[set as usize])
-        .take(n)
-        .ok_or(Error::OutOfBindlessSlots {
-            set: set.name(),
-            count: n,
-        })?;
-    Ok(set.base() + start)
+/// The first `n` contiguous free image slots.
+pub(crate) fn allocate(n: u32) -> Result<u32> {
+    lock(&Bindless::get().free).take(n).ok_or(Error::OutOfBindlessSlots { heap: "image", count: n })
 }
 
-/// Frees slots no frame reaches any more.
-pub(crate) fn free(set: Set, range: Range<u32>) {
-    let base = set.base();
-    lock(&Bindless::get().free[set as usize]).give(range.start - base..range.end - base);
+/// Frees image slots no frame reaches any more.
+pub(crate) fn free(range: Range<u32>) {
+    lock(&Bindless::get().free).give(range);
 }
 
 /// Frees the slots of a destroyed image's handle.
-pub(crate) fn free_handle(handle: BindlessHandle) {
-    for (set, index) in [
-        (Set::Sampled, handle.descriptor_index_set0),
-        (Set::Storage, handle.descriptor_index_set1),
-    ] {
-        if index != NULL_HANDLE {
-            free(set, index..index + 1);
-        }
+pub(crate) fn free_handle(handle: ImageHandle) {
+    if let Some(slots) = handle.slots() {
+        free(slots);
     }
 }
 
-/// Slots of one set the application writes with [`bind`], made by [`reserve_sampled`] and
-/// [`reserve_storage`]. Dropping it frees them once no submission reaches them, and [`bind`]
-/// refuses them right away.
+/// Image slots the application writes with [`bind`], made by [`reserve`]: `len` handles of kind
+/// `K`, each `K::WIDTH` slots. Dropping it frees them once no submission reaches them, and
+/// [`bind`] refuses them right away.
 #[derive(Debug)]
 #[must_use]
-pub struct SlotRange {
-    set: Set,
+pub struct SlotRange<K: Allocatable> {
     start: u32,
     len: u32,
+    kind: PhantomData<K>,
 }
 
-impl SlotRange {
-    pub fn start(&self) -> u32 {
-        self.start
-    }
-
+impl<K: Allocatable> SlotRange<K> {
+    /// How many handles it holds.
     pub fn len(&self) -> u32 {
         self.len
     }
@@ -299,48 +237,40 @@ impl SlotRange {
         self.len == 0
     }
 
-    pub fn indices(&self) -> Range<u32> {
-        self.start..self.start + self.len
+    /// Its slots in the resource heap, `K::WIDTH` per handle.
+    pub fn slots(&self) -> Range<u32> {
+        self.start..self.start + self.len * K::WIDTH
     }
 
-    /// The handle of its `i`-th slot, in its set alone. Panics past its end.
-    pub fn handle(&self, i: u32) -> BindlessHandle {
-        assert!(i < self.len, "slot {i} of a range of {}", self.len);
-        self.set.handle(self.start + i)
+    /// Its `i`-th handle. Panics past its end.
+    pub fn handle(&self, i: u32) -> ImageHandle<K> {
+        assert!(i < self.len, "handle {i} of a range of {}", self.len);
+        ImageHandle::new(self.start + i * K::WIDTH)
     }
 }
 
-impl Drop for SlotRange {
+impl<K: Allocatable> Drop for SlotRange<K> {
     fn drop(&mut self) {
-        let (set, range) = (self.set, self.indices());
+        let range = self.slots();
         let bindless = Bindless::get();
-        let mut reserved = lock(&bindless.reserved[set as usize]);
+        let mut reserved = lock(&bindless.reserved);
         if let Some(i) = reserved.iter().position(|r| *r == range) {
             reserved.swap_remove(i);
         }
         drop(reserved);
         // Nothing reads them any more, and a later copy could overwrite the slots' next owner.
         let layout = &bindless.images;
-        let bytes = layout.offset(0, range.start)..layout.offset(0, range.end);
+        let bytes = layout.offset(range.start)..layout.offset(range.end);
         lock(&bindless.queued).retain(|offset, _| !bytes.contains(offset));
-        lifetime::retire(move || free(set, range));
+        lifetime::retire(move || free(range));
     }
 }
 
-fn reserve(set: Set, n: u32) -> Result<SlotRange> {
-    let start = allocate(set, n)?;
-    lock(&Bindless::get().reserved[set as usize]).push(start..start + n);
-    Ok(SlotRange { set, start, len: n })
-}
-
-/// The first `n` contiguous free slots of the sampled set, for [`bind`].
-pub fn reserve_sampled(n: u32) -> Result<SlotRange> {
-    reserve(Set::Sampled, n)
-}
-
-/// Like [`reserve_sampled`], in the storage set.
-pub fn reserve_storage(n: u32) -> Result<SlotRange> {
-    reserve(Set::Storage, n)
+/// The first `n` handles' worth of contiguous free image slots (`n * K::WIDTH`), for [`bind`].
+pub fn reserve<K: Allocatable>(n: u32) -> Result<SlotRange<K>> {
+    let start = allocate(n * K::WIDTH)?;
+    lock(&Bindless::get().reserved).push(start..start + n * K::WIDTH);
+    Ok(SlotRange { start, len: n, kind: PhantomData })
 }
 
 /// How a [`Sampler`] filters and addresses an image. [`SamplerDesc::new`] (and `Default`)
@@ -493,7 +423,7 @@ impl Sampler {
         let index = lock(&bindless.free_samplers)
             .take(1)
             .ok_or(Error::OutOfBindlessSlots {
-                set: "sampler",
+                heap: "sampler",
                 count: 1,
             })?;
         // From here on `Drop` frees the slot.
@@ -501,7 +431,7 @@ impl Sampler {
         let layout = &bindless.samplers;
         let range = bindless
             .sampler_heap
-            .host_range(layout.offset(0, index), layout.stride);
+            .host_range(layout.offset(index), layout.stride);
         desc.with_create_info(|info| unsafe {
             Functions::descriptor_heap()
                 .write_sampler_descriptors(std::slice::from_ref(info), &[range])
@@ -529,51 +459,217 @@ pub struct SamplerHandle {
     pub index: u32,
 }
 
-pub const NULL_HANDLE: u32 = !0;
-#[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct BindlessHandle {
-    pub descriptor_index_set0: u32,
-    pub descriptor_index_set1: u32,
-}
-impl BindlessHandle {
-    pub fn none() -> Self {
-        Self {
-            descriptor_index_set0: NULL_HANDLE,
-            descriptor_index_set1: NULL_HANDLE,
-        }
-    }
+/// The kinds of descriptors an [`ImageHandle`] names: [`Sampled`], [`Storage`], [`Combined`]
+/// (both), or [`Dynamic`], any of them, known only at runtime.
+pub trait HandleKind: crate::sealed::Sealed + Send + Sync + 'static {}
 
-    /// Only `index` of the sampled set.
-    pub fn sampled(index: u32) -> Self {
-        Self {
-            descriptor_index_set0: index,
-            ..Self::none()
-        }
-    }
-
-    /// Only `index` of the storage set.
-    pub fn storage(index: u32) -> Self {
-        Self {
-            descriptor_index_set1: index,
-            ..Self::none()
-        }
-    }
+/// The kinds images are bound as: `WIDTH` descriptors from the handle's slot.
+pub trait Allocatable: HandleKind {
+    const WIDTH: u32;
+    /// The handle's bits 30 and 31.
+    const BITS: u32;
+    /// Whether it has a sampled descriptor.
+    const SAMPLED: bool;
+    /// Whether it has a storage descriptor.
+    const STORAGE: bool;
+    /// The call that binds an image as it.
+    const BIND: &str;
 }
 
-impl Default for BindlessHandle {
+/// Kinds with a sampled descriptor, which `Tex2D` and the like read.
+pub trait HasSampled: HandleKind {}
+/// Kinds with a storage descriptor, which `Image2D` and the like read and write.
+pub trait HasStorage: HandleKind {}
+
+/// A sampled image descriptor.
+#[derive(Debug)]
+pub enum Sampled {}
+/// A storage image descriptor.
+#[derive(Debug)]
+pub enum Storage {}
+/// A sampled descriptor and, in the next slot, a storage descriptor of the same image
+/// (`MutTex2D`).
+#[derive(Debug)]
+pub enum Combined {}
+/// Any kind, known only at runtime (`DynImg`).
+#[derive(Debug)]
+pub enum Dynamic {}
+
+macro_rules! handle_kinds {
+    ($($kind:ident: $width:literal, $bits:expr, $sampled:literal, $storage:literal, $bind:literal;)*) => {$(
+        impl crate::sealed::Sealed for $kind {}
+        impl HandleKind for $kind {}
+        impl Allocatable for $kind {
+            const WIDTH: u32 = $width;
+            const BITS: u32 = $bits;
+            const SAMPLED: bool = $sampled;
+            const STORAGE: bool = $storage;
+            const BIND: &str = $bind;
+        }
+    )*};
+}
+handle_kinds! {
+    Sampled: 1, 0, true, false, "bind_sampled";
+    Storage: 1, STORAGE_FIRST, false, true, "bind_storage";
+    Combined: 2, PAIR, true, true, "bind_combined";
+}
+impl crate::sealed::Sealed for Dynamic {}
+impl HandleKind for Dynamic {}
+impl HasSampled for Sampled {}
+impl HasSampled for Combined {}
+impl HasStorage for Storage {}
+impl HasStorage for Combined {}
+
+/// The slot bits of an [`ImageHandle`].
+const SLOT: u32 = (1 << 30) - 1;
+/// Set if the first descriptor is a storage descriptor.
+const STORAGE_FIRST: u32 = 1 << 30;
+/// Set if the handle names two descriptors, sampled then storage.
+const PAIR: u32 = 1 << 31;
+
+/// An image as shaders see it (`Img` and `DynImg` in `bindless.slang`), one `u32`: bits 0 to 29
+/// are the slot of its first descriptor in the resource heap, bit 30 that descriptor's kind (0
+/// sampled, 1 storage), bit 31 how many there are (0 one, 1 two: sampled at the slot, storage
+/// at the next). [`Self::NULL`], all ones (storage first, two of them), names nothing.
+///
+/// `K` is what it is known to name: lava's binds and [`reserve`] make the typed kinds, which
+/// [`Self::erase`] turns into [`Dynamic`], and [`Self::as_sampled`]/[`Self::as_storage`] into
+/// the part of a [`Combined`] handle a shader reads; every one of them keeps the bits.
+#[repr(transparent)]
+pub struct ImageHandle<K: HandleKind = Dynamic> {
+    bits: u32,
+    kind: PhantomData<K>,
+}
+
+// SAFETY: a `u32` and a zero-sized marker.
+unsafe impl<K: HandleKind> Zeroable for ImageHandle<K> {}
+unsafe impl<K: HandleKind> Pod for ImageHandle<K> {}
+
+impl<K: HandleKind> Clone for ImageHandle<K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<K: HandleKind> Copy for ImageHandle<K> {}
+impl<K: HandleKind> PartialEq for ImageHandle<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.bits == other.bits
+    }
+}
+impl<K: HandleKind> Eq for ImageHandle<K> {}
+impl<K: HandleKind> std::hash::Hash for ImageHandle<K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bits.hash(state);
+    }
+}
+impl<K: HandleKind> Default for ImageHandle<K> {
     fn default() -> Self {
-        Self::none()
+        Self::NULL
+    }
+}
+impl<K: HandleKind> std::fmt::Debug for ImageHandle<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_null() {
+            return f.write_str("ImageHandle(null)");
+        }
+        f.debug_struct("ImageHandle")
+            .field("sampled", &self.sampled_slot())
+            .field("storage", &self.storage_slot())
+            .finish()
     }
 }
 
-/// Valid sampled indices are `0..max_sampled_images()`.
-pub fn max_sampled_images() -> u32 {
-    Bindless::get().images.count
+impl<K: HandleKind> ImageHandle<K> {
+    /// No image; a `DynImg` reads zeroes from it.
+    pub const NULL: Self = Self::from_bits(!0);
+
+    pub(crate) const fn from_bits(bits: u32) -> Self {
+        Self {
+            bits,
+            kind: PhantomData,
+        }
+    }
+
+    /// The `u32` shaders read.
+    pub const fn bits(self) -> u32 {
+        self.bits
+    }
+
+    pub const fn is_null(self) -> bool {
+        self.bits == Self::NULL.bits
+    }
+
+    /// How many descriptors it names.
+    const fn width(self) -> u32 {
+        1 + (self.bits >> 31)
+    }
+
+    /// Its slots in the resource heap, `None` for `NULL`.
+    pub(crate) fn slots(self) -> Option<Range<u32>> {
+        let first = self.bits & SLOT;
+        (!self.is_null()).then(|| first..first + self.width())
+    }
+
+    /// The slot of its sampled descriptor, if it has one.
+    pub fn sampled_slot(self) -> Option<u32> {
+        (!self.is_null() && self.bits & STORAGE_FIRST == 0).then_some(self.bits & SLOT)
+    }
+
+    /// The slot of its storage descriptor, if it has one.
+    pub fn storage_slot(self) -> Option<u32> {
+        let has = !self.is_null() && self.bits & (STORAGE_FIRST | PAIR) != 0;
+        has.then_some((self.bits & SLOT) + (self.bits >> 31))
+    }
+
+    /// The handle of mip `level` of a mip chain this is mip 0 of (`bind_mips_*`), which lava
+    /// binds `width` slots apart (`Img.Mip(level)` in shaders). Panics for `NULL`.
+    pub fn mip(self, level: u32) -> Self {
+        assert!(!self.is_null(), "a null handle has no mips");
+        let slot = (self.bits & SLOT) + level * self.width();
+        assert!(slot <= SLOT, "mip {level} lies past the last slot");
+        Self::from_bits(self.bits & !SLOT | slot)
+    }
+
+    /// The same handle as [`Dynamic`], for a `DynImg`.
+    pub const fn erase(self) -> ImageHandle {
+        ImageHandle::from_bits(self.bits)
+    }
+
+    /// The same handle, for a shader that reads its sampled descriptor.
+    pub const fn as_sampled(self) -> ImageHandle<Sampled>
+    where
+        K: HasSampled,
+    {
+        ImageHandle::from_bits(self.bits)
+    }
+
+    /// The same handle, for a shader that reads or writes its storage descriptor.
+    pub const fn as_storage(self) -> ImageHandle<Storage>
+    where
+        K: HasStorage,
+    {
+        ImageHandle::from_bits(self.bits)
+    }
 }
 
-/// Valid storage indices are `0..max_storage_images()`.
-pub fn max_storage_images() -> u32 {
+impl ImageHandle {
+    /// The same handle as `K`, if it has `K`'s descriptors.
+    pub(crate) fn narrow<K: Allocatable>(self) -> Option<ImageHandle<K>> {
+        let has = (!K::SAMPLED || self.sampled_slot().is_some()) && (!K::STORAGE || self.storage_slot().is_some());
+        (has && !self.is_null()).then(|| ImageHandle::from_bits(self.bits))
+    }
+}
+
+impl<K: Allocatable> ImageHandle<K> {
+    /// The handle of `K`'s descriptors from `slot` on.
+    pub(crate) fn new(slot: u32) -> Self {
+        assert!(slot + K::WIDTH - 1 <= SLOT, "image slot {slot} doesn't fit a handle");
+        Self::from_bits(slot | K::BITS)
+    }
+}
+
+/// Valid image slots are `0..max_image_slots()`; a [`Combined`] handle takes two.
+pub fn max_image_slots() -> u32 {
     Bindless::get().images.count
 }
 
@@ -602,9 +698,9 @@ impl<F: Format, U: ImageUsage, D: Dim> ImageView<'_, F, U, D> {
     }
 }
 
-/// Writes each image's descriptor into the slots of the handle at the same position, skipping
-/// `NULL_HANDLE`s. Panics unless every index lies in a live [`SlotRange`] and every image has
-/// the usage of its set.
+/// Writes each image's descriptors into the slots of the handle at the same position, skipping
+/// `NULL` handles. Panics unless every slot lies in a live [`SlotRange`] and every image has
+/// the usages of its handle's descriptors.
 ///
 /// The descriptors reach the heap in submission order: the next submission of a timeline with
 /// shaders (graphics or compute) copies them in before its commands, after waiting for every
@@ -615,25 +711,23 @@ impl<F: Format, U: ImageUsage, D: Dim> ImageView<'_, F, U, D> {
 ///
 /// [`wait_for`]: crate::queue::Submission::wait_for
 #[validation_trace]
-pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
+pub fn bind<'a, F: Format, U: ImageUsage, D: Dim, K: Allocatable>(
     images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
-    handles: impl IntoIterator<Item = BindlessHandle>,
+    handles: impl IntoIterator<Item = ImageHandle<K>>,
 ) {
     let bindless = Bindless::get();
-    let reserved = [&bindless.reserved[0], &bindless.reserved[1]].map(lock);
+    let reserved = lock(&bindless.reserved);
     let handles = handles.into_iter().inspect(|handle| {
-        let indices = [handle.descriptor_index_set0, handle.descriptor_index_set1];
-        for (set, index) in indices.into_iter().enumerate() {
+        if let Some(slots) = handle.slots() {
             assert!(
-                index == NULL_HANDLE || reserved[set].iter().any(|r| r.contains(&index)),
-                "bindless index {index} of the {} set lies in no `SlotRange`: `bind` writes only \
-                 reserved slots (`reserve_sampled`, `reserve_storage`)",
-                [Set::Sampled, Set::Storage][set].name()
+                reserved.iter().any(|r| r.start <= slots.start && slots.end <= r.end),
+                "bindless slots {slots:?} lie in no `SlotRange`: `bind` writes only reserved \
+                 slots (`reserve`)"
             );
         }
     });
     let images = images.into_iter().map(|image| image.shader_image());
-    bind_raw(images, handles, true).expect("writing image descriptors failed");
+    bind_raw(images, handles.map(ImageHandle::erase), true).expect("writing image descriptors failed");
 }
 
 /// [`bind`] for any slots: writes the descriptors into the heap right away, or with `queued`
@@ -641,34 +735,30 @@ pub fn bind<'a, F: Format, U: ImageUsage, D: Dim>(
 /// reaches, freshly allocated ones.
 pub(crate) fn bind_raw(
     images: impl IntoIterator<Item = ShaderImage>,
-    handles: impl IntoIterator<Item = BindlessHandle>,
+    handles: impl IntoIterator<Item = ImageHandle>,
     queued: bool,
 ) -> Result<()> {
     let bindless = Bindless::get();
     let layout = &bindless.images;
-    let mut targets: SmallVec<[(ShaderImage, Set, u32); 8]> = SmallVec::new();
+    let mut targets: SmallVec<[(ShaderImage, vk::DescriptorType, u32); 8]> = SmallVec::new();
     for (image, handle) in images.into_iter().zip(handles) {
-        let indices = [handle.descriptor_index_set0, handle.descriptor_index_set1];
-        let usages = [vk::ImageUsageFlags::SAMPLED, vk::ImageUsageFlags::STORAGE];
-        for (set, (index, usage)) in [Set::Sampled, Set::Storage]
-            .into_iter()
-            .zip(indices.into_iter().zip(usages))
-        {
-            if index == NULL_HANDLE {
-                continue;
-            }
+        let descriptors = [
+            (handle.sampled_slot(), vk::ImageUsageFlags::SAMPLED, vk::DescriptorType::SAMPLED_IMAGE),
+            (handle.storage_slot(), vk::ImageUsageFlags::STORAGE, vk::DescriptorType::STORAGE_IMAGE),
+        ];
+        for (slot, usage, ty) in descriptors {
+            let Some(slot) = slot else { continue };
             assert!(
                 image.usage.contains(usage),
-                "an image with usage {:?} can't be bound in the {} set",
+                "an image with usage {:?} can't be bound as {usage:?}",
                 image.usage,
-                set.name()
             );
             assert!(
-                Set::of(index) == Some(set),
-                "bindless index {index} is outside the {} set",
-                set.name(),
+                slot < layout.count,
+                "bindless slot {slot} is outside the {} image slots",
+                layout.count
             );
-            targets.push((image, set, index));
+            targets.push((image, ty, slot));
         }
     }
     if targets.is_empty() {
@@ -701,25 +791,16 @@ pub(crate) fn bind_raw(
     let resources: SmallVec<[_; 8]> = targets
         .iter()
         .zip(&infos)
-        .map(|((_, set, _), info)| {
-            let ty = match set {
-                Set::Sampled => vk::DescriptorType::SAMPLED_IMAGE,
-                Set::Storage => vk::DescriptorType::STORAGE_IMAGE,
-            };
+        .map(|(&(_, ty, _), info)| {
             vk::ResourceDescriptorInfoEXT::default()
                 .ty(ty)
                 .data((info as *const vk::ImageDescriptorInfoEXT).cast())
         })
         .collect();
-    let offset = |_: Set, index: u32| layout.offset(0, index);
     let functions = Functions::descriptor_heap();
     if !queued {
         let ranges: SmallVec<[_; 8]> = (targets.iter())
-            .map(|&(_, set, index)| {
-                bindless
-                    .resource_heap
-                    .host_range(offset(set, index), layout.stride)
-            })
+            .map(|&(.., slot)| bindless.resource_heap.host_range(layout.offset(slot), layout.stride))
             .collect();
         unsafe { functions.write_resource_descriptors(&resources, &ranges)? };
         return Ok(());
@@ -735,8 +816,8 @@ pub(crate) fn bind_raw(
         .collect();
     unsafe { functions.write_resource_descriptors(&resources, &ranges)? };
     let mut queue = lock(&bindless.queued);
-    for (&(_, set, index), descriptor) in targets.iter().zip(staging.chunks(stride)) {
-        queue.insert(offset(set, index), SmallVec::from_slice(descriptor));
+    for (&(.., slot), descriptor) in targets.iter().zip(staging.chunks(stride)) {
+        queue.insert(layout.offset(slot), SmallVec::from_slice(descriptor));
     }
     Ok(())
 }
@@ -753,8 +834,7 @@ impl Bindless {
         let images = HeapLayout::new(
             p.image_descriptor_size,
             p.image_descriptor_alignment,
-            2,
-            MAX_DESCRIPTORS,
+            MAX_IMAGE_SLOTS,
             p.min_resource_heap_reserved_range,
             p.image_descriptor_alignment
                 .max(p.buffer_descriptor_alignment),
@@ -763,7 +843,6 @@ impl Bindless {
         let samplers = HeapLayout::new(
             p.sampler_descriptor_size,
             p.sampler_descriptor_alignment,
-            1,
             MAX_SAMPLERS,
             p.min_sampler_heap_reserved_range,
             p.sampler_descriptor_alignment,
@@ -773,7 +852,7 @@ impl Bindless {
         let sampler_heap = Heap::new(&samplers, p.sampler_heap_alignment)?;
         BINDLESS
             .set(Self {
-                free: [Ranges::all(images.count), Ranges::all(images.count)].map(Mutex::new),
+                free: Mutex::new(Ranges::all(images.count)),
                 reserved: Default::default(),
                 free_samplers: Mutex::new(Ranges::all(samplers.count)),
                 images,
@@ -858,10 +937,10 @@ impl Bindless {
     /// newer one for their slot meanwhile or their reservation was dropped.
     pub(crate) fn requeue(queued: Queued) {
         let s = Self::get();
-        let reserved = [&s.reserved[0], &s.reserved[1]].map(lock);
+        let reserved = lock(&s.reserved);
         let live = |offset: u64| {
-            let index = (offset / s.images.stride) as u32;
-            Set::of(index).is_some_and(|set| reserved[set as usize].iter().any(|range| range.contains(&index)))
+            let slot = (offset / s.images.stride) as u32;
+            reserved.iter().any(|range| range.contains(&slot))
         };
         let mut queue = lock(&s.queued);
         for (offset, descriptor) in queued.into_iter().filter(|&(offset, _)| live(offset)) {

@@ -16,16 +16,18 @@
 //!
 //! # Shader contract
 //! What every frontend's shaders and generated code must match:
-//! - Descriptors live in two heaps (`VK_EXT_descriptor_heap`), which shaders reach through set
-//!   and binding declarations lava maps to them: set 0, binding 0 is the sampler heap's array of
-//!   [`bindless::Sampler`]s; set 0, binding 1 the sampled images and set 1, binding 0 the storage
-//!   images of the resource heap. Passes have no other descriptors.
+//! - Descriptors live in two heaps (`VK_EXT_descriptor_heap`), which shaders index directly
+//!   (`ResourceDescriptorHeap`, `SamplerDescriptorHeap`; `SPV_EXT_descriptor_heap`): the
+//!   resource heap holds image descriptors, the sampler heap the [`bindless::Sampler`]s, each
+//!   `OpConstantSizeOfEXT` of its descriptor type apart. Passes have no other descriptors.
 //! - Push data: a pass pushes its own struct from offset 0, at most
 //!   [`pipeline::MAX_PUSH_CONSTANTS_SIZE`] bytes, read as `[[vk::push_constant]]`.
 //!   Specialization constants have no size limit.
-//! - Shaders see [`bindless::BindlessHandle`] (two `u32` indices, sampled then storage,
-//!   [`bindless::NULL_HANDLE`] for none), [`bindless::SamplerHandle`] (a `u32` index; there are
-//!   no samplers but the ones the application creates) and
+//! - Shaders see [`bindless::ImageHandle`] (a `u32`: bits 0 to 29 the slot of its first
+//!   descriptor, bit 30 that descriptor's kind, 0 sampled and 1 storage, bit 31 set for two
+//!   descriptors, sampled at the slot and storage at the next; all ones for none, and mip `i` of
+//!   a mip chain `i` times its width further), [`bindless::SamplerHandle`] (a `u32` slot; there
+//!   are no samplers but the ones the application creates) and
 //!   [`vkobjects::acceleration_structure::Instance`] (`VkAccelerationStructureInstanceKHR`); a
 //!   TLAS is a `u64` device address.
 //! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) has

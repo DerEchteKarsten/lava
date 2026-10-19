@@ -231,9 +231,20 @@ impl {name} {{
     }
 }
 
+/// The `ImageHandle` kind of an `Img` of kind `usage` (its `U`).
+fn handle_kind(usage: u64) -> &'static str {
+    match usage {
+        0 => "Sampled",
+        3 => "Combined",
+        _ => "Storage",
+    }
+}
+
 fn gpu_type(t: &TypeLayout, structs: &mut Structs) -> String {
-    if is_struct_named(t, &HANDLE_TYPES) {
-        "BindlessHandle".into()
+    if let FieldKind::Image { usage } = field_kind(t) {
+        format!("ImageHandle<bindless::{}>", handle_kind(usage))
+    } else if is_struct_named(t, &HANDLE_TYPES) {
+        "ImageHandle".into()
     } else if is_struct_named(t, &ACCEL_TYPES) {
         "u64".into()
     } else if is_struct_named(t, &BUFFER_TYPES) {
@@ -244,6 +255,14 @@ fn gpu_type(t: &TypeLayout, structs: &mut Structs) -> String {
         "u64".into()
     } else {
         rust_type(t, structs)
+    }
+}
+
+/// A specialization constant's Rust type: an `SCONST` is a `u64` whatever its handle type.
+fn constant_type(t: &TypeLayout, structs: &mut Structs) -> String {
+    match field_kind(t) {
+        FieldKind::Image { .. } => "u64".into(),
+        _ => gpu_type(t, structs),
     }
 }
 
@@ -310,10 +329,12 @@ struct NewFn {
     checks: Vec<String>,
 }
 
+/// `constants`: the fields are specialization constants, whose image handles are `u64`s.
 fn build_new_fn<'a>(
     fields: impl Iterator<Item = (&'a str, &'a TypeLayout)>,
     structs: &mut Structs,
     stage: &str,
+    constants: bool,
 ) -> NewFn {
     let mut out = NewFn {
         params: Vec::new(),
@@ -373,10 +394,13 @@ fn build_new_fn<'a>(
                 };
                 out.checks
                     .push(format!("{name}.usage_check(vk::ImageUsageFlags::{flags});"));
-                out.checks
-                    .push(format!("{name}.bound_check(vk::ImageUsageFlags::{flags});"));
                 out.params.push(format!("{name}: impl {traits} + 'a"));
-                out.gpu_inits.push(format!("{name}: {name}.handle()"));
+                // A specialization constant is a `u64`, the handle zero-extended.
+                let bits = if constants { ".bits() as u64" } else { "" };
+                out.gpu_inits.push(format!(
+                    "{name}: {name}.handle::<bindless::{}>(){bits}",
+                    handle_kind(usage)
+                ));
                 let access = match usage {
                     0 => "vk::AccessFlags2::SHADER_SAMPLED_READ",
                     1 => "vk::AccessFlags2::SHADER_STORAGE_READ",
@@ -412,7 +436,8 @@ fn build_new_fn<'a>(
                 }
             }
             FieldKind::Plain => {
-                let ty = rust_type(t, structs);
+                // A `DynImg` is a plain `ImageHandle`, whose image the command's accesses name.
+                let ty = gpu_type(t, structs);
                 out.params.push(format!("{name}: {ty}"));
                 out.gpu_inits.push(name.to_string());
             }
@@ -493,7 +518,7 @@ use bytemuck::{{Pod, Zeroable}};
 #[allow(unused_imports)]
 use lava::state::raw_vulkan as vk;
 #[allow(unused_imports)]
-use lava::bindless::BindlessHandle;
+use lava::bindless::{{self, ImageHandle}};
 #[allow(unused_imports)]
 use lava::buffer::slice::*;
 #[allow(unused_imports)]
@@ -733,7 +758,7 @@ use lava::pipeline::*;
                             "vk::SpecializationMapEntry {{ constant_id: {id}, offset: core::mem::offset_of!({consts_name}, {name}) as u32, size: size_of::<{ty}>() }}",
                             id = c.id,
                             name = c.name,
-                            ty = gpu_type(c.layout, &mut structs),
+                            ty = constant_type(c.layout, &mut structs),
                         )
                     })
                     .collect();
@@ -817,6 +842,7 @@ pub struct {gpu_name} {{
                     .map(|f| (field_name(f), f.checked_type_layout().unwrap())),
                 &mut structs,
                 stage,
+                false,
             );
             push.gpu_inits.extend(
                 gaps.iter()
@@ -914,17 +940,18 @@ impl {pass_name} {{
                     consts.iter().map(|c| (c.name.as_str(), c.layout)),
                     &mut structs,
                     stage,
+                    true,
                 );
                 let fields: Vec<String> = consts
                     .iter()
-                    .map(|c| format!("    pub {}: {},", c.name, gpu_type(c.layout, &mut structs)))
+                    .map(|c| format!("    pub {}: {},", c.name, constant_type(c.layout, &mut structs)))
                     .collect();
                 let constants_size: usize = consts
                     .iter()
-                    .map(|c| match gpu_type(c.layout, &mut structs).as_str() {
+                    .map(|c| match constant_type(c.layout, &mut structs).as_str() {
                         "u8" => 1,
                         "u32" | "i32" | "f32" => 4,
-                        "u64" | "BindlessHandle" => 8,
+                        "u64" => 8,
                         other => panic!("a specialization constant of type {other}"),
                     })
                     .sum();

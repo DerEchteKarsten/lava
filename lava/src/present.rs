@@ -13,7 +13,7 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use smallvec::SmallVec;
 
 use crate::{
-    bindless::{self, BindlessHandle},
+    bindless::{self, Allocatable, Combined, ImageHandle, Sampled, Storage},
     command_buffer::{
         CommandBuffer,
         image_state::ImageState,
@@ -77,7 +77,7 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
 struct SwapchainImage {
     image: vk::Image,
     view: vk::ImageView,
-    handle: BindlessHandle,
+    handle: ImageHandle,
     state: AtomicU64,
     present: vk::Semaphore,
 }
@@ -401,33 +401,31 @@ impl<U: StaticUsage> PresentSurface<U> {
                             }
                         };
                         let state = ImageState::UNDEFINED.atomic();
-                        let handle = BindlessHandle::none();
+                        let handle = ImageHandle::NULL;
                         swapchain.images.push(SwapchainImage { image, view, handle, state, present });
                     }
-                    for (set, flag) in [
-                        (bindless::Set::Sampled, vk::ImageUsageFlags::SAMPLED),
-                        (bindless::Set::Storage, vk::ImageUsageFlags::STORAGE),
-                    ] {
-                        if !usage.contains(flag) {
-                            continue;
-                        }
-                        let mut indices = SmallVec::<[u32; 5]>::new();
-                        for image in &mut swapchain.images {
-                            let index = bindless::allocate(set, 1)?;
-                            *set.index_mut(&mut image.handle) = index;
-                            indices.push(index);
-                        }
-                        let format = self.format.format;
-                        let images = swapchain.images.iter().map(|image| bindless::ShaderImage {
-                            image: image.image,
-                            format,
-                            aspects: vk::ImageAspectFlags::COLOR,
-                            view_type: vk::ImageViewType::TYPE_2D,
-                            mips: (0..1).into(),
-                            usage,
-                        });
-                        bindless::bind_raw(images, indices.into_iter().map(|index| set.handle(index)), false)?;
+                    // One handle per image, with every descriptor its usage allows.
+                    let sampled = usage.contains(vk::ImageUsageFlags::SAMPLED);
+                    let storage = usage.contains(vk::ImageUsageFlags::STORAGE);
+                    let (width, new): (u32, fn(u32) -> ImageHandle) = match (sampled, storage) {
+                        (true, true) => (Combined::WIDTH, |slot| ImageHandle::<Combined>::new(slot).erase()),
+                        (true, false) => (Sampled::WIDTH, |slot| ImageHandle::<Sampled>::new(slot).erase()),
+                        (false, true) => (Storage::WIDTH, |slot| ImageHandle::<Storage>::new(slot).erase()),
+                        (false, false) => return Ok(()),
+                    };
+                    for image in &mut swapchain.images {
+                        image.handle = new(bindless::allocate(width)?);
                     }
+                    let format = self.format.format;
+                    let images = swapchain.images.iter().map(|image| bindless::ShaderImage {
+                        image: image.image,
+                        format,
+                        aspects: vk::ImageAspectFlags::COLOR,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        mips: (0..1).into(),
+                        usage,
+                    });
+                    bindless::bind_raw(images, swapchain.images.iter().map(|image| image.handle), false)?;
                     Ok(())
                 })();
                 if let Err(err) = made {

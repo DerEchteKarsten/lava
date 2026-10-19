@@ -4,7 +4,7 @@ use std::{iter, sync::atomic::AtomicU64};
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
 
 use crate::{
-    bindless::{HeapLayout, Ranges},
+    bindless::{Combined, HeapLayout, ImageHandle, Ranges, Sampled, Storage},
     command_buffer::{
         BufferAccess, ImageAccess, ImageUse, compute_barriers,
         image_state::{ImageState, check_states, release_states, take_checked_states},
@@ -179,24 +179,58 @@ fn bindless_slots_are_first_fit_and_freed_ranges_merge() {
 }
 
 #[test]
-fn heaps_hold_their_regions_then_the_reserved_range() {
+fn heaps_hold_their_descriptors_then_the_reserved_range() {
     // Intel's resource heap: 64-byte descriptors, nothing reserved, 2 GiB at most.
-    let heap = HeapLayout::new(64, 64, 2, 1 << 15, 0, 64, 1 << 31);
-    assert_eq!((heap.stride, heap.count), (64, 1 << 15));
-    assert_eq!(heap.offset(1, 0), 64 << 15, "the second region follows the first");
-    assert_eq!(heap.offset(1, 3), (64 << 15) + 3 * 64);
-    assert_eq!((heap.reserved_offset, heap.size), (2 * (64 << 15), 2 * (64 << 15)));
+    let heap = HeapLayout::new(64, 64, 1 << 16, 0, 64, 1 << 31);
+    assert_eq!((heap.stride, heap.count), (64, 1 << 16));
+    assert_eq!(heap.offset(3), 3 * 64);
+    assert_eq!((heap.reserved_offset, heap.size), (64 << 16, 64 << 16));
 
     // Strides round up to the descriptor alignment, the reserved range to its own.
-    let heap = HeapLayout::new(48, 32, 2, 10, 100, 512, 1 << 20);
+    let heap = HeapLayout::new(48, 32, 10, 100, 512, 1 << 20);
     assert_eq!((heap.stride, heap.count), (64, 10));
-    assert_eq!((heap.reserved_offset, heap.size), (1536, 1636));
+    assert_eq!((heap.reserved_offset, heap.size), (1024, 1124));
 
     // A small heap holds fewer descriptors, so the padding and reserved range still fit.
-    let heap = HeapLayout::new(64, 64, 2, 1 << 15, 1000, 256, 1 << 16);
-    assert_eq!(heap.count, 502);
+    let heap = HeapLayout::new(64, 64, 1 << 16, 1000, 256, 1 << 16);
+    assert_eq!(heap.count, 1004);
     assert_eq!(heap.reserved_offset % 256, 0);
-    assert!(heap.reserved_offset >= heap.offset(2, 0) && heap.size <= 1 << 16);
+    assert!(heap.reserved_offset >= heap.offset(heap.count) && heap.size <= 1 << 16);
+}
+
+#[test]
+fn image_handles_encode_their_slots_and_kind() {
+    let sampled = ImageHandle::<Sampled>::new(5);
+    assert_eq!(sampled.bits(), 5);
+    assert_eq!((sampled.sampled_slot(), sampled.storage_slot()), (Some(5), None));
+    let storage = ImageHandle::<Storage>::new(5);
+    assert_eq!(storage.bits(), 5 | 1 << 30);
+    assert_eq!((storage.sampled_slot(), storage.storage_slot()), (None, Some(5)));
+    let combined = ImageHandle::<Combined>::new(5);
+    assert_eq!(combined.bits(), 5 | 1 << 31);
+    assert_eq!((combined.sampled_slot(), combined.storage_slot()), (Some(5), Some(6)));
+
+    // Mips are a handle's width apart, and keep its kind.
+    assert_eq!(sampled.mip(3).sampled_slot(), Some(8));
+    assert_eq!(storage.mip(3).storage_slot(), Some(8));
+    let mip = combined.mip(3);
+    assert_eq!((mip.sampled_slot(), mip.storage_slot()), (Some(11), Some(12)));
+
+    // Retyping keeps the bits, so a combined handle read as either kind finds its descriptor.
+    assert_eq!(combined.as_sampled().bits(), combined.bits());
+    assert_eq!(combined.as_storage().storage_slot(), Some(6));
+    assert_eq!(combined.erase().narrow::<Sampled>(), Some(combined.as_sampled()));
+    assert_eq!(combined.erase().narrow::<Storage>(), Some(combined.as_storage()));
+    assert_eq!(sampled.erase().narrow::<Storage>(), None);
+    assert_eq!(sampled.erase().narrow::<Combined>(), None);
+    assert_eq!(storage.erase().narrow::<Sampled>(), None);
+
+    let null = ImageHandle::<Combined>::NULL;
+    assert_eq!(null.bits(), !0);
+    assert!(null.is_null() && ImageHandle::<Sampled>::default().is_null());
+    assert_eq!((null.sampled_slot(), null.storage_slot()), (None, None));
+    assert_eq!(null.erase().narrow::<Sampled>(), None);
+    assert!(!ImageHandle::<Sampled>::new((1 << 30) - 1).is_null(), "the last slot is a handle");
 }
 
 #[test]

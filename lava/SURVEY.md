@@ -238,13 +238,10 @@ listed in `STATE.md`. Done items are removed.
 87. **Struct signatures hold names and offsets, not types** (`codegen.rs:132-157`): `Foo { float x }`
     and `Foo { uint x }` from two passes, or `Pair<float>` and `Pair<uint>`, merge into the first.
 88. **Pointees and array elements skip `gpu_type`** (`codegen.rs:125-129, 402`): `Buf<Tex2D>`
-    becomes `BufferSlice<Img>` with a generated `Img` struct instead of `BindlessHandle`, and so do
+    becomes `BufferSlice<Img>` with a generated `Img` struct instead of `ImageHandle`, and so do
     `[Img; N]`, `[Buf<T>; N]` and `[Accel; N]` behind a `Buf`.
-89. **A top-level `DynImg` push constant doesn't compile** (`codegen.rs:429-432`): the parameter is
-    a generated struct and the field a `BindlessHandle`.
-90. **`SCONST` rules disagree with the docs** (`codegen.rs:614-622`): `SCONST(DynImg, x)` fails
-    the assert (CLAUDE.md allows it), and `Accel` is refused for run-dependent addresses while
-    `Buf`/`MutBuf`, also addresses, pass.
+90. **`SCONST` rules disagree with the docs** (`codegen.rs:614-622`): `Accel` is refused for
+    run-dependent addresses while `Buf`/`MutBuf`, also addresses, pass.
 91. **Non-struct pointee strides aren't checked** *(plausible)* (`codegen.rs:401-403`):
     `Buf<float3>` becomes 12-byte `Vec3` elements against a 16-byte std430 stride.
 92. **Matrices ignore their scalar type** (`codegen.rs:117-124`): `int4x4` becomes `Mat4`;
@@ -370,8 +367,6 @@ listed in `STATE.md`. Done items are removed.
    `first`, UI buffers per slot, and an unsynchronised readback. **Direction:**
    - `PerFrame<Buffer<T>>` whose `host_mut(&submission)` ties writes to the waited slot;
    - a growable stream buffer and a typed `Readback<T>`.
-7. **A bindless handle is 8 bytes for two indices.** **Direction:** the same index in both sets,
-   so a handle can be one `u32`.
 8. **95 image usage marker types**, with names like
    `ColorAttachmentSampledStorageHostCopyTransferSrcTransferDst`, and each new flag (transient,
    input attachment) doubles them. **Direction:** const-generic flags for images. *2026-10-19:*
@@ -463,20 +458,18 @@ listed in `STATE.md`. Done items are removed.
       `ImageView::view()` returns the `vk::ImageView` (`kind.rs:18-22`); `features::gate` is a
       function and a module; `lava_build_slang::SLANG_DIR` (the shader directory) shares the
       name of the `SLANG_DIR` variable (the SDK); `BufferSlice::get_range` returns
-      `std::range::Range` where the rest uses `std::ops::Range`; `BindlessHandle`'s
-      `descriptor_index_set0/1` are `SampledIndex`/`StorageIndex` in Slang; `RasterMesh.amp` where
+      `std::range::Range` where the rest uses `std::ops::Range`; `RasterMesh.amp` where
       lava says task; `Features::DEFAULT` means none; `copy_region_from` takes its offset as a
       `D::Extent`; `pipline_layout_info`, `image_acceses`, `buffer_acceses`.
     - *2026-10-18, missing derives:* `RasterState` and `BufferAccess` could be `Copy`; `Filter` has
       no `Clone`/`Copy`/`Debug` and no cubic filter; `ImageSlice` no `Debug`; `Scissor` and
-      `Viewport` are identical structs; `Config` has no docs or `Debug`; `BindlessHandle` has no
-      `Eq`, `Hash` or `is_null`.
+      `Viewport` are identical structs; `Config` has no docs or `Debug`.
 20. **Codegen errors lack context.** Panics give no file or field (`build.rs:111,118,236`), the
     first failing pass hides the rest, and Slang warnings aren't forwarded.
 21. **Generated code leaks into its includer** (2026-10-18, `codegen.rs:511-535`). It glob-imports
     glam, `lava::command_buffer`, `pipeline`, `format` and `slice`, and imports `vk`, all pasted
     into the user's module by `include_passes!`. Core relies on the leak (`Zeroable`, `Vec2`,
-    `BindlessHandle` in its `bindings.rs`), and a Slang struct named `Bindings`, `Draw` or
+    `ImageHandle` in its `bindings.rs`), and a Slang struct named `Bindings`, `Draw` or
     `PassEntry` breaks the build. Emit `::lava::` paths. The generated functions also lack
     `#[track_caller]`, so binding panics point into `$OUT_DIR` (`codegen.rs:932, 982`).
 22. **Only push-constant structs get `_pad` fields** (2026-10-18, `codegen.rs:171-178, 1032-1035`).
@@ -484,8 +477,8 @@ listed in `STATE.md`. Done items are removed.
     so the engine's shaders pad by hand (`datatypes.slang`, `raster_ui.slang`) and core sets `pad`.
     A pass without push constants panics instead of getting an empty struct (`:583-588`); `i64`,
     `f64` and `bool` vectors panic; arrays above 32 need bytemuck's `min_const_generics`.
-23. **`BindlessHandle` is `Zeroable` but its default is null** (2026-10-18, `bindless.rs:256, 287`):
-    `X::zeroed()` of a generated struct names slot 0, core's first texture.
+23. **`ImageHandle` is `Zeroable` but its default is null** (2026-10-18): `X::zeroed()` of a
+    generated struct names sampled slot 0.
 24. **`bind` zips two iterators** (2026-10-18, `bindless.rs:308-345`): a length mismatch binds less
     silently, and core collects a `Vec` per frame to line them up. Take pairs and assert.
 25. **Presenting takes raw Vulkan** (2026-10-18, `present.rs:170-174, 269-281`):

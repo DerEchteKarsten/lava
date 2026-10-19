@@ -65,11 +65,11 @@ impl<F: Format + ColorAspect, U: IsTransferDst, D: Dim> TransferDstView
 {
 }
 
-/// An image that can be bound in the sampled set. Shaders see one aspect: depth for a combined
+/// An image that can be bound with a sampled descriptor. Shaders see one aspect: depth for a combined
 /// depth-stencil format.
 pub trait SampledImage: crate::sealed::Sealed {}
 impl<F: Format, U: IsSampled, D: Dim, V: Views> SampledImage for Image<F, U, D, V> {}
 
-/// An image that can be bound in the storage set.
+/// An image that can be bound with a storage descriptor.
 pub trait StorageImage: crate::sealed::Sealed {}
 impl<F: Format, U: IsStorage, D: Dim, V: Views> StorageImage for Image<F, U, D, V> {}

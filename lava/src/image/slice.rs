@@ -6,7 +6,7 @@ use bytemuck::Pod;
 use lava_macros::validation_trace;
 
 use crate::{
-    bindless::{BindlessHandle, NULL_HANDLE},
+    bindless::{Allocatable, ImageHandle},
     buffer::slice::BufferSlice,
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
     queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
@@ -30,7 +30,7 @@ pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     pub(crate) mip_range: Range<u32>,
     /// The extent of mip `mip_range.start`.
     pub(crate) extent: D::Extent,
-    pub(crate) handle: BindlessHandle,
+    pub(crate) handle: ImageHandle,
     /// One tracked state for all of `mip_range`, or one per mip.
     pub(crate) states: &'a [AtomicU64],
     pub(crate) format: F,
@@ -58,9 +58,22 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         self.extent
     }
 
-    /// Where the view is bound in the bindless sets (`NULL_HANDLE` where it isn't).
-    pub fn handle(&self) -> BindlessHandle {
-        self.handle
+    /// The view's handle as `K`, for a shader that reads it through `K`'s descriptors. Panics
+    /// unless it is bound with them: a `Sampled` handle needs `bind_sampled` or `bind_combined`
+    /// (`bind_mips_*` for a mip's view), a `Storage` one `bind_storage` or `bind_combined`, a
+    /// `Combined` one `bind_combined`.
+    #[track_caller]
+    pub fn handle<K: Allocatable>(&self) -> ImageHandle<K> {
+        self.handle.narrow().unwrap_or_else(|| {
+            panic!(
+                "a shader reads the view of {:?} as {}, which it isn't bound as ({:?}): call `{}` \
+                 (or `bind_combined` for both descriptors, `bind_mips_*` for a mip's view) on its image",
+                self.image,
+                std::any::type_name::<K>().rsplit("::").next().unwrap(),
+                self.handle,
+                K::BIND,
+            )
+        })
     }
 
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
@@ -115,25 +128,6 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
     pub fn usage_check(&self, required: vk::ImageUsageFlags) {
         self.usage.check(required);
-    }
-
-    /// Panics unless the view is bound in the sampled set if `sets` has `SAMPLED`, and in the
-    /// storage set if it has `STORAGE`: what a shader reading its handle needs.
-    #[track_caller]
-    pub fn bound_check(&self, sets: vk::ImageUsageFlags) {
-        let handle = self.handle;
-        let needed = [
-            (vk::ImageUsageFlags::SAMPLED, handle.descriptor_index_set0, "bind_sampled"),
-            (vk::ImageUsageFlags::STORAGE, handle.descriptor_index_set1, "bind_storage"),
-        ];
-        for (set, index, bind) in needed {
-            assert!(
-                !sets.contains(set) || index != NULL_HANDLE,
-                "a shader reads the view of {:?} through the {set:?} set, where it isn't bound: \
-                 call `{bind}` (or `bind_mips_*` for a mip's view) on its image",
-                self.image
-            );
-        }
     }
 
     /// The same view typed as `format` and `usage` (see `Image::cast`).

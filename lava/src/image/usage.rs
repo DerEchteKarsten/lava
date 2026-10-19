@@ -1,4 +1,4 @@
-//! Image usages: one marker type per combination of usages Vulkan allows (host copies only with `host-image-copy`), mapping to Vulkan flags and the bindless sets they can be bound in, and `Dynamic`, whose usage is only known at runtime
+//! Image usages: one marker type per combination of usages Vulkan allows (host copies only with `host-image-copy`), mapping to Vulkan flags and the bindless descriptors they can be bound with, and `Dynamic`, whose usage is only known at runtime
 use crate::vk;
 
 pub trait ImageUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
@@ -25,7 +25,7 @@ pub trait IsTransferSrc: ImageUsage {}
 /// Usages that can be the destination of a copy, blit or clear.
 pub trait IsTransferDst: ImageUsage {}
 
-/// Usages that can be bound in both sets, which a `MutTex2D` needs.
+/// Usages that can be bound with both descriptors (`bind_combined`), which a `MutTex2D` needs.
 pub trait UnifiedBinding: IsSampled + IsStorage {}
 impl<U: IsSampled + IsStorage> UnifiedBinding for U {}
 

@@ -4,10 +4,7 @@ mod common;
 use common::{Cmd, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer};
 use glam::{IVec2, UVec2, UVec3, UVec4, Vec2, Vec4};
 use lava::{
-    bindless::{
-        BindlessHandle, NULL_HANDLE, Sampler, SamplerDesc, SamplerHandle, max_sampled_images,
-        max_storage_images,
-    },
+    bindless::{self, Combined, ImageHandle, Sampler, SamplerDesc, SamplerHandle, max_image_slots},
     buffer::Buffer,
     command_buffer::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
@@ -24,7 +21,8 @@ use lava::{
             ColorAttachmentSampledTransferSrcTransferDst,
             ColorAttachmentStorageTransferSrcTransferDst, DepthAttachment, Sampled,
             SampledHostCopy, SampledHostCopyTransferSrc, SampledHostCopyTransferSrcTransferDst,
-            DepthAttachmentSampled, SampledStorage, SampledTransferDst,
+            DepthAttachmentSampled, SampledStorage, SampledStorageTransferDst,
+            SampledStorageTransferSrcTransferDst, SampledTransferDst, StorageTransferDst,
             SampledTransferSrcTransferDst,
             Storage as StorageImage, StorageTransferSrcTransferDst,
         },
@@ -37,7 +35,7 @@ use lava::{
     state::Ctx,
 };
 use lava_tests::bindings::{
-    PASS_MAP, TestClock, TestClocks, TestComputeBuffer, TestComputeImage, TestComputeVolume,
+    PASS_MAP, TestClock, TestClocks, TestCombined, TestComputeBuffer, TestComputeImage, TestComputeVolume,
     TestConstants, TestMesh, TestPushData, TestRaster, TestRasterTextured, TestSample,
     TestSampleDepth, TestTexturedVertex, TestVertex,
 };
@@ -325,13 +323,13 @@ fn deletions_wait_for_every_timeline() {
     };
     other.reserve();
     let image = bind();
-    let slot = image.handle();
+    let slot = image.handle::<bindless::Sampled>();
     drop(image);
     gpu.submit(|_| {});
     let unrelated = bind();
-    assert_ne!(unrelated.handle(), slot, "the other timeline may still read it");
+    assert_ne!(unrelated.handle::<bindless::Sampled>(), slot, "the other timeline may still read it");
     other.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
-    assert_eq!(bind().handle(), slot);
+    assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 }
 
 /// A dropped timeline's semaphore goes on in the next, so an old `Wait` stays done.
@@ -1042,17 +1040,20 @@ fn mip_chains_have_a_view_and_handle_per_mip() {
         .unwrap()
         .bind_mips_storage()
         .unwrap();
-    assert_ne!(chain.handle().descriptor_index_set0, NULL_HANDLE);
-    assert_eq!(chain.handle().descriptor_index_set1, NULL_HANDLE, "only the mips are storage");
+    assert!(chain.handle::<bindless::Sampled>().sampled_slot().is_some());
+    let unbound = panic_message(|| chain.handle::<bindless::Storage>());
+    assert!(unbound.contains("bind_storage"), "only the mips are storage: {unbound}");
     let whole = chain.whole_view();
     assert_eq!(whole.subresource_range().level_count, 4);
-    let first = chain.mip_view(0).handle().descriptor_index_set1;
+    let first = chain.mip_view(0).handle::<bindless::Storage>();
+    let slot = first.storage_slot().unwrap();
     for level in 0..4 {
         let view = chain.mip_view(level);
         let range = view.subresource_range();
         assert_eq!((range.base_mip_level, range.level_count), (level, 1));
         assert_eq!(view.extent(), chain.mip_extent(level));
-        assert_eq!(view.handle(), BindlessHandle::storage(first + level));
+        assert_eq!(view.handle::<bindless::Storage>(), first.mip(level));
+        assert_eq!(view.handle::<bindless::Storage>().storage_slot(), Some(slot + level));
         // Descriptors are written without views: only attachments have them.
         assert_eq!(view.view(), lava::vk::ImageView::null());
     }
@@ -1065,7 +1066,7 @@ fn mip_chains_have_a_view_and_handle_per_mip() {
 }
 
 #[test]
-fn binds_take_free_slots_of_their_sets() {
+fn binds_take_free_slots() {
     let _gpu = gpu();
     let sampled = Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::new(4, 4))
         .unwrap()
@@ -1077,37 +1078,82 @@ fn binds_take_free_slots_of_their_sets() {
         .unwrap();
     let both = Image::<R8G8B8A8Unorm, SampledStorage>::new(UVec2::new(4, 4))
         .unwrap()
-        .bind_sampled()
-        .unwrap()
-        .bind_storage()
+        .bind_combined()
         .unwrap();
     let unbound = Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::new(4, 4)).unwrap();
 
-    let (s, st, b) = (sampled.handle(), storage.handle(), both.handle());
-    assert!(s.descriptor_index_set0 < max_sampled_images());
-    assert_eq!(s.descriptor_index_set1, NULL_HANDLE);
-    assert_eq!(st.descriptor_index_set0, NULL_HANDLE);
-    // Storage slots follow the sampled ones in the resource heap.
-    assert!((max_sampled_images()..max_sampled_images() + max_storage_images()).contains(&st.descriptor_index_set1));
-    assert_ne!(b.descriptor_index_set0, s.descriptor_index_set0, "one image per slot");
-    assert_ne!(b.descriptor_index_set1, st.descriptor_index_set1);
-    assert_eq!(unbound.handle(), BindlessHandle::none());
+    let s = sampled.handle::<bindless::Sampled>();
+    let st = storage.handle::<bindless::Storage>();
+    let b = both.handle::<Combined>();
+    let s_slot = s.sampled_slot().unwrap();
+    assert!(s_slot < max_image_slots());
+    assert_eq!(s.storage_slot(), None);
+    assert_eq!(st.sampled_slot(), None);
+    let st_slot = st.storage_slot().unwrap();
+    let pair = b.sampled_slot().unwrap();
+    assert_eq!(b.storage_slot(), Some(pair + 1), "the storage descriptor follows the sampled one");
+    let mut slots = vec![s_slot, st_slot, pair, pair + 1];
+    slots.sort();
+    slots.dedup();
+    assert_eq!(slots.len(), 4, "one descriptor per slot");
+    assert_eq!(both.handle::<bindless::Sampled>(), b.as_sampled());
+    assert_eq!(both.handle::<bindless::Storage>(), b.as_storage());
+    assert!(panic_message(|| unbound.handle::<bindless::Sampled>()).contains("bind_sampled"));
+    assert!(panic_message(|| sampled.handle::<bindless::Storage>()).contains("bind_storage"));
+    assert!(panic_message(|| sampled.handle::<Combined>()).contains("bind_combined"));
+    let twice = panic_message(|| {
+        Image::<R8G8B8A8Unorm, SampledStorage>::new(UVec2::new(4, 4))
+            .unwrap()
+            .bind_sampled()
+            .unwrap()
+            .bind_storage()
+    });
+    assert!(twice.contains("bind_combined"), "a view is bound once: {twice}");
 
     // `bind` writes reserved slots only and checks the usage at runtime, static types included.
-    let reserved = lava::bindless::reserve_sampled(4).unwrap();
-    assert_eq!(reserved.len(), 4);
-    assert!(!reserved.indices().contains(&s.descriptor_index_set0));
-    lava::bindless::bind([unbound.whole_view(); 4], (0..4).map(|i| reserved.handle(i)));
-    let unreserved = std::panic::catch_unwind(|| {
-        lava::bindless::bind([unbound.whole_view()], [s])
-    });
+    let reserved = bindless::reserve::<bindless::Sampled>(4).unwrap();
+    assert_eq!((reserved.len(), reserved.slots().len()), (4, 4));
+    assert!(!reserved.slots().contains(&s_slot));
+    bindless::bind([unbound.whole_view(); 4], (0..4).map(|i| reserved.handle(i)));
+    let unreserved = std::panic::catch_unwind(|| bindless::bind([unbound.whole_view()], [s]));
     assert!(unreserved.is_err(), "the sampled image's slot isn't reserved");
-    let storage_slots = lava::bindless::reserve_storage(1).unwrap();
+    let storage_slots = bindless::reserve::<bindless::Storage>(1).unwrap();
     let refused = std::panic::catch_unwind(|| {
-        lava::bindless::bind([unbound.whole_view()], [storage_slots.handle(0)])
+        bindless::bind([unbound.whole_view()], [storage_slots.handle(0)])
     });
     assert!(refused.is_err(), "a sampled image can't be bound as storage");
     assert!(std::panic::catch_unwind(|| reserved.handle(4)).is_err());
+    let pairs = bindless::reserve::<Combined>(2).unwrap();
+    assert_eq!((pairs.len(), pairs.slots().len()), (2, 4));
+    assert_eq!(pairs.handle(1).sampled_slot(), Some(pairs.slots().start + 2));
+}
+
+/// A pair takes the first two neighbouring free slots, past the holes single slots leave.
+#[test]
+fn pairs_skip_single_holes() {
+    let _gpu = gpu();
+    lava::wait_idle().unwrap();
+    // Single slots until seven in a row: the holes other tests left are filled then.
+    let mut taken = Vec::new();
+    let in_a_row = |taken: &[bindless::SlotRange<bindless::Sampled>]| {
+        taken.len() >= 7 && taken[taken.len() - 7..].windows(2).all(|w| w[1].slots().start == w[0].slots().end)
+    };
+    while !in_a_row(&taken) {
+        taken.push(bindless::reserve::<bindless::Sampled>(1).unwrap());
+    }
+    let start = taken[taken.len() - 7].slots().start;
+    // Every other one of the seven freed again: the holes are one slot each.
+    let (kept, dropped): (Vec<_>, Vec<_>) = taken.into_iter().partition(|slot| {
+        let slot = slot.slots().start;
+        slot < start || (slot - start) % 2 == 0
+    });
+    drop(dropped);
+    lava::wait_idle().unwrap();
+    let pair = bindless::reserve::<Combined>(1).unwrap();
+    assert!(pair.slots().start >= start + 7, "no hole fits a pair: {:?}", pair.slots());
+    let single = bindless::reserve::<bindless::Storage>(1).unwrap();
+    assert_eq!(single.slots().start, start + 1, "a single fills the first hole");
+    drop(kept);
 }
 
 /// Also a dropped reservation's slots, which `bind` refuses right away.
@@ -1123,11 +1169,11 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
             .unwrap()
     };
     let image = bind();
-    let slot = image.handle();
+    let slot = image.handle::<bindless::Sampled>();
     drop(image);
-    assert_ne!(bind().handle(), slot, "taken until no frame reaches it");
+    assert_ne!(bind().handle::<bindless::Sampled>(), slot, "taken until no frame reaches it");
     lava::wait_idle().unwrap();
-    assert_eq!(bind().handle(), slot);
+    assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 
     // A mip chain frees its whole view's slot and each mip's, erased or not.
     lava::wait_idle().unwrap();
@@ -1139,28 +1185,28 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
         .unwrap()
         .erase();
     assert_eq!(chain.format().0, lava::VkFormat::R8G8B8A8_UNORM);
-    let (whole, mips) = (chain.handle(), chain.mip_view(0).handle());
+    let (whole, mips) = (chain.handle::<bindless::Sampled>(), chain.mip_view(0).handle::<bindless::Storage>());
     drop(chain);
     lava::wait_idle().unwrap();
-    assert_eq!(bind().handle(), whole);
-    let storage = lava::bindless::reserve_storage(3).unwrap();
-    assert_eq!(storage.start(), mips.descriptor_index_set1, "the mips' slots came back whole");
+    assert_eq!(bind().handle::<bindless::Sampled>(), whole);
+    let storage = bindless::reserve::<bindless::Storage>(3).unwrap();
+    assert_eq!(storage.handle(0), mips, "the mips' slots came back whole");
+    drop(storage);
+    lava::wait_idle().unwrap();
 
     let texture = Image::<R8G8B8A8Unorm, Sampled>::new(UVec2::new(4, 4)).unwrap();
-    let handle = storage.handle(0);
-    let start = storage.start();
-    drop(storage);
-    let written = std::panic::catch_unwind(|| {
-        lava::bindless::bind([texture.whole_view()], [handle])
-    });
+    let sampled = bindless::reserve::<bindless::Sampled>(3).unwrap();
+    let (handle, slots) = (sampled.handle(0), sampled.slots());
+    drop(sampled);
+    let written = std::panic::catch_unwind(|| bindless::bind([texture.whole_view()], [handle]));
     assert!(written.is_err());
     lava::wait_idle().unwrap();
-    assert_eq!(lava::bindless::reserve_storage(3).unwrap().start(), start);
+    assert_eq!(bindless::reserve::<bindless::Sampled>(3).unwrap().slots(), slots);
 }
 
-const NO_SAMPLER: SamplerHandle = SamplerHandle { index: NULL_HANDLE };
+const NO_SAMPLER: SamplerHandle = SamplerHandle { index: !0 };
 
-/// What `TestSample` reads at `uv` of sampled slot `slot` through `samplers`, the last a
+/// What `TestSample` reads at `uv` of the sampled image `slot` (a handle's bits) through `samplers`, the last a
 /// comparison against `reference` unless it is `NO_SAMPLER`.
 fn sample(
     gpu: &mut common::Gpu,
@@ -1193,10 +1239,10 @@ fn reserved_slots_are_rewritten_between_frames_in_flight() {
     let mut gpu = gpu();
     let red = solid(&mut gpu, [1.0, 0.0, 0.0, 1.0]);
     let green = solid(&mut gpu, [0.0, 1.0, 0.0, 1.0]);
-    let slot = lava::bindless::reserve_sampled(1).unwrap();
+    let slot = bindless::reserve::<bindless::Sampled>(1).unwrap();
     let outs = [zeroed_buffer::<Vec4>(3), zeroed_buffer::<Vec4>(3)];
     let frame = |gpu: &mut common::Gpu, image: &Image<R8G8B8A8Unorm, SampledTransferDst>, out: &Buffer<Vec4>| {
-        lava::bindless::bind([image.whole_view()], [slot.handle(0)]);
+        bindless::bind([image.whole_view()], [slot.handle(0)]);
         let reads = [ImageUse::sampled_read(image.whole_view())];
         let submission = gpu.timeline.begin().unwrap();
         submission
@@ -1206,7 +1252,7 @@ fn reserved_slots_are_rewritten_between_frames_in_flight() {
                     nearest(),
                     nearest(),
                     NO_SAMPLER,
-                    slot.start(),
+                    slot.handle(0).bits(),
                     Vec2::splat(0.5),
                     0.0,
                 );
@@ -1241,7 +1287,7 @@ fn samplers_filter_by_their_description_and_free_their_slots() {
     let reads = [ImageUse::sampled_read(image.whole_view())];
     // A quarter of the way from the first texel's centre to the second's.
     let uv = Vec2::new(0.375, 0.5);
-    let slot = image.handle().descriptor_index_set0;
+    let slot = image.handle::<bindless::Sampled>().bits();
     let samplers = [nearest(), linear.handle(), NO_SAMPLER];
     let [near, filtered, _] = sample(&mut gpu, slot, samplers, uv, 0.0, Accesses::images(&reads));
     assert_eq!(near.x, 0.0);
@@ -1289,12 +1335,132 @@ fn reduction_samplers_return_the_extremes() {
     use lava::vk::SamplerReductionMode as Mode;
     let (min, max) = (reduce(Mode::MIN), reduce(Mode::MAX));
     let reads = [ImageUse::sampled_read(image.whole_view())];
-    let slot = image.handle().descriptor_index_set0;
+    let slot = image.handle::<bindless::Sampled>().bits();
     let samplers = [min.handle(), max.handle(), NO_SAMPLER];
     // The centre, where all four texels weigh the same.
     let [low, high, _] =
         sample(&mut gpu, slot, samplers, Vec2::splat(0.5), 0.0, Accesses::images(&reads));
     assert_eq!((low.x, high.x), (0.1, 0.4));
+}
+
+type Combinable = Image<R8G8B8A8Unorm, SampledStorageTransferSrcTransferDst>;
+type CombinedChain = MipChain<R8G8B8A8Unorm, SampledStorageTransferDst>;
+
+/// A 4x4 combined image of 0.25 everywhere.
+fn quarter(gpu: &mut common::Gpu) -> Combinable {
+    let image = Image::new(UVec2::splat(4)).unwrap();
+    gpu.submit(|cmd| cmd.clear_image(image.whole_view(), [0.25; 4]));
+    image
+}
+
+/// A combined mip chain of `levels` mips, mip `i` cleared to `(i + 1) / 4`.
+fn combined_chain(gpu: &mut common::Gpu, levels: u32) -> CombinedChain {
+    let chain = CombinedChain::with_mip_levels(UVec2::splat(4), levels).unwrap().bind_mips_combined().unwrap();
+    gpu.submit(|cmd| {
+        for level in 0..levels {
+            cmd.clear_image(chain.mip_view(level), [(level + 1) as f32 / 4.0; 4]);
+        }
+    });
+    chain
+}
+
+/// What `TestCombined` writes: the samples of a sampled (red), a storage (green) and a null
+/// `DynImg`, then texel (0, 0) of each mip of `chain`. It doubles `target` and triples `pair`'s
+/// image through the handle given.
+fn run_combined(
+    gpu: &mut common::Gpu,
+    target: &Combinable,
+    pair: Option<(ImageHandle<Combined>, &Combinable)>,
+    chain: &CombinedChain,
+) -> Vec<Vec4> {
+    let sampled = Image::<R8G8B8A8Unorm, SampledTransferDst>::new(UVec2::ONE).unwrap().bind_sampled().unwrap();
+    let storage = Image::<R8G8B8A8Unorm, StorageTransferDst>::new(UVec2::ONE).unwrap().bind_storage().unwrap();
+    gpu.submit(|cmd| {
+        cmd.clear_image(sampled.whole_view(), [1.0, 0.0, 0.0, 1.0]);
+        cmd.clear_image(storage.whole_view(), [0.0, 1.0, 0.0, 1.0]);
+    });
+    let levels = chain.mip_levels();
+    let out = zeroed_buffer::<Vec4>(3 + levels as usize);
+    let mut reads = vec![
+        ImageUse::sampled_read(sampled.whole_view()),
+        ImageUse::storage_read(storage.whole_view()),
+    ];
+    reads.extend((1..levels).map(|level| ImageUse::sampled_read(chain.mip_view(level))));
+    let both = lava::AccessFlags2::SHADER_SAMPLED_READ | lava::AccessFlags2::SHADER_STORAGE_WRITE;
+    reads.extend(pair.map(|(_, image)| image.whole_view().access(lava::PipelineStageFlags2::NONE, both, lava::ImageLayout::GENERAL)));
+    gpu.submit(|cmd| {
+        let bindings = TestCombined::push_bindings(
+            target.whole_view(),
+            pair.map_or(!0, |(handle, _)| handle.bits()),
+            chain.mip_view(0),
+            sampled.handle::<bindless::Sampled>().erase(),
+            storage.handle::<bindless::Storage>().erase(),
+            ImageHandle::NULL,
+            nearest(),
+            out.range(..),
+            levels,
+        );
+        cmd.compute(&bindings, [1, 1, 1], Some(Accesses::images(&reads)));
+    });
+    out.host().to_vec()
+}
+
+/// Every texel of a 4x4 image.
+fn texels(gpu: &mut common::Gpu, image: &Combinable) -> Vec<[u8; 4]> {
+    let readback = zeroed_buffer::<[u8; 4]>(16);
+    gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
+    readback.host().to_vec()
+}
+
+/// A combined image reads through its sampled descriptor and writes through the storage one
+/// in the next slot; a `DynImg` reads whichever descriptor its handle has, and zeroes for none.
+#[test]
+fn combined_images_read_sampled_and_write_storage() {
+    let mut gpu = gpu();
+    let target = quarter(&mut gpu).bind_combined().unwrap();
+    let chain = combined_chain(&mut gpu, 1);
+    let out = run_combined(&mut gpu, &target, None, &chain);
+    for texel in texels(&mut gpu, &target) {
+        assert!(close(texel, [128; 4]), "doubled: {texel:?}");
+    }
+    assert_eq!(out[0], Vec4::new(1.0, 0.0, 0.0, 1.0), "the sampled image");
+    assert_eq!(out[1], Vec4::new(0.0, 1.0, 0.0, 1.0), "the storage image, nearest");
+    assert_eq!(out[2], Vec4::ZERO, "the null handle");
+}
+
+/// `bind` writes both descriptors of a reserved pair.
+#[test]
+fn reserved_pairs_hold_both_descriptors() {
+    let mut gpu = gpu();
+    let target = quarter(&mut gpu).bind_combined().unwrap();
+    let image = quarter(&mut gpu);
+    let pairs = bindless::reserve::<Combined>(2).unwrap();
+    bindless::bind([image.whole_view()], [pairs.handle(1)]);
+    let chain = combined_chain(&mut gpu, 1);
+    run_combined(&mut gpu, &target, Some((pairs.handle(1), &image)), &chain);
+    for texel in texels(&mut gpu, &image) {
+        assert!(close(texel, [192; 4]), "tripled: {texel:?}");
+    }
+}
+
+/// `bind_mips_combined` puts each mip's pair after the last, and `Img.Mip` reads each mip.
+#[test]
+fn combined_mips_lie_a_pair_apart() {
+    let mut gpu = gpu();
+    let chain = combined_chain(&mut gpu, 3);
+    let first = chain.mip_view(0).handle::<Combined>();
+    let slot = first.sampled_slot().unwrap();
+    for level in 0..3 {
+        let handle = chain.mip_view(level).handle::<Combined>();
+        assert_eq!(handle, first.mip(level));
+        assert_eq!((handle.sampled_slot(), handle.storage_slot()), (Some(slot + 2 * level), Some(slot + 2 * level + 1)));
+    }
+    let target = quarter(&mut gpu).bind_combined().unwrap();
+    let out = run_combined(&mut gpu, &target, None, &chain);
+    for level in 0..3 {
+        let expected = (level + 1) as f32 / 4.0;
+        assert!((out[3 + level] - Vec4::splat(expected)).abs().max_element() < 0.01, "mip {level}: {}", out[3 + level]);
+    }
 }
 
 /// A pass can push all of `MAX_PUSH_CONSTANTS_SIZE`.
@@ -2227,8 +2393,8 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
     assert_eq!(depth_at(IN_LEFT), 0.5);
     assert_eq!(depth_at(IN_RIGHT), 0.25);
 
-    let slot = lava::bindless::reserve_sampled(1).unwrap();
-    lava::bindless::bind([depth.whole_view()], [slot.handle(0)]);
+    let slot = bindless::reserve::<bindless::Sampled>(1).unwrap();
+    bindless::bind([depth.whole_view()], [slot.handle(0)]);
     let less = Sampler::new(
         &SamplerDesc::new()
             .filter(lava::vk::Filter::NEAREST)
@@ -2239,7 +2405,7 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
     let uv = |(x, y): (u32, u32)| (Vec2::new(x as f32, y as f32) + 0.5) / SIZE as f32;
     let reads = [ImageUse::sampled_read(depth.whole_view())];
     let at = |gpu: &mut common::Gpu, texel, reference| {
-        sample(gpu, slot.start(), samplers, uv(texel), reference, Accesses::images(&reads))
+        sample(gpu, slot.handle(0).bits(), samplers, uv(texel), reference, Accesses::images(&reads))
     };
     let [read, _, compared] = at(&mut gpu, IN_LEFT, 0.4);
     assert_eq!((read.x, compared.x), (0.5, 1.0), "0.4 < 0.5");
@@ -2946,8 +3112,8 @@ mod generated {
         let bindings =
             TestComputeImage::push_bindings(target, Vec4::ONE, UVec2::ZERO, UVec2::new(8, 8));
         let constants: CTestComputeImageBindings = push_constants(&bindings);
-        assert_eq!(constants.target, image.handle());
-        assert_ne!(constants.target.descriptor_index_set1, NULL_HANDLE);
+        assert_eq!(constants.target, image.handle::<bindless::Storage>());
+        assert!(constants.target.storage_slot().is_some());
         let [image]: [_; 1] = bindings
             .sections()
             .images()

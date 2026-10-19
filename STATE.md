@@ -29,12 +29,11 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 
 ## lava: descriptor heaps (`VK_EXT_descriptor_heap`, required since 2026-10-19)
 ----find solutions----
-- Whether RenderDoc can capture an application on descriptor heaps is unchecked (none is installed here); Nsight Graphics 2026.2 can. lava can't fall back to descriptor sets.
-- `gpu_window` hung twice on 2026-10-19 in `vkAcquireNextImageKHR` (timeout `u64::MAX`) at its resize step (`a_new_size_recreates_the_swapchain_and_frees_the_old_slots`), once on the commit before the heaps and once after, then passed: probably while the compositor didn't show the test window. A finite acquire timeout would make it fail instead of hang.
+- Whether RenderDoc can capture an application on descriptor heaps is unchecked (none is installed here); Nsight Graphics 2026.2 can. Whether either reads shaders that index the heaps directly (`SPV_EXT_descriptor_heap`, untyped pointers, since 2026-10-19) is unchecked too. lava can't fall back to descriptor sets.
+- `gpu_window` hung twice on 2026-10-19 in `vkAcquireNextImageKHR` (timeout `u64::MAX`) at its resize step (`a_new_size_recreates_the_swapchain_and_frees_the_old_slots`), once on the commit before the heaps and once after, and a third time at the same step with direct heap access (not traced), then passed: probably while the compositor didn't show the test window. A finite acquire timeout would make it fail instead of hang.
 ----intended----
 - A submission that copies queued `bind` rewrites waits once at its start for every earlier command of its queue, so batch rewrites. Another timeline sees a rewrite only after a `Wait` on that submission, and a submission of another timeline must not read a slot while it is rewritten (the same rule as shared images).
 - The heaps are `CpuToGpu` buffers, on a discrete GPU without ReBAR inside the 256 MiB BAR window (a few MiB: 4 MiB of image descriptors and 128 KiB of samplers on Intel). If a driver warns about host-visible heaps, make them device-local and copy every write the way `bind` copies rewrites.
-- `runtimeDescriptorArray` and non-uniform image array indexing stay required: `bindless.slang` still declares runtime arrays indexed with `NonUniformResourceIndex`, whose SPIR-V capabilities need them (direct heap access, see Ideas, would drop them).
 - Samplers aren't deduplicated: equal descriptions take a slot each (32 bytes on Intel).
 
 ## lava: ray tracing (tested by `gpu_ray_tracing`, not used by core yet)
@@ -73,7 +72,7 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 - A `Timeline` dropped after `reserve()` or an unsubmitted `begin()` holds back every later destruction for good; a failed barrier-only replay leaves a value nothing signals (64, 65). The public `reclaim()` never polls (67). `init` isn't atomic: a late failure leaks the device and every retry says "already initialised" (69).
 - A failed pipeline creation poisons the pipeline cache of its kind for every later recording (72).
 - `cmd.present` marks the image presented while recording, so `surface.present()` inside the submit closure presents on an unsignalled semaphore; a failed swapchain recreation keeps the retired swapchain (77, 78).
-- The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `BindlessHandle` (87, 88).
+- The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `ImageHandle` (87, 88).
 
 ## Performance
 --- find solutions ---
@@ -85,16 +84,6 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 (hot reload is a debug feature anyways)
 
 ## Ideas
-
-### Direct heap access from Slang (2026-10-19)
-`bindless.slang` could index `ResourceDescriptorHeap`/`SamplerDescriptorHeap` instead of declaring sets and bindings, which drops the mappings (`Bindless::mapping_info`), the runtime arrays and probably the indexing features. The Slang SDK lava uses (2026.17) already does it: with `.capability(global.find_capability("spvDescriptorHeapEXT"))` in `compile::session` it emits `SPV_EXT_descriptor_heap` (`ResourceHeapEXT`/`SamplerHeapEXT` built-ins, untyped access chains, which pass `spirv-val`); without it, it falls back to hidden descriptor arrays at set 2. Probed 2026-10-19; nothing was run on the GPU. Still to do or check:
-- enable `VK_KHR_shader_untyped_pointers` (`shaderUntypedPointers`, new structs in `vk.rs`);
-- check whether non-uniform heap indices still need `NonUniformResourceIndex` (Slang added no decoration for a push-constant index);
-- make lava's slot stride match the shader's, `OpConstantSizeOfEXT` of the descriptor type (on the Arc B390 sizes equal alignments);
-- store storage handles as absolute heap indices (`count + i`), since the shader indexes the whole resource heap from 0;
-- check RenderDoc and Nsight with the new SPIR-V.
-
-It would also allow a one-`u32` `BindlessHandle` with the same index in both regions (SURVEY API 7), which changes `Img`'s layout in every engine struct, so it is its own decision.
 
 ### Multi-pass hardware counter captures (2026-10-15)
 `QueryPool::performance` refuses selections that need more than one counter pass, since a frame is submitted once. A tool capture could record one frame's command buffer once and submit it once per pass with `VkPerformanceQuerySubmitInfoKHR.counterPassIndex` (with the per-pass resets the extension asks for), reading each pass's counters from the same pool. It needs a submission path that replays a recorded command buffer, which `Submission` doesn't have.

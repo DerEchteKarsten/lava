@@ -15,8 +15,8 @@ pub enum Error {
     Lock,
     /// The device lacks an optional feature lava checks at runtime.
     MissingFeature(MissingFeature),
-    /// A bindless set has no `count` contiguous free slots (`set`: "sampled" or "storage").
-    OutOfBindlessSlots { set: &'static str, count: u32 },
+    /// A bindless heap has no `count` contiguous free slots (`heap`: "image" or "sampler").
+    OutOfBindlessSlots { heap: &'static str, count: u32 },
     /// `queue::MAX_TIMELINES` timelines exist already.
     OutOfTimelines,
 }
@@ -38,8 +38,8 @@ impl fmt::Display for Error {
             Error::Message(msg) => f.write_str(msg),
             Error::Lock => write!(f, "lock error"),
             Error::MissingFeature(missing) => missing.fmt(f),
-            Error::OutOfBindlessSlots { set, count } => {
-                write!(f, "the bindless {set} set has no {count} contiguous free slots")
+            Error::OutOfBindlessSlots { heap, count } => {
+                write!(f, "the bindless {heap} heap has no {count} contiguous free slots")
             }
             Error::OutOfTimelines => write!(
                 f,
