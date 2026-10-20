@@ -11,10 +11,19 @@ use bytemuck::Pod;
 use lava_macros::validation_trace;
 
 use crate::{
-    buffer::{Buffer, Gpu, Upload, slice::{BufferSlice, MAX_UPDATE}},
+    buffer::{
+        Buffer, Gpu, Upload,
+        slice::{BufferSlice, MAX_UPDATE},
+    },
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse, image_state::ImageState},
     error::{Error, Result},
-    image::{Image, Views, dim::Dim, expected_data_len, format::{ColorAspect, Format, bc_block}, usage::IsTransferDst},
+    image::{
+        Image, Views,
+        dim::Dim,
+        expected_data_len,
+        format::{ColorAspect, Format, bc_block},
+        usage::IsTransferDst,
+    },
     queue::{Kind, QueueKind, lock},
     state::Functions,
     vk,
@@ -62,7 +71,10 @@ impl ImageCopy {
             [state] => (std::slice::from_ref(state), (0..self.mip_levels).into()),
             states => {
                 let level = self.level as usize;
-                (&states[level..level + 1], (self.level..self.level + 1).into())
+                (
+                    &states[level..level + 1],
+                    (self.level..self.level + 1).into(),
+                )
             }
         }
     }
@@ -145,7 +157,11 @@ pub(crate) fn flush<K: QueueKind>(cmd: &mut CommandBuffer<'_, K>) {
     }
 }
 
-fn record_image_copy<K: QueueKind>(cmd: &mut CommandBuffer<'_, K>, src: BufferSlice<'_, u8>, copy: &ImageCopy) {
+fn record_image_copy<K: QueueKind>(
+    cmd: &mut CommandBuffer<'_, K>,
+    src: BufferSlice<'_, u8>,
+    copy: &ImageCopy,
+) {
     let (states, mip_range) = copy.accessed();
     let image = ImageUse {
         access: ImageAccess {
@@ -160,7 +176,10 @@ fn record_image_copy<K: QueueKind>(cmd: &mut CommandBuffer<'_, K>, src: BufferSl
     };
     cmd.rec.flush_pending(
         std::iter::once(image),
-        std::iter::once(src.access(vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ)),
+        std::iter::once(src.access(
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        )),
     );
     let regions = [vk::DeviceMemoryImageCopyKHR::default()
         .address_range(src.address_range())
@@ -216,10 +235,15 @@ impl<T: Copy + Pod> Buffer<T, Gpu> {
     #[validation_trace]
     pub fn from_slice(data: &[T]) -> Result<Self> {
         let buffer = Self::new(data.len())?;
-        let coherent = buffer.allocation.memory_properties().contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+        let coherent = buffer
+            .allocation
+            .memory_properties()
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
         match buffer.mapping() {
             // SAFETY: no submission has seen the new buffer.
-            Some(ptr) if coherent => unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) },
+            Some(ptr) if coherent => unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len())
+            },
             _ => buffer.write(0, data)?,
         }
         Ok(buffer)
@@ -233,7 +257,9 @@ impl<T: Copy + Pod> Buffer<T, Gpu> {
     #[validation_trace]
     pub fn write(&self, offset: usize, data: &[T]) -> Result<()> {
         assert!(
-            offset.checked_add(data.len()).is_some_and(|end| end <= self.len()),
+            offset
+                .checked_add(data.len())
+                .is_some_and(|end| end <= self.len()),
             "writing {} elements at {offset} into a buffer of {}",
             data.len(),
             self.len()
@@ -242,7 +268,10 @@ impl<T: Copy + Pod> Buffer<T, Gpu> {
             return Ok(());
         }
         let staging = staged(bytemuck::cast_slice(data))?;
-        push(staging, Target::Buffer(self.address + (offset * size_of::<T>()) as u64));
+        push(
+            staging,
+            Target::Buffer(self.address + (offset * size_of::<T>()) as u64),
+        );
         Ok(())
     }
 }
@@ -323,7 +352,9 @@ impl StagingRing {
         let ptr = buffer.mapping().expect("upload memory is mapped");
         // SAFETY: the slot's earlier submissions that read the ring finished, and this
         // recording's earlier uploads lie before `start`.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(start as usize), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(start as usize), bytes.len())
+        };
         Ok(buffer.byte_range(start as usize..(start + size) as usize))
     }
 }

@@ -16,9 +16,19 @@ pub enum Error {
     /// The device lacks an optional feature lava checks at runtime.
     MissingFeature(MissingFeature),
     /// A bindless heap has no `count` contiguous free slots (`heap`: "image" or "sampler").
-    OutOfBindlessSlots { heap: &'static str, count: u32 },
+    OutOfBindlessSlots {
+        heap: &'static str,
+        count: u32,
+    },
     /// `queue::MAX_TIMELINES` timelines exist already.
     OutOfTimelines,
+    /// A buffer sub-range that starts after it ends (`start > end`) or ends past the `size`
+    /// bytes of what it is taken from; all in bytes.
+    SliceOutOfRange {
+        start: u64,
+        end: u64,
+        size: u64,
+    },
 }
 
 impl Error {
@@ -39,12 +49,25 @@ impl fmt::Display for Error {
             Error::Lock => write!(f, "lock error"),
             Error::MissingFeature(missing) => missing.fmt(f),
             Error::OutOfBindlessSlots { heap, count } => {
-                write!(f, "the bindless {heap} heap has no {count} contiguous free slots")
+                write!(
+                    f,
+                    "the bindless {heap} heap has no {count} contiguous free slots"
+                )
             }
             Error::OutOfTimelines => write!(
                 f,
                 "{} timelines exist already, the most lava has",
                 crate::queue::MAX_TIMELINES
+            ),
+            Error::SliceOutOfRange { start, end, size } if start > end => {
+                write!(
+                    f,
+                    "buffer slice starts at byte {start} but ends at byte {end}"
+                )
+            }
+            Error::SliceOutOfRange { end, size, .. } => write!(
+                f,
+                "buffer slice ends at byte {end} but the buffer is only {size} bytes long"
             ),
         }
     }
@@ -61,7 +84,9 @@ impl std::error::Error for Error {
             Error::Message(_) => None,
             Error::Lock => None,
             Error::MissingFeature(missing) => Some(missing),
-            Error::OutOfBindlessSlots { .. } | Error::OutOfTimelines => None,
+            Error::OutOfBindlessSlots { .. }
+            | Error::OutOfTimelines
+            | Error::SliceOutOfRange { .. } => None,
         }
     }
 }

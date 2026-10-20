@@ -2,7 +2,7 @@
 use crate::vk;
 use bytemuck::Pod;
 use std::marker::PhantomData;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::range::Range;
 
 use lava_macros::validation_trace;
@@ -10,6 +10,7 @@ use smallvec::SmallVec;
 use std::iter;
 
 use crate::{
+    Error, Result,
     buffer::{Buffer, Memory},
     command_buffer::{BufferAccess, CommandBuffer},
     queue::QueueKind,
@@ -25,43 +26,72 @@ pub struct BufferSlice<'a, T: Copy + Pod> {
     pub(crate) _marker: PhantomData<&'a [T]>,
 }
 
+#[track_caller]
 fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
     index: R,
     address: u64,
     size: u64,
 ) -> BufferSlice<'a, T> {
+    try_new_slice(index, address, size).unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// The `index` range of `T`s within the `size` bytes at `address`, or
+/// [`Error::SliceOutOfRange`] when it starts after it ends or ends past `size`.
+fn try_new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
+    index: R,
+    address: u64,
+    size: u64,
+) -> Result<BufferSlice<'a, T>> {
     let element = size_of::<T>() as u64;
-    let start_offset = match index.start_bound() {
-        std::ops::Bound::Unbounded => 0,
-        std::ops::Bound::Excluded(start) => (*start as u64 + 1) * element,
-        std::ops::Bound::Included(start) => *start as u64 * element,
+    // Saturating, so an offset past `u64::MAX` fails the checks below instead of overflowing.
+    let offset = |i: usize, plus_one: bool| {
+        (i as u64)
+            .saturating_add(plus_one as u64)
+            .saturating_mul(element)
     };
-    let end_offset = match index.end_bound() {
-        std::ops::Bound::Unbounded => size,
-        std::ops::Bound::Excluded(end) => *end as u64 * element,
-        std::ops::Bound::Included(end) => (*end as u64 + 1) * element,
+    let start = match index.start_bound() {
+        Bound::Unbounded => 0,
+        Bound::Excluded(start) => offset(*start, true),
+        Bound::Included(start) => offset(*start, false),
     };
-    assert!(
-        start_offset <= end_offset,
-        "buffer slice starts at byte {start_offset} but ends at byte {end_offset}"
-    );
-    assert!(
-        end_offset <= size,
-        "buffer slice ends at byte {end_offset} but the buffer is only {size} bytes long"
-    );
-    BufferSlice {
-        address: address + start_offset,
-        size: end_offset - start_offset,
-        _marker: PhantomData,
+    let end = match index.end_bound() {
+        Bound::Unbounded => size,
+        Bound::Excluded(end) => offset(*end, false),
+        Bound::Included(end) => offset(*end, true),
+    };
+    if start > end || end > size {
+        return Err(Error::SliceOutOfRange { start, end, size });
     }
+    Ok(BufferSlice {
+        address: address + start,
+        size: end - start,
+        _marker: PhantomData,
+    })
 }
 
 impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
+    /// The `index` range of the buffer's elements; panics where [`Self::try_range`] fails.
+    #[track_caller]
     pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
         new_slice(index, self.address, self.size())
     }
+    /// The `index` range of the buffer's bytes; panics where [`Self::try_byte_range`] fails.
+    #[track_caller]
     pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, u8> {
         new_slice::<u8, R>(index, self.address, self.size())
+    }
+    /// The `index` range of the buffer's elements, or [`Error::SliceOutOfRange`] when it starts
+    /// after it ends or ends past the buffer.
+    pub fn try_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> Result<BufferSlice<'a, T>> {
+        try_new_slice(index, self.address, self.size())
+    }
+    /// The `index` range of the buffer's bytes, or [`Error::SliceOutOfRange`] when it starts
+    /// after it ends or ends past the buffer.
+    pub fn try_byte_range<'a, R: RangeBounds<usize>>(
+        &'a self,
+        index: R,
+    ) -> Result<BufferSlice<'a, u8>> {
+        try_new_slice::<u8, R>(index, self.address, self.size())
     }
 }
 
@@ -75,11 +105,7 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
         }
     }
     /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`].
-    pub fn access(
-        &self,
-        stage: vk::PipelineStageFlags2,
-        access: vk::AccessFlags2,
-    ) -> BufferAccess {
+    pub fn access(&self, stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> BufferAccess {
         BufferAccess {
             stage,
             access,
@@ -90,11 +116,25 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     pub fn get_range(&self) -> Range<u64> {
         (self.address..(self.address + self.size)).into()
     }
+    /// The `index` range of the slice's elements; panics where [`Self::try_range`] fails.
+    #[track_caller]
     pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
         new_slice(index, self.address, self.size)
     }
+    /// The `index` range of the slice's bytes; panics where [`Self::try_byte_range`] fails.
+    #[track_caller]
     pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, u8> {
         new_slice::<u8, R>(index, self.address, self.size)
+    }
+    /// The `index` range of the slice's elements, or [`Error::SliceOutOfRange`] when it starts
+    /// after it ends or ends past the slice.
+    pub fn try_range<R: RangeBounds<usize>>(self, index: R) -> Result<BufferSlice<'a, T>> {
+        try_new_slice(index, self.address, self.size)
+    }
+    /// The `index` range of the slice's bytes, or [`Error::SliceOutOfRange`] when it starts
+    /// after it ends or ends past the slice.
+    pub fn try_byte_range<R: RangeBounds<usize>>(self, index: R) -> Result<BufferSlice<'a, u8>> {
+        try_new_slice::<u8, R>(index, self.address, self.size)
     }
     pub fn len(&self) -> usize {
         self.size as usize / size_of::<T>()
@@ -167,11 +207,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Writes `data`, repeated, into every 4-byte word of `buffer`, whose address and size have
     /// to be multiples of 4.
     #[validation_trace]
-    pub fn fill_buffer<'a, T: Copy + Pod>(
-        &mut self,
-        buffer: BufferSlice<'a, T>,
-        data: u32,
-    ) {
+    pub fn fill_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: u32) {
         check_words(buffer.address, buffer.size, "a fill");
         self.rec.flush_pending(
             std::iter::empty(),
@@ -194,12 +230,11 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Writes `data` into the first element of `buffer`, from the command buffer itself: for
     /// small writes (at most 64 KiB, whole 4-byte words at a 4-byte aligned address).
     #[validation_trace]
-    pub fn update_buffer<'a, T: Copy + Pod>(
-        &mut self,
-        buffer: BufferSlice<'a, T>,
-        data: &T,
-    ) {
-        assert!(!buffer.is_empty(), "an update writes the first element of an empty slice");
+    pub fn update_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: &T) {
+        assert!(
+            !buffer.is_empty(),
+            "an update writes the first element of an empty slice"
+        );
         assert!(
             size_of::<T>() <= MAX_UPDATE,
             "an update writes at most {MAX_UPDATE} bytes, not {}",
@@ -260,7 +295,8 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 ]
             })
             .collect::<SmallVec<[_; 4]>>();
-        self.rec.flush_pending(iter::empty(), accesses.iter().cloned());
+        self.rec
+            .flush_pending(iter::empty(), accesses.iter().cloned());
         let copies = regions
             .iter()
             .map(|(src, dst)| {
