@@ -19,12 +19,14 @@ mod tests {
             assert_eq!(end.max().unwrap_or(0), pass.constants_size, "{}", pass.name);
             let names: Vec<&CStr> = match pass.kind {
                 PassKind::Compute { entry } => vec![entry],
-                PassKind::RasterVertex { vertex, fragment } => vec![vertex, fragment],
+                PassKind::RasterVertex { vertex, fragment } => {
+                    [vertex].into_iter().chain(fragment).collect()
+                }
                 PassKind::RasterMesh {
                     amp,
                     mesh,
                     fragment,
-                } => amp.into_iter().chain([mesh, fragment]).collect(),
+                } => amp.into_iter().chain([mesh]).chain(fragment).collect(),
                 PassKind::RayTracing {
                     raygen,
                     miss,

@@ -1,7 +1,8 @@
-//! The state of a draw (`RasterState`): every rasterization, depth, stencil and blend setting, its setters gated by the features they need, and how it reaches the GPU: as dynamic state a rendering sets once and then per draw only where it changed, or, where the device can't set it dynamically (`dynamic-*` features), baked into the pipeline through its key (`Baked`)
+//! The state of a draw (`RasterState`): every rasterization, depth, stencil and blend setting plus its viewport and scissor (`Rect`), its setters gated by the features they need, the checks of its values against the device, and how it reaches the GPU: as dynamic state a rendering sets once and then per draw only where it changed, or, where the device can't set it dynamically (`dynamic-*` features, a topology class without `dynamicPrimitiveTopologyUnrestricted`), baked into the pipeline through its key (`Baked`)
 use std::ops::Deref;
 
 use crate::vk;
+use glam::{I64Vec2, IVec2, UVec2};
 
 pub use crate::vk::{
     BlendFactor, BlendOp, ColorComponentFlags, CompareOp, ConservativeRasterizationModeEXT,
@@ -11,7 +12,7 @@ pub use crate::vk::{
 
 use smallvec::SmallVec;
 #[allow(unused_imports)]
-use crate::features::{Features, Gated, gate};
+use crate::features::{Features, Gated, On, gate};
 use crate::state::{Ctx, Functions};
 
 /// How a color attachment combines a fragment's output `src` with the stored value `dst`.
@@ -144,9 +145,69 @@ pub struct LineStipple {
     pub pattern: u16,
 }
 
+/// A rectangle of texels: a rendering's area, a viewport or a scissor. A `UVec2` is the
+/// rectangle of that extent at the origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Rect {
+    pub offset: IVec2,
+    pub extent: UVec2,
+}
+
+impl Rect {
+    pub const fn new(offset: IVec2, extent: UVec2) -> Self {
+        Self { offset, extent }
+    }
+
+    pub(crate) fn vk(self) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: self.offset.x,
+                y: self.offset.y,
+            },
+            extent: vk::Extent2D {
+                width: self.extent.x,
+                height: self.extent.y,
+            },
+        }
+    }
+
+    /// Panics unless it has texels.
+    #[track_caller]
+    pub(crate) fn check_viewport(self) {
+        assert!(
+            self.extent.cmpgt(UVec2::ZERO).all(),
+            "a viewport of extent {} has no pixels",
+            self.extent
+        );
+    }
+
+    /// Panics unless it starts at a non-negative offset and ends below 2^31, as scissors and
+    /// render areas do.
+    #[track_caller]
+    pub(crate) fn check_scissor(self, what: &str) {
+        let end = self.offset.as_i64vec2() + self.extent.as_i64vec2();
+        assert!(
+            self.offset.cmpge(IVec2::ZERO).all() && end.cmple(I64Vec2::splat(i32::MAX as i64)).all(),
+            "a {what} starts at a non-negative offset and ends below 2^31, not {} texels at {}",
+            self.extent,
+            self.offset
+        );
+    }
+}
+
+impl From<UVec2> for Rect {
+    fn from(extent: UVec2) -> Self {
+        Self {
+            offset: IVec2::ZERO,
+            extent,
+        }
+    }
+}
+
 /// The state of one draw into `COLOR_ATTACHMENTS` color attachments. The defaults draw
 /// back-face-culled triangles with clockwise front faces, depth-tested with `GREATER` (reversed
-/// depth) and depth-writing, and replace every color attachment.
+/// depth) and depth-writing, replace every color attachment, and use the rendering's viewport
+/// and scissor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RasterState<const COLOR_ATTACHMENTS: usize> {
     pub(super) topology: PrimitiveTopology,
@@ -165,11 +226,14 @@ pub struct RasterState<const COLOR_ATTACHMENTS: usize> {
     pub(super) depth_bounds: Option<[f32; 2]>,
     pub(super) depth_bias: Option<DepthBias>,
     pub(super) depth_clamp: Option<DepthClamp>,
-    pub(super) depth_clip: bool,
+    /// `None`: clipped unless clamped.
+    pub(super) depth_clip: Option<bool>,
     pub(super) depth_clip_negative_one_to_one: bool,
     pub(super) stencil: Option<Stencil>,
     pub(super) logic_op: Option<LogicOp>,
     pub(super) blend_constants: [f32; 4],
+    pub(super) viewport: Option<Rect>,
+    pub(super) scissor: Option<Rect>,
     pub(super) blends: [Blend; COLOR_ATTACHMENTS],
     pub(super) write_masks: [ColorComponentFlags; COLOR_ATTACHMENTS],
 }
@@ -193,11 +257,13 @@ impl<const COLOR_ATTACHMENTS: usize> Default for RasterState<COLOR_ATTACHMENTS> 
             depth_bounds: None,
             depth_bias: None,
             depth_clamp: None,
-            depth_clip: true,
+            depth_clip: None,
             depth_clip_negative_one_to_one: false,
             stencil: None,
             logic_op: None,
             blend_constants: [0.0; 4],
+            viewport: None,
+            scissor: None,
             blends: [Blend::Replace; COLOR_ATTACHMENTS],
             write_masks: [ColorComponentFlags::RGBA; COLOR_ATTACHMENTS],
         }
@@ -218,7 +284,7 @@ macro_rules! setters {
 setters! {
     /// The primitives vertex draws assemble (mesh shaders output their own).
     topology: PrimitiveTopology,
-    /// Whether the index `!0` restarts strips and fans.
+    /// Whether the index `!0` (of its index type) restarts strips and fans; lists can't restart.
     primitive_restart: bool,
     rasterizer_discard: bool,
     cull_mode: CullModeFlags,
@@ -231,8 +297,12 @@ setters! {
     stencil: Option<Stencil>,
     /// The constants of `CONSTANT_*` blend factors.
     blend_constants: [f32; 4],
-    /// The components each color attachment keeps of what blending makes.
-    write_masks: [ColorComponentFlags; COLOR_ATTACHMENTS],
+    /// The draw's viewport (depths 0 to 1); `None` is the rendering's
+    /// (`RasterBuilder::viewport`), by default its area.
+    viewport: Option<Rect>,
+    /// The draw's scissor; `None` is the rendering's (`RasterBuilder::scissor`), by default its
+    /// area. Draws of one rendering with different scissors clip it per draw (UI clipping).
+    scissor: Option<Rect>,
 }
 
 macro_rules! gated_setters {
@@ -299,8 +369,11 @@ gated_setters! {
     "depth-clamp-control" => DepthClampControl: depth_clamp_range(state, min: f32, max: f32) {
         state.depth_clamp = Some(DepthClamp::Range { min, max })
     }
-    /// Whether primitives are clipped against the near and far planes (the default).
-    "depth-clip-enable" => DepthClipEnable: depth_clip(state, on: bool) { state.depth_clip = on }
+    /// Whether primitives are clipped against the near and far planes; by default they are
+    /// unless depths are clamped (`depth_clamp`), on every device.
+    "depth-clip-enable" => DepthClipEnable: depth_clip(state, on: bool) {
+        state.depth_clip = Some(on)
+    }
     /// Clip space depth from -1 to 1 (OpenGL's) instead of 0 to 1.
     "depth-clip-control" => DepthClipControl: depth_clip_negative_one_to_one(state, on: bool) {
         state.depth_clip_negative_one_to_one = on
@@ -312,12 +385,25 @@ gated_setters! {
     "independent-blend" => IndependentBlend: blends(state, blends: [Blend; COLOR_ATTACHMENTS]) {
         state.blends = blends
     }
+    /// The components each color attachment keeps of what blending makes, in attachment order
+    /// ([`Self::write_mask`] gives all the same one, which needs no feature).
+    "independent-blend" => IndependentBlend: write_masks(state,
+        masks: [ColorComponentFlags; COLOR_ATTACHMENTS]
+    ) {
+        state.write_masks = masks
+    }
 }
 
 impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
     /// The same blend for every color attachment.
     pub fn blend(mut self, blend: Blend) -> Self {
         self.blends = [blend; COLOR_ATTACHMENTS];
+        self
+    }
+
+    /// The components every color attachment keeps of what blending makes (all by default).
+    pub fn write_mask(mut self, mask: ColorComponentFlags) -> Self {
+        self.write_masks = [mask; COLOR_ATTACHMENTS];
         self
     }
 
@@ -344,10 +430,124 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
             stencil: self.stencil,
             logic_op: self.logic_op,
             blend_constants: self.blend_constants,
+            viewport: self.viewport,
+            scissor: self.scissor,
             blends: [],
             write_masks: [],
         };
         (state, self.blends, self.write_masks)
+    }
+
+    /// Whether primitives are clipped against the near and far planes: as set, else unless
+    /// depths are clamped.
+    pub(crate) fn effective_depth_clip(&self) -> bool {
+        self.depth_clip.unwrap_or(self.depth_clamp.is_none())
+    }
+
+    /// Panics for values the device can't draw with: blend factors of a second output without
+    /// `dual-src-blend` or beyond `maxFragmentDualSrcAttachments`, a stipple factor outside 1 to
+    /// 256, a line width outside `lineWidthRange`, depth bounds or clamp ranges outside 0 to 1,
+    /// underestimation without `primitiveUnderestimation`, primitive restart of lists, and
+    /// viewports and scissors without texels or outside 2^31.
+    #[track_caller]
+    pub(crate) fn check(&self, blends: &[Blend], vertex: bool) {
+        let physical = Ctx::physical_device();
+        let limits = &physical.properties.limits;
+        for (i, blend) in blends.iter().enumerate() {
+            let Some(e) = blend.equation() else { continue };
+            let src1 = [e.src_color, e.dst_color, e.src_alpha, e.dst_alpha].iter().any(|f| {
+                matches!(
+                    *f,
+                    BlendFactor::SRC1_COLOR
+                        | BlendFactor::ONE_MINUS_SRC1_COLOR
+                        | BlendFactor::SRC1_ALPHA
+                        | BlendFactor::ONE_MINUS_SRC1_ALPHA
+                )
+            });
+            if !src1 {
+                continue;
+            }
+            assert!(
+                <gate::DualSrcBlend as On>::on(),
+                "the blend of color attachment {i} reads a second fragment output (`SRC1_*`), \
+                 which needs lava's `dual-src-blend` feature on the device (`dualSrcBlend`)"
+            );
+            assert!(
+                (i as u32) < limits.max_fragment_dual_src_attachments,
+                "the blend of color attachment {i} reads a second fragment output, which the \
+                 device has for {} attachments (`maxFragmentDualSrcAttachments`)",
+                limits.max_fragment_dual_src_attachments
+            );
+        }
+        if let Some(stipple) = self.line_stipple {
+            assert!(
+                (1..=256).contains(&stipple.factor),
+                "a line stipple repeats each bit 1 to 256 times, not {}",
+                stipple.factor
+            );
+        }
+        let [min, max] = limits.line_width_range;
+        assert!(
+            self.line_width == 1.0 || (min <= self.line_width && self.line_width <= max),
+            "a line width of {} is outside the device's {min} to {max} (`lineWidthRange`)",
+            self.line_width
+        );
+        let unit = |v: f32| (0.0..=1.0).contains(&v);
+        if let Some([min, max]) = self.depth_bounds {
+            assert!(
+                unit(min) && unit(max),
+                "depth bounds lie between 0 and 1, not {min} to {max}"
+            );
+        }
+        if let Some(DepthClamp::Range { min, max }) = self.depth_clamp {
+            assert!(
+                unit(min) && unit(max) && min <= max,
+                "a depth clamp range lies between 0 and 1 and starts at its minimum, not {min} to \
+                 {max}"
+            );
+        }
+        assert!(
+            self.conservative != ConservativeRasterizationModeEXT::UNDERESTIMATE
+                || physical.primitive_underestimation,
+            "the device can't underestimate primitives (`primitiveUnderestimation`)"
+        );
+        if vertex && self.primitive_restart {
+            use PrimitiveTopology as T;
+            assert!(
+                !matches!(
+                    self.topology,
+                    T::POINT_LIST
+                        | T::LINE_LIST
+                        | T::TRIANGLE_LIST
+                        | T::LINE_LIST_WITH_ADJACENCY
+                        | T::TRIANGLE_LIST_WITH_ADJACENCY
+                        | T::PATCH_LIST
+                ),
+                "primitive restart cuts strips and fans, not {:?} (lava doesn't enable \
+                 `primitiveTopologyListRestart`)",
+                self.topology
+            );
+        }
+        if let Some(viewport) = self.viewport {
+            viewport.check_viewport();
+        }
+        if let Some(scissor) = self.scissor {
+            scissor.check_scissor("scissor");
+        }
+    }
+}
+
+/// The class of a topology, which a pipeline bakes where the device can't leave it dynamically
+/// (`dynamicPrimitiveTopologyUnrestricted`): its first topology.
+pub(crate) fn topology_class(topology: PrimitiveTopology) -> PrimitiveTopology {
+    use PrimitiveTopology as T;
+    match topology {
+        T::POINT_LIST => T::POINT_LIST,
+        T::LINE_LIST | T::LINE_STRIP | T::LINE_LIST_WITH_ADJACENCY | T::LINE_STRIP_WITH_ADJACENCY => {
+            T::LINE_LIST
+        }
+        T::PATCH_LIST => T::PATCH_LIST,
+        _ => T::TRIANGLE_LIST,
     }
 }
 
@@ -381,11 +581,18 @@ pub(crate) struct Dynamic {
     pub(crate) line_stipple_enable: bool,
     pub(crate) line_stipple: bool,
     pub(crate) provoking_vertex: bool,
+    /// A dynamic topology may leave the class the pipeline was made with
+    /// (`dynamicPrimitiveTopologyUnrestricted`, a property of the enabled
+    /// `VK_EXT_extended_dynamic_state3`); else the class is baked.
+    pub(crate) topology_unrestricted: bool,
 }
 
 impl Dynamic {
-    pub(crate) fn of(f: &Features) -> Self {
+    /// `unrestricted`: the device's `dynamicPrimitiveTopologyUnrestricted`.
+    pub(crate) fn of(f: &Features, unrestricted: bool) -> Self {
+        let eds3 = ash::ext::extended_dynamic_state3::NAME;
         Self {
+            topology_unrestricted: unrestricted && f.extensions().contains(&eds3),
             blend: on!(f, "dynamic-blend", dynamic_blend),
             polygon_mode: on!(f, "dynamic-polygon-mode", dynamic_polygon_mode),
             depth_clamp: on!(f, "dynamic-depth-clamp", dynamic_depth_clamp),
@@ -416,6 +623,8 @@ impl Dynamic {
 /// state, so draws share pipelines elsewhere.
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub(crate) struct Baked {
+    /// The topology class of vertex pipelines (`topology_class`).
+    pub(crate) topology: PrimitiveTopology,
     #[cfg(bake_polygon_mode)]
     pub(crate) polygon_mode: PolygonMode,
     #[cfg(bake_depth_clamp)]
@@ -438,8 +647,12 @@ pub(crate) struct Baked {
 
 #[allow(unused_variables, unused_mut)]
 impl Baked {
-    pub(crate) fn of(state: &RasterState<0>, dynamic: &Dynamic) -> Self {
+    /// `vertex`: a vertex pipeline, which has a topology.
+    pub(crate) fn of(state: &RasterState<0>, dynamic: &Dynamic, vertex: bool) -> Self {
         let mut baked = Self::default();
+        if vertex && !dynamic.topology_unrestricted {
+            baked.topology = topology_class(state.topology);
+        }
         #[cfg(bake_polygon_mode)]
         if !dynamic.polygon_mode {
             baked.polygon_mode = state.polygon_mode;
@@ -450,7 +663,7 @@ impl Baked {
         }
         #[cfg(bake_depth_clip)]
         if !dynamic.depth_clip {
-            baked.depth_clip = state.depth_clip;
+            baked.depth_clip = state.effective_depth_clip();
         }
         #[cfg(bake_depth_clip_negative_one_to_one)]
         if !dynamic.depth_clip_negative_one_to_one {
@@ -492,6 +705,9 @@ pub(super) struct Rendering {
     pub(super) color_attachments: usize,
     pub(super) depth: bool,
     pub(super) stencil: bool,
+    /// What draws without a viewport or scissor of their own use.
+    pub(super) viewport: Rect,
+    pub(super) scissor: Rect,
 }
 
 pub(super) type Assembly = Option<(PrimitiveTopology, bool)>;
@@ -536,6 +752,24 @@ impl DrawState<'_> {
             };
         }
         unsafe {
+            let viewport = self.viewport.unwrap_or(rendering.viewport);
+            if last.is_none_or(|last| last.viewport.unwrap_or(rendering.viewport) != viewport) {
+                device.cmd_set_viewport_with_count(
+                    cmd,
+                    &[vk::Viewport {
+                        x: viewport.offset.x as f32,
+                        y: viewport.offset.y as f32,
+                        width: viewport.extent.x as f32,
+                        height: viewport.extent.y as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                );
+            }
+            let scissor = self.scissor.unwrap_or(rendering.scissor);
+            if last.is_none_or(|last| last.scissor.unwrap_or(rendering.scissor) != scissor) {
+                device.cmd_set_scissor_with_count(cmd, &[scissor.vk()]);
+            }
             if vertex && *assembly != Some((self.topology, self.primitive_restart)) {
                 device.cmd_set_primitive_topology(cmd, self.topology);
                 device.cmd_set_primitive_restart_enable(cmd, self.primitive_restart);
@@ -625,8 +859,11 @@ impl DrawState<'_> {
                     Functions::depth_clamp_control().cmd_set_depth_clamp_range(cmd, mode, &range);
                 }
             }
-            if dynamic.depth_clip && changed!(depth_clip) {
-                d3.cmd_set_depth_clip_enable(cmd, self.depth_clip);
+            let depth_clip = self.effective_depth_clip();
+            if dynamic.depth_clip
+                && last.is_none_or(|last| last.effective_depth_clip() != depth_clip)
+            {
+                d3.cmd_set_depth_clip_enable(cmd, depth_clip);
             }
             if dynamic.depth_clip_negative_one_to_one && changed!(depth_clip_negative_one_to_one) {
                 d3.cmd_set_depth_clip_negative_one_to_one(cmd, self.depth_clip_negative_one_to_one);
@@ -637,10 +874,16 @@ impl DrawState<'_> {
                     cmd,
                     rendering.stencil && self.stencil.is_some(),
                 );
-                for (face, s) in [
-                    (vk::StencilFaceFlags::FRONT, stencil.front),
-                    (vk::StencilFaceFlags::BACK, stencil.back),
-                ] {
+                // One set of calls where both faces are alike.
+                let faces: &[_] = if stencil.front == stencil.back {
+                    &[(vk::StencilFaceFlags::FRONT_AND_BACK, stencil.front)]
+                } else {
+                    &[
+                        (vk::StencilFaceFlags::FRONT, stencil.front),
+                        (vk::StencilFaceFlags::BACK, stencil.back),
+                    ]
+                };
+                for &(face, s) in faces {
                     device.cmd_set_stencil_op(cmd, face, s.fail, s.pass, s.depth_fail, s.compare);
                     device.cmd_set_stencil_compare_mask(cmd, face, s.compare_mask);
                     device.cmd_set_stencil_write_mask(cmd, face, s.write_mask);

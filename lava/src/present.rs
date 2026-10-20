@@ -796,6 +796,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                 aspects: vk::ImageAspectFlags::COLOR,
                 view_type: vk::ImageViewType::TYPE_2D,
                 mips: (0..1).into(),
+                layers: (0..1).into(),
                 usage,
             });
             bindless::bind_raw(images, swapchain.images.iter().map(|image| image.handle), false)?;
@@ -824,9 +825,11 @@ impl<U: StaticUsage> PresentSurface<U> {
             image: i.image,
             view: i.view,
             mip_range: (0..1).into(),
+            layers: (0..1).into(),
             extent: swapchain.extent,
             handle: i.handle,
             states: std::slice::from_ref(&i.state),
+            cache: None,
             format: self.format(),
             usage: U::default(),
             dim: D2,

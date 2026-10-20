@@ -1,4 +1,4 @@
-//! Borrowed image views of a mip range (over every aspect) and their slices, the only image types commands take (bounded by the traits of `kind`), their accesses (shaders' always in `GENERAL`), and the image transfer commands (clear, blit, copies to and from buffers; blits and copies track only the mip they touch)
+//! Borrowed image views of a mip range and a layer range (over every aspect) and their slices, the only image types commands take (bounded by the traits of `kind`), their accesses (shaders' always in `GENERAL`), and the image transfer commands (clear, blit, copies to and from buffers; blits and copies track only the mip they touch)
 use std::{iter, range::Range, sync::atomic::AtomicU64};
 
 use crate::vk;
@@ -11,8 +11,8 @@ use crate::{
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
     queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
     image::{
-        Image, Views,
-        dim::{D2, Dim},
+        Image, ViewCache, Views,
+        dim::{D2, D2Array, Dim},
         expected_data_len,
         format::{Format, bc_block},
         kind::{ImageRef, TransferDstView, TransferSrcView},
@@ -21,18 +21,23 @@ use crate::{
     state::{Ctx, Functions},
 };
 
-/// A borrowed view of `mip_range` of an image, over every aspect: the image type commands,
-/// bindless binds and generated bindings take.
+/// A borrowed view of `mip_range` and `layer_range` of an image, over every aspect: the image
+/// type commands, bindless binds and generated bindings take.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     pub(crate) image: vk::Image,
+    /// The image's own `VkImageView` of these mips and layers, if it has one.
     pub(crate) view: vk::ImageView,
     pub(crate) mip_range: Range<u32>,
+    pub(crate) layers: Range<u32>,
     /// The extent of mip `mip_range.start`.
     pub(crate) extent: D::Extent,
     pub(crate) handle: ImageHandle,
-    /// The image's tracked states: one for all its mips, or one per mip of the image.
+    /// The image's tracked states: one for all its mips, or one per mip of the image; each
+    /// covers every layer.
     pub(crate) states: &'a [AtomicU64],
+    /// Where an attachment image keeps the `VkImageView`s of views without one of their own.
+    pub(crate) cache: Option<&'a ViewCache>,
     pub(crate) format: F,
     pub(crate) usage: U,
     pub(crate) dim: D,
@@ -44,13 +49,39 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     }
 
     /// Its `VkImageView`, which only images with an attachment usage have (null otherwise):
-    /// descriptors are written without one.
+    /// descriptors are written without one. A view of some layers of an array gets its own the
+    /// first time it is asked for, kept until the image is destroyed.
     pub fn view(&self) -> vk::ImageView {
-        self.view
+        self.vk_view()
+    }
+
+    /// [`Self::view`], by a name `ImageRef::view` doesn't shadow.
+    pub(crate) fn vk_view(&self) -> vk::ImageView {
+        match self.cache {
+            Some(cache) if self.view == vk::ImageView::null() => cache.get(
+                self.image,
+                self.format.vk_format(),
+                self.format.aspects(),
+                D::VIEW_TYPE,
+                self.mip_range,
+                self.layers,
+            ),
+            _ => self.view,
+        }
     }
 
     pub fn mip_range(&self) -> Range<u32> {
         self.mip_range
+    }
+
+    /// The array layers it shows: `0..1` unless its image is a `D2Array` image.
+    pub fn layer_range(&self) -> Range<u32> {
+        self.layers
+    }
+
+    /// How many layers it shows.
+    pub fn layer_count(&self) -> u32 {
+        self.layers.end - self.layers.start
     }
 
     /// The extent of its first mip.
@@ -81,18 +112,18 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             aspect_mask: self.format.aspects(),
             base_mip_level: self.mip_range.start,
             level_count: self.mip_range.end - self.mip_range.start,
-            base_array_layer: 0,
-            layer_count: 1,
+            base_array_layer: self.layers.start,
+            layer_count: self.layer_count(),
         }
     }
-    /// The layers of `mip_level` a copy or blit addresses: one aspect, depth for a combined
-    /// depth-stencil format.
+    /// The layers of `mip_level` a copy or blit addresses: the view's, of one aspect, depth for
+    /// a combined depth-stencil format.
     pub fn subresource_layers(&self, mip_level: u32) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
             aspect_mask: single_aspect(self.format.aspects()),
             mip_level,
-            base_array_layer: 0,
-            layer_count: 1,
+            base_array_layer: self.layers.start,
+            layer_count: self.layer_count(),
         }
     }
     /// All of mip `mip_range.start`.
@@ -144,9 +175,11 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             image: self.image,
             view: self.view,
             mip_range: self.mip_range,
+            layers: self.layers,
             extent: self.extent,
             handle: self.handle,
             states: self.states,
+            cache: self.cache,
             format,
             usage,
             dim: self.dim,
@@ -192,6 +225,53 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             first.access.mip_range.end = first.access.mip_range.start + 1;
         }
         first
+    }
+}
+
+impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U, D2Array> {
+    /// Layer `layer` of the view, as a 2D view of the same mips: to render into one layer, copy
+    /// it or bind it alone (`bindless::bind`). It has no handle of its own (the array's
+    /// `bind_*` bind the array). Panics for a layer the view doesn't show.
+    #[track_caller]
+    pub fn layer(self, layer: u32) -> ImageView<'a, F, U, D2> {
+        let layers = self.layers(layer..layer + 1);
+        ImageView {
+            image: layers.image,
+            view: vk::ImageView::null(),
+            mip_range: layers.mip_range,
+            layers: layers.layers,
+            extent: layers.extent,
+            handle: ImageHandle::NULL,
+            states: layers.states,
+            cache: layers.cache,
+            format: layers.format,
+            usage: layers.usage,
+            dim: D2,
+        }
+    }
+
+    /// Layers `layers` of the view (counted from the image's first), still an array: for a
+    /// layered or multiview rendering into some layers. Panics for layers the view doesn't
+    /// show; fewer than the view's have no handle.
+    #[track_caller]
+    pub fn layers(self, layers: std::ops::Range<u32>) -> Self {
+        assert!(
+            self.layers.start <= layers.start
+                && layers.start < layers.end
+                && layers.end <= self.layers.end,
+            "layers {layers:?} aren't some of the view's {:?}",
+            self.layers
+        );
+        let layers: Range<u32> = layers.into();
+        if layers == self.layers {
+            return self;
+        }
+        ImageView {
+            view: vk::ImageView::null(),
+            layers,
+            handle: ImageHandle::NULL,
+            ..self
+        }
     }
 }
 
@@ -288,7 +368,7 @@ pub enum Filter {
 }
 
 impl<K: HasCompute> CommandBuffer<'_, K> {
-    /// Clears every mip of the view `image` to `clear_color`.
+    /// Clears every mip and layer of the view `image` to `clear_color`.
     #[validation_trace]
     pub fn clear_image<T: TransferDstView>(
         &mut self,
@@ -333,6 +413,11 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
         check_box(&src, false, "source");
         check_box(&dst, false, "destination");
+        assert_eq!(
+            src.view.layer_count(),
+            dst.view.layer_count(),
+            "a blit's source and destination have as many layers"
+        );
         self.rec.flush_pending(
             [
                 src.view.first_mip_access(
@@ -381,7 +466,8 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
 }
 
 impl<K: QueueKind> CommandBuffer<'_, K> {
-    /// Copies the tightly packed texels of `src` into the box `dst`.
+    /// Copies the tightly packed texels of `src` into the box `dst` of every layer of its view,
+    /// one layer after another.
     #[validation_trace]
     pub fn copy_buffer_to_image<T: Copy + Pod, I: TransferDstView>(
         &mut self,
@@ -400,6 +486,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 vk::AccessFlags2::TRANSFER_WRITE,
             )),
             iter::once(BufferAccess {
+                unordered: false,
                 access: vk::AccessFlags2::TRANSFER_READ,
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 range: src.get_range(),
@@ -422,8 +509,8 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         };
     }
 
-    /// Copies the texels of the box `src` into `dst`, tightly packed. It takes a slice, never a
-    /// view:
+    /// Copies the texels of the box `src` of every layer of its view into `dst`, tightly packed,
+    /// one layer after another. It takes a slice, never a view:
     /// ```compile_fail
     /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer, queue::Graphics};
     /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::usage};
@@ -456,6 +543,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 vk::AccessFlags2::TRANSFER_READ,
             )),
             iter::once(BufferAccess {
+                unordered: false,
                 access: vk::AccessFlags2::TRANSFER_WRITE,
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 range: dst.get_range(),
@@ -536,7 +624,8 @@ fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
         format.texel_size(),
         bc_block(format.vk_format()),
     );
-    if let Some(needed) = needed {
+    // The box of every layer of the view, one after another.
+    if let Some(needed) = needed.map(|bytes| bytes * slice.view.layer_count() as usize) {
         assert!(
             needed as u64 <= buffer_bytes,
             "the {what} buffer has {buffer_bytes} bytes, the copy of {:?} texels of {:?} takes {needed}",

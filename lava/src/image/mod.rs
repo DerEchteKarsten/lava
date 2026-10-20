@@ -1,12 +1,13 @@
-//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`; staged ones are `Uploader::image` in `buffer/staging.rs`), type erasure, and their destruction once no frame can reach them
+//! Format-, usage- and dimension-typed GPU images, with array layers for `D2Array`, with one view over all mips or one per mip (`VkImageView`s only for attachments, made on first use for layer views; bindless descriptors need none), host uploads (`host-image-copy`; staged ones are `Uploader::image` in `buffer/staging.rs`), type erasure, and their destruction once no frame can reach them
 use std::{
     mem::{self, ManuallyDrop},
     range::Range,
-    sync::atomic::AtomicU64,
+    sync::{Mutex, atomic::AtomicU64},
 };
 
 use crate::error::{Error, Result};
 use crate::vk;
+use glam::UVec2;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
 
@@ -30,10 +31,10 @@ pub mod kind;
 pub mod slice;
 pub mod usage;
 
-pub use dim::{D2, D3, Dim};
+pub use dim::{D2, D2Array, D3, Dim, Dim2D};
 pub use kind::{
-    ColorTarget, DepthTarget, ImageRef, SampledImage, SampledView, StorageImage, StorageView,
-    TransferDstView, TransferSrcView,
+    ColorTarget, DepthTarget, ImageRef, SampledImage, SampledView, StencilTarget, StorageImage,
+    StorageView, TransferDstView, TransferSrcView,
 };
 
 /// The `vk::Image` and its memory. It has no public constructor, so only lava implements
@@ -44,40 +45,114 @@ pub struct RawImage<F: Format, U: ImageUsage, D: Dim> {
     allocation: Allocation,
     extent: D::Extent,
     mip_levels: u32,
+    /// 1 unless `D` is `D2Array`.
+    layers: u32,
     format: F,
     usage: U,
+    /// The `VkImageView`s of views other than the image's own, made when a rendering first
+    /// needs one (`ImageView::view`).
+    cache: ViewCache,
     /// Last, so it counts the image until its drop finished.
     live: Live,
 }
 
+fn has_attachment_usage(usage: vk::ImageUsageFlags) -> bool {
+    usage.intersects(
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+    )
+}
+
+/// A `VkImageView` of `mips` and `layers` of `image` over every aspect, of `view_type`.
+fn create_view(
+    image: vk::Image,
+    format: vk::Format,
+    aspects: vk::ImageAspectFlags,
+    view_type: vk::ImageViewType,
+    mips: Range<u32>,
+    layers: Range<u32>,
+) -> Result<vk::ImageView> {
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(view_type)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: aspects,
+            base_mip_level: mips.start,
+            level_count: mips.end - mips.start,
+            base_array_layer: layers.start,
+            layer_count: layers.end - layers.start,
+        });
+    Ok(unsafe { Ctx::device().create_image_view(&info, None)? })
+}
+
+/// The `VkImageView`s an attachment image makes on first use for views without one of their
+/// own (one layer of an array, a range of layers), by mips, layers and view type; destroyed
+/// with the image.
+#[derive(Debug, Default)]
+pub(crate) struct ViewCache(Mutex<Vec<(ViewKey, vk::ImageView)>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewKey {
+    mips: (u32, u32),
+    layers: (u32, u32),
+    view_type: vk::ImageViewType,
+}
+
+impl ViewCache {
+    /// The view of `mips` and `layers` of `image`, made the first time it is asked for.
+    /// Panics if the device can't make it (out of memory).
+    pub(crate) fn get(
+        &self,
+        image: vk::Image,
+        format: vk::Format,
+        aspects: vk::ImageAspectFlags,
+        view_type: vk::ImageViewType,
+        mips: Range<u32>,
+        layers: Range<u32>,
+    ) -> vk::ImageView {
+        let key = ViewKey {
+            mips: (mips.start, mips.end),
+            layers: (layers.start, layers.end),
+            view_type,
+        };
+        let mut views = crate::queue::lock(&self.0);
+        if let Some(&(_, view)) = views.iter().find(|(k, _)| *k == key) {
+            return view;
+        }
+        let view = create_view(image, format, aspects, view_type, mips, layers)
+            .unwrap_or_else(|err| panic!("creating a view of layers {layers:?} failed: {err}"));
+        views.push((key, view));
+        view
+    }
+
+    fn take(&mut self) -> Vec<vk::ImageView> {
+        let views = self.0.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+        mem::take(views).into_iter().map(|(_, view)| view).collect()
+    }
+}
+
 impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
-    /// A view of `mips` over every aspect where renderings need one (attachment usages), else
-    /// null: descriptors are written from a view's description, without a view object.
+    /// A view of `mips` and every layer over every aspect where renderings need one
+    /// (attachment usages), else null: descriptors are written from a view's description,
+    /// without a view object.
     fn create_view(&self, mips: Range<u32>) -> Result<vk::ImageView> {
-        let attachment =
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
-        if !self.usage.flags().intersects(attachment) {
+        if !has_attachment_usage(self.usage.flags()) {
             return Ok(vk::ImageView::null());
         }
-        let info = vk::ImageViewCreateInfo::default()
-            .image(self.image)
-            .view_type(D::VIEW_TYPE)
-            .format(self.format.vk_format())
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: self.format.aspects(),
-                base_mip_level: mips.start,
-                level_count: mips.end - mips.start,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        Ok(unsafe { Ctx::device().create_image_view(&info, None)? })
+        let format = self.format.vk_format();
+        let layers = (0..self.layers).into();
+        create_view(self.image, format, self.format.aspects(), D::VIEW_TYPE, mips, layers)
     }
 }
 
 impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
     fn drop(&mut self) {
         let (image, allocation) = (self.image, mem::take(&mut self.allocation));
+        let views = self.cache.take();
         lifetime::retire(move || {
+            for view in views {
+                unsafe { Ctx::device().destroy_image_view(view, None) };
+            }
             forget_image(image);
             unsafe { Ctx::device().destroy_image(image, None) };
             if let Err(err) = Ctx::allocator().free(allocation) {
@@ -261,12 +336,46 @@ impl<F: StaticFormat, U: StaticUsage, D: Dim, V: Views> Image<F, U, D, V> {
     }
 }
 
+impl<F: StaticFormat, U: StaticUsage, V: Views> Image<F, U, D2Array, V> {
+    /// Creates an image of `layers` array layers, each of `extent` and `mip_levels` mips, bound
+    /// in no bindless set. Its views show every layer; [`ImageView::layer`] and
+    /// [`ImageView::layers`] show fewer.
+    #[validation_trace]
+    pub fn with_layers(extent: UVec2, mip_levels: u32, layers: u32) -> Result<Self> {
+        Self::with_layer_params(F::default(), U::default(), extent, mip_levels, layers)
+    }
+}
+
+impl<F: Format, U: ImageUsage, V: Views> Image<F, U, D2Array, V> {
+    /// Like `with_layers`, for any format and usage, `Dynamic` ones included.
+    #[validation_trace]
+    pub fn with_layer_params(
+        format: F,
+        usage: U,
+        extent: UVec2,
+        mip_levels: u32,
+        layers: u32,
+    ) -> Result<Self> {
+        Self::create(format, usage, extent, mip_levels, layers)
+    }
+}
+
 impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
-    /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included.
+    /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included; one layer.
     #[validation_trace]
     pub fn with_params(format: F, usage: U, extent: D::Extent, mip_levels: u32) -> Result<Self> {
+        Self::create(format, usage, extent, mip_levels, 1)
+    }
+
+    fn create(format: F, usage: U, extent: D::Extent, mip_levels: u32, layers: u32) -> Result<Self> {
         let live = Live::new();
         check_extent::<D>(extent, mip_levels)?;
+        let max_layers = Ctx::device_properties().limits.max_image_array_layers;
+        if layers == 0 || layers > max_layers {
+            return Err(Error::Unsupported(format!(
+                "an image has 1 to {max_layers} layers on this device, not {layers}"
+            )));
+        }
         if bc_block(format.vk_format()).is_some() {
             #[cfg(feature = "bc-compression")]
             gate::BcCompression::check()?;
@@ -285,7 +394,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             ));
         }
         let create_info = vk::ImageCreateInfo {
-            array_layers: 1,
+            array_layers: layers,
             extent: D::extent_3d(extent),
             format: format.vk_format(),
             image_type: D::IMAGE_TYPE,
@@ -338,8 +447,10 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             allocation,
             extent,
             mip_levels,
+            layers,
             format,
             usage,
+            cache: ViewCache::default(),
             live,
         };
         unsafe {
@@ -372,6 +483,11 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 
     pub fn mip_levels(&self) -> u32 {
         self.raw.mip_levels
+    }
+
+    /// Its array layers: 1 unless it is a `D2Array` image made `with_layers`.
+    pub fn layers(&self) -> u32 {
+        self.raw.layers
     }
 
     pub fn mip_extent(&self, level: u32) -> D::Extent {
@@ -408,7 +524,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         self.raw.usage.check(required);
     }
 
-    /// The view over every mip.
+    /// The view over every mip and layer.
     pub fn whole_view(&self) -> ImageView<'_, F, U, D> {
         let (view, handle, states) = self.views.whole();
         self.view(view, (0..self.raw.mip_levels).into(), handle, states)
@@ -421,13 +537,16 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         handle: ImageHandle,
         states: &'a [AtomicU64],
     ) -> ImageView<'a, F, U, D> {
+        let attachment = has_attachment_usage(self.raw.usage.flags());
         ImageView {
             image: self.raw.image,
             view,
             mip_range,
+            layers: (0..self.raw.layers).into(),
             extent: self.mip_extent(mip_range.start),
             handle,
             states,
+            cache: attachment.then_some(&self.raw.cache),
             format: self.raw.format,
             usage: self.raw.usage,
             dim: D::default(),
@@ -452,8 +571,10 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
                 allocation: mem::take(&mut raw.allocation),
                 extent: raw.extent,
                 mip_levels: raw.mip_levels,
+                layers: raw.layers,
                 format,
                 usage,
+                cache: mem::take(&mut raw.cache),
                 live: mem::replace(&mut raw.live, Live::internal()),
             },
         }
@@ -577,8 +698,8 @@ use crate::{
 
 #[cfg(feature = "host-image-copy")]
 impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
-    /// Writes a whole mip level from the host, right away, unsynchronised with frames in flight
-    /// that read the image.
+    /// Writes a whole mip level of every layer from the host (the layers one after another),
+    /// right away, unsynchronised with frames in flight that read the image.
     #[validation_trace]
     ///
     /// Panics for a mip it doesn't have, data of another length than the mip's, and combined
@@ -590,8 +711,8 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
         self.host_copy(data, mip_level, D::ZERO, extent)
     }
 
-    /// Like `copy_from`, for the `extent` texels at `offset`; `data` holds that box, tightly
-    /// packed.
+    /// Like `copy_from`, for the `extent` texels at `offset` of every layer; `data` holds that
+    /// box per layer, tightly packed.
     #[validation_trace]
     pub fn copy_region_from(
         &mut self,
@@ -635,7 +756,7 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
             format.texel_size(),
             bc_block(format.vk_format()),
         );
-        if let Some(expected) = expected {
+        if let Some(expected) = expected.map(|bytes| bytes * self.raw.layers as usize) {
             assert!(
                 data.len() == expected,
                 "{} holds {expected} bytes but {} were given",
@@ -670,7 +791,7 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
                         base_mip_level: mips.start,
                         level_count: mips.end - mips.start,
                         base_array_layer: 0,
-                        layer_count: 1,
+                        layer_count: vk::REMAINING_ARRAY_LAYERS,
                     }),
             )
         });
@@ -685,7 +806,7 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
                 aspect_mask: aspect,
                 mip_level,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: self.raw.layers,
             })
             // 0: rows as long as the region is wide, also right for a BC mip narrower than
             // its block.

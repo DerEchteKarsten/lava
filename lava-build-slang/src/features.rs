@@ -10,6 +10,7 @@ pub(crate) const CAPABILITY_FEATURES: &[(u32, &str, &str)] = &[
     (32, "clip-distance", "ClipDistance"),
     (33, "cull-distance", "CullDistance"),
     (39, "shader-int8", "ShaderInt8"),
+    (69, "shader-output-layer", "ShaderOutputLayer"),
     (4433, "storage-16bit", "Storage16Bit"),
     (4434, "storage-16bit", "Storage16Bit"),
     (4435, "storage-16bit", "Storage16Bit"),
@@ -20,6 +21,7 @@ pub(crate) const CAPABILITY_FEATURES: &[(u32, &str, &str)] = &[
     (4472, "ray-query", "RayQuery"),
     (4478, "ray-traversal-primitive-culling", "RayTraversalPrimitiveCulling"),
     (4479, "ray-tracing-pipeline", "RayTracingPipeline"),
+    (5254, "shader-output-layer", "ShaderOutputLayer"),
     (5055, "shader-clock", "ShaderClock"),
     (5283, "mesh-shader", "MeshShader"),
 ];

@@ -164,6 +164,89 @@ public extension Img<E, Shape, 3> {
     }
 }
 
+/// A 2D array image (`lava::image::D2Array`, every layer of the view it was bound from) the pass
+/// reads through the descriptors its kind `U` names, like `Img`: 0 sampled (`Tex2DArray`), 1 and
+/// 2 storage (`Image2DArray`, `MutImage2DArray`). Coordinates end with the layer.
+public struct ImgArray<E : ITexelElement, let U : int> {
+    public uint32_t handle;
+
+    [ForceInline] public __init(uint32_t handle) {
+        this.handle = handle;
+    }
+
+    /// The image behind an `SCONST`.
+    [ForceInline] public static ImgArray<E, U> fromConst(uint64_t value) {
+        return ImgArray<E, U>(uint32_t(value));
+    }
+
+    [ForceInline] public bool IsNull() {
+        return handle == NULL_HANDLE;
+    }
+
+    typealias SampledTexture = _Texture<E, __Shape2D, 1, 0, 0, 0, 0, 0, 0>;
+    typealias StorageTexture = _Texture<E, __Shape2D, 1, 0, 0, 1, 0, 0, 0>;
+
+    [ForceInline] internal SampledTexture sampled() {
+        SampledTexture texture = ResourceDescriptorHeap[handleSampledSlot(handle)];
+        return texture;
+    }
+    [ForceInline] internal StorageTexture storage() {
+        StorageTexture texture = ResourceDescriptorHeap[handleStorageSlot(handle)];
+        return texture;
+    }
+
+    /// Size in texels of mip 0 and the layer count, read through the descriptor it reads.
+    public uint3 GetDimensions() {
+        uint width;
+        uint height;
+        uint layers;
+        if (U == 0) {
+            sampled().GetDimensions(width, height, layers);
+        } else {
+            storage().GetDimensions(width, height, layers);
+        }
+        return uint3(width, height, layers);
+    }
+}
+
+__generic<E : ITexelElement>
+public extension ImgArray<E, 0> {
+    /// The texel at `p.xy` of layer `p.z`.
+    [ForceInline] public E Load(uint3 p) {
+        return sampled()[p];
+    }
+    /// Samples layer `uvl.z` at `uvl.xy`.
+    [ForceInline] public E Sample(Sampler sampler, float3 uvl) {
+        return sampled().Sample(sampler.get(), uvl);
+    }
+    [ForceInline] public E SampleLevel(Sampler sampler, float3 uvl, float level) {
+        return sampled().SampleLevel(sampler.get(), uvl, level);
+    }
+    [ForceInline] public float SampleCmp(Sampler sampler, float3 uvl, float reference) {
+        return sampled().SampleCmp(sampler.getCmp(), uvl, reference);
+    }
+    [ForceInline] public float SampleCmpLevelZero(Sampler sampler, float3 uvl, float reference) {
+        return sampled().SampleCmpLevelZero(sampler.getCmp(), uvl, reference);
+    }
+}
+
+__generic<E : ITexelElement>
+public extension ImgArray<E, 1> {
+    [ForceInline] public E Load(uint3 p) {
+        return storage()[p];
+    }
+}
+
+__generic<E : ITexelElement>
+public extension ImgArray<E, 2> {
+    [ForceInline] public E Load(uint3 p) {
+        return storage()[p];
+    }
+    [ForceInline] public void Store(uint3 p, E v) {
+        storage().Store(p, v);
+    }
+}
+
 /// A 2D image whose kind is only known at runtime, e.g. a handle stored in vertex data.
 /// Reads the sampled descriptor if the handle has one, the storage descriptor otherwise.
 public struct DynImg<E : ITexelElement = float4> {
@@ -241,6 +324,9 @@ public typealias Image3D<E : ITexelElement = float4>    = Img<E, __Shape3D, 1>;
 public typealias MutImage2D<E : ITexelElement = float4> = Img<E, __Shape2D, 2>;
 public typealias MutImage3D<E : ITexelElement = float4> = Img<E, __Shape3D, 2>;
 public typealias MutTex2D<E : ITexelElement = float4>   = Img<E, __Shape2D, 3>;
+public typealias Tex2DArray<E : ITexelElement = float4>      = ImgArray<E, 0>;
+public typealias Image2DArray<E : ITexelElement = float4>    = ImgArray<E, 1>;
+public typealias MutImage2DArray<E : ITexelElement = float4> = ImgArray<E, 2>;
 
 /// A buffer the pass only reads, which lava tracks as a read: its pointer is read-only, so a
 /// write through it doesn't compile. `MutBuf` is read and written.

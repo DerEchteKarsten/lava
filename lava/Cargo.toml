@@ -54,6 +54,9 @@ default = [
     "async-transfer",
     "bc-compression",
     "independent-blend",
+    "dual-src-blend",
+    "multi-draw",
+    "shader-output-layer",
     "fill-mode-non-solid",
     "wide-lines",
     "depth-bounds",
@@ -132,6 +135,12 @@ bc-compression = []
 assert-bc-compression = ["bc-compression"]
 independent-blend = []
 assert-independent-blend = ["independent-blend"]
+dual-src-blend = []
+assert-dual-src-blend = ["dual-src-blend"]
+multi-draw = []
+assert-multi-draw = ["multi-draw"]
+shader-output-layer = []
+assert-shader-output-layer = ["shader-output-layer"]
 fill-mode-non-solid = []
 assert-fill-mode-non-solid = ["fill-mode-non-solid"]
 wide-lines = []

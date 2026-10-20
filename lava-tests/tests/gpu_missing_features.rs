@@ -1,14 +1,14 @@
-//! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`, `rebar` too), the functions that need them return `MissingFeature`, uploads go through staging buffers, and draw state the device can't set dynamically is baked into pipelines and renders the same
+//! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`, `rebar` too), the functions that need them return `MissingFeature` (or panic, for draw state), uploads go through staging buffers, and draw state the device can't set dynamically is baked into pipelines and renders the same, the topology class too (without extended dynamic state 3 the device can't leave it)
 mod common;
 
-use common::{Cmd, Gpu, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, Gpu, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     Error, Features,
     buffer::{Buffer, Location, Shared},
     command_buffer::{
-        Attachment, BindingOutput, Blend, CullModeFlags, Draw, LogicOp, PolygonMode,
-        RasterState, kind,
+        Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp, CullModeFlags,
+        Draw, LogicOp, MultiDraw, PolygonMode, PrimitiveTopology, RasterState, kind,
     },
     features::MissingFeature,
     image::{
@@ -21,7 +21,7 @@ use lava::{
     queue::{Compute, Kind, Timeline, Transfer},
     state::Ctx,
 };
-use lava_tests::bindings::{TestMesh, TestRaster, TestVertex};
+use lava_tests::bindings::{TestLayered, TestMesh, TestRaster, TestVertex};
 
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
@@ -46,6 +46,9 @@ fn disabled() -> Features {
         async_transfer: true,
         host_image_copy: true,
         bc_compression: true,
+        dual_src_blend: true,
+        multi_draw: true,
+        shader_output_layer: true,
         wide_lines: true,
         depth_bounds: true,
         dynamic_blend: true,
@@ -211,6 +214,56 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
         state.depth_bounds(Some([0.0, 0.5])).err(),
         Some(missing("depth-bounds"))
     );
+    let vertices = buffer_with::<TestVertex>(&[bytemuck::Zeroable::zeroed(); 3]);
+    let draws = [MultiDraw {
+        first_vertex: 0,
+        vertex_count: 3,
+    }];
+    let bindings = TestRaster::push_bindings(vertices.range(..), Vec2::ZERO);
+    let multi = Draw::multi(&bindings, &draws, 1, RasterState::<1>::default(), None);
+    assert_eq!(multi.err(), Some(missing("multi-draw")));
+    let layered = TestLayered::push_bindings(vertices.range(..), Vec4::ONE);
+    assert_eq!(layered.err(), Some(missing("shader-output-layer")));
+    // Draw state that needs a feature without a setter of its own panics.
+    let src1 = BlendEquation {
+        src_color: BlendFactor::SRC1_COLOR,
+        dst_color: BlendFactor::ZERO,
+        color_op: BlendOp::ADD,
+        src_alpha: BlendFactor::ONE,
+        dst_alpha: BlendFactor::ZERO,
+        alpha_op: BlendOp::ADD,
+    };
+    let message = common::panic_message(|| {
+        let state = RasterState::<1>::default().blend(Blend::Equation(src1));
+        drop(Draw::new(&bindings, 3, 1, state, None));
+    });
+    assert!(message.contains("`dual-src-blend`"), "{message}");
+}
+
+#[test]
+fn baked_topology_classes_draw_like_dynamic_ones() {
+    let mut gpu = gpu_without();
+    let vertices = two_triangles(&mut gpu);
+    // Pipelines bake the line class, which the draw's dynamic topology stays in (validation
+    // checks it), and a triangle draw after it binds its own.
+    let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+        let lines = unculled().topology(PrimitiveTopology::LINE_LIST);
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines, None))
+            .record("lines")
+    });
+    // The same image as `gpu_headless`'s line list on a device without the restriction.
+    assert_golden("raster_lines", &pixels, [SIZE, SIZE]);
+    let mixed = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+        let lines = unculled().topology(PrimitiveTopology::LINE_STRIP);
+        let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&left, 3, 1, lines, None))
+            .draw(&Draw::new(&right, 3, 1, unculled(), None))
+            .record("lines then triangles")
+    });
+    assert_pixel(&mixed, 16, 44, [0, 0, 0, 255]);
+    assert_pixel(&mixed, 48, 44, [255, 255, 0, 255]);
 }
 
 /// Without `rebar` or host image copies, buffers and images are filled through the timeline's

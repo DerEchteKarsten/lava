@@ -297,8 +297,17 @@ features! {
     async_transfer: "async-transfer" / "assert-async-transfer" => AsyncTransfer,
     /// BC1-7 compressed formats.
     bc_compression: "bc-compression" / "assert-bc-compression" => BcCompression,
-    /// Different blends for the color attachments of one draw (`RasterState::blends`).
+    /// Different blends and write masks for the color attachments of one draw
+    /// (`RasterState::blends`, `write_masks`).
     independent_blend: "independent-blend" / "assert-independent-blend" => IndependentBlend,
+    /// Blend factors of a fragment shader's second output (`BlendFactor::SRC1_*`, `dualSrcBlend`).
+    dual_src_blend: "dual-src-blend" / "assert-dual-src-blend" => DualSrcBlend,
+    /// `VK_EXT_multi_draw`: many direct draws in one command (`Draw::multi`, `multi_indexed`).
+    multi_draw: "multi-draw" / "assert-multi-draw" => MultiDraw,
+    /// Vertex shaders that pick the layer they draw into (`SV_RenderTargetArrayIndex`,
+    /// `shaderOutputLayer` with `shaderOutputViewportIndex`, which `ShaderViewportIndexLayerEXT`
+    /// declares too), for layered renderings (`RasterBuilder::layers`).
+    shader_output_layer: "shader-output-layer" / "assert-shader-output-layer" => ShaderOutputLayer,
     /// Line and point polygons (`RasterState::polygon_mode`).
     fill_mode_non_solid: "fill-mode-non-solid" / "assert-fill-mode-non-solid" => FillModeNonSolid,
     /// `RasterState::line_width`.
@@ -386,6 +395,7 @@ pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
     (32, "clip-distance"),
     (33, "cull-distance"),
     (39, "shader-int8"),
+    (69, "shader-output-layer"),
     (4433, "storage-16bit"),
     (4434, "storage-16bit"),
     (4435, "storage-16bit"),
@@ -396,6 +406,7 @@ pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
     (4472, "ray-query"),
     (4478, "ray-traversal-primitive-culling"),
     (4479, "ray-tracing-pipeline"),
+    (5254, "shader-output-layer"),
     (5055, "shader-clock"),
     (5283, "mesh-shader"),
 ];
@@ -541,6 +552,7 @@ impl Features {
                 ash::ext::conservative_rasterization::NAME
             ],
             "provoking-vertex" => provoking_vertex: [ash::ext::provoking_vertex::NAME],
+            "multi-draw" => multi_draw: [ash::ext::multi_draw::NAME],
             "dynamic-blend" => dynamic_blend: [eds3],
             "dynamic-polygon-mode" => dynamic_polygon_mode: [eds3],
             "dynamic-depth-clamp" => dynamic_depth_clamp: [eds3],
@@ -592,6 +604,7 @@ pub(crate) struct FeatureChain {
     dynamic_state3: vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static>,
     lines: vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static>,
     provoking_vertex: vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>,
+    multi_draw: vk::PhysicalDeviceMultiDrawFeaturesEXT<'static>,
     depth_clip_enable: vk::PhysicalDeviceDepthClipEnableFeaturesEXT<'static>,
     depth_clip_control: vk::PhysicalDeviceDepthClipControlFeaturesEXT<'static>,
     depth_clamp_control: vk::PhysicalDeviceDepthClampControlFeaturesEXT<'static>,
@@ -633,6 +646,7 @@ impl FeatureChain {
             dynamic_state3,
             lines,
             provoking_vertex,
+            multi_draw,
             depth_clip_enable,
             depth_clip_control,
             depth_clamp_control,
@@ -663,6 +677,7 @@ impl FeatureChain {
             dynamic_state3,
             lines,
             provoking_vertex,
+            multi_draw,
             depth_clip_enable,
             depth_clip_control,
             depth_clamp_control,
@@ -696,6 +711,7 @@ impl FeatureChain {
             ash::ext::extended_dynamic_state3::NAME => dynamic_state3,
             ash::khr::line_rasterization::NAME => lines,
             ash::ext::provoking_vertex::NAME => provoking_vertex,
+            ash::ext::multi_draw::NAME => multi_draw,
             ash::ext::depth_clip_enable::NAME => depth_clip_enable,
             ash::ext::depth_clip_control::NAME => depth_clip_control,
             crate::vk::depth_clamp_control::NAME => depth_clamp_control,
@@ -712,6 +728,11 @@ impl FeatureChain {
         features
     }
 
+    /// Whether the device draws mesh passes in multiview renderings.
+    pub(crate) fn multiview_mesh_shader(&self) -> bool {
+        self.mesh.multiview_mesh_shader == vk::TRUE
+    }
+
     /// What lava needs that the device lacks, by name.
     pub(crate) fn lava_missing(&self, has: &dyn Fn(&CStr) -> bool) -> Vec<String> {
         let extensions = LAVA_EXTENSIONS.iter().filter(|name| !has(name));
@@ -721,7 +742,11 @@ impl FeatureChain {
             ("shaderInt64", c.shader_int64),
             ("fragmentStoresAndAtomics", c.fragment_stores_and_atomics),
             ("vertexPipelineStoresAndAtomics", c.vertex_pipeline_stores_and_atomics),
+            ("multiDrawIndirect", c.multi_draw_indirect),
+            ("drawIndirectFirstInstance", c.draw_indirect_first_instance),
+            ("depthBiasClamp", c.depth_bias_clamp),
             ("shaderDrawParameters", v11.shader_draw_parameters),
+            ("multiview", v11.multiview),
             ("bufferDeviceAddress", v12.buffer_device_address),
             ("timelineSemaphore", v12.timeline_semaphore),
             ("drawIndirectCount", v12.draw_indirect_count),
@@ -787,6 +812,11 @@ impl FeatureChain {
             "async-transfer" => async_transfer = device.dedicated_transfer,
             "bc-compression" => bc_compression = t(c.texture_compression_bc),
             "independent-blend" => independent_blend = t(c.independent_blend),
+            "dual-src-blend" => dual_src_blend = t(c.dual_src_blend),
+            "multi-draw" => multi_draw =
+                has(ash::ext::multi_draw::NAME) && t(self.multi_draw.multi_draw),
+            "shader-output-layer" => shader_output_layer =
+                t(v12.shader_output_layer) && t(v12.shader_output_viewport_index),
             "fill-mode-non-solid" => fill_mode_non_solid = t(c.fill_mode_non_solid),
             "wide-lines" => wide_lines = t(c.wide_lines),
             "depth-bounds" => depth_bounds = t(c.depth_bounds),
@@ -865,8 +895,13 @@ impl FeatureChain {
         chain.core = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
             .fragment_stores_and_atomics(true)
-            .vertex_pipeline_stores_and_atomics(true);
-        chain.vk11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+            .vertex_pipeline_stores_and_atomics(true)
+            .multi_draw_indirect(true)
+            .draw_indirect_first_instance(true)
+            .depth_bias_clamp(true);
+        chain.vk11 = vk::PhysicalDeviceVulkan11Features::default()
+            .shader_draw_parameters(true)
+            .multiview(true);
         chain.vk12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .timeline_semaphore(true)
@@ -895,6 +930,7 @@ impl FeatureChain {
         set! { c:
             "bc-compression" => texture_compression_bc = on(f.bc_compression),
             "independent-blend" => independent_blend = on(f.independent_blend),
+            "dual-src-blend" => dual_src_blend = on(f.dual_src_blend),
             "fill-mode-non-solid" => fill_mode_non_solid = on(f.fill_mode_non_solid),
             "wide-lines" => wide_lines = on(f.wide_lines),
             "depth-bounds" => depth_bounds = on(f.depth_bounds),
@@ -917,6 +953,8 @@ impl FeatureChain {
         set! { v12:
             "sampler-minmax" => sampler_filter_minmax = on(f.sampler_minmax),
             "shader-int8" => shader_int8 = on(f.shader_int8),
+            "shader-output-layer" => shader_output_layer = on(f.shader_output_layer),
+            "shader-output-layer" => shader_output_viewport_index = on(f.shader_output_layer),
             "shader-float16" => shader_float16 = on(f.shader_float16),
             "shader-int64-atomics" => shader_buffer_int64_atomics = on(f.shader_int64_atomics),
             "shader-int64-atomics" => shader_shared_int64_atomics =
@@ -974,6 +1012,10 @@ impl FeatureChain {
             "mesh-shader" => mesh.task_shader = on(f.mesh_shader),
             "mesh-shader" => mesh.mesh_shader = on(f.mesh_shader),
             "mesh-shader-queries" => mesh.mesh_shader_queries = on(f.mesh_shader_queries),
+            // Multiview renderings of mesh passes, where the device has them.
+            "mesh-shader" => mesh.multiview_mesh_shader =
+                on(f.mesh_shader && has(queried.mesh.multiview_mesh_shader)),
+            "multi-draw" => multi_draw.multi_draw = on(f.multi_draw),
             "acceleration-structure" => acceleration_structure.acceleration_structure =
                 on(f.acceleration_structure),
             "ray-query" => ray_query.ray_query = on(f.ray_query),

@@ -150,6 +150,8 @@ pub(crate) struct ImageCopy {
     mips: Range<u32>,
     level: u32,
     extent: vk::Extent3D,
+    /// Every layer of the image, the data one layer after another.
+    layers: u32,
 }
 
 // SAFETY: `states` points at atomics, which every thread may access.
@@ -579,7 +581,8 @@ impl Uploader {
         Ok(())
     }
 
-    /// Stages the whole mip `level` of `image` from `data`, tightly packed; needs a ring.
+    /// Stages the whole mip `level` of every layer of `image` from `data`, tightly packed, one
+    /// layer after another; needs a ring.
     /// Drained on a family other than the uploader's destination, the image is released to
     /// it. `Image::copy_from` writes right away instead, with host image copies. Panics for a
     /// mip the image doesn't have and data of another length than the mip's.
@@ -615,10 +618,12 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
     );
     let extent = D::extent_3d(image.mip_extent(level));
     let format = image.format();
-    let expected = expected_data_len(extent, format.texel_size(), bc_block(format.vk_format()));
+    let layers = image.layers();
+    let expected = expected_data_len(extent, format.texel_size(), bc_block(format.vk_format()))
+        .map(|bytes| bytes * layers as usize);
     assert!(
         expected == Some(len),
-        "mip level {level} holds {expected:?} bytes but {len} were given"
+        "mip level {level} of {layers} layers holds {expected:?} bytes but {len} were given"
     );
     let states = image.whole_view().states;
     let mips = match states.len() {
@@ -633,6 +638,7 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
         mips,
         level,
         extent,
+        layers,
     })
 }
 
@@ -770,7 +776,7 @@ fn record_image_copy<K: QueueKind>(
             aspect_mask: copy.aspect,
             mip_level: copy.level,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: copy.layers,
         })
         .image_layout(vk::ImageLayout::GENERAL)
         .image_offset(vk::Offset3D::default())

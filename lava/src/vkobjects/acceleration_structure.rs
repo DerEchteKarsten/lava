@@ -57,6 +57,7 @@ pub fn scratch_alignment() -> u64 {
 pub(crate) fn every_structure_read(stage: vk::PipelineStageFlags2) -> BufferAccess {
     let access = if stage == BUILD { READ } else { TRACE_READ };
     BufferAccess {
+        unordered: false,
         stage,
         access,
         range: EVERY_ACCELERATION_STRUCTURE,
@@ -338,6 +339,7 @@ impl<L: Level> AccelerationStructure<L> {
         access: vk::AccessFlags2,
     ) -> BufferAccess {
         BufferAccess {
+            unordered: false,
             stage,
             access,
             range: self.buffer.range(..).get_range(),
@@ -397,18 +399,8 @@ impl VertexPosition for Vec4 {
     const FORMAT: vk::Format = vk::Format::R32G32B32_SFLOAT;
 }
 
-/// An index type a triangle geometry can use.
-pub trait IndexFormat: crate::sealed::Sealed + Copy + Pod {
-    const TYPE: vk::IndexType;
-}
-impl crate::sealed::Sealed for u16 {}
-impl IndexFormat for u16 {
-    const TYPE: vk::IndexType = vk::IndexType::UINT16;
-}
-impl crate::sealed::Sealed for u32 {}
-impl IndexFormat for u32 {
-    const TYPE: vk::IndexType = vk::IndexType::UINT32;
-}
+/// The index types a triangle geometry can use, those of indexed draws.
+pub use crate::command_buffer::IndexFormat;
 
 /// The bytes of a vertex format's smallest component, which vertex addresses and strides are
 /// multiples of; 1 for formats it doesn't know.
@@ -836,6 +828,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             let dst = if update { READ | WRITE } else { WRITE };
             accesses.push(structure.access(BUILD, dst));
             accesses.push(BufferAccess {
+                unordered: false,
                 stage: BUILD,
                 access: READ | WRITE,
                 range: chunk,
@@ -846,6 +839,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
                 .filter(|r| !r.is_empty())
             {
                 accesses.push(BufferAccess {
+                    unordered: false,
                     stage: BUILD,
                     access: vk::AccessFlags2::SHADER_READ,
                     range: input,

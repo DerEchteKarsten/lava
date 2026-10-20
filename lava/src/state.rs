@@ -1,6 +1,7 @@
-//! Global Vulkan context: instance, device ranking, selection and creation, queues, features, validation logging, and their destruction at shutdown
+//! Global Vulkan context: instance, device ranking, selection and creation, queues, features, format properties (cached per format), validation logging, and their destruction at shutdown
 use std::{
     cell::Cell,
+    collections::HashMap,
     ffi::{c_char, c_void},
     fmt::Debug,
     panic::Location,
@@ -54,6 +55,8 @@ pub struct Ctx {
     pub(crate) queues: DeviceQueues,
     /// Set by the first poll that saw the device lost, which logs it.
     pub(crate) device_lost: AtomicBool,
+    /// The optimal-tiling features of each format asked so far (`Ctx::format_features`).
+    format_features: Mutex<HashMap<vk::Format, vk::FormatFeatureFlags2>>,
 }
 
 static STATE: Global<Ctx> = Global::new();
@@ -179,7 +182,13 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
     let has = |name: &CStr| (supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes());
     let mem_properties = unsafe { instance.get_physical_device_memory_properties(handel) };
 
+    let mut vk11_properties = vk::PhysicalDeviceVulkan11Properties::default();
     let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
+    let mut conservative_properties =
+        vk::PhysicalDeviceConservativeRasterizationPropertiesEXT::default();
+    let mut eds3_properties = vk::PhysicalDeviceExtendedDynamicState3PropertiesEXT::default();
+    let mut multi_draw_properties = vk::PhysicalDeviceMultiDrawPropertiesEXT::default();
+    let mut multiview_mesh_shader = false;
     let mut rt_pipeline_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
     let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
     let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
@@ -191,9 +200,20 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
         (Features::DEFAULT, vec!["Vulkan 1.4".to_owned()])
     } else {
         let chain = FeatureChain::query(instance, handel, &has);
+        multiview_mesh_shader = chain.multiview_mesh_shader();
         // Only the structs of extensions the device has.
-        let mut properties2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut vk12_properties);
+        let mut properties2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut vk11_properties)
+            .push_next(&mut vk12_properties);
+        if has(ash::ext::conservative_rasterization::NAME) {
+            properties2 = properties2.push_next(&mut conservative_properties);
+        }
+        if has(ash::ext::extended_dynamic_state3::NAME) {
+            properties2 = properties2.push_next(&mut eds3_properties);
+        }
+        if has(ash::ext::multi_draw::NAME) {
+            properties2 = properties2.push_next(&mut multi_draw_properties);
+        }
         if has(ash::khr::ray_tracing_pipeline::NAME) {
             properties2 = properties2.push_next(&mut rt_pipeline_properties);
         }
@@ -235,6 +255,7 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
     };
     // Detach them from the chain on this stack.
     mesh_shader_properties.p_next = std::ptr::null_mut();
+    vk11_properties.p_next = std::ptr::null_mut();
     vk12_properties.p_next = std::ptr::null_mut();
     rt_pipeline_properties.p_next = std::ptr::null_mut();
     acc_properties.p_next = std::ptr::null_mut();
@@ -244,7 +265,12 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
         properties,
         mesh_shader_properties,
         descriptor_heap_properties: heap_properties,
+        vk11_properties,
         vk12_properties,
+        primitive_underestimation: conservative_properties.primitive_underestimation == vk::TRUE,
+        topology_unrestricted: eds3_properties.dynamic_primitive_topology_unrestricted == vk::TRUE,
+        max_multi_draw_count: multi_draw_properties.max_multi_draw_count,
+        multiview_mesh_shader,
         mem_properties,
         handel,
         name,
@@ -309,6 +335,25 @@ impl Ctx {
     }
     pub(crate) fn dynamic() -> &'static Dynamic {
         &Ctx::get().dynamic
+    }
+
+    /// What images of `format` in optimal tiling support (`VkFormatProperties3`), queried once
+    /// per format.
+    pub fn format_features(format: vk::Format) -> vk::FormatFeatureFlags2 {
+        let ctx = Ctx::get();
+        let mut cache = crate::queue::lock(&ctx.format_features);
+        *cache.entry(format).or_insert_with(|| {
+            let mut properties3 = vk::FormatProperties3::default();
+            let mut properties = vk::FormatProperties2::default().push_next(&mut properties3);
+            unsafe {
+                Functions::instance().get_physical_device_format_properties2(
+                    ctx.physical_device.handel,
+                    format,
+                    &mut properties,
+                )
+            };
+            properties3.optimal_tiling_features
+        })
     }
 
     /// Creates the instance, picks and creates the device, and sets lava's context and
@@ -614,6 +659,10 @@ impl Ctx {
             host_image_copy: load::<gate::HostImageCopy, _>(features.host_image_copy, || {
                 ash::ext::host_image_copy::Device::new(&instance, &device)
             }),
+            #[cfg(feature = "multi-draw")]
+            multi_draw: load::<gate::MultiDraw, _>(features.multi_draw, || {
+                ash::ext::multi_draw::Device::new(&instance, &device)
+            }),
             dynamic_state2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
             dynamic_state3: ash::ext::extended_dynamic_state3::Device::new(&instance, &device),
             line_rasterization: ash::khr::line_rasterization::Device::new(&instance, &device),
@@ -647,10 +696,11 @@ impl Ctx {
             device,
             allocator: Mutex::new(Some(allocator)),
             queues,
-            dynamic: Dynamic::of(&features),
+            dynamic: Dynamic::of(&features, physical_device.topology_unrestricted),
             features,
             physical_device,
             device_lost: AtomicBool::new(false),
+            format_features: Mutex::new(HashMap::new()),
         });
         undo_device.disarm();
         undo_messenger.disarm();
@@ -814,6 +864,8 @@ pub struct Functions {
         Loader<gate::CalibratedTimestamps, ash::khr::calibrated_timestamps::Device>,
     #[cfg(feature = "hdr-metadata")]
     hdr_metadata: Loader<gate::HdrMetadata, ash::ext::hdr_metadata::Device>,
+    #[cfg(feature = "multi-draw")]
+    multi_draw: Loader<gate::MultiDraw, ash::ext::multi_draw::Device>,
 }
 
 impl Debug for Functions {
@@ -880,6 +932,10 @@ impl Functions {
     #[cfg(feature = "hdr-metadata")]
     pub(crate) fn hdr_metadata() -> &'static ash::ext::hdr_metadata::Device {
         loaded::<gate::HdrMetadata, _>(&get().hdr_metadata)
+    }
+    #[cfg(feature = "multi-draw")]
+    pub(crate) fn multi_draw() -> &'static ash::ext::multi_draw::Device {
+        loaded::<gate::MultiDraw, _>(&get().multi_draw)
     }
     #[cfg(feature = "ray-tracing-pipeline")]
     pub(crate) fn raytracing_pipeline() -> &'static ash::khr::ray_tracing_pipeline::Device {

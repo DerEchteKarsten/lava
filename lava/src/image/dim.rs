@@ -1,10 +1,11 @@
-//! Image dimensions: `D2` and `D3` marker types with their extent and offset vectors
+//! Image dimensions: `D2`, `D2Array` (2D images with array layers) and `D3` marker types with their extent and offset vectors, and the 2D ones attachments take (`Dim2D`)
 use std::{fmt::Debug, ops::Add};
 
 use crate::vk;
 use glam::{IVec2, IVec3, UVec2, UVec3};
 
-/// The dimension of an image and its views. A 3D image's mips halve in depth too.
+/// The dimension of an image and its views. A 3D image's mips halve in depth too; a
+/// [`D2Array`] image's layers are no dimension of its extent, which is a layer's.
 pub trait Dim: crate::sealed::Sealed + Copy + Default + Debug + Send + Sync + 'static {
     /// `UVec2` or `UVec3`: sizes, and the unsigned offsets of host copies.
     type Extent: Copy + Debug + PartialEq + Add<Output = Self::Extent> + Send + Sync;
@@ -29,8 +30,18 @@ pub trait Dim: crate::sealed::Sealed + Copy + Default + Debug + Send + Sync + 's
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct D2;
+/// 2D images with array layers (`Image::with_layers`), viewed as one array (`Tex2DArray`,
+/// layered renderings) or a layer at a time (`ImageView::layer`, a [`D2`] view).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct D2Array;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct D3;
+
+/// The dimensions renderings draw into: [`D2`], and [`D2Array`] for layered and multiview
+/// renderings.
+pub trait Dim2D: Dim<Extent = UVec2, Offset = IVec2> {}
+impl Dim2D for D2 {}
+impl Dim2D for D2Array {}
 
 fn halve(size: u32, level: u32) -> u32 {
     size.checked_shr(level).unwrap_or(0).max(1)
@@ -67,6 +78,30 @@ impl Dim for D2 {
         extent.cmpgt(UVec2::ZERO).all()
             && offset.cmple(mip_extent).all()
             && extent.cmple(mip_extent - offset.min(mip_extent)).all()
+    }
+}
+
+impl crate::sealed::Sealed for D2Array {}
+impl Dim for D2Array {
+    type Extent = UVec2;
+    type Offset = IVec2;
+    const ZERO: UVec2 = UVec2::ZERO;
+    const IMAGE_TYPE: vk::ImageType = vk::ImageType::TYPE_2D;
+    const VIEW_TYPE: vk::ImageViewType = vk::ImageViewType::TYPE_2D_ARRAY;
+    fn extent_3d(e: UVec2) -> vk::Extent3D {
+        D2::extent_3d(e)
+    }
+    fn offset_3d(o: IVec2) -> vk::Offset3D {
+        D2::offset_3d(o)
+    }
+    fn unsigned_offset_3d(o: UVec2) -> vk::Offset3D {
+        D2::unsigned_offset_3d(o)
+    }
+    fn mip_extent(e: UVec2, level: u32) -> UVec2 {
+        D2::mip_extent(e, level)
+    }
+    fn region_fits(mip_extent: UVec2, offset: UVec2, extent: UVec2) -> bool {
+        D2::region_fits(mip_extent, offset, extent)
     }
 }
 

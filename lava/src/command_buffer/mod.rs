@@ -1,17 +1,19 @@
-//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches (the last bound compute and ray tracing pipeline kept), scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
+//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings (render areas, depth or stencil attachments, layered and multiview) and their draws (direct, indexed, indirect from any `StartsWith` command records, counted, multi-draws, mesh launches), dispatches (the last bound compute and ray tracing pipeline kept), scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
 use std::{
     fmt::Debug, marker::PhantomData, ops::Deref, panic::AssertUnwindSafe, ptr::NonNull,
     range::Range, sync::atomic::AtomicU64,
 };
 
-use crate::vk::{self, IndexType, PipelineStageFlags2 as S2};
+use crate::vk::{self, PipelineStageFlags2 as S2};
 #[cfg(feature = "acceleration-structure")]
 use crate::vkobjects::acceleration_structure::Tlas;
 use crate::{
     buffer::slice::BufferSlice,
     image::{
+        dim::Dim2D,
         format::Format,
-        kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StorageView},
+        kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StencilTarget, StorageView},
+        slice::ImageView,
     },
     pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterKeyRef, pass_map, pipelines},
     present::Present,
@@ -23,7 +25,9 @@ use crate::{
     state::{Ctx, Functions, with_debug_name},
 };
 use bytemuck::{Pod, Zeroable};
-use glam::{I64Vec2, IVec2, UVec2};
+use glam::UVec2;
+#[cfg(feature = "multi-draw")]
+use crate::features::{Gated, gate};
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -47,6 +51,8 @@ pub struct BufferAccess {
     pub stage: vk::PipelineStageFlags2,
     pub access: vk::AccessFlags2,
     pub range: Range<u64>,
+    /// Draws of one rendering may make it alongside each other's (`unordered`).
+    pub(crate) unordered: bool,
 }
 
 /// A read of every acceleration structure (the BLASes a TLAS build or trace reaches): empty, so
@@ -64,6 +70,23 @@ pub(crate) const EVERY_BUFFER: Range<u64> = Range {
 };
 
 impl BufferAccess {
+    /// The same access, made by draws of one rendering in any order: a rendering doesn't
+    /// refuse two draws whose accesses of a range are both unordered, though one writes it
+    /// (`RasterBuilder::record` refuses other pairs). Nothing orders such draws' accesses, so
+    /// the application guarantees their result doesn't depend on it: atomics that commute
+    /// (counters, `InterlockedAdd`, min and max), or writes of elements no other draw of the
+    /// rendering reads or writes. Commands of other renderings or passes are ordered with it
+    /// by barriers as usual.
+    pub fn unordered(mut self) -> Self {
+        self.unordered = true;
+        self
+    }
+
+    /// Whether it is [`Self::unordered`].
+    pub fn is_unordered(&self) -> bool {
+        self.unordered
+    }
+
     fn overlaps(&self, other: &BufferAccess) -> bool {
         let writes_structure = |a: &BufferAccess| {
             a.access
@@ -243,17 +266,15 @@ const INLINE_DRAWS: usize = 16;
 /// [`Self::record`].
 pub struct RasterBuilder<'a, 'p, const N: usize> {
     cmd_buf: &'a mut Recording<'p>,
-    extent: UVec2,
-    viewport: Viewport,
-    scissor: vk::Rect2D,
+    area: Rect,
+    viewport: Rect,
+    scissor: Rect,
+    /// The layers a layered rendering draws into (`layers`).
+    layer_count: u32,
+    /// The views of a multiview rendering (`view_mask`), 0 for none.
+    view_mask: u32,
     color: [Attachment<'a>; N],
-    depth_format: vk::Format,
-    stencil_format: vk::Format,
-    depth_attachment: vk::ImageView,
-    /// Only a read; `record` adds the write.
-    depth_access: Option<ImageUse<'a>>,
-    clear_depth: Option<vk::ClearValue>,
-    depth_discard: Discard,
+    depth_stencil: Option<DepthStencil<'a>>,
     draws: SmallVec<[NonNull<DrawOutput<'static>>; INLINE_DRAWS]>,
     marker: PhantomData<&'a DrawOutput<'a>>,
 }
@@ -265,9 +286,24 @@ pub struct Attachment<'a> {
     format: vk::Format,
     view: vk::ImageView,
     extent: UVec2,
+    layers: u32,
     clear: Option<vk::ClearValue>,
     discard: Discard,
     access: ImageUse<'a>,
+}
+
+/// The depth or stencil attachment of a rendering, both for a combined format attached as depth.
+struct DepthStencil<'a> {
+    view: vk::ImageView,
+    format: vk::Format,
+    /// Attached as the depth, the stencil attachment, or both.
+    depth: bool,
+    stencil: bool,
+    layers: u32,
+    /// Only a read; `record` adds the write.
+    access: ImageUse<'a>,
+    clear: Option<vk::ClearValue>,
+    discard: Discard,
 }
 
 /// The contents a rendering drops of an attachment: `before` loads nothing (`DONT_CARE`, for
@@ -301,7 +337,8 @@ impl Discard {
 }
 
 impl<'a> Attachment<'a> {
-    /// Renders into `image`, a view of one mip.
+    /// Renders into `image`, a view of one mip: one layer, or the layers of an array a layered
+    /// or multiview rendering draws into.
     pub fn color<T: ColorTarget + 'a>(
         image: T,
         clear: Option<<T::Format as Format>::Texels>,
@@ -323,8 +360,9 @@ impl<'a> Attachment<'a> {
         );
         Self {
             format: image.format().vk_format(),
-            view: image.view,
+            view: image.vk_view(),
             extent: image.extent,
+            layers: image.layer_count(),
             clear: clear.map(|e| image.format().clear_value(e).into()),
             discard: Discard::default(),
             access,
@@ -377,7 +415,7 @@ unsized_struct! {
         bindings: &'a BindingOutput<'a, ()>,
         /// The pass's shader stages (`PassKind::stages`), where its declared accesses happen.
         stages: vk::PipelineStageFlags2,
-        command: DrawCommand,
+        command: DrawCommand<'a>,
         state: RasterState<0>,
         samples: Option<(&'a QueryPool<Occlusion>, u32)>,
         accesses: Option<Accesses<'a>>,
@@ -400,26 +438,31 @@ impl<'a> DrawOutput<'a> {
             .chain(self.extra().iter().cloned())
             .chain(declared)
     }
+
+    /// A vertex draw, which has a topology, rather than a mesh launch.
+    fn is_vertex(&self) -> bool {
+        self.command.is_vertex()
+    }
 }
 
 /// Panics if a draw accesses what another draw of the rendering writes: draws are ordered only
 /// by depth tests and blending, and nothing else passes between them. Attachments aren't draws'
-/// accesses, so they are left out.
+/// accesses, so they are left out, and so are pairs of [`BufferAccess::unordered`] accesses.
 fn check_hazards<'a>(name: &str, draws: impl Iterator<Item = &'a DrawOutput<'a>> + Clone) {
     let writes = |access: vk::AccessFlags2| access.intersects(all_write_access());
     let hazard = |i: usize, j: usize, what: std::fmt::Arguments| -> ! {
         panic!(
             "draws {i} and {j} of the rendering `{name}` both access {what}, which draw {i} \
              writes: draws of one rendering are ordered only by depth tests and blending, so \
-             record them in two renderings"
+             record them in two renderings (or mark accesses whose order doesn't matter \
+             `BufferAccess::unordered`)"
         )
     };
     for (i, draw) in draws.clone().enumerate() {
         for write in draw.buffer_accesses().filter(|b| writes(b.access)) {
             let mut others = draws.clone().enumerate().filter(|&(j, _)| j != i);
-            if let Some((j, _)) =
-                others.find(|(_, d)| d.buffer_accesses().any(|b| b.overlaps(&write)))
-            {
+            let conflicts = |b: &BufferAccess| b.overlaps(&write) && !(b.unordered && write.unordered);
+            if let Some((j, _)) = others.find(|(_, d)| d.buffer_accesses().any(|b| conflicts(&b))) {
                 hazard(i, j, format_args!("the addresses {:?}", write.range));
             }
         }
@@ -447,15 +490,17 @@ fn check_hazards<'a>(name: &str, draws: impl Iterator<Item = &'a DrawOutput<'a>>
 }
 
 impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
+    #[track_caller]
     fn with(
         bindings: &'a BindingOutput<'a, ()>,
         stages: vk::PipelineStageFlags2,
-        command: DrawCommand,
+        command: DrawCommand<'a>,
         extra: [BufferAccess; E],
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (state, blends, write_masks) = state.split();
+        state.check(&blends, command.is_vertex());
         Self::from_parts(
             bindings,
             stages,
@@ -474,9 +519,142 @@ impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
         self.samples = Some((pool, index));
         self
     }
+
+    /// Starts instance indices at `first` (`SV_StartInstanceLocation`; Slang's `SV_InstanceID`
+    /// doesn't include it, `SV_VulkanInstanceID` does). Panics unless the draw is direct
+    /// (`new`, `indexed`, `multi`, `multi_indexed`): indirect commands carry their own.
+    #[track_caller]
+    pub fn first_instance(mut self, first: u32) -> Self {
+        match &mut self.command {
+            DrawCommand::Draw { first_instance, .. }
+            | DrawCommand::Indexed { first_instance, .. }
+            | DrawCommand::Multi { first_instance, .. }
+            | DrawCommand::MultiIndexed { first_instance, .. } => *first_instance = first,
+            other => panic!("`first_instance` is for direct draws, not {}", other.name()),
+        }
+        self
+    }
+
+    /// Starts vertex indices at `first` (`SV_StartVertexLocation`; Slang's `SV_VertexID`
+    /// doesn't include it, `SV_VulkanVertexID` does). Panics unless the draw is `Draw::new`.
+    #[track_caller]
+    pub fn first_vertex(mut self, first: u32) -> Self {
+        match &mut self.command {
+            DrawCommand::Draw { first_vertex, .. } => *first_vertex = first,
+            other => panic!("`first_vertex` is for `Draw::new`, not {}", other.name()),
+        }
+        self
+    }
+
+    /// Adds `offset` to every index before it picks a vertex. Panics unless the draw is
+    /// `Draw::indexed` (a multi-draw's offsets are per draw, in `MultiDrawIndexed`).
+    #[track_caller]
+    pub fn vertex_offset(mut self, offset: i32) -> Self {
+        match &mut self.command {
+            DrawCommand::Indexed { vertex_offset, .. } => *vertex_offset = offset,
+            other => panic!("`vertex_offset` is for `Draw::indexed`, not {}", other.name()),
+        }
+        self
+    }
+}
+
+/// The index buffer of an indexed draw.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Indices {
+    range: vk::DeviceAddressRangeKHR,
+    flags: vk::AddressCommandFlagsKHR,
+    ty: vk::IndexType,
+}
+
+impl Indices {
+    fn of<I: IndexFormat>(buffer: BufferSlice<'_, I>) -> (Self, BufferAccess) {
+        let access = buffer.access(
+            vk::PipelineStageFlags2::INDEX_INPUT,
+            vk::AccessFlags2::INDEX_READ,
+        );
+        let indices = Self {
+            range: buffer.address_range(),
+            flags: buffer.address_flags(),
+            ty: I::TYPE,
+        };
+        (indices, access)
+    }
+
+    unsafe fn bind(&self, cmd: vk::CommandBuffer) {
+        unsafe {
+            Functions::device_address_commands().cmd_bind_index_buffer3(
+                cmd,
+                &vk::BindIndexBuffer3InfoKHR::default()
+                    .address_range(self.range)
+                    .address_flags(self.flags)
+                    .index_type(self.ty),
+            )
+        };
+    }
+}
+
+/// The commands of an indirect draw in `buffer`, `T`'s stride apart.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Commands {
+    range: vk::StridedDeviceAddressRangeKHR,
+    flags: vk::AddressCommandFlagsKHR,
+    count: u32,
+}
+
+impl Commands {
+    fn of<C: Pod, T: StartsWith<C>>(buffer: BufferSlice<'_, T>) -> (Self, BufferAccess) {
+        const {
+            assert!(
+                size_of::<T>() >= size_of::<C>() && size_of::<T>() % 4 == 0,
+                "an indirect command's stride holds the command and is a multiple of 4 bytes"
+            )
+        };
+        let commands = Self {
+            range: buffer.strided_range(),
+            flags: buffer.address_flags(),
+            count: buffer.len() as u32,
+        };
+        (commands, indirect_access(buffer))
+    }
+
+    fn info(&self) -> vk::DrawIndirect2InfoKHR<'static> {
+        vk::DrawIndirect2InfoKHR::default()
+            .address_range(self.range)
+            .address_flags(self.flags)
+            .draw_count(self.count)
+    }
+
+    fn count_info(&self, count: &Count) -> vk::DrawIndirectCount2InfoKHR<'static> {
+        vk::DrawIndirectCount2InfoKHR::default()
+            .address_range(self.range)
+            .address_flags(self.flags)
+            .count_address_range(count.range)
+            .count_address_flags(count.flags)
+            .max_draw_count(self.count)
+    }
+}
+
+/// The buffer an indirect draw reads its draw count from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Count {
+    range: vk::DeviceAddressRangeKHR,
+    flags: vk::AddressCommandFlagsKHR,
+}
+
+impl Count {
+    fn of(buffer: BufferSlice<'_, u32>) -> (Self, BufferAccess) {
+        let count = Self {
+            range: buffer.address_range(),
+            flags: buffer.address_flags(),
+        };
+        (count, indirect_access(buffer))
+    }
 }
 
 impl<'a, const N: usize> Draw<'a, N, 0> {
+    /// Draws `vertices` vertices of `instances` instances ([`Self::first_vertex`] and
+    /// [`Self::first_instance`] start elsewhere).
+    #[track_caller]
     pub fn new(
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
         vertices: u32,
@@ -487,6 +665,8 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         let command = DrawCommand::Draw {
             vertices,
             instances,
+            first_vertex: 0,
+            first_instance: 0,
         };
         Self::with(
             bindings.erase(),
@@ -498,8 +678,38 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         )
     }
 
+    /// Draws each of `draws` (a range of vertices) with `instances` instances in one command
+    /// (`VK_EXT_multi_draw`), at most `maxMultiDrawCount`.
+    #[cfg(feature = "multi-draw")]
+    #[track_caller]
+    pub fn multi(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        draws: &'a [MultiDraw],
+        instances: u32,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Gated<gate::MultiDraw, Self> {
+        crate::features::gate::<gate::MultiDraw, _>(|| {
+            check_multi_draws(draws.len());
+            let command = DrawCommand::Multi {
+                draws,
+                instances,
+                first_instance: 0,
+            };
+            Self::with(
+                bindings.erase(),
+                kind::RasterVertex::STAGES,
+                command,
+                [],
+                state,
+                accesses,
+            )
+        })
+    }
+
     /// Launches `groups` task (or, without a task shader, mesh) workgroups.
     #[cfg(feature = "mesh-shader")]
+    #[track_caller]
     pub fn launch(
         bindings: &'a BindingOutput<'a, kind::RasterMesh>,
         groups: [u32; 3],
@@ -538,22 +748,23 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
 }
 
 impl<'a, const N: usize> Draw<'a, N, 1> {
-    pub fn indexed(
+    /// Draws the vertices `index_buffer` names (`u16` or `u32` indices), `instances` times
+    /// ([`Self::vertex_offset`] and [`Self::first_instance`] shift them).
+    #[track_caller]
+    pub fn indexed<I: IndexFormat>(
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        index_buffer: BufferSlice<'a, u32>,
+        index_buffer: BufferSlice<'a, I>,
         instances: u32,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
-        let index_access = index_buffer.access(
-            vk::PipelineStageFlags2::INDEX_INPUT,
-            vk::AccessFlags2::INDEX_READ,
-        );
+        let (indices, index_access) = Indices::of(index_buffer);
         let command = DrawCommand::Indexed {
-            indices: index_buffer.address_range(),
-            flags: index_buffer.address_flags(),
+            indices,
             count: index_buffer.len() as u32,
             instances,
+            vertex_offset: 0,
+            first_instance: 0,
         };
         Self::with(
             bindings.erase(),
@@ -565,45 +776,84 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         )
     }
 
-    pub fn indirect(
+    /// Draws each of `draws` (a range of `index_buffer` and a vertex offset) with `instances`
+    /// instances in one command (`VK_EXT_multi_draw`), at most `maxMultiDrawCount`. Panics for
+    /// a draw outside the index buffer.
+    #[cfg(feature = "multi-draw")]
+    #[track_caller]
+    pub fn multi_indexed<I: IndexFormat>(
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        buffer: BufferSlice<'a, DrawIndirectCommand>,
+        index_buffer: BufferSlice<'a, I>,
+        draws: &'a [MultiDrawIndexed],
+        instances: u32,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Gated<gate::MultiDraw, Self> {
+        crate::features::gate::<gate::MultiDraw, _>(|| {
+            check_multi_draws(draws.len());
+            let len = index_buffer.len() as u64;
+            for (i, draw) in draws.iter().enumerate() {
+                assert!(
+                    draw.first_index as u64 + draw.index_count as u64 <= len,
+                    "draw {i} reads indices {}..{} of an index buffer of {len}",
+                    draw.first_index,
+                    draw.first_index as u64 + draw.index_count as u64
+                );
+            }
+            let (indices, index_access) = Indices::of(index_buffer);
+            let command = DrawCommand::MultiIndexed {
+                indices,
+                draws,
+                instances,
+                first_instance: 0,
+            };
+            Self::with(
+                bindings.erase(),
+                kind::RasterVertex::STAGES,
+                command,
+                [index_access],
+                state,
+                accesses,
+            )
+        })
+    }
+
+    /// Draws every command of `buffer`: a slice of commands, or of any `T` that starts with one
+    /// ([`StartsWith`]), `T`'s size apart.
+    #[track_caller]
+    pub fn indirect<T: StartsWith<DrawIndirectCommand>>(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        buffer: BufferSlice<'a, T>,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
-        let command = DrawCommand::Indirect {
-            draws: buffer.strided_range(),
-            flags: buffer.address_flags(),
-            count: buffer.len() as u32,
-        };
+        let (commands, access) = Commands::of::<DrawIndirectCommand, T>(buffer);
         Self::with(
             bindings.erase(),
             kind::RasterVertex::STAGES,
-            command,
-            [indirect_access(buffer)],
+            DrawCommand::Indirect(commands),
+            [access],
             state,
             accesses,
         )
     }
 
-    /// Launches the task (or, without a task shader, mesh) workgroup counts in `buffer`.
+    /// Launches the task (or, without a task shader, mesh) workgroup counts of every command in
+    /// `buffer` (any `T` that starts with one, like [`Self::indirect`]).
     #[cfg(feature = "mesh-shader")]
-    pub fn launch_indirect(
+    #[track_caller]
+    pub fn launch_indirect<T: StartsWith<DispatchIndirectCommand>>(
         bindings: &'a BindingOutput<'a, kind::RasterMesh>,
-        buffer: BufferSlice<'a, DispatchIndirectCommand>,
+        buffer: BufferSlice<'a, T>,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
-        let command = DrawCommand::LaunchIndirect {
-            draws: buffer.strided_range(),
-            flags: buffer.address_flags(),
-            count: buffer.len() as u32,
-        };
+        let (commands, access) = Commands::of::<DispatchIndirectCommand, T>(buffer);
         Self::with(
             bindings.erase(),
             kind::RasterMesh::STAGES,
-            command,
-            [indirect_access(buffer)],
+            DrawCommand::LaunchIndirect(commands),
+            [access],
             state,
             accesses,
         )
@@ -611,67 +861,296 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
 }
 
 impl<'a, const N: usize> Draw<'a, N, 2> {
-    pub fn indirect_count(
+    /// Draws the first `count_buffer[0]` commands of `buffer`, at most all of them.
+    #[track_caller]
+    pub fn indirect_count<T: StartsWith<DrawIndirectCommand>>(
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
-        buffer: BufferSlice<'a, DrawIndirectCommand>,
+        buffer: BufferSlice<'a, T>,
         count_buffer: BufferSlice<'a, u32>,
         state: RasterState<N>,
         accesses: Option<Accesses<'a>>,
     ) -> Self {
-        let extra = [indirect_access(buffer), indirect_access(count_buffer)];
-        let command = DrawCommand::IndirectCount {
-            draws: buffer.strided_range(),
-            flags: buffer.address_flags(),
-            count: count_buffer.address_range(),
-            count_flags: count_buffer.address_flags(),
-            max_count: buffer.len() as u32,
-        };
+        let (commands, access) = Commands::of::<DrawIndirectCommand, T>(buffer);
+        let (count, count_access) = Count::of(count_buffer);
         Self::with(
             bindings.erase(),
             kind::RasterVertex::STAGES,
-            command,
-            extra,
+            DrawCommand::IndirectCount(commands, count),
+            [access, count_access],
+            state,
+            accesses,
+        )
+    }
+
+    /// Draws every indexed command of `buffer` with the indices of `index_buffer`.
+    #[track_caller]
+    pub fn indexed_indirect<I: IndexFormat, T: StartsWith<DrawIndexedIndirectCommand>>(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        index_buffer: BufferSlice<'a, I>,
+        buffer: BufferSlice<'a, T>,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let (indices, index_access) = Indices::of(index_buffer);
+        let (commands, access) = Commands::of::<DrawIndexedIndirectCommand, T>(buffer);
+        Self::with(
+            bindings.erase(),
+            kind::RasterVertex::STAGES,
+            DrawCommand::IndexedIndirect(indices, commands),
+            [index_access, access],
+            state,
+            accesses,
+        )
+    }
+
+    /// Launches the first `count_buffer[0]` commands of `buffer`, at most all of them.
+    #[cfg(feature = "mesh-shader")]
+    #[track_caller]
+    pub fn launch_indirect_count<T: StartsWith<DispatchIndirectCommand>>(
+        bindings: &'a BindingOutput<'a, kind::RasterMesh>,
+        buffer: BufferSlice<'a, T>,
+        count_buffer: BufferSlice<'a, u32>,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let (commands, access) = Commands::of::<DispatchIndirectCommand, T>(buffer);
+        let (count, count_access) = Count::of(count_buffer);
+        Self::with(
+            bindings.erase(),
+            kind::RasterMesh::STAGES,
+            DrawCommand::LaunchIndirectCount(commands, count),
+            [access, count_access],
             state,
             accesses,
         )
     }
 }
 
+impl<'a, const N: usize> Draw<'a, N, 3> {
+    /// Draws the first `count_buffer[0]` indexed commands of `buffer`, at most all of them.
+    #[track_caller]
+    pub fn indexed_indirect_count<I: IndexFormat, T: StartsWith<DrawIndexedIndirectCommand>>(
+        bindings: &'a BindingOutput<'a, kind::RasterVertex>,
+        index_buffer: BufferSlice<'a, I>,
+        buffer: BufferSlice<'a, T>,
+        count_buffer: BufferSlice<'a, u32>,
+        state: RasterState<N>,
+        accesses: Option<Accesses<'a>>,
+    ) -> Self {
+        let (indices, index_access) = Indices::of(index_buffer);
+        let (commands, access) = Commands::of::<DrawIndexedIndirectCommand, T>(buffer);
+        let (count, count_access) = Count::of(count_buffer);
+        Self::with(
+            bindings.erase(),
+            kind::RasterVertex::STAGES,
+            DrawCommand::IndexedIndirectCount(indices, commands, count),
+            [index_access, access, count_access],
+            state,
+            accesses,
+        )
+    }
+}
+
+#[cfg(feature = "multi-draw")]
+#[track_caller]
+fn check_multi_draws(count: usize) {
+    // Multi-draw bindings exist only past the feature's check.
+    let max = Ctx::physical_device().max_multi_draw_count;
+    assert!(
+        count <= max as usize,
+        "{count} draws are more than the device's {max} per multi-draw (`maxMultiDrawCount`)"
+    );
+}
+
 #[derive(Debug)]
-pub(crate) enum DrawCommand {
+pub(crate) enum DrawCommand<'a> {
     Draw {
         vertices: u32,
         instances: u32,
+        first_vertex: u32,
+        first_instance: u32,
     },
     Indexed {
-        indices: vk::DeviceAddressRangeKHR,
-        flags: vk::AddressCommandFlagsKHR,
+        indices: Indices,
         count: u32,
         instances: u32,
+        vertex_offset: i32,
+        first_instance: u32,
     },
-    Indirect {
-        draws: vk::StridedDeviceAddressRangeKHR,
-        flags: vk::AddressCommandFlagsKHR,
-        count: u32,
+    Indirect(Commands),
+    IndirectCount(Commands, Count),
+    IndexedIndirect(Indices, Commands),
+    IndexedIndirectCount(Indices, Commands, Count),
+    // Made only with `multi-draw`.
+    #[cfg_attr(not(feature = "multi-draw"), allow(dead_code))]
+    Multi {
+        draws: &'a [MultiDraw],
+        instances: u32,
+        first_instance: u32,
     },
-    IndirectCount {
-        draws: vk::StridedDeviceAddressRangeKHR,
-        flags: vk::AddressCommandFlagsKHR,
-        count: vk::DeviceAddressRangeKHR,
-        count_flags: vk::AddressCommandFlagsKHR,
-        max_count: u32,
+    #[cfg_attr(not(feature = "multi-draw"), allow(dead_code))]
+    MultiIndexed {
+        indices: Indices,
+        draws: &'a [MultiDrawIndexed],
+        instances: u32,
+        first_instance: u32,
     },
     #[cfg(feature = "mesh-shader")]
     Launch([u32; 3]),
     #[cfg(feature = "mesh-shader")]
-    LaunchIndirect {
-        draws: vk::StridedDeviceAddressRangeKHR,
-        flags: vk::AddressCommandFlagsKHR,
-        count: u32,
-    },
+    LaunchIndirect(Commands),
+    #[cfg(feature = "mesh-shader")]
+    LaunchIndirectCount(Commands, Count),
 }
 
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+impl DrawCommand<'_> {
+    fn is_vertex(&self) -> bool {
+        match self {
+            #[cfg(feature = "mesh-shader")]
+            DrawCommand::Launch(_)
+            | DrawCommand::LaunchIndirect(_)
+            | DrawCommand::LaunchIndirectCount(..) => false,
+            _ => true,
+        }
+    }
+
+    /// Draws nothing: the validation layer warns about direct draws of nothing, and an empty
+    /// index range can't be bound without `nullDescriptor`. Their queries count 0.
+    fn is_empty(&self) -> bool {
+        match self {
+            DrawCommand::Draw { instances, .. } => *instances == 0,
+            DrawCommand::Indexed {
+                instances, count, ..
+            } => *instances == 0 || *count == 0,
+            DrawCommand::Multi {
+                draws, instances, ..
+            } => *instances == 0 || draws.is_empty(),
+            DrawCommand::MultiIndexed {
+                draws, instances, ..
+            } => *instances == 0 || draws.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            DrawCommand::Draw { .. } => "`Draw::new`",
+            DrawCommand::Indexed { .. } => "`Draw::indexed`",
+            DrawCommand::Indirect(_) => "`Draw::indirect`",
+            DrawCommand::IndirectCount(..) => "`Draw::indirect_count`",
+            DrawCommand::IndexedIndirect(..) => "`Draw::indexed_indirect`",
+            DrawCommand::IndexedIndirectCount(..) => "`Draw::indexed_indirect_count`",
+            DrawCommand::Multi { .. } => "`Draw::multi`",
+            DrawCommand::MultiIndexed { .. } => "`Draw::multi_indexed`",
+            #[cfg(feature = "mesh-shader")]
+            DrawCommand::Launch(_) => "`Draw::launch`",
+            #[cfg(feature = "mesh-shader")]
+            DrawCommand::LaunchIndirect(_) => "`Draw::launch_indirect`",
+            #[cfg(feature = "mesh-shader")]
+            DrawCommand::LaunchIndirectCount(..) => "`Draw::launch_indirect_count`",
+        }
+    }
+
+    /// Records the draw; its pipeline, push constants and state are recorded.
+    unsafe fn record(&self, cmd: vk::CommandBuffer) {
+        let device = Ctx::device();
+        let address = Functions::device_address_commands();
+        unsafe {
+            match *self {
+                DrawCommand::Draw {
+                    vertices,
+                    instances,
+                    first_vertex,
+                    first_instance,
+                } => device.cmd_draw(cmd, vertices, instances, first_vertex, first_instance),
+                DrawCommand::Indexed {
+                    indices,
+                    count,
+                    instances,
+                    vertex_offset,
+                    first_instance,
+                } => {
+                    indices.bind(cmd);
+                    device.cmd_draw_indexed(cmd, count, instances, 0, vertex_offset, first_instance);
+                }
+                DrawCommand::Indirect(commands) => address.cmd_draw_indirect2(cmd, &commands.info()),
+                DrawCommand::IndirectCount(commands, count) => {
+                    address.cmd_draw_indirect_count2(cmd, &commands.count_info(&count))
+                }
+                DrawCommand::IndexedIndirect(indices, commands) => {
+                    indices.bind(cmd);
+                    address.cmd_draw_indexed_indirect2(cmd, &commands.info());
+                }
+                DrawCommand::IndexedIndirectCount(indices, commands, count) => {
+                    indices.bind(cmd);
+                    address.cmd_draw_indexed_indirect_count2(cmd, &commands.count_info(&count));
+                }
+                #[cfg(feature = "multi-draw")]
+                DrawCommand::Multi {
+                    draws,
+                    instances,
+                    first_instance,
+                } => {
+                    // `MultiDraw` has `VkMultiDrawInfoEXT`'s layout.
+                    (Functions::multi_draw().fp().cmd_draw_multi_ext)(
+                        cmd,
+                        draws.len() as u32,
+                        draws.as_ptr().cast(),
+                        instances,
+                        first_instance,
+                        size_of::<MultiDraw>() as u32,
+                    );
+                }
+                #[cfg(feature = "multi-draw")]
+                DrawCommand::MultiIndexed {
+                    indices,
+                    draws,
+                    instances,
+                    first_instance,
+                } => {
+                    indices.bind(cmd);
+                    // `MultiDrawIndexed` has `VkMultiDrawIndexedInfoEXT`'s layout; each draw
+                    // has its own vertex offset.
+                    (Functions::multi_draw().fp().cmd_draw_multi_indexed_ext)(
+                        cmd,
+                        draws.len() as u32,
+                        draws.as_ptr().cast(),
+                        instances,
+                        first_instance,
+                        size_of::<MultiDrawIndexed>() as u32,
+                        std::ptr::null(),
+                    );
+                }
+                #[cfg(not(feature = "multi-draw"))]
+                DrawCommand::Multi { .. } | DrawCommand::MultiIndexed { .. } => {
+                    unreachable!("multi-draws are made only with `multi-draw`")
+                }
+                #[cfg(feature = "mesh-shader")]
+                DrawCommand::Launch([x, y, z]) => Functions::mesh().cmd_draw_mesh_tasks(cmd, x, y, z),
+                #[cfg(feature = "mesh-shader")]
+                DrawCommand::LaunchIndirect(commands) => {
+                    address.cmd_draw_mesh_tasks_indirect2(cmd, &commands.info())
+                }
+                #[cfg(feature = "mesh-shader")]
+                DrawCommand::LaunchIndirectCount(commands, count) => {
+                    address.cmd_draw_mesh_tasks_indirect_count2(cmd, &commands.count_info(&count))
+                }
+            }
+        }
+    }
+}
+
+/// A type whose first bytes are an indirect command `C`, so a slice of it is a buffer of
+/// commands `size_of::<Self>()` apart: indirect draws and dispatches take a slice of any
+/// `T: StartsWith<C>`, like a culling pass's draw records with the command first.
+///
+/// # Safety
+/// `Self` is `#[repr(C)]` (or `#[repr(transparent)]` over such a type) and holds a `C` at offset
+/// 0. Its size being a multiple of 4 and at least `C`'s is checked at compile time.
+pub unsafe trait StartsWith<C: Pod>: Pod {}
+
+/// `VkDrawIndirectCommand`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct DrawIndirectCommand {
     pub vertex_count: u32,
@@ -679,48 +1158,75 @@ pub struct DrawIndirectCommand {
     pub first_vertex: u32,
     pub first_instance: u32,
 }
+// SAFETY: every type starts with itself.
+unsafe impl StartsWith<DrawIndirectCommand> for DrawIndirectCommand {}
 
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+/// `VkDrawIndexedIndirectCommand`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct DrawIndexedIndirectCommand {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub vertex_offset: i32,
+    pub first_instance: u32,
+}
+// SAFETY: every type starts with itself.
+unsafe impl StartsWith<DrawIndexedIndirectCommand> for DrawIndexedIndirectCommand {}
+
+/// `VkDispatchIndirectCommand`, also the workgroup counts of an indirect mesh launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct DispatchIndirectCommand {
     pub x: u32,
     pub y: u32,
     pub z: u32,
 }
+// SAFETY: every type starts with itself.
+unsafe impl StartsWith<DispatchIndirectCommand> for DispatchIndirectCommand {}
 
 /// The rays of an indirect trace (`VkTraceRaysIndirectCommandKHR`).
 #[cfg(feature = "ray-tracing-pipeline")]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct TraceRaysIndirectCommand {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
 }
+// SAFETY: every type starts with itself.
+#[cfg(feature = "ray-tracing-pipeline")]
+unsafe impl StartsWith<TraceRaysIndirectCommand> for TraceRaysIndirectCommand {}
 
-#[derive(Clone, Copy)]
-pub struct Scissor {
-    pub offset: IVec2,
-    pub extent: UVec2,
+/// One draw of [`Draw::multi`]: `vertex_count` vertices from `first_vertex` (`VkMultiDrawInfoEXT`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct MultiDraw {
+    pub first_vertex: u32,
+    pub vertex_count: u32,
 }
 
-#[derive(Clone, Copy)]
-pub struct Viewport {
-    pub offset: IVec2,
-    pub extent: UVec2,
+/// One draw of [`Draw::multi_indexed`]: `index_count` indices from `first_index`, each plus
+/// `vertex_offset` (`VkMultiDrawIndexedInfoEXT`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct MultiDrawIndexed {
+    pub first_index: u32,
+    pub index_count: u32,
+    pub vertex_offset: i32,
 }
 
-fn rect(offset: IVec2, extent: UVec2) -> vk::Rect2D {
-    vk::Rect2D {
-        offset: vk::Offset2D {
-            x: offset.x,
-            y: offset.y,
-        },
-        extent: vk::Extent2D {
-            width: extent.x,
-            height: extent.y,
-        },
-    }
+/// An index type: draws (`Draw::indexed`) and triangle geometries take `u16` and `u32` indices.
+pub trait IndexFormat: crate::sealed::Sealed + Copy + Pod {
+    const TYPE: vk::IndexType;
+}
+impl crate::sealed::Sealed for u16 {}
+impl IndexFormat for u16 {
+    const TYPE: vk::IndexType = vk::IndexType::UINT16;
+}
+impl crate::sealed::Sealed for u32 {}
+impl IndexFormat for u32 {
+    const TYPE: vk::IndexType = vk::IndexType::UINT32;
 }
 
 fn iter_draws<'a>(
@@ -730,8 +1236,11 @@ fn iter_draws<'a>(
 }
 
 impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
-    /// Depth-tests the draws against `image`, a view of one mip (nearer = greater). `clear`
-    /// resets the depth first.
+    /// Depth-tests the draws against `image`, a view of one mip (nearer = greater), and for a
+    /// combined depth-stencil format stencil-tests them too. `clear` resets it first. A
+    /// rendering has one depth-stencil image: this replaces an earlier `depth_attachment` or
+    /// `stencil_attachment`.
+    #[track_caller]
     pub fn depth_attachment<T: DepthTarget + 'a>(
         &mut self,
         image: T,
@@ -739,68 +1248,124 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     ) -> &mut Self {
         let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::DEPTH);
+        let stencil = image.format().aspects().contains(vk::ImageAspectFlags::STENCIL);
+        let clear = clear.map(|e| image.format().clear_value(e).into());
+        self.depth_stencil(image, clear, true, stencil, "depth")
+    }
+
+    /// Stencil-tests the draws against `image`, a view of one mip of a stencil-only format
+    /// (`S8Uint`), or of a combined one whose depth the rendering leaves alone. `clear` resets
+    /// it first. A rendering has one depth-stencil image: this replaces an earlier
+    /// `depth_attachment` (a combined format's stencil comes with that) or `stencil_attachment`.
+    #[track_caller]
+    pub fn stencil_attachment<T: StencilTarget + 'a>(
+        &mut self,
+        image: T,
+        clear: Option<<T::Format as Format>::Texels>,
+    ) -> &mut Self {
+        let image = image.view();
+        image.aspect_check(vk::ImageAspectFlags::STENCIL);
+        let clear = clear.map(|e| image.format().clear_value(e).into());
+        self.depth_stencil(image, clear, false, true, "stencil")
+    }
+
+    #[track_caller]
+    fn depth_stencil<F: Format, U: crate::image::usage::ImageUsage, D: Dim2D>(
+        &mut self,
+        image: ImageView<'a, F, U, D>,
+        clear: Option<vk::ClearValue>,
+        depth: bool,
+        stencil: bool,
+        what: &str,
+    ) -> &mut Self {
         image.usage_check(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT);
         one_mip(image.mip_range);
-        fits(self.extent, image.extent, "depth");
-        let format = image.format();
-        self.depth_format = format.vk_format();
-        self.stencil_format = match format.aspects().contains(vk::ImageAspectFlags::STENCIL) {
-            true => format.vk_format(),
-            false => vk::Format::UNDEFINED,
-        };
-        self.depth_attachment = image.view;
-        self.clear_depth = clear.map(|e| format.clear_value(e).into());
-        self.depth_discard = Discard::default();
-        self.depth_access = Some(image.access_in(
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
-            vk::ImageLayout::ATTACHMENT_OPTIMAL,
-        ));
+        fits(self.area, image.extent, what);
+        self.depth_stencil = Some(DepthStencil {
+            view: image.vk_view(),
+            format: image.format().vk_format(),
+            depth,
+            stencil,
+            layers: image.layer_count(),
+            access: image.access_in(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+                vk::ImageLayout::ATTACHMENT_OPTIMAL,
+            ),
+            clear,
+            discard: Discard::default(),
+        });
         self
     }
 
-    /// Doesn't load the depth attachment (`DONT_CARE`), like [`Attachment::discard_before`].
-    /// Panics without a depth attachment or for a cleared one.
+    /// Doesn't load the depth-stencil attachment (`DONT_CARE`), like
+    /// [`Attachment::discard_before`]. Panics without one or for a cleared one.
     #[track_caller]
     pub fn discard_depth_before(&mut self) -> &mut Self {
-        assert!(self.depth_access.is_some(), "`discard_depth_before` needs a `depth_attachment`");
-        self.depth_discard.before(self.clear_depth);
+        let ds = (self.depth_stencil.as_mut())
+            .expect("`discard_depth_before` needs a `depth_attachment` or `stencil_attachment`");
+        ds.discard.before(ds.clear);
         self
     }
 
-    /// Doesn't store the depth attachment (`DONT_CARE`), like [`Attachment::discard_after`]:
-    /// for a depth buffer only this rendering tests against. Panics without a depth attachment.
+    /// Doesn't store the depth-stencil attachment (`DONT_CARE`), like
+    /// [`Attachment::discard_after`]: for a depth buffer only this rendering tests against.
+    /// Panics without one.
     #[track_caller]
     pub fn discard_depth_after(&mut self) -> &mut Self {
-        assert!(self.depth_access.is_some(), "`discard_depth_after` needs a `depth_attachment`");
-        self.depth_discard.after = true;
+        let ds = (self.depth_stencil.as_mut())
+            .expect("`discard_depth_after` needs a `depth_attachment` or `stencil_attachment`");
+        ds.discard.after = true;
         self
     }
 
-    /// Replaces the default viewport, the whole render area.
-    pub fn viewport(&mut self, viewport: Viewport) -> &mut Self {
-        assert!(
-            viewport.extent.cmpgt(UVec2::ZERO).all(),
-            "a viewport of extent {} has no pixels",
-            viewport.extent
-        );
+    /// Replaces the default viewport of the rendering's draws, its area; a draw's own
+    /// (`RasterState::viewport`) replaces it for that draw.
+    #[track_caller]
+    pub fn viewport(&mut self, viewport: Rect) -> &mut Self {
+        viewport.check_viewport();
         self.viewport = viewport;
         self
     }
 
-    /// Replaces the default scissor, the whole render area. There is one, as there is one
-    /// viewport.
-    pub fn scissor(&mut self, scissor: Scissor) -> &mut Self {
-        let end = scissor.offset.as_i64vec2() + scissor.extent.as_i64vec2();
+    /// Replaces the default scissor of the rendering's draws, its area; a draw's own
+    /// (`RasterState::scissor`) replaces it for that draw.
+    #[track_caller]
+    pub fn scissor(&mut self, scissor: Rect) -> &mut Self {
+        scissor.check_scissor("scissor");
+        self.scissor = scissor;
+        self
+    }
+
+    /// Draws into `count` layers of every attachment (a layered rendering): each primitive goes
+    /// to the layer its vertex or mesh shader picks (`SV_RenderTargetArrayIndex`; vertex
+    /// shaders need `shader-output-layer`), so every attachment is an array view of at least
+    /// `count` layers. At most `maxFramebufferLayers`; not with a [`Self::view_mask`].
+    #[track_caller]
+    pub fn layers(&mut self, count: u32) -> &mut Self {
+        let max = Ctx::device_properties().limits.max_framebuffer_layers;
         assert!(
-            scissor.offset.cmpge(IVec2::ZERO).all()
-                && end.cmple(I64Vec2::splat(i32::MAX as i64)).all(),
-            "a scissor starts at a non-negative offset and ends below 2^31, not {} texels at {}",
-            scissor.extent,
-            scissor.offset
+            (1..=max).contains(&count),
+            "a rendering draws into 1 to {max} layers (`maxFramebufferLayers`), not {count}"
         );
-        self.scissor = rect(scissor.offset, scissor.extent);
+        self.layer_count = count;
+        self
+    }
+
+    /// Draws every draw once per set bit of `mask` (multiview), into the layer of the bit's
+    /// index; shaders read the index as `SV_ViewID`. Every attachment is an array view with a
+    /// layer for the highest bit. At most `maxMultiviewViewCount` views; mesh passes need the
+    /// device's `multiviewMeshShader`. Part of each pipeline's key.
+    #[track_caller]
+    pub fn view_mask(&mut self, mask: u32) -> &mut Self {
+        let max = Ctx::physical_device().vk11_properties.max_multiview_view_count;
+        assert!(
+            mask != 0 && 32 - mask.leading_zeros() <= max,
+            "a view mask has views 0 to {} (`maxMultiviewViewCount`), not {mask:#b}",
+            max.saturating_sub(1)
+        );
+        self.view_mask = mask;
         self
     }
 
@@ -810,11 +1375,61 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         self
     }
 
+    /// The layers every attachment needs: the highest view's with a view mask, else the
+    /// rendering's layer count.
+    #[track_caller]
+    fn check_layers(&self) {
+        assert!(
+            self.view_mask == 0 || self.layer_count == 1,
+            "a multiview rendering (`view_mask`) isn't layered (`layers`) too"
+        );
+        let needed = match self.view_mask {
+            0 => self.layer_count,
+            mask => 32 - mask.leading_zeros(),
+        };
+        let layers = (self.color.iter().map(|c| c.layers)).chain(self.depth_stencil.as_ref().map(|d| d.layers));
+        for layers in layers {
+            assert!(
+                layers >= needed,
+                "an attachment of {layers} layers in a rendering that draws into {needed}: give \
+                 it an array view (`ImageView::layers`) of as many"
+            );
+        }
+        if self.view_mask != 0 && !Ctx::physical_device().multiview_mesh_shader {
+            assert!(
+                iter_draws(&self.draws).all(|d| d.is_vertex()),
+                "the device draws no mesh passes in multiview renderings (`multiviewMeshShader`)"
+            );
+        }
+    }
+
+    /// Panics if a draw blends into an attachment whose format can't blend
+    /// (`COLOR_ATTACHMENT_BLEND`).
+    #[track_caller]
+    fn check_blends(&self) {
+        let blending = |i: usize| {
+            iter_draws(&self.draws).any(|d| d.blends()[i].equation().is_some())
+        };
+        for (i, color) in self.color.iter().enumerate() {
+            if blending(i) {
+                let features = Ctx::format_features(color.format);
+                assert!(
+                    features.contains(vk::FormatFeatureFlags2::COLOR_ATTACHMENT_BLEND),
+                    "a draw blends into color attachment {i}, whose format {:?} doesn't blend on \
+                     this device: draw it with `Blend::Replace`",
+                    color.format
+                );
+            }
+        }
+    }
+
     /// Records the rendering under the GPU scope `name`, its draws in order. Only depth tests,
     /// depth writes and blending see earlier draws, so no draw may read what an earlier one writes.
     #[validation_trace]
     pub fn record(&mut self, name: &'static str) {
         let _span = tracing::info_span!("draw", pass = name).entered();
+        self.check_layers();
+        self.check_blends();
         // One mip can't be in two layouts in one rendering, so an attachment whose mip a draw
         // also accesses is rendered in `GENERAL`, its descriptor's layout.
         let in_layout = |mut access: ImageUse<'a>| {
@@ -831,16 +1446,18 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             access
         };
         let color_accesses = self.color.each_ref().map(|c| in_layout(c.access.clone()));
-        let depth_access = self.depth_access.clone().map(|mut depth| {
+        let ds_access = self.depth_stencil.as_ref().map(|ds| {
+            let mut access = ds.access.clone();
             let writes = |d: &DrawOutput| {
-                (d.state.depth_test.is_some() && d.state.depth_write) || d.state.stencil.is_some()
+                (ds.depth && d.state.depth_test.is_some() && d.state.depth_write)
+                    || (ds.stencil && d.state.stencil.is_some())
             };
             // `DONT_CARE` loads and stores write too.
-            let discards = self.depth_discard.before || self.depth_discard.after;
-            if self.clear_depth.is_some() || discards || iter_draws(&self.draws).any(writes) {
-                depth.access.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+            let discards = ds.discard.before || ds.discard.after;
+            if ds.clear.is_some() || discards || iter_draws(&self.draws).any(writes) {
+                access.access.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
             }
-            in_layout(depth)
+            in_layout(access)
         });
         let draws = iter_draws(&self.draws);
         check_hazards(name, draws.clone());
@@ -849,7 +1466,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                 .clone()
                 .flat_map(|draw| draw.image_accesses())
                 .chain(color_accesses.iter().cloned())
-                .chain(depth_access.clone()),
+                .chain(ds_access.clone()),
             draws.flat_map(|draw| draw.buffer_accesses()),
         );
 
@@ -864,30 +1481,33 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         });
         let mut rendering_info = vk::RenderingInfo::default()
             .color_attachments(&color_attachments)
-            .layer_count(1)
-            .render_area(rect(IVec2::ZERO, self.extent))
-            .view_mask(0);
+            .layer_count(self.layer_count)
+            .render_area(self.area.vk())
+            .view_mask(self.view_mask);
 
-        let depth_info;
-        if let Some(depth) = &depth_access {
-            let written = depth
-                .access
-                .access
+        let ds_info;
+        let (mut depth_format, mut stencil_format) = (vk::Format::UNDEFINED, vk::Format::UNDEFINED);
+        if let (Some(ds), Some(access)) = (&self.depth_stencil, &ds_access) {
+            let written = (access.access.access)
                 .contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE);
-            let store_op = match (self.depth_discard.after, written) {
+            let store_op = match (ds.discard.after, written) {
                 (true, _) => vk::AttachmentStoreOp::DONT_CARE,
                 (false, true) => vk::AttachmentStoreOp::STORE,
                 (false, false) => vk::AttachmentStoreOp::NONE,
             };
-            depth_info = vk::RenderingAttachmentInfo::default()
-                .image_layout(depth.access.layout)
-                .image_view(self.depth_attachment)
-                .load_op(self.depth_discard.load_op(self.clear_depth))
+            ds_info = vk::RenderingAttachmentInfo::default()
+                .image_layout(access.access.layout)
+                .image_view(ds.view)
+                .load_op(ds.discard.load_op(ds.clear))
                 .store_op(store_op)
-                .clear_value(self.clear_depth.unwrap_or_default());
-            rendering_info = rendering_info.depth_attachment(&depth_info);
-            if self.stencil_format != vk::Format::UNDEFINED {
-                rendering_info = rendering_info.stencil_attachment(&depth_info);
+                .clear_value(ds.clear.unwrap_or_default());
+            if ds.depth {
+                rendering_info = rendering_info.depth_attachment(&ds_info);
+                depth_format = ds.format;
+            }
+            if ds.stencil {
+                rendering_info = rendering_info.stencil_attachment(&ds_info);
+                stencil_format = ds.format;
             }
         }
 
@@ -896,25 +1516,15 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         self.cmd_buf.enter(name, true);
         unsafe {
             device.cmd_begin_rendering(handle, &rendering_info);
-            self.cmd_buf.in_rendering = true;
-            device.cmd_set_viewport_with_count(
-                handle,
-                &[vk::Viewport {
-                    x: self.viewport.offset.x as f32,
-                    y: self.viewport.offset.y as f32,
-                    width: self.viewport.extent.x as f32,
-                    height: self.viewport.extent.y as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            device.cmd_set_scissor_with_count(handle, &[self.scissor]);
         }
+        self.cmd_buf.in_rendering = true;
         let color_formats = self.color.each_ref().map(|c| c.format);
         let rendering = Rendering {
             color_attachments: N,
-            depth: depth_access.is_some(),
-            stencil: self.stencil_format != vk::Format::UNDEFINED,
+            depth: depth_format != vk::Format::UNDEFINED,
+            stencil: stencil_format != vk::Format::UNDEFINED,
+            viewport: self.viewport,
+            scissor: self.scissor,
         };
         let dynamic = *Ctx::dynamic();
         let mut state: Option<DrawState> = None;
@@ -924,14 +1534,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             if let Some((pool, query)) = draw.samples {
                 self.cmd_buf.begin_query(pool, query);
             }
-            // The validation layer warns about direct draws of nothing, and an empty index
-            // range can't be bound without `nullDescriptor`. Their queries count 0.
-            if !matches!(
-                draw.command,
-                DrawCommand::Draw { instances: 0, .. }
-                    | DrawCommand::Indexed { instances: 0, .. }
-                    | DrawCommand::Indexed { count: 0, .. }
-            ) {
+            if !draw.command.is_empty() {
                 let sections = draw.bindings.sections();
                 let draw_state = DrawState {
                     state: &draw.state,
@@ -943,12 +1546,14 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                     true => (&[][..], &[][..]),
                     false => (draw_state.blends, draw_state.write_masks),
                 };
+                let vertex = draw.is_vertex();
                 let key = RasterKeyRef {
                     color_formats: &color_formats,
-                    depth_format: self.depth_format,
-                    stencil_format: self.stencil_format,
+                    depth_format,
+                    stencil_format,
+                    view_mask: self.view_mask,
                     constants: sections.constants,
-                    baked: Baked::of(draw_state.state, &dynamic),
+                    baked: Baked::of(draw_state.state, &dynamic, vertex),
                     #[cfg(bake_blend)]
                     blends,
                     #[cfg(bake_blend)]
@@ -962,11 +1567,6 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                     bound = Some((sections.pass, key));
                 }
                 self.cmd_buf.push_constants(sections.push_constants);
-                let vertex = match draw.command {
-                    #[cfg(feature = "mesh-shader")]
-                    DrawCommand::Launch(_) | DrawCommand::LaunchIndirect { .. } => false,
-                    _ => true,
-                };
                 draw_state.record(
                     state.as_ref(),
                     rendering,
@@ -976,71 +1576,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                     handle,
                 );
                 state = Some(draw_state);
-                unsafe {
-                    match draw.command {
-                        DrawCommand::Draw {
-                            vertices,
-                            instances,
-                        } => device.cmd_draw(handle, vertices, instances, 0, 0),
-                        DrawCommand::Indexed {
-                            indices,
-                            flags,
-                            count,
-                            instances,
-                        } => {
-                            Functions::device_address_commands().cmd_bind_index_buffer3(
-                                handle,
-                                &vk::BindIndexBuffer3InfoKHR::default()
-                                    .address_range(indices)
-                                    .address_flags(flags)
-                                    .index_type(IndexType::UINT32),
-                            );
-                            device.cmd_draw_indexed(handle, count, instances, 0, 0, 0);
-                        }
-                        DrawCommand::Indirect {
-                            draws,
-                            flags,
-                            count,
-                        } => Functions::device_address_commands().cmd_draw_indirect2(
-                            handle,
-                            &vk::DrawIndirect2InfoKHR::default()
-                                .address_range(draws)
-                                .address_flags(flags)
-                                .draw_count(count),
-                        ),
-                        DrawCommand::IndirectCount {
-                            draws,
-                            flags,
-                            count,
-                            count_flags,
-                            max_count,
-                        } => Functions::device_address_commands().cmd_draw_indirect_count2(
-                            handle,
-                            &vk::DrawIndirectCount2InfoKHR::default()
-                                .address_range(draws)
-                                .address_flags(flags)
-                                .count_address_range(count)
-                                .count_address_flags(count_flags)
-                                .max_draw_count(max_count),
-                        ),
-                        #[cfg(feature = "mesh-shader")]
-                        DrawCommand::Launch([x, y, z]) => {
-                            Functions::mesh().cmd_draw_mesh_tasks(handle, x, y, z)
-                        }
-                        #[cfg(feature = "mesh-shader")]
-                        DrawCommand::LaunchIndirect {
-                            draws,
-                            flags,
-                            count,
-                        } => Functions::device_address_commands().cmd_draw_mesh_tasks_indirect2(
-                            handle,
-                            &vk::DrawIndirect2InfoKHR::default()
-                                .address_range(draws)
-                                .address_flags(flags)
-                                .draw_count(count),
-                        ),
-                    }
-                }
+                unsafe { draw.command.record(handle) };
             }
             if let Some((pool, query)) = draw.samples {
                 self.cmd_buf.end_query(pool, query);
@@ -1053,11 +1589,15 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     }
 }
 
+/// Panics unless the render area lies inside an attachment of `attachment` texels.
 #[track_caller]
-fn fits(extent: UVec2, attachment: UVec2, what: &str) {
+fn fits(area: Rect, attachment: UVec2, what: &str) {
+    let end = area.offset.as_i64vec2() + area.extent.as_i64vec2();
     assert!(
-        extent.cmple(attachment).all(),
-        "a rendering of extent {extent} doesn't fit its {what} attachment of {attachment}"
+        end.cmple(attachment.as_i64vec2()).all(),
+        "a rendering of {} texels at {} doesn't fit its {what} attachment of {attachment}",
+        area.extent,
+        area.offset
     );
 }
 
@@ -1075,6 +1615,29 @@ fn check_groups(groups: [u32; 3], max: [u32; 3], total: u64, what: &str) {
     );
 }
 
+/// The address range of the first command of `buffer` an indirect dispatch or trace reads, and
+/// its access.
+fn first_command<C: Pod, T: StartsWith<C>>(
+    buffer: BufferSlice<'_, T>,
+) -> (vk::DeviceAddressRangeKHR, BufferAccess) {
+    const {
+        assert!(
+            size_of::<T>() >= size_of::<C>() && size_of::<T>() % 4 == 0,
+            "an indirect command's stride holds the command and is a multiple of 4 bytes"
+        )
+    };
+    let range = buffer.address_range();
+    let first = vk::DeviceAddressRangeKHR {
+        address: range.address,
+        size: range.size.min(size_of::<C>() as u64),
+    };
+    (first, indirect_access(buffer))
+}
+
+fn address_flags() -> vk::AddressCommandFlagsKHR {
+    vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE | vk::AddressCommandFlagsKHR::FULLY_BOUND
+}
+
 fn indirect_access<T: Copy + Pod>(buffer: BufferSlice<'_, T>) -> BufferAccess {
     buffer.access(
         vk::PipelineStageFlags2::DRAW_INDIRECT,
@@ -1083,35 +1646,33 @@ fn indirect_access<T: Copy + Pod>(buffer: BufferSlice<'_, T>) -> BufferAccess {
 }
 
 impl<'p, K: HasGraphics> CommandBuffer<'p, K> {
-    /// Starts a rendering of the area `extent` into the `color` attachments, with viewport and
-    /// scissor covering it. Every attachment is at least as large.
+    /// Starts a rendering of `area` (an extent at the origin, or a [`Rect`]) into the `color`
+    /// attachments, with viewport and scissor covering it. Every attachment covers the area.
+    #[track_caller]
     pub fn raster<'a, const N: usize>(
         &'a mut self,
-        extent: UVec2,
+        area: impl Into<Rect>,
         color: [Attachment<'a>; N],
     ) -> RasterBuilder<'a, 'p, N> {
+        let area = area.into();
         assert!(
-            extent.cmpgt(UVec2::ZERO).all(),
-            "a rendering of extent {extent} has no pixels"
+            area.extent.cmpgt(UVec2::ZERO).all(),
+            "a rendering of extent {} has no pixels",
+            area.extent
         );
+        area.check_scissor("render area");
         for attachment in &color {
-            fits(extent, attachment.extent, "color");
+            fits(area, attachment.extent, "color");
         }
         RasterBuilder {
             cmd_buf: &mut self.rec,
-            extent,
-            viewport: Viewport {
-                offset: IVec2::ZERO,
-                extent,
-            },
-            scissor: rect(IVec2::ZERO, extent),
+            area,
+            viewport: area,
+            scissor: area,
+            layer_count: 1,
+            view_mask: 0,
             color,
-            depth_format: vk::Format::UNDEFINED,
-            stencil_format: vk::Format::UNDEFINED,
-            depth_attachment: vk::ImageView::null(),
-            depth_access: None,
-            clear_depth: None,
-            depth_discard: Discard::default(),
+            depth_stencil: None,
             draws: SmallVec::new(),
             marker: PhantomData,
         }
@@ -1123,7 +1684,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
         dispatch: [u32; 3],
-        indirect_buffer: Option<BufferSlice<'_, DispatchIndirectCommand>>,
+        indirect_buffer: Option<(vk::DeviceAddressRangeKHR, BufferAccess)>,
         accesses: Option<Accesses<'_>>,
     ) {
         let sections = bindings.sections();
@@ -1134,7 +1695,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         rec.flush_pending(
             sections.images().chain(images),
             (sections.buffers())
-                .chain(indirect_buffer.map(indirect_access))
+                .chain(indirect_buffer.as_ref().map(|(_, access)| access.clone()))
                 .chain(buffers),
         );
         rec.push_constants(sections.push_constants);
@@ -1152,12 +1713,12 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             },
         );
         unsafe {
-            if let Some(slice) = indirect_buffer {
+            if let Some((range, _)) = indirect_buffer {
                 Functions::device_address_commands().cmd_dispatch_indirect2(
                     rec.handle,
                     &vk::DispatchIndirect2InfoKHR::default()
-                        .address_range(slice.address_range())
-                        .address_flags(slice.address_flags()),
+                        .address_range(range)
+                        .address_flags(address_flags()),
                 );
             } else {
                 Ctx::device().cmd_dispatch(rec.handle, dispatch[0], dispatch[1], dispatch[2]);
@@ -1166,15 +1727,18 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         rec.exit(pass.name, true);
     }
 
-    /// Like [`Self::compute`], with the workgroup counts read from `buffer` on the GPU.
+    /// Like [`Self::compute`], with the workgroup counts read from the first command of
+    /// `buffer` on the GPU (a slice of commands, or of any `T` that starts with one,
+    /// [`StartsWith`]).
     #[validation_trace]
-    pub fn compute_indirect(
+    pub fn compute_indirect<T: StartsWith<DispatchIndirectCommand>>(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
-        buffer: BufferSlice<'_, DispatchIndirectCommand>,
+        buffer: BufferSlice<'_, T>,
         accesses: Option<Accesses<'_>>,
     ) {
-        self.compute_private(bindings, [0, 0, 0], Some(buffer), accesses);
+        let first = first_command::<DispatchIndirectCommand, T>(buffer);
+        self.compute_private(bindings, [0, 0, 0], Some(first), accesses);
     }
 
     /// Dispatches `dispatch` workgroups of a compute pass that also reaches `accesses`.
@@ -1195,7 +1759,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
         rays: [u32; 3],
-        indirect_buffer: Option<BufferSlice<'_, TraceRaysIndirectCommand>>,
+        indirect_buffer: Option<(vk::DeviceAddressRangeKHR, BufferAccess)>,
         accesses: Option<Accesses<'_>>,
     ) {
         let sections = bindings.sections();
@@ -1206,7 +1770,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         rec.flush_pending(
             sections.images().chain(images),
             (sections.buffers())
-                .chain(indirect_buffer.map(indirect_access))
+                .chain(indirect_buffer.as_ref().map(|(_, access)| access.clone()))
                 .chain(buffers),
         );
         rec.push_constants(sections.push_constants);
@@ -1232,13 +1796,13 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             let functions = Functions::raytracing_pipeline();
             let [raygen, miss, hit, callable] = &pipeline.regions;
             match indirect_buffer {
-                Some(slice) => functions.cmd_trace_rays_indirect(
+                Some((range, _)) => functions.cmd_trace_rays_indirect(
                     handle,
                     raygen,
                     miss,
                     hit,
                     callable,
-                    slice.address(),
+                    range.address,
                 ),
                 None => functions.cmd_trace_rays(
                     handle, raygen, miss, hit, callable, rays[0], rays[1], rays[2],
@@ -1270,16 +1834,18 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         self.raytrace_private(bindings, rays, None, accesses);
     }
 
-    /// Like [`Self::raytrace`], with the ray counts read from `buffer` on the GPU.
+    /// Like [`Self::raytrace`], with the ray counts read from the first command of `buffer`
+    /// on the GPU (any `T` that starts with one, like [`Self::compute_indirect`]).
     #[cfg(feature = "ray-tracing-pipeline")]
     #[validation_trace]
-    pub fn raytrace_indirect(
+    pub fn raytrace_indirect<T: StartsWith<TraceRaysIndirectCommand>>(
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
-        buffer: BufferSlice<'_, TraceRaysIndirectCommand>,
+        buffer: BufferSlice<'_, T>,
         accesses: Option<Accesses<'_>>,
     ) {
-        self.raytrace_private(bindings, [0, 0, 0], Some(buffer), accesses);
+        let first = first_command::<TraceRaysIndirectCommand, T>(buffer);
+        self.raytrace_private(bindings, [0, 0, 0], Some(first), accesses);
     }
 }
 
@@ -2024,11 +2590,12 @@ pub(crate) fn compute_barriers<'a>(
     })
 }
 
+/// Every layer of `mips`: an image's tracked states cover all its layers.
 fn subresource_range(aspect: vk::ImageAspectFlags, mips: Range<u32>) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
         aspect_mask: aspect,
         base_array_layer: 0,
-        layer_count: 1,
+        layer_count: vk::REMAINING_ARRAY_LAYERS,
         base_mip_level: mips.start,
         level_count: mips.end - mips.start,
     }

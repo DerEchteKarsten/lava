@@ -51,7 +51,17 @@ pub struct PhysicalDevice {
     pub mem_properties: vk::PhysicalDeviceMemoryProperties,
     pub properties: vk::PhysicalDeviceProperties,
     pub mesh_shader_properties: vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>,
+    pub vk11_properties: vk::PhysicalDeviceVulkan11Properties<'static>,
     pub vk12_properties: vk::PhysicalDeviceVulkan12Properties<'static>,
+    /// `VK_EXT_conservative_rasterization`'s `primitiveUnderestimation`.
+    pub primitive_underestimation: bool,
+    /// `VK_EXT_extended_dynamic_state3`'s `dynamicPrimitiveTopologyUnrestricted`: a dynamic
+    /// topology may leave the class the pipeline was made with.
+    pub topology_unrestricted: bool,
+    /// `VK_EXT_multi_draw`'s `maxMultiDrawCount` (0 without it).
+    pub max_multi_draw_count: u32,
+    /// `multiviewMeshShader`: mesh passes in multiview renderings.
+    pub multiview_mesh_shader: bool,
     /// Zeroed on a device without `VK_EXT_descriptor_heap`, which lava never picks.
     pub descriptor_heap_properties: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
     pub queue_families: Vec<QueueFamily>,

@@ -42,9 +42,10 @@ type Structs = BTreeMap<String, StructDef>;
 /// A copy of `lava::pipeline::MAX_PUSH_CONSTANTS_SIZE`.
 const MAX_PUSH_CONSTANTS_SIZE: usize = 256;
 
-const IMAGE_TYPES: [&str; 1] = ["Img"];
+/// `ImgArray` is a 2D array (`lava::image::D2Array`).
+const IMAGE_TYPES: [&str; 2] = ["Img", "ImgArray"];
 const BUFFER_TYPES: [&str; 2] = ["Buf", "MutBuf"];
-const HANDLE_TYPES: [&str; 2] = ["Img", "DynImg"];
+const HANDLE_TYPES: [&str; 3] = ["Img", "ImgArray", "DynImg"];
 const ACCEL_TYPES: [&str; 1] = ["Accel"];
 /// (Slang name, Rust path) of the Slang structs that mirror a lava type.
 const MIRRORED_TYPES: [(&str, &str); 2] = [
@@ -354,9 +355,14 @@ fn build_new_fn<'a>(
                         .find(|tp| tp.checked_name() == Some(parameter))
                         .and_then(|tp| generics.checked_concrete_type(tp))
                 };
-                let dim = match concrete("Shape").and_then(|shape| shape.checked_name()) {
+                let shape = match type_name(t) {
+                    "ImgArray" => Some("array"),
+                    _ => concrete("Shape").and_then(|shape| shape.checked_name()),
+                };
+                let dim = match shape {
                     Some("__Shape2D") => "image::D2",
                     Some("__Shape3D") => "image::D3",
+                    Some("array") => "image::D2Array",
                     other => panic!("image shape {other:?} has no Rust dimension"),
                 };
                 let mut bounds = format!("Dim = {dim}");
@@ -636,14 +642,21 @@ use lava::pipeline::*;
             let index = pass_map.len();
 
             let entry = |stage: &str| entries.iter().find(|e| e.stage == stage).map(|e| e.name);
+            // An optional entry point as the `Option<&CStr>` of a `PassKind` field.
+            let optional = |stage: &str| match entry(stage) {
+                Some(name) => format!("Some(c{name:?})"),
+                None => "None".to_string(),
+            };
             let mut stages: Vec<&str> = entries.iter().map(|e| e.stage).collect();
             stages.sort_unstable();
 
             let kind = match stages.as_slice() {
-                ["fragment", "vertex"] => PassKind::RasterVertex,
-                ["fragment", "mesh"] | ["amplification", "fragment", "mesh"] => {
-                    PassKind::RasterMesh
-                }
+                // Without a fragment shader, a raster pass draws depth and stencil alone.
+                ["fragment", "vertex"] | ["vertex"] => PassKind::RasterVertex,
+                ["fragment", "mesh"]
+                | ["amplification", "fragment", "mesh"]
+                | ["mesh"]
+                | ["amplification", "mesh"] => PassKind::RasterMesh,
                 ["compute"] => PassKind::Compute,
                 stages
                     if stages.contains(&"raygen")
@@ -666,17 +679,13 @@ use lava::pipeline::*;
             };
             let kind_fields = match kind {
                 PassKind::RasterVertex => {
-                    let (vertex, fragment) =
-                        (entry("vertex").unwrap(), entry("fragment").unwrap());
-                    format!("RasterVertex {{ fragment: c{fragment:?}, vertex: c{vertex:?} }}")
+                    let (vertex, fragment) = (entry("vertex").unwrap(), optional("fragment"));
+                    format!("RasterVertex {{ fragment: {fragment}, vertex: c{vertex:?} }}")
                 }
                 PassKind::RasterMesh => {
-                    let (mesh, fragment) = (entry("mesh").unwrap(), entry("fragment").unwrap());
-                    let task = match entry("amplification") {
-                        Some(task) => format!("Some(c{task:?})"),
-                        None => "None".to_string(),
-                    };
-                    format!("RasterMesh {{ fragment: c{fragment:?}, mesh: c{mesh:?}, amp: {task} }}")
+                    let (mesh, fragment) = (entry("mesh").unwrap(), optional("fragment"));
+                    let task = optional("amplification");
+                    format!("RasterMesh {{ fragment: {fragment}, mesh: c{mesh:?}, amp: {task} }}")
                 }
                 PassKind::Compute => {
                     let compute = entry("compute").unwrap();

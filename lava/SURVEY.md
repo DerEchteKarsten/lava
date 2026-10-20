@@ -17,15 +17,8 @@ commits). Numbers are this survey's items. Delete a line, and its item below, wh
 Items that aren't named here stay as they are, on purpose (e.g. bug 31, MSAA, async pipeline
 compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
-5. **Raster and draws:** 38 and 39 (require `multiDrawIndirect`, `drawIndirectFirstInstance`,
-   `depthBiasClamp`), 40 (query `dynamicPrimitiveTopologyUnrestricted`; key by topology class
-   without it), 41 (`depth_clip` defaults to not clamped), 42 (`write_mask` and gated
-   `write_masks`), 55 (asserts, a `dual-src-blend` feature), render area offset, per-draw scissor
-   and viewport, vertex-only passes, array layers, layered rendering, multiview, dynamic rendering
-   local read, indexed indirect (count) and `launch_indirect_count`, u16 indices, first
-   vertex/instance and vertex offset, multi-draw, stencil attachments, `BufferAccess::unordered`,
-   4.13 (an unsafe prefix trait for indirect command structs), `Scissor`/`Viewport` merged,
-   stencil state set `FRONT_AND_BACK` when equal.
+5. **Raster and draws:** dynamic rendering local read (skipped 2026-10-21, see section 5:
+   input attachments don't fit lava's descriptor heaps and Slang yet).
 6. **Images and formats:** 27 (block sizes for BC, ETC2, EAC and ASTC; the compression features
    gated and enabled), 43 (64-bit clear components as two words), 53 (a format-property cache;
    blit, clear, address, granularity and host block checks; `with_params` asks the device), 54
@@ -90,23 +83,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     Internal; make it a method of the builder so the lifetime is its own.
 
 ### Vulkan valid usage (2026-10-18)
-38. **`multiDrawIndirect` and `drawIndirectFirstInstance` are never enabled** (`features.rs:657-683,
-    794-797`). `Draw::indirect` and `launch_indirect` pass `drawCount = buffer.len()`
-    (`mod.rs:406, 428`), so any buffer of more than one command is invalid, and so is a non-zero
-    `first_instance`. The tests draw one command. Require and enable both.
-39. **`depthBiasClamp` is never enabled** (`raster_state.rs:90-96, 600-608`), so any non-zero
-    `DepthBias::clamp` is invalid on every device. Depth bias has no test.
-40. **Line and point draws break without extended dynamic state 3** (`pipeline.rs:672-674, 736`).
-    Vertex pipelines bake `TRIANGLE_LIST` and set the topology dynamically, which crosses topology
-    classes only with `dynamicPrimitiveTopologyUnrestricted`, never queried. `gpu_headless` draws
-    `LINE_LIST` this way; `Config::disabled` can't show it, since it is a property. Put the
-    topology class into `Baked` unless the property is set.
-41. **`depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists**
-    (`raster_state.rs:293-301`, `pipeline.rs:813-821`): lava always pushes `depth_clip = true`,
-    so one state renders differently per device. Default `depth_clip` to `!clamp` unless set.
-42. **Per-attachment write masks need `independentBlend`** (`raster_state.rs:234-235`,
-    `pipeline.rs:742-764`): `write_masks` has no gate while `blends` does, and on the baked path
-    different masks make different `pAttachments` entries.
 43. **64-bit clear values are packed as 32-bit** (`format.rs:198-204`). Vulkan reads a 64-bit
     component from two array elements, so `R64Sfloat` clears to garbage, `R64G64Uint [a, b]` puts
     both into the first component, and values above 32 bits panic.
@@ -130,11 +106,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 54. **A host layout transition starts from the tracked layout** *(plausible)* (`image/mod.rs:740`):
     `ATTACHMENT_OPTIMAL` may not be in `pCopySrcLayouts`, and the states move before
     `transition_image_layout` can fail.
-55. **Raster state values aren't checked** *(plausible)* (`raster_state.rs`): `SRC1_*` factors
-    without `dualSrcBlend`; blending on attachments without the `BLEND` format bit; logic ops;
-    the stipple factor (1..=256); `line_width` against `lineWidthRange`; depth bounds and clamp
-    ranges against [0, 1]; `UNDERESTIMATE` without `primitiveUnderestimation`
-    (`features.rs:737-738`); primitive restart on list topologies.
 57. **`E5B9G9R9UfloatPack32` has 4 components** (`format.rs:356`), so a `Tex2D<float3>` refuses it.
 58. **`Dynamic::info` panics for formats outside the table** (`format.rs:77`): A4R4G4B4, A8 and
     A1B5G5R5 are missing, and `PresentSurface::new`'s fallback could pick one *(plausible)*.
@@ -196,8 +167,8 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   buffers sharing an image be recorded in order.
 
 ### Found 2026-10-18
-- **Small per-call costs:** a stencil change makes 8 calls where front equals back
-  (`:640-648`); `unsized_struct!` accessors walk every earlier section (`unsized_struct.rs:12-28`).
+- **Small per-call costs:** `unsized_struct!` accessors walk every earlier section
+  (`unsized_struct.rs:12-28`).
 - **The engine's specialization constants change at runtime** (engine `render.rs:723-729, 793`):
   `BvhCull`'s buffer lengths double on overflow and `Composite`'s sky slot changes per sky, so
   each value compiles a pipeline mid-frame.
@@ -240,9 +211,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     `div_ceil(64)`, and constants like `MESHLET_STRIDE`, `INSTANCE_FLAG_BITS` and the overflow
     bits are copied. Generate `Pass::WORKGROUP_SIZE` with a `compute_threads(extent)`, and export
     marked Slang constants.
-13. **Indirect commands need byte gymnastics.** Core uses
-    `byte_range(offset_of!..).cast::<MeshletDraw>()` and a 16→12-byte cast. Add field projection,
-    and let indirect draws take any `T` that starts with the command, using its stride.
+13. **Field projection.** Core slices a struct field out of a buffer with
+    `byte_range(offset_of!..).cast::<MeshletDraw>()`. (Indirect draws and dispatches take any
+    `T: StartsWith<C>` since 2026-10-21, which removes the 16→12-byte cast.)
 14. **Scope names must be `&'static str`.**
 15. **Resize and grow is hand-rolled.** `RenderResources::fit`, a `fresh` flag and
     `grow_overflowed` could become `Image::fit(extent)` and `Buffer::reserve(len)` that keep the
@@ -283,8 +254,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     - *2026-10-18, unused:* `usage::UnifiedBinding`, `Features::union`, `ImageView::cast`,
       `ImageSlice::cast`, `Image::aspect_check`/`texel_check`, `Dim::texels`,
       `SlotRange::is_empty` (always false), `Config::gpu_assisted_validation` (no user), the
-      root re-exports `AccessFlags2`/`ImageLayout`, and three loaded draw commands in `vk.rs`
-      (`cmd_draw_indexed_indirect2`, `..._count2`, `cmd_draw_mesh_tasks_indirect_count2`).
+      root re-exports `AccessFlags2`/`ImageLayout`.
     - *2026-10-18, naming traps:* `ImageRef::view()` returns the `ImageView` while
       `ImageView::view()` returns the `vk::ImageView` (`kind.rs:18-22`); `features::gate` is a
       function and a module; `lava_build_slang::SLANG_DIR` (the shader directory) shares the
@@ -293,8 +263,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
       lava says task; `Features::DEFAULT` means none; `copy_region_from` takes its offset as a
       `D::Extent`; `image_acceses`, `buffer_acceses`.
     - *2026-10-18, missing derives:* `RasterState` and `BufferAccess` could be `Copy`; `Filter` has
-      no `Clone`/`Copy`/`Debug` and no cubic filter; `ImageSlice` no `Debug`; `Scissor` and
-      `Viewport` are identical structs; `Config` has no docs or `Debug`.
+      no `Clone`/`Copy`/`Debug` and no cubic filter; `ImageSlice` no `Debug`; `Config` has no docs or `Debug`.
 20. **Codegen errors lack context.** Panics give no file or field (`build.rs:111,118,236`), the
     first failing pass hides the rest, and Slang warnings aren't forwarded.
 21. **Generated code leaks into its includer** (2026-10-18, `codegen.rs:511-535`). It glob-imports
@@ -317,9 +286,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     `range(..)` but not in `range(..len())`; `alignment: Option<u32>` isn't checked for a power of
     two and is narrower than Vulkan's `u64`. `update_buffer` writes one element only
     (`slice.rs:217-222`).
-28. **Small API gaps** (2026-10-18): `DepthTarget` needs a depth aspect, so `S8Uint` can't be an
-    attachment (`kind.rs:51-52`); `check_hazards` forbids two draws of a rendering writing one
-    buffer, ruling out atomics across draws (`mod.rs:263-293`); `depth_clamp_range`'s wrapper
+28. **Small API gaps** (2026-10-18): `depth_clamp_range`'s wrapper
     takes a reference where Vulkan's is optional (`vk.rs:466-475`);
     `dynamic-line-mode` implies no capability (`Cargo.toml:179`); `#[validation_trace(anything)]`
     compiles and the non-function error has no span (`lava-macros/src/lib.rs:10`); `Shaders` isn't
@@ -331,14 +298,21 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 
 - **Raster:**
   - **Sampling:** MSAA with resolve attachments, sample shading, alpha-to-coverage.
-  - **Rendering:** multiview, layered rendering, a render area offset, per-draw scissor and
-    viewport (UI clipping), vertex-only passes (depth and shadow), dynamic rendering local read.
-  - **Draws:** `draw_indexed_indirect(_count)` and `launch_indirect_count` (their loaders exist), u16 indices,
-    first vertex/instance and vertex offset, multi-draw.
+  - **Rendering:** dynamic rendering local read (core in 1.4; the Arc B390 has it). Skipped
+    2026-10-21: an input attachment is a heap descriptor of type `INPUT_ATTACHMENT`, which
+    needs an `InputAttachment` usage flag (a new `Usage` parameter) and a bind for it; Slang
+    decorates `InputAttachmentIndex` only on global parameters, which lava-build-slang rejects,
+    and a heap-loaded `SubpassInput` (it compiles, spirv-val accepts it) is undecorated, which
+    the default mapping gives the depth-stencil attachment, never a colour one, unless
+    `vkCmdSetRenderingInputAttachmentIndices` maps them; draws that read what earlier ones of
+    the rendering wrote also need a by-region barrier inside it (`FRAGMENT_SHADER` from
+    `COLOR_ATTACHMENT_OUTPUT`, the attachment in `RENDERING_LOCAL_READ`), which `record` would
+    have to insert between them.
 - **Compute:** reflected workgroup size, dispatch base, subgroup size control (`[WaveSize]` →
   `requiredSubgroupSize`), several entry points per file.
 - **Images:**
-  - **Types:** array layers, cube maps, 1D, MSAA.
+  - **Types:** cube maps (arrays of 6 layers exist since 2026-10-21; a cube view and
+    `TexCube` don't), 1D, MSAA.
   - **Views:** format reinterpretation (sRGB storage through a UNORM view, R32 aliases for
     atomics), swizzles, per-aspect depth/stencil views.
   - **Checks:** a format-support query.
@@ -398,7 +372,7 @@ Small things, by file; none changes behaviour.
   (`present`)" fallback comment is stale and its `src_access.is_empty()` branch never fires
   (`:1641-1650`); the `index < count` assert is repeated in three places instead of
   `Recording::begin_query`, and `end_query` bounds `QueryKind` where `begin_query` bounds
-  `Scoped`; `view_mask(0)` is the default. `pending.rs`: the transitions loop in `made_visible`
+  `Scoped`. `pending.rs`: the transitions loop in `made_visible`
   is redundant *(plausible)* (`:102-123`) and the access sets could be `const`s (`:235-281`).
   `image_state.rs`: `for_each` ignores `mips.end` without an assert (`:72-79`),
   `run_mips.end == mips.start` is always true (`:119`), a panic prints `Some(Compute)`

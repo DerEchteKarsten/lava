@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init and the layouts the GPU reads
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads, topology classes and render areas
 use std::{
     iter,
     sync::atomic::AtomicU64,
@@ -33,6 +33,7 @@ const GRAPHICS: FamilyInfo = FamilyInfo {
 
 fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess {
     BufferAccess {
+        unordered: false,
         stage,
         access,
         range: range.into(),
@@ -711,4 +712,26 @@ fn calls_before_init_panic() {
     let message = panicked.downcast_ref::<String>().cloned().unwrap_or_default();
     assert!(message.contains("lava is not initialised"), "{message}");
     assert!(crate::shutdown().is_ok());
+}
+
+#[test]
+fn topology_classes_and_render_areas() {
+    use crate::command_buffer::{PrimitiveTopology as T, Rect, topology_class};
+    let classes = [
+        (T::POINT_LIST, T::POINT_LIST),
+        (T::LINE_LIST, T::LINE_LIST),
+        (T::LINE_STRIP, T::LINE_LIST),
+        (T::LINE_STRIP_WITH_ADJACENCY, T::LINE_LIST),
+        (T::TRIANGLE_LIST, T::TRIANGLE_LIST),
+        (T::TRIANGLE_STRIP, T::TRIANGLE_LIST),
+        (T::TRIANGLE_FAN, T::TRIANGLE_LIST),
+        (T::TRIANGLE_LIST_WITH_ADJACENCY, T::TRIANGLE_LIST),
+        (T::PATCH_LIST, T::PATCH_LIST),
+    ];
+    for (topology, class) in classes {
+        assert_eq!(topology_class(topology), class, "{topology:?}");
+    }
+    let area = Rect::from(glam::UVec2::new(4, 8));
+    assert_eq!(area, Rect::new(glam::IVec2::ZERO, glam::UVec2::new(4, 8)));
+    assert_eq!(area.vk().extent.height, 8);
 }

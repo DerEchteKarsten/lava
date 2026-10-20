@@ -107,6 +107,7 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`].
     pub fn access(&self, stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> BufferAccess {
         BufferAccess {
+            unordered: false,
             stage,
             access,
             range: self.get_range(),
@@ -212,6 +213,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         self.rec.flush_pending(
             std::iter::empty(),
             std::iter::once(BufferAccess {
+                unordered: false,
                 access: vk::AccessFlags2::TRANSFER_WRITE,
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 range: buffer.get_range(),
@@ -245,6 +247,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         self.rec.flush_pending(
             iter::empty(),
             iter::once(BufferAccess {
+                unordered: false,
                 stage: vk::PipelineStageFlags2::TRANSFER,
                 access: vk::AccessFlags2::TRANSFER_WRITE,
                 range: buffer.get_range(),

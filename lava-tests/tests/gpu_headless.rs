@@ -10,8 +10,7 @@ use lava::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
         BufferAccess, ColorComponentFlags, CompareOp, CullModeFlags,
         DispatchIndirectCommand, Draw, DrawIndirectCommand, FrontFace, ImageUse, LogicOp,
-        PolygonMode, PrimitiveTopology, RasterState, Scissor, Stencil, StencilFace, StencilOp,
-        Viewport, kind,
+        PolygonMode, PrimitiveTopology, RasterState, Rect, Stencil, StencilFace, StencilOp, kind,
     },
     image::{
         D3, Image, MipChain,
@@ -1267,10 +1266,8 @@ fn attachments_are_one_mip_at_least_as_large_as_the_rendering() {
     assert!(message.contains("doesn't fit its depth attachment"), "{message}");
     let message = panic_message(|| {
         gpu.submit(|cmd| {
-            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)]).scissor(Scissor {
-                offset: IVec2::new(-1, 0),
-                extent: EXTENT,
-            });
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+                .scissor(Rect::new(IVec2::new(-1, 0), EXTENT));
         })
     });
     assert!(message.contains("non-negative"), "{message}");
@@ -2421,10 +2418,7 @@ fn scissor_clips_and_viewport_scales_the_draw() {
     // Scissor: the full-size picture, cut to the left half.
     let scissored = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .scissor(Scissor {
-                offset: IVec2::ZERO,
-                extent: UVec2::new(SIZE / 2, SIZE),
-            })
+            .scissor(Rect::new(IVec2::ZERO, UVec2::new(SIZE / 2, SIZE)))
             .draw(&Draw::new(&bindings(&vertices), 6, 1, unculled(), None))
             .record("scissored")
     });
@@ -2440,10 +2434,7 @@ fn scissor_clips_and_viewport_scales_the_draw() {
     // Viewport: the whole picture squeezed into the bottom-right quarter.
     let quarter = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .viewport(Viewport {
-                offset: IVec2::splat(SIZE as i32 / 2),
-                extent: EXTENT / 2,
-            })
+            .viewport(Rect::new(IVec2::splat(SIZE as i32 / 2), EXTENT / 2))
             .draw(&Draw::new(&bindings(&vertices), 6, 1, unculled(), None))
             .record("viewport")
     });
@@ -2660,6 +2651,8 @@ fn line_lists_draw_only_edges() {
     });
     assert_pixel(&pixels, IN_LEFT.0, IN_LEFT.1, BLACK);
     assert!(pixels.chunks_exact(4).any(|p| p != BLACK));
+    // `gpu_missing_features` draws it with the topology class baked.
+    assert_golden("raster_lines", &pixels, [SIZE, SIZE]);
 }
 
 #[test]
@@ -2668,7 +2661,7 @@ fn write_masks_keep_the_masked_components() {
     let vertices = overlapping_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         let blue = Attachment::color(target.whole_view(), Some([0.0, 0.0, 1.0, 1.0]));
-        let state = RasterState::default().write_masks([ColorComponentFlags::R]);
+        let state = RasterState::default().write_mask(ColorComponentFlags::R);
         cmd.raster(EXTENT, [blue])
             .draw(&Draw::new(&bindings(&vertices), 6, 1, state, None))
             .record("red only");
@@ -2743,7 +2736,7 @@ fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
                 front: mark,
                 back: mark,
             }))
-            .write_masks([ColorComponentFlags::empty()]);
+            .write_mask(ColorComponentFlags::empty());
         let drawing = unculled().depth_test(None).stencil(Some(Stencil {
             front: marked,
             back: marked,
@@ -3336,10 +3329,10 @@ fn mesh_pass_emits_triangles_per_workgroup() {
 }
 
 #[test]
-fn indirect_mesh_launch_matches_the_direct_one() {
+fn indirect_mesh_launches_match_the_direct_one() {
     let mut gpu = gpu();
     if !Ctx::features().mesh_shader {
-        eprintln!("SKIPPED indirect_mesh_launch_matches_the_direct_one: no mesh shader support");
+        eprintln!("SKIPPED indirect_mesh_launches_match_the_direct_one: no mesh shader support");
         return;
     }
     let bindings =
@@ -3365,6 +3358,25 @@ fn indirect_mesh_launch_matches_the_direct_one() {
             .record("indirect")
     });
     assert_eq!(indirect, direct);
+
+    // The first of two commands, counted on the GPU.
+    let launches = buffer_with::<DispatchIndirectCommand>(&[
+        DispatchIndirectCommand { x: 2, y: 1, z: 1 },
+        DispatchIndirectCommand { x: 1, y: 1, z: 1 },
+    ]);
+    let count = buffer_with::<u32>(&[1]);
+    let counted = render(&mut gpu, |cmd, target| {
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::launch_indirect_count(
+                &bindings(),
+                launches.range(..),
+                count.range(..),
+                unculled(),
+                None,
+            ))
+            .record("indirect count")
+    });
+    assert_eq!(counted, direct);
 }
 
 // ---- generated bindings ----------------------------------------------------------------------
@@ -3402,7 +3414,7 @@ mod generated {
             PASS_MAP.passes[raster].kind,
             PassKind::RasterVertex {
                 vertex: c"test_raster_vertex",
-                fragment: c"test_raster_fragment"
+                fragment: Some(c"test_raster_fragment")
             }
         );
         assert_eq!(PASS_MAP.passes[raster].name, "TestRaster");

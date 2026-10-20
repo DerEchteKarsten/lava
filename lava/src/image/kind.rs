@@ -1,8 +1,8 @@
-//! Sealed marker traits that commands, bindless binds and generated bindings bound by: what a view can be used as (`SampledView`, `ColorTarget`, `TransferSrcView`, ...; regions are an `ImageSlice` of one) and which images shaders can bind (`SampledImage`, `StorageImage`)
+//! Sealed marker traits that commands, bindless binds and generated bindings bound by: what a view can be used as (`SampledView`, `ColorTarget`, `DepthTarget`, `StencilTarget`, `TransferSrcView`, ...; regions are an `ImageSlice` of one) and which images shaders can bind (`SampledImage`, `StorageImage`)
 use crate::image::{
     Image, Views,
-    dim::{D2, Dim},
-    format::{ColorAspect, DepthAspect, Format},
+    dim::{Dim, Dim2D},
+    format::{ColorAspect, DepthAspect, Format, StencilAspect},
     slice::ImageView,
     usage::{
         ImageUsage, IsColorAttachment, IsDepthAttachment, IsSampled, IsStorage, IsTransferDst,
@@ -43,13 +43,32 @@ impl<F: Format, U: IsSampled, D: Dim> SampledView for ImageView<'_, F, U, D> {}
 pub trait StorageView: ImageRef<Usage: IsStorage> {}
 impl<F: Format, U: IsStorage, D: Dim> StorageView for ImageView<'_, F, U, D> {}
 
-/// A 2D colour view a rendering draws to (`Attachment::color`).
-pub trait ColorTarget: ImageRef<Format: ColorAspect, Usage: IsColorAttachment, Dim = D2> {}
-impl<F: Format + ColorAspect, U: IsColorAttachment> ColorTarget for ImageView<'_, F, U, D2> {}
+/// A 2D colour view a rendering draws to (`Attachment::color`): one layer, or layers of an
+/// array for a layered or multiview rendering.
+pub trait ColorTarget: ImageRef<Format: ColorAspect, Usage: IsColorAttachment, Dim: Dim2D> {}
+impl<F: Format + ColorAspect, U: IsColorAttachment, D: Dim2D> ColorTarget
+    for ImageView<'_, F, U, D>
+{
+}
 
-/// A 2D depth view a rendering tests against (`RasterBuilder::depth_attachment`).
-pub trait DepthTarget: ImageRef<Format: DepthAspect, Usage: IsDepthAttachment, Dim = D2> {}
-impl<F: Format + DepthAspect, U: IsDepthAttachment> DepthTarget for ImageView<'_, F, U, D2> {}
+/// A 2D depth view a rendering tests against (`RasterBuilder::depth_attachment`); a combined
+/// depth-stencil format is its stencil attachment too.
+pub trait DepthTarget: ImageRef<Format: DepthAspect, Usage: IsDepthAttachment, Dim: Dim2D> {}
+impl<F: Format + DepthAspect, U: IsDepthAttachment, D: Dim2D> DepthTarget
+    for ImageView<'_, F, U, D>
+{
+}
+
+/// A 2D stencil view a rendering tests against (`RasterBuilder::stencil_attachment`): a
+/// stencil-only format like `S8Uint`, or a combined one.
+pub trait StencilTarget:
+    ImageRef<Format: StencilAspect, Usage: IsDepthAttachment, Dim: Dim2D>
+{
+}
+impl<F: Format + StencilAspect, U: IsDepthAttachment, D: Dim2D> StencilTarget
+    for ImageView<'_, F, U, D>
+{
+}
 
 /// A colour view a blit or a copy to a buffer reads, through an `ImageSlice` of it.
 pub trait TransferSrcView: ImageRef<Format: ColorAspect, Usage: IsTransferSrc> {}

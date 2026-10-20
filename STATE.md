@@ -36,6 +36,19 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - The engine-facing `Gated` setters of `RasterState` check the capability whatever the value (`polygon_mode(FILL)` needs `fill-mode-non-solid` too).
 - Baked draw state can make many pipelines per pass on devices without the dynamic state (the 16-pipeline warning then names the pass); `dynamic-*` without `assert-` keeps that possible.
 
+## lava: renderings and draws (2026-10-21)
+----find solutions----
+- Dynamic rendering local read (a draw reading an attachment of its own rendering) isn't there: input attachments need an image usage flag, heap descriptors of their own type, and an `InputAttachmentIndex` Slang only puts on global parameters (details in SURVEY section 5).
+----intended----
+- An image's tracked states cover all its layers (one per mip for a `MipChain`), so a transition moves every layer of the mip, layer views share their image's states, and an attachment of one layer whose mip a draw also reads (another layer) is rendered in `GENERAL`. Hazards between draws are per image and mip, not per layer.
+- Layer views (`ImageView::layer`, a `layers` range other than the view's) have no bindless handle: `bind_*` bind the whole array, and a layer alone is bound into reserved slots with `bindless::bind`. Their `VkImageView`s (attachments only) are made the first time a rendering or `view()` asks and kept in the image (`ViewCache`) until it is destroyed.
+- A rendering has one depth-stencil image: `stencil_attachment` replaces a `depth_attachment` and the other way round (Vulkan wants the same view for both), so a separate depth image and `S8Uint` image can't be attached together; a combined format attaches both through `depth_attachment`.
+- `BufferAccess::unordered` is the application's word: lava doesn't check that unordered draws' writes commute.
+- Multiview renderings of mesh passes panic on devices without `multiviewMeshShader` (the Arc B390, Mesa 26.2, has none), so they are untested here.
+- Blending checks the attachment format's `COLOR_ATTACHMENT_BLEND` through `Ctx::format_features`, a cache of each format's optimal-tiling features filled on first use (a mutex lock per check, once per rendering whose draws blend).
+- Recording bench, 2026-10-21 (`taskset -c 2`, two runs alternating with the commit before): `many_draws` about 2% slower (243 vs 236 µs), `mesh` about 10% (35.6 vs 32.2 µs for 32 launches in 8 renderings, some 100 ns a draw), `compute` and `declared` within noise. Suspects: `RasterState::check` per `Draw` constructor, the larger `DrawCommand`, and the per-draw viewport and scissor comparisons; not profiled.
+- The topology class is baked only without `dynamicPrimitiveTopologyUnrestricted` on an enabled `VK_EXT_extended_dynamic_state3` (every `dynamic-*` feature off, as `gpu_missing_features` has it); the Arc B390 has the property.
+
 ## lava: descriptor heaps (`VK_EXT_descriptor_heap`, required since 2026-10-19)
 ----find solutions----
 - Whether RenderDoc can capture an application on descriptor heaps is unchecked (none is installed here); Nsight Graphics 2026.2 can. Whether either reads shaders that index the heaps directly (`SPV_EXT_descriptor_heap`, untyped pointers, since 2026-10-19) is unchecked too. lava can't fall back to descriptor sets.
@@ -86,8 +99,7 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
 - Safe code reaches undefined behaviour: tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 27-37).
-- `multiDrawIndirect`, `drawIndirectFirstInstance` and `depthBiasClamp` are never enabled, though `Draw::indirect` passes `buffer.len()` draws and `DepthBias::clamp` is public (38, 39).
-- Without extended dynamic state 3, line and point draws use a pipeline baked with `TRIANGLE_LIST` (`dynamicPrimitiveTopologyUnrestricted` is never queried) (40). `depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists (41). 64-bit clear values are packed as 32-bit (43).
+- 64-bit clear values are packed as 32-bit (43).
 - The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `ImageHandle` (87, 88).
 
 ## Performance

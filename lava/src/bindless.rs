@@ -720,8 +720,8 @@ pub fn max_image_slots() -> u32 {
     Bindless::get().images.count
 }
 
-/// What an image descriptor shows: `mips` of one image through a view of `view_type`, of the
-/// format's one aspect, or depth for a combined depth-stencil format.
+/// What an image descriptor shows: `mips` and `layers` of one image through a view of
+/// `view_type`, of the format's one aspect, or depth for a combined depth-stencil format.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ShaderImage {
     pub(crate) image: vk::Image,
@@ -729,6 +729,7 @@ pub(crate) struct ShaderImage {
     pub(crate) aspects: vk::ImageAspectFlags,
     pub(crate) view_type: vk::ImageViewType,
     pub(crate) mips: std::range::Range<u32>,
+    pub(crate) layers: std::range::Range<u32>,
     pub(crate) usage: vk::ImageUsageFlags,
 }
 
@@ -740,6 +741,7 @@ impl<F: Format, U: ImageUsage, D: Dim> ImageView<'_, F, U, D> {
             aspects: self.format.aspects(),
             view_type: D::VIEW_TYPE,
             mips: self.mip_range,
+            layers: self.layers,
             usage: self.usage.flags(),
         }
     }
@@ -834,8 +836,8 @@ pub(crate) fn bind_raw(
                     aspect_mask: single_aspect(image.aspects),
                     base_mip_level: image.mips.start,
                     level_count: image.mips.end - image.mips.start,
-                    base_array_layer: 0,
-                    layer_count: 1,
+                    base_array_layer: image.layers.start,
+                    layer_count: image.layers.end - image.layers.start,
                 })
         })
         .collect();

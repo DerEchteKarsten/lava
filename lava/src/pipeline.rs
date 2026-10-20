@@ -1,4 +1,4 @@
-//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups), each pass's pipelines per specialization and raster key (attachment formats and the draw state the device can't set dynamically) behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), `reload_pass`, which replaces a pass's pipelines and retires the old ones, and their destruction at `shutdown`
+//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups), each pass's pipelines per specialization and raster key (attachment formats, view mask and the draw state the device can't set dynamically, the topology class among it), raster passes with or without a fragment shader behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), `reload_pass`, which replaces a pass's pipelines and retires the old ones, and their destruction at `shutdown`
 use std::{
     ffi::CStr,
     hash::Hash,
@@ -11,7 +11,7 @@ use std::{
 
 use crate::vk;
 use hashbrown::{Equivalent, HashMap};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use crate::{
     command_buffer::{Baked, ColorComponentFlags},
@@ -74,14 +74,16 @@ pub enum PassKind {
         /// device's `maxRayRecursionDepth` gets no pipeline, like one needing a missing feature.
         max_recursion: u32,
     },
+    /// Without a fragment shader, a pass draws only depth and stencil (shadow maps, depth
+    /// prepasses).
     RasterVertex {
         vertex: &'static CStr,
-        fragment: &'static CStr,
+        fragment: Option<&'static CStr>,
     },
     RasterMesh {
         amp: Option<&'static CStr>,
         mesh: &'static CStr,
-        fragment: &'static CStr,
+        fragment: Option<&'static CStr>,
     },
 }
 
@@ -123,6 +125,7 @@ pub(crate) struct RasterKey {
     color_formats: SmallVec<[vk::Format; 4]>,
     depth_format: vk::Format,
     stencil_format: vk::Format,
+    view_mask: u32,
     constants: Box<[u8]>,
     baked: Baked,
     #[cfg(bake_blend)]
@@ -137,6 +140,7 @@ impl RasterKey {
             color_formats: &self.color_formats,
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
+            view_mask: self.view_mask,
             constants: &self.constants,
             baked: self.baked,
             #[cfg(bake_blend)]
@@ -154,6 +158,7 @@ pub(crate) struct RasterKeyRef<'a> {
     pub(crate) color_formats: &'a [vk::Format],
     pub(crate) depth_format: vk::Format,
     pub(crate) stencil_format: vk::Format,
+    pub(crate) view_mask: u32,
     pub(crate) constants: &'a [u8],
     pub(crate) baked: Baked,
     #[cfg(bake_blend)]
@@ -168,6 +173,7 @@ impl RasterKeyRef<'_> {
             color_formats: SmallVec::from_slice(self.color_formats),
             depth_format: self.depth_format,
             stencil_format: self.stencil_format,
+            view_mask: self.view_mask,
             constants: self.constants.into(),
             baked: self.baked,
             #[cfg(bake_blend)]
@@ -853,10 +859,17 @@ fn create_raster_pipeline(
     let c = specialization(pass, key.constants);
     let stages = match pass.kind {
         PassKind::RasterVertex { vertex, fragment } => {
-            smallvec![
-                make_shader_stage(vertex, vk::ShaderStageFlags::VERTEX, module, &c),
-                make_shader_stage(fragment, vk::ShaderStageFlags::FRAGMENT, module, &c),
-            ]
+            let mut stages = SmallVec::<[vk::PipelineShaderStageCreateInfo<'_>; 3]>::new();
+            stages.push(make_shader_stage(vertex, vk::ShaderStageFlags::VERTEX, module, &c));
+            if let Some(fragment) = fragment {
+                stages.push(make_shader_stage(
+                    fragment,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    module,
+                    &c,
+                ));
+            }
+            stages
         }
         PassKind::RasterMesh {
             amp,
@@ -878,21 +891,29 @@ fn create_raster_pipeline(
                 module,
                 &c,
             ));
-            stages.push(make_shader_stage(
-                fragment,
-                vk::ShaderStageFlags::FRAGMENT,
-                module,
-                &c,
-            ));
+            if let Some(fragment) = fragment {
+                stages.push(make_shader_stage(
+                    fragment,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    module,
+                    &c,
+                ));
+            }
             stages
         }
         other => panic!("pass {other:?} is not a raster pass"),
     };
 
     let mut create_info = vk::GraphicsPipelineCreateInfo::default();
+    // Draws set the topology dynamically, within the baked class where the device can't leave
+    // it (`Baked::topology`).
+    let topology = match Ctx::dynamic().topology_unrestricted {
+        true => vk::PrimitiveTopology::TRIANGLE_LIST,
+        false => key.baked.topology,
+    };
     let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
         .primitive_restart_enable(false)
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        .topology(topology);
     let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_attribute_descriptions(&[])
         .vertex_binding_descriptions(&[]);
@@ -904,7 +925,7 @@ fn create_raster_pipeline(
         .color_attachment_formats(key.color_formats)
         .depth_attachment_format(key.depth_format)
         .stencil_attachment_format(key.stencil_format)
-        .view_mask(0);
+        .view_mask(key.view_mask);
     // State the device sets dynamically is ignored here; the rest is the key's (`Baked`).
     let features = Ctx::features_ref();
     let dynamic = Ctx::dynamic();
@@ -1033,6 +1054,8 @@ fn create_raster_pipeline(
     }
     #[cfg(bake_depth_clip)]
     let depth_clip = key.baked.depth_clip;
+    // Unused: the state is dynamic or the feature compiled out (then clamped primitives aren't
+    // clipped, as without the extension).
     #[cfg(not(bake_depth_clip))]
     let depth_clip = true;
     let mut depth_clip = vk::PipelineRasterizationDepthClipStateCreateInfoEXT::default()
