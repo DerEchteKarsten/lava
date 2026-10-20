@@ -21,8 +21,8 @@ use crate::{
     image::{
         Image, Views,
         dim::Dim,
-        expected_data_len,
-        format::{ColorAspect, Format, bc_block},
+        format::{ColorAspect, Format},
+        slice::{copy_block_of, rows_len},
         usage::IsTransferDst,
     },
     queue::{Kind, QueueKind, lock, timeline},
@@ -619,11 +619,19 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
     let extent = D::extent_3d(image.mip_extent(level));
     let format = image.format();
     let layers = image.layers();
-    let expected = expected_data_len(extent, format.texel_size(), bc_block(format.vk_format()))
-        .map(|bytes| bytes * layers as usize);
+    let block = copy_block_of(&format, vk::ImageAspectFlags::COLOR);
+    // Staged bytes start on `STAGING_ALIGN`, and a copy's address is a multiple of its block.
     assert!(
-        expected == Some(len),
-        "mip level {level} of {layers} layers holds {expected:?} bytes but {len} were given"
+        STAGING_ALIGN % block.bytes as u64 == 0,
+        "staged uploads into {:?} aren't supported: its {}-byte texel blocks don't divide the \
+         ring's {STAGING_ALIGN}-byte alignment",
+        format.vk_format(),
+        block.bytes
+    );
+    let expected = rows_len(block, extent, layers, (0, 0));
+    assert!(
+        expected == len,
+        "mip level {level} of {layers} layers holds {expected} bytes but {len} were given"
     );
     let states = image.whole_view().states;
     let mips = match states.len() {

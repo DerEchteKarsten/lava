@@ -1,14 +1,20 @@
-//! Image usages: one const-generic `Usage` with a `bool` per flag, which implements the usage traits only for the sets Vulkan allows (host copies only with `host-image-copy`), `usage!` to name one by its flags, and `Dynamic`, whose usage is only known at runtime
+//! Image usages: one const-generic `Usage` with a `bool` per flag (and `MutableFormat`, for views of other formats), which implements the usage traits only for the sets lava allows (host copies only with `host-image-copy` and never with attachments), `usage!` to name one by its flags, and `Dynamic`, whose usage is only known at runtime
 use crate::vk;
 
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is no image usage",
     label = "not a usage an image can have",
     note = "an image needs at least one usage, can't be both a colour and a depth attachment, \
-            and has `HostCopy` only with lava's `host-image-copy` feature"
+            has `HostCopy` only with lava's `host-image-copy` feature and never with an \
+            attachment usage, and `MutableFormat` is no usage of its own"
 )]
 pub trait ImageUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
     fn flags(&self) -> vk::ImageUsageFlags;
+    /// The create flags it implies: `MUTABLE_FORMAT` with `EXTENDED_USAGE` for a usage with
+    /// `MutableFormat`, else none (a `Dynamic` usage never has them).
+    fn create_flags(&self) -> vk::ImageCreateFlags {
+        vk::ImageCreateFlags::empty()
+    }
     /// Panics unless the usage has every flag of `required`; a static usage's does nothing.
     fn check(&self, required: vk::ImageUsageFlags);
 }
@@ -30,24 +36,43 @@ pub trait IsHostCopy: ImageUsage {}
 pub trait IsTransferSrc: ImageUsage {}
 /// Usages that can be the destination of a copy, blit or clear.
 pub trait IsTransferDst: ImageUsage {}
-
-/// Usages that can be bound with both descriptors (`bind_combined`), which a `MutTex2D` needs.
-pub trait UnifiedBinding: IsSampled + IsStorage {}
-impl<U: IsSampled + IsStorage> UnifiedBinding for U {}
+/// Usages whose images have views of other formats of their compatibility class
+/// (`ImageView::reinterpret`): `MutableFormat`, and `Dynamic`, checked at runtime.
+pub trait IsMutableFormat: ImageUsage {}
 
 /// A static image usage, one `bool` per flag. Name one with [`usage!`](crate::usage), which
 /// takes its flags in any order: `Image<R8Unorm, usage![Sampled, HostCopy]>`.
 ///
-/// Only the sets Vulkan allows are usages ([`ImageUsage`]): none is empty, none is both a
-/// colour and a depth attachment, and host copies need lava's `host-image-copy` feature. The
-/// others are types that `cargo check` refuses wherever an image needs a usage:
+/// `MutableFormat` isn't a usage but a create flag (`MUTABLE_FORMAT` with `EXTENDED_USAGE`): its
+/// images have views of the other formats of their compatibility class
+/// ([`ImageView::reinterpret`](crate::image::slice::ImageView::reinterpret)), and may have
+/// usages their own format lacks if such a format has them (storage of an sRGB image through a
+/// UNORM view). It can cost the driver compression, so give it only to images that need it.
+///
+/// Only the sets lava allows are usages ([`ImageUsage`]): none is empty, none is both a
+/// colour and a depth attachment, host copies need lava's `host-image-copy` feature and never
+/// go with an attachment usage (their layouts would be the attachments', which host copies
+/// don't take). The others are types that `cargo check` refuses wherever an image needs a
+/// usage:
 /// ```compile_fail
 /// # use lava::image::{Image, format::R8Unorm, usage::Usage};
-/// fn empty(_: Image<R8Unorm, Usage<false, false, false, false, false, false, false>>) {}
+/// fn empty(_: Image<R8Unorm, Usage<false, false, false, false, false, false, false, false>>) {}
+/// ```
+/// ```compile_fail
+/// # use lava::image::{Image, format::R8Unorm, usage::usage};
+/// fn mutable_alone(_: Image<R8Unorm, usage![MutableFormat]>) {}
 /// ```
 /// ```compile_fail
 /// # use lava::image::{Image, format::D32Sfloat, usage::usage};
 /// fn both(_: Image<D32Sfloat, usage![ColorAttachment, DepthAttachment]>) {}
+/// ```
+/// ```compile_fail
+/// # use lava::image::{Image, format::R8G8B8A8Unorm, usage::usage};
+/// fn host_copied_target(_: Image<R8G8B8A8Unorm, usage![ColorAttachment, HostCopy]>) {}
+/// ```
+/// ```compile_fail
+/// # use lava::image::{Image, format::D32Sfloat, usage::usage};
+/// fn host_copied_depth(_: Image<D32Sfloat, usage![DepthAttachment, Sampled, HostCopy]>) {}
 /// ```
 /// The traits commands bound by follow the flags:
 /// ```compile_fail
@@ -71,6 +96,7 @@ pub struct Usage<
     const HOST_COPY: bool,
     const TRANSFER_SRC: bool,
     const TRANSFER_DST: bool,
+    const MUTABLE_FORMAT: bool,
 >;
 
 impl<
@@ -81,8 +107,19 @@ impl<
     const H: bool,
     const TS: bool,
     const TD: bool,
-> Usage<C, D, S, ST, H, TS, TD>
+    const M: bool,
+> Usage<C, D, S, ST, H, TS, TD, M>
 {
+    /// The create flags of `MutableFormat`.
+    pub const CREATE_FLAGS: vk::ImageCreateFlags = if M {
+        vk::ImageCreateFlags::from_raw(
+            vk::ImageCreateFlags::MUTABLE_FORMAT.as_raw()
+                | vk::ImageCreateFlags::EXTENDED_USAGE.as_raw(),
+        )
+    } else {
+        vk::ImageCreateFlags::empty()
+    };
+
     /// The Vulkan flags of the set `bool`s.
     pub const FLAGS: vk::ImageUsageFlags = {
         const fn flag(set: bool, flag: vk::ImageUsageFlags) -> vk::Flags {
@@ -108,10 +145,14 @@ impl<
     const H: bool,
     const TS: bool,
     const TD: bool,
-> std::fmt::Debug for Usage<C, D, S, ST, H, TS, TD>
+    const M: bool,
+> std::fmt::Debug for Usage<C, D, S, ST, H, TS, TD, M>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Usage({:?})", Self::FLAGS)
+        match M {
+            true => write!(f, "Usage({:?}, mutable format)", Self::FLAGS),
+            false => write!(f, "Usage({:?})", Self::FLAGS),
+        }
     }
 }
 
@@ -123,7 +164,8 @@ impl<
     const H: bool,
     const TS: bool,
     const TD: bool,
-> crate::sealed::Sealed for Usage<C, D, S, ST, H, TS, TD>
+    const M: bool,
+> crate::sealed::Sealed for Usage<C, D, S, ST, H, TS, TD, M>
 {
 }
 
@@ -152,22 +194,25 @@ macro_rules! usage_impls {
 }
 
 // One impl per flag, for the sets in which it is the first: together every non-empty set but
-// colour with depth attachment, which no format supports.
+// colour with depth attachment, which no format supports, and attachments with host copies.
 usage_impls! {
     ImageUsage {
         fn flags(&self) -> vk::ImageUsageFlags {
             Self::FLAGS
         }
+        fn create_flags(&self) -> vk::ImageCreateFlags {
+            Self::CREATE_FLAGS
+        }
         fn check(&self, _: vk::ImageUsageFlags) {}
     }
-    <S, ST, H, TS, TD> Usage<true, false, S, ST, H, TS, TD> where Bool<H>: HostCopyAllowed;
-    <S, ST, H, TS, TD> Usage<false, true, S, ST, H, TS, TD> where Bool<H>: HostCopyAllowed;
-    <ST, H, TS, TD> Usage<false, false, true, ST, H, TS, TD> where Bool<H>: HostCopyAllowed;
-    <H, TS, TD> Usage<false, false, false, true, H, TS, TD> where Bool<H>: HostCopyAllowed;
+    <S, ST, TS, TD, M> Usage<true, false, S, ST, false, TS, TD, M>;
+    <S, ST, TS, TD, M> Usage<false, true, S, ST, false, TS, TD, M>;
+    <ST, H, TS, TD, M> Usage<false, false, true, ST, H, TS, TD, M> where Bool<H>: HostCopyAllowed;
+    <H, TS, TD, M> Usage<false, false, false, true, H, TS, TD, M> where Bool<H>: HostCopyAllowed;
     #[cfg(feature = "host-image-copy")]
-    <TS, TD> Usage<false, false, false, false, true, TS, TD>;
-    <TD> Usage<false, false, false, false, false, true, TD>;
-    <> Usage<false, false, false, false, false, false, true>;
+    <TS, TD, M> Usage<false, false, false, false, true, TS, TD, M>;
+    <TD, M> Usage<false, false, false, false, false, true, TD, M>;
+    <M> Usage<false, false, false, false, false, false, true, M>;
 }
 
 /// Implements each marker trait for the usages with its flag set.
@@ -178,14 +223,15 @@ macro_rules! flag_traits {
 }
 
 flag_traits! {
-    IsColorAttachment: <D, S, ST, H, TS, TD> Usage<true, D, S, ST, H, TS, TD>;
-    IsDepthAttachment: <C, S, ST, H, TS, TD> Usage<C, true, S, ST, H, TS, TD>;
-    IsSampled: <C, D, ST, H, TS, TD> Usage<C, D, true, ST, H, TS, TD>;
-    IsStorage: <C, D, S, H, TS, TD> Usage<C, D, S, true, H, TS, TD>;
+    IsColorAttachment: <D, S, ST, H, TS, TD, M> Usage<true, D, S, ST, H, TS, TD, M>;
+    IsDepthAttachment: <C, S, ST, H, TS, TD, M> Usage<C, true, S, ST, H, TS, TD, M>;
+    IsSampled: <C, D, ST, H, TS, TD, M> Usage<C, D, true, ST, H, TS, TD, M>;
+    IsStorage: <C, D, S, H, TS, TD, M> Usage<C, D, S, true, H, TS, TD, M>;
     #[cfg(feature = "host-image-copy")]
-    IsHostCopy: <C, D, S, ST, TS, TD> Usage<C, D, S, ST, true, TS, TD>;
-    IsTransferSrc: <C, D, S, ST, H, TD> Usage<C, D, S, ST, H, true, TD>;
-    IsTransferDst: <C, D, S, ST, H, TS> Usage<C, D, S, ST, H, TS, true>;
+    IsHostCopy: <C, D, S, ST, TS, TD, M> Usage<C, D, S, ST, true, TS, TD, M>;
+    IsTransferSrc: <C, D, S, ST, H, TD, M> Usage<C, D, S, ST, H, true, TD, M>;
+    IsTransferDst: <C, D, S, ST, H, TS, M> Usage<C, D, S, ST, H, TS, true, M>;
+    IsMutableFormat: <C, D, S, ST, H, TS, TD> Usage<C, D, S, ST, H, TS, TD, true>;
 }
 
 impl<
@@ -196,7 +242,8 @@ impl<
     const H: bool,
     const TS: bool,
     const TD: bool,
-> StaticUsage for Usage<C, D, S, ST, H, TS, TD>
+    const M: bool,
+> StaticUsage for Usage<C, D, S, ST, H, TS, TD, M>
 where
     Self: ImageUsage,
 {
@@ -214,6 +261,7 @@ pub enum Flag {
     HostCopy,
     TransferSrc,
     TransferDst,
+    MutableFormat,
 }
 
 /// Whether `flags` holds `flag`, for [`usage!`](crate::usage).
@@ -230,7 +278,8 @@ pub const fn has(flags: &[Flag], flag: Flag) -> bool {
 }
 
 /// The [`Usage`] with the given flags, in any order: `ColorAttachment`, `DepthAttachment`,
-/// `Sampled`, `Storage`, `HostCopy`, `TransferSrc`, `TransferDst`.
+/// `Sampled`, `Storage`, `HostCopy`, `TransferSrc`, `TransferDst`, and `MutableFormat` (no
+/// usage, see [`Usage`]).
 /// `usage![Sampled, TransferDst]` and `usage![TransferDst, Sampled]` are the same type.
 #[macro_export]
 macro_rules! usage {
@@ -243,6 +292,7 @@ macro_rules! usage {
             { $crate::image::usage::has(&[$($crate::image::usage::Flag::$flag),+], $crate::image::usage::Flag::HostCopy) },
             { $crate::image::usage::has(&[$($crate::image::usage::Flag::$flag),+], $crate::image::usage::Flag::TransferSrc) },
             { $crate::image::usage::has(&[$($crate::image::usage::Flag::$flag),+], $crate::image::usage::Flag::TransferDst) },
+            { $crate::image::usage::has(&[$($crate::image::usage::Flag::$flag),+], $crate::image::usage::Flag::MutableFormat) },
         >
     };
 }
@@ -276,3 +326,4 @@ impl IsDepthAttachment for Dynamic {}
 impl IsHostCopy for Dynamic {}
 impl IsTransferSrc for Dynamic {}
 impl IsTransferDst for Dynamic {}
+impl IsMutableFormat for Dynamic {}

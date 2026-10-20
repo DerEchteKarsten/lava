@@ -203,10 +203,11 @@ pub(crate) fn release_states(
     }
 }
 
-/// Moves the layouts of `mips` to `layout` for host image copies, leaving their owners alone,
-/// and calls `changed(mips, old)` per run of mips that had another layout.
+/// Calls `changed(mips, old)` per run of `mips` whose layout isn't `layout`, for the host
+/// transitions of host image copies, without moving anything: `commit_host_layouts` does once
+/// they succeeded. The caller holds the image mutably, so no recording moves the states between.
 #[cfg(feature = "host-image-copy")]
-pub(crate) fn take_host_layouts(
+pub(crate) fn host_layouts(
     states: &[AtomicU64],
     mips: Range<u32>,
     layout: vk::ImageLayout,
@@ -214,10 +215,7 @@ pub(crate) fn take_host_layouts(
 ) {
     let mut old: Option<(Range<u32>, vk::ImageLayout)> = None;
     for_each(states, mips, |state, mips| {
-        let bits = state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
-            Some(ImageState { layout, ..ImageState::unpack(bits) }.pack())
-        });
-        let previous = ImageState::unpack(bits.unwrap_or_else(|bits| bits)).layout;
+        let previous = ImageState::load(state).layout;
         match &mut old {
             Some((run, run_layout)) if *run_layout == previous => *run = (run.start..mips.end).into(),
             _ => {
@@ -234,4 +232,13 @@ pub(crate) fn take_host_layouts(
     {
         changed(run, run_layout);
     }
+}
+
+/// Moves the layouts of `mips` to `layout` after host transitions, leaving their owners alone.
+#[cfg(feature = "host-image-copy")]
+pub(crate) fn commit_host_layouts(states: &[AtomicU64], mips: Range<u32>, layout: vk::ImageLayout) {
+    for_each(states, mips, |state, _| {
+        let new = ImageState { layout, ..ImageState::load(state) };
+        state.store(new.pack(), Ordering::Relaxed);
+    });
 }

@@ -1,4 +1,3 @@
-//! Borrowed image views of a mip range and a layer range (over every aspect) and their slices, the only image types commands take (bounded by the traits of `kind`), their accesses (shaders' always in `GENERAL`), and the image transfer commands (clear, blit, copies to and from buffers; blits and copies track only the mip they touch)
 use std::{iter, range::Range, sync::atomic::AtomicU64};
 
 use crate::vk;
@@ -9,14 +8,13 @@ use crate::{
     bindless::{Allocatable, ImageHandle},
     buffer::slice::BufferSlice,
     command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
-    queue::{HasCompute, HasGraphics, Kind, QueueKind, FamilyInfo},
+    queue::{FamilyInfo, HasCompute, HasGraphics, Kind, QueueKind},
     image::{
         Image, ViewCache, Views,
         dim::{D2, D2Array, Dim},
-        expected_data_len,
-        format::{Format, bc_block},
+        format::{self, Block, ColorAspect, DepthStencilAspect, Format, Numeric, StaticFormat, StencilAspect},
         kind::{ImageRef, TransferDstView, TransferSrcView},
-        usage::ImageUsage,
+        usage::{ImageUsage, IsMutableFormat},
     },
     state::{Ctx, Functions},
 };
@@ -38,6 +36,8 @@ pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     pub(crate) states: &'a [AtomicU64],
     /// Where an attachment image keeps the `VkImageView`s of views without one of their own.
     pub(crate) cache: Option<&'a ViewCache>,
+    /// Its image was created with `MUTABLE_FORMAT`, so it has views of compatible formats.
+    pub(crate) mutable: bool,
     pub(crate) format: F,
     pub(crate) usage: U,
     pub(crate) dim: D,
@@ -48,9 +48,11 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         self.image
     }
 
-    /// Its `VkImageView`, which only images with an attachment usage have (null otherwise):
-    /// descriptors are written without one. A view of some layers of an array gets its own the
-    /// first time it is asked for, kept until the image is destroyed.
+    /// Its `VkImageView`, which only images with an attachment usage have (null otherwise),
+    /// for renderings: its usage is the image's attachment usage alone. Descriptors are
+    /// written without one. A view of some layers of an array, or of another format
+    /// (`reinterpret`), gets its own the first time it is asked for, kept until the image is
+    /// destroyed.
     pub fn view(&self) -> vk::ImageView {
         self.vk_view()
     }
@@ -65,6 +67,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
                 D::VIEW_TYPE,
                 self.mip_range,
                 self.layers,
+                self.usage.flags(),
             ),
             _ => self.view,
         }
@@ -119,8 +122,16 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     /// The layers of `mip_level` a copy or blit addresses: the view's, of one aspect, depth for
     /// a combined depth-stencil format.
     pub fn subresource_layers(&self, mip_level: u32) -> vk::ImageSubresourceLayers {
+        self.subresource_layers_of(mip_level, single_aspect(self.format.aspects()))
+    }
+
+    pub(crate) fn subresource_layers_of(
+        &self,
+        mip_level: u32,
+        aspect: vk::ImageAspectFlags,
+    ) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
-            aspect_mask: single_aspect(self.format.aspects()),
+            aspect_mask: aspect,
             mip_level,
             base_array_layer: self.layers.start,
             layer_count: self.layer_count(),
@@ -133,9 +144,11 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     /// The `extend` texels at the origin of mip `mip_range.start`.
     pub fn region(self, extend: D::Extent) -> ImageSlice<Self> {
         ImageSlice {
+            level: self.mip_range.start,
             view: self,
             offset: D::Offset::default(),
             extend,
+            stencil: false,
         }
     }
     pub fn format(&self) -> F {
@@ -180,8 +193,61 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             handle: self.handle,
             states: self.states,
             cache: self.cache,
+            mutable: self.mutable,
             format,
             usage,
+            dim: self.dim,
+        }
+    }
+
+    /// The same mips and layers as `F2`, a format of the image's compatibility class (sRGB
+    /// texels as UNORM ones for storage, `R32Uint` for atomics on `R32Sfloat`): for an image
+    /// whose usage has `MutableFormat`. It has no handle (bind it into reserved slots with
+    /// `bindless::bind`) and, for an attachment image, its own `VkImageView`, made on first
+    /// use. Panics for a format of another class (see `reinterpret_as`).
+    #[track_caller]
+    pub fn reinterpret<F2: StaticFormat>(self) -> ImageView<'a, F2, U, D>
+    where
+        U: IsMutableFormat,
+    {
+        self.reinterpret_as(F2::default())
+    }
+
+    /// [`Self::reinterpret`] for any format, `format::Dynamic` included. Panics unless the
+    /// image was created with `MutableFormat` (a `Dynamic` usage's image may not be) and
+    /// `format` is of its format's compatibility class: uncompressed colour formats of one
+    /// texel size share one, block-compressed formats one per block type, and depth or
+    /// stencil formats are alone in theirs.
+    #[track_caller]
+    pub fn reinterpret_as<F2: Format>(self, format: F2) -> ImageView<'a, F2, U, D>
+    where
+        U: IsMutableFormat,
+    {
+        let (from, to) = (self.format.vk_format(), format.vk_format());
+        assert!(
+            self.mutable,
+            "a view of {from:?} as {to:?} needs an image created with `MutableFormat` in its usage"
+        );
+        let class = |f: vk::Format, size: usize, aspects| format::class(f, size, aspects);
+        assert!(
+            class(from, self.format.texel_size(), self.format.aspects())
+                == class(to, format.texel_size(), format.aspects()),
+            "{from:?} and {to:?} are of different compatibility classes: a view reinterprets \
+             texels of one size, or blocks of one type"
+        );
+        let same = from == to;
+        ImageView {
+            image: self.image,
+            view: if same { self.view } else { vk::ImageView::null() },
+            mip_range: self.mip_range,
+            layers: self.layers,
+            extent: self.extent,
+            handle: if same { self.handle } else { ImageHandle::NULL },
+            states: self.states,
+            cache: self.cache,
+            mutable: self.mutable,
+            format,
+            usage: self.usage,
             dim: self.dim,
         }
     }
@@ -213,16 +279,17 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         }
     }
 
-    /// The `GENERAL` access of a transfer that touches only the first mip: just that mip where
+    /// The `GENERAL` access of a transfer that touches only mip `level`: just that mip where
     /// the image tracks its mips one by one, else all of the view's, which share one state.
-    pub(crate) fn first_mip_access(
+    pub(crate) fn mip_access(
         &self,
+        level: u32,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
     ) -> ImageUse<'a> {
         let mut first = self.access(stage, access);
         if self.states.len() > 1 {
-            first.access.mip_range.end = first.access.mip_range.start + 1;
+            first.access.mip_range = (level..level + 1).into();
         }
         first
     }
@@ -244,6 +311,7 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U, D2Array> {
             handle: ImageHandle::NULL,
             states: layers.states,
             cache: layers.cache,
+            mutable: layers.mutable,
             format: layers.format,
             usage: layers.usage,
             dim: D2,
@@ -275,12 +343,16 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U, D2Array> {
     }
 }
 
-/// A box of texels: `extend` texels at `offset` of the first mip of `view`, made by
-/// `view.whole()` or `view.region(extent)`.
+/// A box of texels: `extend` texels at `offset` of one mip of `view` (its first, unless
+/// [`Self::mip`] picked another), made by `view.whole()` or `view.region(extent)`.
 pub struct ImageSlice<R: ImageRef> {
     pub view: R,
     pub offset: <R::Dim as Dim>::Offset,
     pub extend: <R::Dim as Dim>::Extent,
+    /// The mip it lies in, one of the view's.
+    pub(crate) level: u32,
+    /// Copies to and from buffers move a combined depth-stencil format's stencil, not its depth.
+    pub(crate) stencil: bool,
 }
 
 impl<R: ImageRef> Clone for ImageSlice<R> {
@@ -289,6 +361,17 @@ impl<R: ImageRef> Clone for ImageSlice<R> {
     }
 }
 impl<R: ImageRef> Copy for ImageSlice<R> {}
+
+impl<R: ImageRef> std::fmt::Debug for ImageSlice<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageSlice")
+            .field("offset", &self.offset)
+            .field("extend", &self.extend)
+            .field("level", &self.level)
+            .field("stencil", &self.stencil)
+            .finish_non_exhaustive()
+    }
+}
 
 impl<R: ImageRef> ImageSlice<R> {
     pub fn offset(mut self, offset: <R::Dim as Dim>::Offset) -> Self {
@@ -301,6 +384,52 @@ impl<R: ImageRef> ImageSlice<R> {
         self
     }
 
+    /// The same offset with a box of `extend` texels.
+    pub fn with_extent(mut self, extend: <R::Dim as Dim>::Extent) -> Self {
+        self.extend = extend;
+        self
+    }
+
+    /// The mip it lies in.
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// All of mip `level` of its view's image, one of the view's mips: a transfer of one mip
+    /// of an image with one view for all of them (`Single`) needs no `MipChain`. Panics for a
+    /// mip the view doesn't show.
+    #[track_caller]
+    pub fn mip<'a>(self, level: u32) -> Self
+    where
+        R: 'a,
+    {
+        let view = ImageRef::view::<'a>(self.view);
+        let mips = view.mip_range;
+        assert!(
+            mips.start <= level && level < mips.end,
+            "mip {level} isn't one of the view's mips {mips:?}"
+        );
+        ImageSlice {
+            view: self.view,
+            offset: Default::default(),
+            extend: R::Dim::mip_extent(view.extent, level - mips.start),
+            level,
+            stencil: self.stencil,
+        }
+    }
+
+    /// The same box of a combined depth-stencil format's stencil aspect (or of a stencil
+    /// format), for copies to and from buffers, which move one aspect: its depth by default.
+    pub fn stencil(mut self) -> Self
+    where
+        R::Format: StencilAspect,
+    {
+        let view = ImageRef::view(self.view);
+        view.aspect_check(vk::ImageAspectFlags::STENCIL);
+        self.stencil = true;
+        self
+    }
+
     /// The same box, of an `ImageView`.
     pub fn resolve<'a>(self) -> ImageSlice<ImageView<'a, R::Format, R::Usage, R::Dim>>
     where
@@ -310,6 +439,8 @@ impl<R: ImageRef> ImageSlice<R> {
             view: self.view.view(),
             offset: self.offset,
             extend: self.extend,
+            level: self.level,
+            stencil: self.stencil,
         }
     }
 
@@ -326,7 +457,29 @@ impl<R: ImageRef> ImageSlice<R> {
             view: self.view.view().cast(format, usage),
             offset: self.offset,
             extend: self.extend,
+            level: self.level,
+            stencil: self.stencil,
         }
+    }
+}
+
+impl<F: Format, U: ImageUsage, D: Dim> ImageSlice<ImageView<'_, F, U, D>> {
+    /// The extent of the mip it lies in.
+    fn mip_extent(&self) -> D::Extent {
+        D::mip_extent(self.view.extent, self.level - self.view.mip_range.start)
+    }
+
+    /// The aspect copies to and from buffers move: the stencil if `stencil` picked it, else
+    /// the format's one aspect (depth for a combined depth-stencil format).
+    fn copy_aspect(&self) -> vk::ImageAspectFlags {
+        match self.stencil {
+            true => vk::ImageAspectFlags::STENCIL,
+            false => single_aspect(self.view.format.aspects()),
+        }
+    }
+
+    fn subresource(&self, aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceLayers {
+        self.view.subresource_layers_of(self.level, aspect)
     }
 }
 
@@ -362,15 +515,53 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 
 /// How a blit samples its source.
 #[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filter {
     Nearest = 0,
-    Liniear = 1,
+    /// Needs `SAMPLED_IMAGE_FILTER_LINEAR` of the source format, which integer formats never
+    /// have.
+    Linear = 1,
+}
+
+/// The buffer side of a copy between a buffer and an image: a slice with the layout of the
+/// texels in it. A `BufferSlice` converts into tightly packed rows; [`BufferSlice::rows`] sets
+/// a row length and image height (in texels) of its own.
+#[derive(Clone, Copy, Debug)]
+pub struct TexelBuffer<'a> {
+    pub(crate) slice: BufferSlice<'a, u8>,
+    pub(crate) row_length: u32,
+    pub(crate) image_height: u32,
+}
+
+impl<'a, T: Copy + Pod> From<BufferSlice<'a, T>> for TexelBuffer<'a> {
+    fn from(slice: BufferSlice<'a, T>) -> Self {
+        TexelBuffer {
+            slice: slice.bytes(),
+            row_length: 0,
+            image_height: 0,
+        }
+    }
+}
+
+impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
+    /// The slice as the buffer side of an image copy whose rows start `row_length` texels apart
+    /// and whose slices (and layers) `image_height` rows apart: a box of a larger image in the
+    /// buffer. 0 for either is the box's own width or height, as a plain slice has them;
+    /// otherwise at least that, and whole blocks of a block-compressed format.
+    pub fn rows(self, row_length: u32, image_height: u32) -> TexelBuffer<'a> {
+        TexelBuffer {
+            slice: self.bytes(),
+            row_length,
+            image_height,
+        }
+    }
 }
 
 impl<K: HasCompute> CommandBuffer<'_, K> {
-    /// Clears every mip and layer of the view `image` to `clear_color`.
+    /// Clears every mip and layer of the colour view `image` to `clear_color`. Panics for a
+    /// block-compressed format and one without `TRANSFER_DST` in its format features.
     #[validation_trace]
-    pub fn clear_image<T: TransferDstView>(
+    pub fn clear_image<T: TransferDstView<Format: ColorAspect>>(
         &mut self,
         image: T,
         clear_color: <T::Format as Format>::Texels,
@@ -378,6 +569,13 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         let image = image.view();
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        let format = image.format().vk_format();
+        assert!(
+            format::block(format).is_none(),
+            "{format:?} is block-compressed, and Vulkan clears no compressed images"
+        );
+        transfer_feature_check(format, vk::FormatFeatureFlags2::TRANSFER_DST, "cleared");
+        let value = vk::ClearValue::from(image.format().clear_value(clear_color));
         self.rec.flush_pending(
             std::iter::once(image.access(
                 vk::PipelineStageFlags2::TRANSFER,
@@ -390,7 +588,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
                 self.rec.handle,
                 image.image,
                 vk::ImageLayout::GENERAL,
-                &vk::ClearValue::from(image.format().clear_value(clear_color)).color,
+                &value.color,
                 &[image.subresource_range()],
             )
         };
@@ -398,9 +596,60 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
 }
 
 impl<K: HasGraphics> CommandBuffer<'_, K> {
-    /// Blits the box `src` into the box `dst`, scaling it to fit.
+    /// Clears every mip and layer of the depth or stencil view `image` to `value` (a depth in
+    /// 0 to 1, a stencil value, or both for a combined format), every aspect it has.
     #[validation_trace]
-    pub fn blit_image<S: TransferSrcView, T: TransferDstView<Dim = S::Dim>>(
+    pub fn clear_depth_stencil<T: TransferDstView<Format: DepthStencilAspect>>(
+        &mut self,
+        image: T,
+        value: <T::Format as Format>::Texels,
+    ) {
+        let image = image.view();
+        let aspects = image.format().aspects();
+        assert!(
+            aspects.intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL),
+            "an image of format {:?} has no depth or stencil aspect: clear it with `clear_image`",
+            image.format().vk_format()
+        );
+        image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        let format = image.format().vk_format();
+        transfer_feature_check(format, vk::FormatFeatureFlags2::TRANSFER_DST, "cleared");
+        let format::ClearValue::DepthStencil { depth, stencil } = image.format().clear_value(value)
+        else {
+            unreachable!("depth and stencil formats clear to depth and stencil values")
+        };
+        assert!(
+            (0.0..=1.0).contains(&depth),
+            "a depth clear value lies in 0 to 1, not {depth}"
+        );
+        self.rec.flush_pending(
+            std::iter::once(image.access(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            )),
+            std::iter::empty(),
+        );
+        unsafe {
+            Ctx::device().cmd_clear_depth_stencil_image(
+                self.rec.handle,
+                image.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearDepthStencilValue { depth, stencil },
+                &[image.subresource_range()],
+            )
+        };
+    }
+
+    /// Blits the box `src` into the box `dst` of colour formats, scaling it to fit. Panics
+    /// where the formats lack `BLIT_SRC`/`BLIT_DST`, for a linear filter of a format that
+    /// can't filter linearly (integer ones never do), formats of different numeric types
+    /// (integers blit only to integers of the same signedness), and boxes of one mip that
+    /// overlap.
+    #[validation_trace]
+    pub fn blit_image<
+        S: TransferSrcView<Format: ColorAspect>,
+        T: TransferDstView<Dim = S::Dim, Format: ColorAspect>,
+    >(
         &mut self,
         src: ImageSlice<S>,
         dst: ImageSlice<T>,
@@ -418,13 +667,44 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
             dst.view.layer_count(),
             "a blit's source and destination have as many layers"
         );
+        let (from, to) = (src.view.format().vk_format(), dst.view.format().vk_format());
+        let src_features = Ctx::format_features(from);
+        assert!(
+            src_features.contains(vk::FormatFeatureFlags2::BLIT_SRC),
+            "the device doesn't blit from {from:?} (BLIT_SRC)"
+        );
+        assert!(
+            Ctx::format_features(to).contains(vk::FormatFeatureFlags2::BLIT_DST),
+            "the device doesn't blit into {to:?} (BLIT_DST)"
+        );
+        let numeric = |f: vk::Format| format::info(f).map(|info| info.numeric);
+        let (src_numeric, dst_numeric) = (numeric(from), numeric(to));
+        if filter == Filter::Linear {
+            assert!(
+                !matches!(src_numeric, Some(Numeric::Uint | Numeric::Sint)),
+                "{from:?} is an integer format, which blits filter only by the nearest texel"
+            );
+            assert!(
+                src_features.contains(vk::FormatFeatureFlags2::SAMPLED_IMAGE_FILTER_LINEAR),
+                "the device doesn't filter {from:?} linearly (SAMPLED_IMAGE_FILTER_LINEAR): blit it with `Filter::Nearest`"
+            );
+        }
+        let integer = |n: Option<Numeric>| matches!(n, Some(Numeric::Uint | Numeric::Sint));
+        assert!(
+            src_numeric == dst_numeric || !integer(src_numeric) && !integer(dst_numeric),
+            "a blit from {from:?} into {to:?} mixes numeric types: integers blit only into \
+             integers of the same signedness"
+        );
+        check_overlap(&src, &dst, "blit");
         self.rec.flush_pending(
             [
-                src.view.first_mip_access(
+                src.view.mip_access(
+                    src.level,
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_READ,
                 ),
-                dst.view.first_mip_access(
+                dst.view.mip_access(
+                    dst.level,
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_WRITE,
                 ),
@@ -448,8 +728,8 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         let regions = [vk::ImageBlit {
             src_offsets: corners(src.offset, src.extend),
             dst_offsets: corners(dst.offset, dst.extend),
-            src_subresource: src.view.subresource_layers(src.view.mip_range.start),
-            dst_subresource: dst.view.subresource_layers(dst.view.mip_range.start),
+            src_subresource: src.subresource(vk::ImageAspectFlags::COLOR),
+            dst_subresource: dst.subresource(vk::ImageAspectFlags::COLOR),
         }];
         unsafe {
             Ctx::device().cmd_blit_image(
@@ -466,22 +746,103 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
 }
 
 impl<K: QueueKind> CommandBuffer<'_, K> {
-    /// Copies the tightly packed texels of `src` into the box `dst` of every layer of its view,
-    /// one layer after another.
+    /// Copies the box `src` into the box `dst` of the same extent, texel for texel
+    /// (`vkCmdCopyImage2`), between images of any dimension whose formats have the same texel
+    /// block (a depth or stencil format only into itself, every aspect), as many layers, and,
+    /// within one mip of one image, boxes that don't overlap. On a transfer family the boxes
+    /// keep its image granularity, and depth or stencil copies need graphics.
     #[validation_trace]
-    pub fn copy_buffer_to_image<T: Copy + Pod, I: TransferDstView>(
+    pub fn copy_image<S: TransferSrcView, T: TransferDstView<Dim = S::Dim>>(
         &mut self,
-        src: BufferSlice<'_, T>,
+        src: ImageSlice<S>,
+        dst: ImageSlice<T>,
+    ) {
+        let (src, dst) = (src.resolve(), dst.resolve());
+        src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
+        dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
+        check_box(&src, true, "source");
+        check_box(&dst, true, "destination");
+        let (from, to) = (src.view.format(), dst.view.format());
+        let (from_vk, to_vk) = (from.vk_format(), to.vk_format());
+        let colour = vk::ImageAspectFlags::COLOR;
+        let aspects = from.aspects();
+        if !aspects.contains(colour) || !to.aspects().contains(colour) {
+            assert!(
+                from_vk == to_vk,
+                "a depth or stencil image copies only into its own format, not {from_vk:?} into {to_vk:?}"
+            );
+        }
+        let (src_block, dst_block) = (copy_block_of(&from, aspects), copy_block_of(&to, to.aspects()));
+        assert!(
+            src_block == dst_block,
+            "{from_vk:?} ({src_block:?}) and {to_vk:?} ({dst_block:?}) have different texel blocks: \
+             image copies keep them"
+        );
+        assert!(
+            src.extend == dst.extend,
+            "an image copy's source box {:?} and destination box {:?} are of one extent",
+            src.extend,
+            dst.extend
+        );
+        assert_eq!(
+            src.view.layer_count(),
+            dst.view.layer_count(),
+            "an image copy's source and destination have as many layers"
+        );
+        transfer_feature_check(from_vk, vk::FormatFeatureFlags2::TRANSFER_SRC, "copied from");
+        transfer_feature_check(to_vk, vk::FormatFeatureFlags2::TRANSFER_DST, "copied into");
+        check_overlap(&src, &dst, "copy");
+        check_image_family(&self.rec.family, &src, false);
+        check_image_family(&self.rec.family, &dst, true);
+        self.rec.flush_pending(
+            [
+                src.view.mip_access(
+                    src.level,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                ),
+                dst.view.mip_access(
+                    dst.level,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                ),
+            ]
+            .into_iter(),
+            iter::empty(),
+        );
+        let regions = [vk::ImageCopy2::default()
+            .src_subresource(src.subresource(aspects))
+            .src_offset(S::Dim::offset_3d(src.offset))
+            .dst_subresource(dst.subresource(aspects))
+            .dst_offset(S::Dim::offset_3d(dst.offset))
+            .extent(S::Dim::extent_3d(src.extend))];
+        let info = vk::CopyImageInfo2::default()
+            .src_image(src.view.image)
+            .src_image_layout(vk::ImageLayout::GENERAL)
+            .dst_image(dst.view.image)
+            .dst_image_layout(vk::ImageLayout::GENERAL)
+            .regions(&regions);
+        unsafe { Ctx::device().cmd_copy_image2(self.rec.handle, &info) };
+    }
+
+    /// Copies the texels of `src` into the box `dst` of every layer of its view, one layer
+    /// after another: tightly packed from a `BufferSlice`, or with the row length and image
+    /// height of [`BufferSlice::rows`]. One aspect: a combined depth-stencil format's depth, or
+    /// its stencil with [`ImageSlice::stencil`]. The buffer's address is a multiple of the
+    /// texel block's size (4 for depth and stencil, and on a transfer family).
+    #[validation_trace]
+    pub fn copy_buffer_to_image<'b, I: TransferDstView>(
+        &mut self,
+        src: impl Into<TexelBuffer<'b>>,
         dst: ImageSlice<I>,
     ) {
+        let src = src.into();
         let dst = dst.resolve();
-        dst.view.aspect_check(vk::ImageAspectFlags::COLOR);
         dst.view.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-        check_box(&dst, true, "destination");
-        check_copy_size(&dst, src.size(), "source");
-        check_family(&self.rec.family, &dst, src.address(), true);
+        let region = buffer_image_region(&self.rec.family, &dst, src, true);
         self.rec.flush_pending(
-            iter::once(dst.view.first_mip_access(
+            iter::once(dst.view.mip_access(
+                dst.level,
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
             )),
@@ -489,16 +850,10 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 unordered: false,
                 access: vk::AccessFlags2::TRANSFER_READ,
                 stage: vk::PipelineStageFlags2::TRANSFER,
-                range: src.get_range(),
+                range: src.slice.get_range(),
             }),
         );
-        let regions = [vk::DeviceMemoryImageCopyKHR::default()
-            .address_range(src.address_range())
-            .address_flags(src.address_flags())
-            .image_subresource(dst.view.subresource_layers(dst.view.mip_range.start))
-            .image_layout(vk::ImageLayout::GENERAL)
-            .image_offset(I::Dim::offset_3d(dst.offset))
-            .image_extent(I::Dim::extent_3d(dst.extend))];
+        let regions = [region];
         unsafe {
             Functions::device_address_commands().cmd_copy_memory_to_image(
                 self.rec.handle,
@@ -509,8 +864,9 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         };
     }
 
-    /// Copies the texels of the box `src` of every layer of its view into `dst`, tightly packed,
-    /// one layer after another. It takes a slice, never a view:
+    /// Copies the texels of the box `src` of every layer of its view into `dst`, one layer
+    /// after another, tightly packed or with the rows of [`BufferSlice::rows`] (see
+    /// [`Self::copy_buffer_to_image`]). It takes a slice, never a view:
     /// ```compile_fail
     /// # use lava::{buffer::slice::BufferSlice, command_buffer::CommandBuffer, queue::Graphics};
     /// # use lava::image::{format::R8G8B8A8Unorm, slice::ImageView, usage::usage};
@@ -526,19 +882,18 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// }
     /// ```
     #[validation_trace]
-    pub fn copy_image_to_buffer<I: TransferSrcView, T: Copy + Pod>(
+    pub fn copy_image_to_buffer<'b, I: TransferSrcView>(
         &mut self,
         src: ImageSlice<I>,
-        dst: BufferSlice<'_, T>,
+        dst: impl Into<TexelBuffer<'b>>,
     ) {
+        let dst = dst.into();
         let src = src.resolve();
-        src.view.aspect_check(vk::ImageAspectFlags::COLOR);
         src.view.usage_check(vk::ImageUsageFlags::TRANSFER_SRC);
-        check_box(&src, true, "source");
-        check_copy_size(&src, dst.size(), "destination");
-        check_family(&self.rec.family, &src, dst.address(), false);
+        let region = buffer_image_region(&self.rec.family, &src, dst, false);
         self.rec.flush_pending(
-            iter::once(src.view.first_mip_access(
+            iter::once(src.view.mip_access(
+                src.level,
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
             )),
@@ -546,16 +901,10 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 unordered: false,
                 access: vk::AccessFlags2::TRANSFER_WRITE,
                 stage: vk::PipelineStageFlags2::TRANSFER,
-                range: dst.get_range(),
+                range: dst.slice.get_range(),
             }),
         );
-        let regions = [vk::DeviceMemoryImageCopyKHR::default()
-            .address_range(dst.address_range())
-            .address_flags(dst.address_flags())
-            .image_subresource(src.view.subresource_layers(src.view.mip_range.start))
-            .image_layout(vk::ImageLayout::GENERAL)
-            .image_offset(I::Dim::offset_3d(src.offset))
-            .image_extent(I::Dim::extent_3d(src.extend))];
+        let regions = [region];
         unsafe {
             Functions::device_address_commands().cmd_copy_image_to_memory(
                 self.rec.handle,
@@ -567,6 +916,116 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     }
 }
 
+/// Checks a copy between `slice` and `buffer` (the box, its blocks, the buffer's size, address
+/// and rows, the family's rules) and returns its region.
+#[track_caller]
+fn buffer_image_region<'s, F: Format, U: ImageUsage, D: Dim>(
+    family: &FamilyInfo,
+    slice: &ImageSlice<ImageView<'_, F, U, D>>,
+    buffer: TexelBuffer<'s>,
+    into_image: bool,
+) -> vk::DeviceMemoryImageCopyKHR<'s> {
+    let what = if into_image { "destination" } else { "source" };
+    let other = if into_image { "source" } else { "destination" };
+    check_box(slice, true, what);
+    let format = slice.view.format;
+    let aspect = slice.copy_aspect();
+    let block = copy_block_of(&format, aspect);
+    let vk_format = format.vk_format();
+    let rows = (buffer.row_length, buffer.image_height);
+    let extent = D::extent_3d(slice.extend);
+    check_rows(block, vk_format, extent, rows);
+    // With address commands neither the driver nor the validation layer checks the size.
+    let needed = rows_len(block, extent, slice.view.layer_count(), rows) as u64;
+    let bytes = buffer.slice.size();
+    assert!(
+        needed <= bytes,
+        "the {other} buffer has {bytes} bytes, the copy of {:?} texels of {vk_format:?} takes {needed}",
+        slice.extend
+    );
+    let address = buffer.slice.address();
+    let depth_stencil = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+    let align = match aspect.intersects(depth_stencil) {
+        true => 4,
+        false => block.bytes as u64,
+    };
+    assert!(
+        address % align == 0,
+        "copies of {vk_format:?} take buffer addresses that are multiples of {align} bytes, not {address:#x}"
+    );
+    if family.kind == Kind::Transfer {
+        assert!(
+            address % 4 == 0,
+            "a transfer family copies from and to 4-byte aligned buffer addresses, not {address:#x}"
+        );
+    }
+    check_image_family(family, slice, into_image);
+    vk::DeviceMemoryImageCopyKHR::default()
+        .address_range(buffer.slice.address_range())
+        .address_flags(buffer.slice.address_flags())
+        .address_row_length(buffer.row_length)
+        .address_image_height(buffer.image_height)
+        .image_subresource(slice.subresource(aspect))
+        .image_layout(vk::ImageLayout::GENERAL)
+        .image_offset(D::offset_3d(slice.offset))
+        .image_extent(extent)
+}
+
+/// The texel block copies of `aspect` of `format` move. Panics for a format lava knows no block
+/// of, whose copies it can't check.
+#[track_caller]
+pub(crate) fn copy_block_of<F: Format>(format: &F, aspect: vk::ImageAspectFlags) -> Block {
+    let vk_format = format.vk_format();
+    format::copy_block(vk_format, format.texel_size(), single_aspect(aspect)).unwrap_or_else(|| {
+        panic!("lava knows no texel block of {vk_format:?}, so it doesn't copy it")
+    })
+}
+
+/// Bytes a copy of `extent` texels of every one of `layers` takes in memory whose rows are
+/// `row_length` texels apart and slices `image_height` rows apart (0: the extent's), up to the
+/// last block's end.
+pub(crate) fn rows_len(
+    block: Block,
+    extent: vk::Extent3D,
+    layers: u32,
+    (row_length, image_height): (u32, u32),
+) -> usize {
+    let row_length = if row_length == 0 { extent.width } else { row_length };
+    let image_height = if image_height == 0 { extent.height } else { image_height };
+    let (w, h) = (block.width as usize, block.height as usize);
+    let row_blocks = (row_length as usize).div_ceil(w);
+    let slice_rows = (image_height as usize).div_ceil(h);
+    let (width_blocks, height_blocks) = ((extent.width as usize).div_ceil(w), (extent.height as usize).div_ceil(h));
+    let slices = extent.depth as usize * layers as usize;
+    if slices == 0 || height_blocks == 0 || width_blocks == 0 {
+        return 0;
+    }
+    let last_row = (slices - 1) * slice_rows + height_blocks - 1;
+    (last_row * row_blocks + width_blocks) * block.bytes as usize
+}
+
+/// Panics unless a row length and image height are 0 or hold the extent, in whole blocks.
+#[track_caller]
+fn check_rows(block: Block, format: vk::Format, extent: vk::Extent3D, (row_length, image_height): (u32, u32)) {
+    assert!(
+        row_length == 0 || row_length >= extent.width,
+        "rows of {row_length} texels are narrower than the box's {}",
+        extent.width
+    );
+    assert!(
+        image_height == 0 || image_height >= extent.height,
+        "slices of {image_height} rows are lower than the box's {}",
+        extent.height
+    );
+    assert!(
+        row_length % block.width == 0 && image_height % block.height == 0,
+        "rows of {row_length} texels and slices of {image_height} rows of {format:?} are whole \
+         {}x{} blocks",
+        block.width,
+        block.height
+    );
+}
+
 /// Panics unless the box lies inside its mip and, for a copy, has texels and covers whole blocks
 /// of a block-compressed format.
 #[track_caller]
@@ -576,7 +1035,8 @@ fn check_box<F: Format, U: ImageUsage, D: Dim>(
     what: &str,
 ) {
     let (offset, extent) = (D::offset_3d(slice.offset), D::extent_3d(slice.extend));
-    let mip = D::extent_3d(slice.view.extent);
+    let mip_extent = slice.mip_extent();
+    let mip = D::extent_3d(mip_extent);
     let axes = [
         (offset.x, extent.width, mip.width),
         (offset.y, extent.height, mip.height),
@@ -586,7 +1046,7 @@ fn check_box<F: Format, U: ImageUsage, D: Dim>(
     assert!(
         inside,
         "the {what} box of {:?} texels at {:?} lies outside its mip of {:?}",
-        slice.extend, slice.offset, slice.view.extent
+        slice.extend, slice.offset, mip_extent
     );
     if !copy {
         return;
@@ -596,50 +1056,80 @@ fn check_box<F: Format, U: ImageUsage, D: Dim>(
         "the {what} box of {:?} texels is empty",
         slice.extend
     );
-    if let Some((side, _)) = bc_block(slice.view.format.vk_format()) {
-        let whole = |&(o, e, m): &(i32, u32, u32)| {
-            o as u32 % side == 0 && (e % side == 0 || o as u32 + e == m)
-        };
-        assert!(
-            axes[..2].iter().all(whole),
-            "copies of {:?} cover whole {side}x{side} blocks (or reach the mip's edge), not \
-             {:?} texels at {:?} of a mip of {:?}",
-            slice.view.format.vk_format(),
-            slice.extend,
-            slice.offset,
-            slice.view.extent
-        );
-    }
+    let block = copy_block_of(&slice.view.format, slice.copy_aspect());
+    check_whole_blocks(block, slice.view.format.vk_format(), offset, extent, mip);
 }
 
-/// With address commands neither the driver nor the validation layer checks a copy's buffer size.
-fn check_copy_size<F: Format, U: ImageUsage, D: Dim>(
-    slice: &ImageSlice<ImageView<'_, F, U, D>>,
-    buffer_bytes: u64,
+/// Panics unless the box at `offset` starts on a block and covers whole blocks or reaches the
+/// mip's edge.
+#[track_caller]
+pub(crate) fn check_whole_blocks(
+    block: Block,
+    format: vk::Format,
+    offset: vk::Offset3D,
+    extent: vk::Extent3D,
+    mip: vk::Extent3D,
+) {
+    if block.is_texel() {
+        return;
+    }
+    let whole = |o: i32, e: u32, m: u32, side: u32| {
+        o as u32 % side == 0 && (e % side == 0 || o as u32 + e == m)
+    };
+    assert!(
+        whole(offset.x, extent.width, mip.width, block.width)
+            && whole(offset.y, extent.height, mip.height, block.height),
+        "copies of {format:?} cover whole {}x{} blocks (or reach the mip's edge), not \
+         {extent:?} texels at {offset:?} of a mip of {mip:?}",
+        block.width,
+        block.height
+    );
+}
+
+/// Panics unless the device's format features of `format` have `feature`.
+#[track_caller]
+fn transfer_feature_check(format: vk::Format, feature: vk::FormatFeatureFlags2, done: &str) {
+    assert!(
+        Ctx::format_features(format).contains(feature),
+        "images of {format:?} can't be {done} on this device ({feature:?})"
+    );
+}
+
+/// Panics when `src` and `dst` are boxes of one mip of one image that share texels of a layer.
+#[track_caller]
+fn check_overlap<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
+    src: &ImageSlice<ImageView<'_, F, U, D>>,
+    dst: &ImageSlice<ImageView<'_, F2, U2, D>>,
     what: &str,
 ) {
-    let format = slice.view.format;
-    let needed = expected_data_len(
-        D::extent_3d(slice.extend),
-        format.texel_size(),
-        bc_block(format.vk_format()),
-    );
-    // The box of every layer of the view, one after another.
-    if let Some(needed) = needed.map(|bytes| bytes * slice.view.layer_count() as usize) {
-        assert!(
-            needed as u64 <= buffer_bytes,
-            "the {what} buffer has {buffer_bytes} bytes, the copy of {:?} texels of {:?} takes {needed}",
-            slice.extend,
-            format.vk_format()
-        );
+    if src.view.image != dst.view.image || src.level != dst.level {
+        return;
     }
+    let (sl, dl) = (src.view.layers, dst.view.layers);
+    if sl.end <= dl.start || dl.end <= sl.start {
+        return;
+    }
+    let (so, se) = (D::offset_3d(src.offset), D::extent_3d(src.extend));
+    let (dof, de) = (D::offset_3d(dst.offset), D::extent_3d(dst.extend));
+    let apart = |a: i32, al: u32, b: i32, bl: u32| a as i64 + al as i64 <= b as i64 || b as i64 + bl as i64 <= a as i64;
+    let disjoint = apart(so.x, se.width, dof.x, de.width)
+        || apart(so.y, se.height, dof.y, de.height)
+        || apart(so.z, se.depth, dof.z, de.depth);
+    assert!(
+        disjoint,
+        "a {what} within one mip of one image takes boxes that don't overlap, not {:?} at {:?} \
+         and {:?} at {:?}",
+        src.extend, src.offset, dst.extend, dst.offset
+    );
 }
 
+/// Panics where the family can't copy the box: into depth or stencil images only on graphics,
+/// and on a transfer family only boxes of its image granularity (in blocks for a
+/// block-compressed format).
 #[track_caller]
-fn check_family<F: Format, U: ImageUsage, D: Dim>(
+fn check_image_family<F: Format, U: ImageUsage, D: Dim>(
     family: &FamilyInfo,
     slice: &ImageSlice<ImageView<'_, F, U, D>>,
-    address: u64,
     into_image: bool,
 ) {
     let depth_stencil = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
@@ -652,13 +1142,19 @@ fn check_family<F: Format, U: ImageUsage, D: Dim>(
     if family.kind != Kind::Transfer {
         return;
     }
-    assert!(
-        address % 4 == 0,
-        "a transfer family copies from and to 4-byte aligned buffer addresses, not {address:#x}"
-    );
     let (offset, extent) = (D::offset_3d(slice.offset), D::extent_3d(slice.extend));
-    let mip = D::extent_3d(slice.view.extent);
-    let granularity = family.image_granularity;
+    let mip = D::extent_3d(slice.mip_extent());
+    let block = format::block(slice.view.format.vk_format()).unwrap_or(Block {
+        width: 1,
+        height: 1,
+        bytes: 0,
+    });
+    let g = family.image_granularity;
+    let granularity = vk::Extent3D {
+        width: g.width * block.width,
+        height: g.height * block.height,
+        depth: g.depth,
+    };
     let axes = [
         (granularity.width, offset.x, extent.width, mip.width),
         (granularity.height, offset.y, extent.height, mip.height),
@@ -672,7 +1168,7 @@ fn check_family<F: Format, U: ImageUsage, D: Dim>(
     });
     assert!(
         fits,
-        "a transfer family copies boxes of its image granularity {granularity:?}, not \
-         {extent:?} at {offset:?} of a mip of {mip:?}"
+        "a transfer family copies boxes of its image granularity {granularity:?} (in texels), \
+         not {extent:?} at {offset:?} of a mip of {mip:?}"
     );
 }

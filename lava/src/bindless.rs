@@ -1,4 +1,4 @@
-//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, freed with their images) or in ranges the application reserves (`reserve`, rewritten in submission order by `bind`), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap
+//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, freed with their images) or in ranges the application reserves (`reserve`, rewritten in submission order by `bind`, as a fitted image's slots are by `rebind`), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
@@ -35,6 +35,9 @@ pub struct Bindless {
     free: Mutex<Ranges>,
     /// The live slot ranges of `reserve`, which `bind` writes.
     reserved: Mutex<Vec<Range<u32>>>,
+    /// The slots of images `Image::fit` recreated, whose rewrites are queued like `bind`'s
+    /// until the image is dropped.
+    rebound: Mutex<Vec<Range<u32>>>,
     free_samplers: Mutex<Ranges>,
     resource_heap: HeapBuffer,
     sampler_heap: HeapBuffer,
@@ -238,6 +241,39 @@ pub(crate) fn free_handle(handle: ImageHandle) {
     if let Some(slots) = handle.slots() {
         free(slots);
     }
+}
+
+/// Writes `image`'s descriptors into the slots of `handle`, which an image `Image::fit`
+/// replaced had, in submission order like [`bind`]'s: frames in flight read the old image's.
+pub(crate) fn rebind(image: ShaderImage, handle: ImageHandle) -> Result<()> {
+    let Some(slots) = handle.slots() else {
+        return Ok(());
+    };
+    {
+        let mut rebound = lock(&Bindless::get().rebound);
+        if !rebound.contains(&slots) {
+            rebound.push(slots);
+        }
+    }
+    bind_raw([image], [handle], true)
+}
+
+/// Discards the queued rewrites of a dropped image's slots, which nothing reads any more and
+/// which would overwrite the slots' next owner.
+pub(crate) fn forget_handle(handle: ImageHandle) {
+    let Some(slots) = handle.slots() else { return };
+    let bindless = Bindless::get();
+    {
+        let mut rebound = lock(&bindless.rebound);
+        if let Some(i) = rebound.iter().position(|r| *r == slots) {
+            rebound.swap_remove(i);
+        } else {
+            return;
+        }
+    }
+    let layout = &bindless.images;
+    let bytes = layout.offset(slots.start)..layout.offset(slots.end);
+    lock(&bindless.queued).retain(|offset, _| !bytes.contains(offset));
 }
 
 /// Image slots the application writes with [`bind`], made by [`reserve`]: `len` handles of kind
@@ -825,10 +861,24 @@ pub(crate) fn bind_raw(
     if targets.is_empty() {
         return Ok(());
     }
+    // Each descriptor's view shows only its own usage: a `MutableFormat` image may have usages
+    // its view's format lacks (storage of an sRGB image through a UNORM view).
+    let mut usages: SmallVec<[_; 8]> = targets
+        .iter()
+        .map(|&(_, ty, _)| {
+            let usage = match ty {
+                vk::DescriptorType::SAMPLED_IMAGE => vk::ImageUsageFlags::SAMPLED,
+                _ => vk::ImageUsageFlags::STORAGE,
+            };
+            vk::ImageViewUsageCreateInfo::default().usage(usage)
+        })
+        .collect();
     let views: SmallVec<[_; 8]> = targets
         .iter()
-        .map(|(image, ..)| {
+        .zip(usages.iter_mut())
+        .map(|((image, ..), usage)| {
             vk::ImageViewCreateInfo::default()
+                .push_next(usage)
                 .image(image.image)
                 .view_type(image.view_type)
                 .format(image.format)
@@ -917,6 +967,7 @@ impl Bindless {
         BINDLESS.set(Self {
                 free: Mutex::new(Ranges::all(images.count)),
                 reserved: Default::default(),
+                rebound: Default::default(),
                 free_samplers: Mutex::new(Ranges::all(samplers.count)),
                 images,
                 samplers,
@@ -996,13 +1047,14 @@ impl Bindless {
     }
 
     /// Queues descriptors again whose submission never reached the GPU, unless `bind` queued a
-    /// newer one for their slot meanwhile or their reservation was dropped.
+    /// newer one for their slot meanwhile or their reservation (or fitted image) was dropped.
     pub(crate) fn requeue(queued: Queued) {
         let s = Self::get();
         let reserved = lock(&s.reserved);
+        let rebound = lock(&s.rebound);
         let live = |offset: u64| {
             let slot = (offset / s.images.stride) as u32;
-            reserved.iter().any(|range| range.contains(&slot))
+            (reserved.iter().chain(rebound.iter())).any(|range| range.contains(&slot))
         };
         let mut queue = lock(&s.queued);
         for (offset, descriptor) in queued.into_iter().filter(|&(offset, _)| live(offset)) {

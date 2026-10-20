@@ -1,4 +1,4 @@
-//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones, checked against GPU writes still in flight; the staging rings and uploaders (`staging`); casts, and their destruction once no frame can reach them
+//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones, checked against GPU writes still in flight; the staging rings and uploaders (`staging`); casts, and their destruction once no frame can reach them (`retire_buffer`, which sparse and external buffers share)
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -75,21 +75,27 @@ pub struct Buffer<T: Copy + Pod, M: Memory = Gpu> {
 impl<T: Copy + Pod, M: Memory> Drop for Buffer<T, M> {
     fn drop(&mut self) {
         let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
-        let range = self.address..self.address + self.num_bytes;
-        staging::forget_buffer(range.clone());
-        lifetime::retire(move || {
-            for index in INDICES.iter() {
-                let pending = &mut lock(&index.state).pending;
-                let outside = |access: &BufferAccess| !range.contains(&access.range.start);
-                pending.buffer_reads.retain(|read| outside(&read.read));
-                pending.buffer_writes.retain(|write| outside(&write.write));
-            }
-            unsafe { Ctx::device().destroy_buffer(handle, None) };
-            if let Err(err) = Ctx::allocator().free(allocation) {
-                tracing::error!(%err, "failed to free buffer allocation");
-            }
-        });
+        retire_buffer(handle, self.address..self.address + self.num_bytes, allocation);
     }
+}
+
+/// Forgets the uploads into a dropped buffer's addresses `range` and, once no submission
+/// reaches it, its pending accesses, the buffer and its allocation (null for sparse and
+/// external buffers, whose memory their owners free after).
+pub(crate) fn retire_buffer(handle: vk::Buffer, range: std::ops::Range<u64>, allocation: Allocation) {
+    staging::forget_buffer(range.clone());
+    lifetime::retire(move || {
+        for index in INDICES.iter() {
+            let pending = &mut lock(&index.state).pending;
+            let outside = |access: &BufferAccess| !range.contains(&access.range.start);
+            pending.buffer_reads.retain(|read| outside(&read.read));
+            pending.buffer_writes.retain(|write| outside(&write.write));
+        }
+        unsafe { Ctx::device().destroy_buffer(handle, None) };
+        if let Err(err) = Ctx::allocator().free(allocation) {
+            tracing::error!(%err, "failed to free buffer allocation");
+        }
+    });
 }
 
 impl<'a, T: Copy + Pod, M: Memory> Into<BufferSlice<'a, T>> for &'a Buffer<T, M> {
@@ -106,6 +112,23 @@ impl<T: Copy + Pod> Buffer<T, Gpu> {
     #[validation_trace]
     pub fn new(len: usize) -> Result<Self> {
         Self::with_memory(Gpu, len)
+    }
+}
+
+impl<T: Copy + Pod> Buffer<T, Gpu> {
+    /// A buffer whose memory its owner bound and frees after it (external memory), with a null
+    /// allocation.
+    #[cfg(all(feature = "external-memory", unix))]
+    pub(crate) fn from_external(handle: vk::Buffer, address: u64, num_bytes: u64, live: Live) -> Self {
+        Buffer {
+            handle,
+            address,
+            num_bytes,
+            allocation: Allocation::default(),
+            memory: Gpu,
+            _type_marker: PhantomData,
+            live,
+        }
     }
 }
 

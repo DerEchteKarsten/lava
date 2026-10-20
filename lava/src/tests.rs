@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads, topology classes and render areas
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, texel blocks, copy sizes with row pitches, 64-bit clear values and format compatibility classes, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads, topology classes and render areas
 use std::{
     iter,
     sync::atomic::AtomicU64,
@@ -15,7 +15,11 @@ use crate::{
         pending::{MAX_PENDING_BUFFER_WRITES, PendingAccesses},
     },
     features::{DeviceFacts, FeatureChain, Features},
-    image::usage::{ImageUsage, StaticUsage, Usage, usage},
+    image::{
+        format::{self, Block, ClearValue, Format},
+        slice::rows_len,
+        usage::{ImageUsage, StaticUsage, Usage, usage},
+    },
     queue::{FamilyInfo, Kind},
     vkobjects::physical_device::{QueueFamily, pick_queue_families},
 };
@@ -363,7 +367,13 @@ fn usages_are_their_flags_in_any_order() {
     use vk::ImageUsageFlags as U;
     fn same<T>(_: T, _: T) {}
     same(<usage![TransferDst, Sampled]>::default(), <usage![Sampled, TransferDst]>::default());
-    same(<usage![Storage]>::default(), Usage::<false, false, false, true, false, false, false>);
+    same(<usage![Storage]>::default(), Usage::<false, false, false, true, false, false, false, false>);
+    assert!(<usage![Storage]>::default().create_flags().is_empty());
+    assert_eq!(
+        <usage![Storage, Sampled, MutableFormat]>::default().create_flags(),
+        vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE
+    );
+    assert_eq!(<usage![Storage, MutableFormat]>::VK, U::STORAGE, "no usage flag of its own");
     assert_eq!(<usage![TransferDst, Sampled]>::VK, U::SAMPLED | U::TRANSFER_DST);
     assert_eq!(
         <usage![ColorAttachment, Storage, TransferSrc, TransferDst]>::default().flags(),
@@ -483,6 +493,7 @@ fn enabled_features_read_back_as_supported() {
         strict_lines: true,
         dedicated_compute: true,
         dedicated_transfer: true,
+        sparse_queue: true,
     };
     assert_eq!(enabling(&all).optional(&|_| true, facts), all);
 }
@@ -734,4 +745,114 @@ fn topology_classes_and_render_areas() {
     let area = Rect::from(glam::UVec2::new(4, 8));
     assert_eq!(area, Rect::new(glam::IVec2::ZERO, glam::UVec2::new(4, 8)));
     assert_eq!(area.vk().extent.height, 8);
+}
+
+#[test]
+fn compressed_formats_have_their_blocks() {
+    use vk::Format as F;
+    let block = |w, h, bytes| Some(Block { width: w, height: h, bytes });
+    assert_eq!(format::block(F::BC1_RGB_SRGB_BLOCK), block(4, 4, 8));
+    assert_eq!(format::block(F::BC7_UNORM_BLOCK), block(4, 4, 16));
+    assert_eq!(format::block(F::ETC2_R8G8B8_UNORM_BLOCK), block(4, 4, 8));
+    assert_eq!(format::block(F::ETC2_R8G8B8A1_SRGB_BLOCK), block(4, 4, 8));
+    assert_eq!(format::block(F::ETC2_R8G8B8A8_UNORM_BLOCK), block(4, 4, 16));
+    assert_eq!(format::block(F::EAC_R11_SNORM_BLOCK), block(4, 4, 8));
+    assert_eq!(format::block(F::EAC_R11G11_UNORM_BLOCK), block(4, 4, 16));
+    assert_eq!(format::block(F::ASTC_5X4_UNORM_BLOCK), block(5, 4, 16));
+    assert_eq!(format::block(F::ASTC_12X10_SRGB_BLOCK), block(12, 10, 16));
+    assert_eq!(format::block(F::R8G8B8A8_UNORM), None);
+    // Every compressed format lava has a type for has a block and a feature.
+    for raw in 131..=184 {
+        let format = F::from_raw(raw);
+        assert!(format::block(format).is_some(), "{format:?}");
+        assert!(format::compression(format).is_some(), "{format:?}");
+    }
+    assert_eq!(format::compression(F::ASTC_4X4_SRGB_BLOCK), Some("astc-compression"));
+    assert_eq!(format::compression(F::EAC_R11G11_SNORM_BLOCK), Some("etc2-compression"));
+    // Copies move one aspect: a combined format's depth or stencil alone.
+    let aspect = |a| format::copy_block(F::D32_SFLOAT_S8_UINT, 5, a).unwrap().bytes;
+    assert_eq!(aspect(vk::ImageAspectFlags::DEPTH), 4);
+    assert_eq!(aspect(vk::ImageAspectFlags::STENCIL), 1);
+    assert_eq!(format::copy_block(F::R8G8B8_UNORM, 3, vk::ImageAspectFlags::COLOR).unwrap().bytes, 3);
+    assert_eq!(format::copy_block(F::UNDEFINED, 0, vk::ImageAspectFlags::COLOR), None);
+}
+
+#[test]
+fn copy_sizes_count_whole_blocks_and_rows() {
+    let extent = |w, h, d| vk::Extent3D { width: w, height: h, depth: d };
+    let texel = Block { width: 1, height: 1, bytes: 4 };
+    let bc = Block { width: 4, height: 4, bytes: 16 };
+    assert_eq!(rows_len(texel, extent(3, 2, 1), 1, (0, 0)), 3 * 2 * 4);
+    assert_eq!(rows_len(texel, extent(3, 2, 1), 2, (0, 0)), 2 * 3 * 2 * 4, "layers one after another");
+    // Rows 8 texels apart: the last row ends after its 3 texels.
+    assert_eq!(rows_len(texel, extent(3, 2, 1), 1, (8, 0)), (8 + 3) * 4);
+    // Slices 4 rows apart, two of them.
+    assert_eq!(rows_len(texel, extent(3, 2, 2), 1, (8, 4)), ((4 + 1) * 8 + 3) * 4);
+    // A 6x6 box of 4x4 blocks takes 2x2 blocks; a mip narrower than its block takes one.
+    assert_eq!(rows_len(bc, extent(6, 6, 1), 1, (0, 0)), 4 * 16);
+    assert_eq!(rows_len(bc, extent(2, 2, 1), 1, (0, 0)), 16);
+    assert_eq!(rows_len(bc, extent(4, 4, 1), 1, (16, 0)), 16, "one row of blocks");
+    let astc = Block { width: 5, height: 4, bytes: 16 };
+    assert_eq!(rows_len(astc, extent(10, 8, 1), 1, (0, 0)), 2 * 2 * 16);
+}
+
+#[test]
+fn clear_values_pack_64_bit_components_into_two_words() {
+    use crate::image::format::{R64G64Sint, R64G64Uint, R64Sfloat, R64Uint, R64G64B64A64Uint};
+    assert_eq!(
+        R64Uint.clear_value([0x1_0000_0002]),
+        ClearValue::Uint([2, 1, 0, 0])
+    );
+    assert_eq!(
+        R64G64Uint.clear_value([u64::MAX, 5]),
+        ClearValue::Uint([u32::MAX, u32::MAX, 5, 0])
+    );
+    assert_eq!(R64G64Sint.clear_value([-1, 2]), ClearValue::Sint([-1, -1, 2, 0]));
+    let ClearValue::Float(words) = R64Sfloat.clear_value([1.5]) else { panic!() };
+    let bits = words.map(f32::to_bits);
+    assert_eq!((bits[1] as u64) << 32 | bits[0] as u64, 1.5f64.to_bits());
+    assert_eq!(R64G64B64A64Uint.clear_value([1, 2, 0, 0]), ClearValue::Uint([1, 0, 2, 0]));
+    let third = std::panic::catch_unwind(|| R64G64B64A64Uint.clear_value([1, 2, 3, 0]));
+    assert!(third.is_err(), "a clear value holds two 64-bit components");
+}
+
+#[test]
+fn reinterpreting_views_keep_the_compatibility_class() {
+    use crate::image::format::*;
+    fn class<F: Format>(f: F) -> format::Class {
+        format::class(f.vk_format(), f.texel_size(), f.aspects())
+    }
+    assert_eq!(class(R8G8B8A8Srgb), class(R8G8B8A8Unorm));
+    assert_eq!(class(R32Uint), class(R32Sfloat));
+    assert_eq!(class(B10G11R11UfloatPack32), class(R8G8B8A8Uint));
+    assert_eq!(class(E5B9G9R9UfloatPack32), class(R32Sfloat));
+    assert_ne!(class(R16G16Sfloat), class(R16Sfloat));
+    assert_ne!(class(A8Unorm), class(R8Unorm), "8-bit alpha is a class of its own");
+    assert_ne!(class(D32Sfloat), class(R32Sfloat));
+    assert_ne!(class(D24UnormS8Uint), class(X8D24UnormPack32));
+    #[cfg(feature = "bc-compression")]
+    {
+        assert_eq!(class(BC7UnormBlock), class(BC7SrgbBlock));
+        assert_eq!(class(BC4UnormBlock), class(BC4SnormBlock));
+        assert_ne!(class(BC1RgbUnormBlock), class(BC1RgbaUnormBlock));
+        assert_ne!(class(BC7UnormBlock), class(R32G32B32A32Uint), "no block-texel views");
+    }
+}
+
+#[test]
+fn formats_count_their_components() {
+    use crate::image::format::*;
+    fn texels<F: HasTexels<T>, T>(_: F) {}
+    texels::<_, [f32; 3]>(E5B9G9R9UfloatPack32);
+    texels::<_, [f32; 4]>(A8Unorm);
+    texels::<_, [f32; 4]>(A4R4G4B4UnormPack16);
+    texels::<_, [f32; 4]>(A1B5G5R5UnormPack16);
+    for format in [
+        vk::Format::A4R4G4B4_UNORM_PACK16,
+        vk::Format::A4B4G4R4_UNORM_PACK16,
+        vk::Format::A8_UNORM_KHR,
+        vk::Format::A1B5G5R5_UNORM_PACK16_KHR,
+    ] {
+        assert!(format::info(format).is_some(), "{format:?} has a type");
+    }
 }

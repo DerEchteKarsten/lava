@@ -1,4 +1,4 @@
-//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (queued bindless rewrites first; with `submit_profiled` inside a hardware counter query, and `capture` once per counter pass), with the snapshot of their submitted buffer writes that host access checks; values no submission signals (a dropped timeline's stamp, a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
+//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (queued bindless rewrites first, after the last sparse binding; with `submit_profiled` inside a hardware counter query, and `capture` once per counter pass) and sparse bindings (`submit_sparse`, ordered with them by the semaphore), with the snapshot of their submitted buffer writes that host access checks; values no submission signals (a dropped timeline's stamp, a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
 use std::{
     fmt,
     marker::PhantomData,
@@ -220,6 +220,10 @@ struct Inner {
     begun: u64,
     /// Its staging ring; none on `rebar` devices or with a size of 0.
     staging: Option<Arc<Staging>>,
+    /// The value of its last sparse binding, which the next submission waits for: binds aren't
+    /// ordered with command buffers even on one queue, and a later value mustn't be signalled
+    /// first.
+    sparse_wait: u64,
     /// Last, so it counts the timeline until its drop finished.
     _live: Live,
 }
@@ -381,6 +385,7 @@ impl<K: QueueKind> Timeline<K> {
                 slots,
                 begun: 0,
                 staging,
+                sparse_wait: 0,
                 _live: live,
             },
             _kind: PhantomData,
@@ -404,6 +409,33 @@ impl<K: QueueKind> Timeline<K> {
     /// what is dropped after it lives until that submission finished.
     pub fn reserve(&self) {
         INDICES[self.inner.index].stamp.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Submits a sparse binding through `bind` on the timeline's queue, after every earlier
+    /// submission of the timeline (its wait, the timeline's last value) and signalling its
+    /// next value, which the next submission waits for. `bind` gets the queue, the wait (none
+    /// before the first submission) and the signal.
+    #[cfg(feature = "sparse-binding")]
+    pub(crate) fn submit_sparse(
+        &mut self,
+        bind: impl FnOnce(vk::Queue, Option<(vk::Semaphore, u64)>, (vk::Semaphore, u64)) -> Result<()>,
+    ) -> Result<Wait> {
+        let inner = &mut self.inner;
+        let i = inner.index;
+        let index = &INDICES[i];
+        let mut state = lock(&index.state);
+        index.stamp.fetch_max(state.submitted + 1, Ordering::SeqCst);
+        let value = index.stamp.load(Ordering::SeqCst);
+        let wait = (state.submitted > 0).then_some((semaphore(i), state.submitted));
+        let queue = &inner.family.queues[inner.queue];
+        bind(*lock(queue), wait, (semaphore(i), value))?;
+        state.submitted = value;
+        inner.sparse_wait = value;
+        Ok(Wait {
+            timeline: i as u8,
+            value,
+            stage: Default::default(),
+        })
     }
 
     /// Waits until the next frame slot's last submission finished and destroys what that frees.
@@ -552,11 +584,16 @@ impl<K: QueueKind> Submission<'_, K> {
             .collect();
         let presents: SmallVec<[_; 1]> = rec.presents.iter().map(|p| p.present).collect();
         let queue = &inner.family.queues[inner.queue];
+        // After the timeline's last sparse binding, which nothing else orders it after.
+        let sparse_wait = std::mem::take(&mut inner.sparse_wait);
+        let own_wait = (sparse_wait > completed(i))
+            .then_some((semaphore(i), sparse_wait, vk::PipelineStageFlags2::ALL_COMMANDS));
         // The counter pass of a profiled recording; a replay records no queries.
         let submit = |cmd: vk::CommandBuffer, pass: Option<u32>| -> Result<()> {
             let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let waits: SmallVec<[_; 4]> = (self.waits.iter())
                 .map(|&(t, value, stages)| (semaphore(t), value, stages))
+                .chain(own_wait)
                 .chain(binary_waits.iter().map(|&(s, stages)| (s, 0, stages)))
                 .map(|(semaphore, value, stages)| {
                     vk::SemaphoreSubmitInfo::default()

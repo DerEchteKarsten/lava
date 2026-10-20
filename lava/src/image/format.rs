@@ -1,4 +1,4 @@
-//! Image formats: one marker type per Vulkan format with its aspects and clear-value texels, and `Dynamic`, whose format is only known at runtime
+//! Image formats: one marker type per Vulkan format with its aspects, clear-value texels (64-bit components as two words) and numeric type, `Dynamic`, whose format is only known at runtime, the texel blocks of every format (compressed ones' from `block`), and the compatibility classes reinterpreting views keep
 use std::{
     any::{TypeId, type_name},
     mem::{Discriminant, discriminant},
@@ -13,7 +13,7 @@ pub trait Format: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fm
 
     fn vk_format(&self) -> vk::Format;
     fn aspects(&self) -> vk::ImageAspectFlags;
-    /// Bytes per texel in host memory, 0 for block-compressed formats.
+    /// Bytes per texel in host memory, 0 for block-compressed formats (see [`block`]).
     fn texel_size(&self) -> usize;
     fn clear_value(&self, value: Self::Texels) -> ClearValue;
     /// Panics unless the format has the `required` aspects; a static format's does nothing.
@@ -31,8 +31,12 @@ pub trait HasTexels<T>: Format {}
 pub trait ColorAspect: crate::sealed::Sealed {}
 pub trait DepthAspect: crate::sealed::Sealed {}
 pub trait StencilAspect: crate::sealed::Sealed {}
+/// Formats with a depth or a stencil aspect, or both: what `clear_depth_stencil` clears.
+pub trait DepthStencilAspect: crate::sealed::Sealed {}
 
-/// The value an attachment or image is cleared to, padded to 4 components.
+/// The value an attachment or image is cleared to, padded to 4 components. A 64-bit format's
+/// components take two words each, the low one first, so two of them fill it (`R64G64Uint`
+/// clears to `Uint([r_low, r_high, g_low, g_high])`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClearValue {
     Float([f32; 4]),
@@ -68,19 +72,11 @@ pub struct Dynamic(pub vk::Format);
 impl Dynamic {
     /// Whether lava has a format type for it (else its checks panic).
     pub(crate) fn known(self) -> bool {
-        #[cfg(feature = "bc-compression")]
-        if bc_info(self.0).is_some() {
-            return true;
-        }
-        plain_info(self.0).is_some()
+        info(self.0).is_some()
     }
 
     fn info(self) -> Info {
-        #[cfg(feature = "bc-compression")]
-        if let Some(info) = bc_info(self.0) {
-            return info;
-        }
-        plain_info(self.0).unwrap_or_else(|| panic!("lava has no format type for {:?}", self.0))
+        info(self.0).unwrap_or_else(|| panic!("lava has no format type for {:?}", self.0))
     }
 }
 
@@ -127,27 +123,96 @@ impl<T> HasTexels<T> for Dynamic {}
 impl ColorAspect for Dynamic {}
 impl DepthAspect for Dynamic {}
 impl StencilAspect for Dynamic {}
+impl DepthStencilAspect for Dynamic {}
 
-/// What `Dynamic` takes from the static format of its `vk::Format`.
-struct Info {
-    aspects: vk::ImageAspectFlags,
-    texel_size: usize,
+/// The numeric type of a format's texels, which blits keep: floats (normalised, scaled, sRGB
+/// and float formats), unsigned or signed integers, or depth and stencil.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Numeric {
+    Float,
+    Uint,
+    Sint,
+    DepthStencil,
+}
+
+/// What lava knows of a format it has a type for (`Dynamic` takes it from its static format).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Info {
+    pub(crate) aspects: vk::ImageAspectFlags,
+    pub(crate) texel_size: usize,
     /// Of the texels shaders read (`HasTexels`).
     texels: TypeId,
     clear: Discriminant<ClearValue>,
+    pub(crate) numeric: Numeric,
 }
 
-/// Side length in texels and size in bytes of the blocks of a BC format, `None` for every
-/// other format.
-pub fn bc_block(format: vk::Format) -> Option<(u32, usize)> {
+/// What lava knows of `format`, `None` for a format it has no type for (or whose cargo feature
+/// it was compiled without).
+pub(crate) fn info(format: vk::Format) -> Option<Info> {
+    #[cfg(feature = "bc-compression")]
+    if let Some(info) = bc_info(format) {
+        return Some(info);
+    }
+    #[cfg(feature = "etc2-compression")]
+    if let Some(info) = etc2_info(format) {
+        return Some(info);
+    }
+    #[cfg(feature = "astc-compression")]
+    if let Some(info) = astc_info(format) {
+        return Some(info);
+    }
+    plain_info(format)
+}
+
+/// A texel block: `width` by `height` texels in `bytes` (1 by 1 and the texel's size for an
+/// uncompressed format).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u32,
+}
+
+impl Block {
+    const fn new(width: u32, height: u32, bytes: u32) -> Self {
+        Block {
+            width,
+            height,
+            bytes,
+        }
+    }
+
+    /// Whether it is a single texel.
+    pub fn is_texel(&self) -> bool {
+        self.width == 1 && self.height == 1
+    }
+
+    /// Bytes of `extent` texels in tightly packed blocks (a partial block counts whole).
+    pub fn data_len(&self, extent: vk::Extent3D) -> usize {
+        extent.width.div_ceil(self.width) as usize
+            * extent.height.div_ceil(self.height) as usize
+            * extent.depth as usize
+            * self.bytes as usize
+    }
+}
+
+/// The block of a block-compressed format (BC, ETC2, EAC and ASTC), `None` for every other.
+pub fn block(format: vk::Format) -> Option<Block> {
     use vk::Format as F;
+    let astc = |w, h| Some(Block::new(w, h, 16));
     match format {
         F::BC1_RGB_UNORM_BLOCK
         | F::BC1_RGB_SRGB_BLOCK
         | F::BC1_RGBA_UNORM_BLOCK
         | F::BC1_RGBA_SRGB_BLOCK
         | F::BC4_UNORM_BLOCK
-        | F::BC4_SNORM_BLOCK => Some((4, 8)),
+        | F::BC4_SNORM_BLOCK
+        | F::ETC2_R8G8B8_UNORM_BLOCK
+        | F::ETC2_R8G8B8_SRGB_BLOCK
+        | F::ETC2_R8G8B8A1_UNORM_BLOCK
+        | F::ETC2_R8G8B8A1_SRGB_BLOCK
+        | F::EAC_R11_UNORM_BLOCK
+        | F::EAC_R11_SNORM_BLOCK => Some(Block::new(4, 4, 8)),
         F::BC2_UNORM_BLOCK
         | F::BC2_SRGB_BLOCK
         | F::BC3_UNORM_BLOCK
@@ -157,9 +222,112 @@ pub fn bc_block(format: vk::Format) -> Option<(u32, usize)> {
         | F::BC6H_UFLOAT_BLOCK
         | F::BC6H_SFLOAT_BLOCK
         | F::BC7_UNORM_BLOCK
-        | F::BC7_SRGB_BLOCK => Some((4, 16)),
+        | F::BC7_SRGB_BLOCK
+        | F::ETC2_R8G8B8A8_UNORM_BLOCK
+        | F::ETC2_R8G8B8A8_SRGB_BLOCK
+        | F::EAC_R11G11_UNORM_BLOCK
+        | F::EAC_R11G11_SNORM_BLOCK => Some(Block::new(4, 4, 16)),
+        F::ASTC_4X4_UNORM_BLOCK | F::ASTC_4X4_SRGB_BLOCK => astc(4, 4),
+        F::ASTC_5X4_UNORM_BLOCK | F::ASTC_5X4_SRGB_BLOCK => astc(5, 4),
+        F::ASTC_5X5_UNORM_BLOCK | F::ASTC_5X5_SRGB_BLOCK => astc(5, 5),
+        F::ASTC_6X5_UNORM_BLOCK | F::ASTC_6X5_SRGB_BLOCK => astc(6, 5),
+        F::ASTC_6X6_UNORM_BLOCK | F::ASTC_6X6_SRGB_BLOCK => astc(6, 6),
+        F::ASTC_8X5_UNORM_BLOCK | F::ASTC_8X5_SRGB_BLOCK => astc(8, 5),
+        F::ASTC_8X6_UNORM_BLOCK | F::ASTC_8X6_SRGB_BLOCK => astc(8, 6),
+        F::ASTC_8X8_UNORM_BLOCK | F::ASTC_8X8_SRGB_BLOCK => astc(8, 8),
+        F::ASTC_10X5_UNORM_BLOCK | F::ASTC_10X5_SRGB_BLOCK => astc(10, 5),
+        F::ASTC_10X6_UNORM_BLOCK | F::ASTC_10X6_SRGB_BLOCK => astc(10, 6),
+        F::ASTC_10X8_UNORM_BLOCK | F::ASTC_10X8_SRGB_BLOCK => astc(10, 8),
+        F::ASTC_10X10_UNORM_BLOCK | F::ASTC_10X10_SRGB_BLOCK => astc(10, 10),
+        F::ASTC_12X10_UNORM_BLOCK | F::ASTC_12X10_SRGB_BLOCK => astc(12, 10),
+        F::ASTC_12X12_UNORM_BLOCK | F::ASTC_12X12_SRGB_BLOCK => astc(12, 12),
         _ => None,
     }
+}
+
+/// The cargo feature images of a block-compressed format need: `bc-compression`,
+/// `etc2-compression` (ETC2 and EAC) or `astc-compression` (ASTC LDR).
+pub(crate) fn compression(format: vk::Format) -> Option<&'static str> {
+    let raw = format.as_raw();
+    match raw {
+        131..=146 => Some("bc-compression"),
+        147..=156 => Some("etc2-compression"),
+        157..=184 => Some("astc-compression"),
+        _ => None,
+    }
+}
+
+/// The block a copy of `aspect` of `format` moves: its compressed block, the texel of the
+/// aspect (a combined depth-stencil format's depth or stencil alone), or the texel; `None`
+/// where lava knows neither.
+pub(crate) fn copy_block(
+    format: vk::Format,
+    texel_size: usize,
+    aspect: vk::ImageAspectFlags,
+) -> Option<Block> {
+    use vk::Format as F;
+    if let Some(block) = block(format) {
+        return Some(block);
+    }
+    let bytes = if aspect == vk::ImageAspectFlags::STENCIL {
+        1
+    } else if aspect == vk::ImageAspectFlags::DEPTH {
+        match format {
+            F::D16_UNORM | F::D16_UNORM_S8_UINT => 2,
+            F::X8_D24_UNORM_PACK32
+            | F::D24_UNORM_S8_UINT
+            | F::D32_SFLOAT
+            | F::D32_SFLOAT_S8_UINT => 4,
+            _ => texel_size as u32,
+        }
+    } else {
+        texel_size as u32
+    };
+    (bytes != 0).then_some(Block::new(1, 1, bytes))
+}
+
+/// A format's compatibility class: views of an image created with `MutableFormat` take formats
+/// of its own class. Uncompressed colour formats share one class per texel size (sRGB with
+/// UNORM, `R32Uint` with `R32Sfloat`), except `A8Unorm`'s; a compressed format shares its class
+/// only with the formats of its block type (sRGB or signed siblings); depth and stencil formats
+/// are alone in theirs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Class {
+    Bits(u32),
+    Alpha8,
+    Compressed(vk::Format),
+    Own(vk::Format),
+}
+
+pub(crate) fn class(format: vk::Format, texel_size: usize, aspects: vk::ImageAspectFlags) -> Class {
+    if block(format).is_some() {
+        // Each block type's two formats are neighbours: unorm with sRGB or snorm, ufloat
+        // with sfloat (BC1_RGB_UNORM_BLOCK = 131 to ASTC_12X12_SRGB_BLOCK = 184).
+        let raw = format.as_raw();
+        return Class::Compressed(vk::Format::from_raw(raw - (raw - 131) % 2));
+    }
+    if format == vk::Format::A8_UNORM_KHR {
+        return Class::Alpha8;
+    }
+    if !aspects.contains(vk::ImageAspectFlags::COLOR) {
+        return Class::Own(format);
+    }
+    Class::Bits(texel_size as u32 * 8)
+}
+
+/// Two words per 64-bit component, the low one first: a `VkClearColorValue` holds two. Panics
+/// for a third or fourth component that isn't 0, which it can't hold.
+pub(crate) fn pack_64(components: &[u64]) -> [u32; 4] {
+    assert!(
+        components.iter().skip(2).all(|&c| c == 0),
+        "a clear value holds two 64-bit components: {components:?} has more"
+    );
+    let mut words = [0; 4];
+    for (i, &c) in components.iter().take(2).enumerate() {
+        words[2 * i] = c as u32;
+        words[2 * i + 1] = (c >> 32) as u32;
+    }
+    words
 }
 
 fn pad<T: Copy + Default, const N: usize>(value: [T; N]) -> [T; 4] {
@@ -194,16 +362,24 @@ macro_rules! formats {
     };
     (@aspects $color:ident) => { vk::ImageAspectFlags::COLOR };
 
+    (@numeric float) => { Numeric::Float };
+    (@numeric float64) => { Numeric::Float };
+    (@numeric uint) => { Numeric::Uint };
+    (@numeric uint64) => { Numeric::Uint };
+    (@numeric sint) => { Numeric::Sint };
+    (@numeric sint64) => { Numeric::Sint };
+    (@numeric $depth_or_stencil:ident) => { Numeric::DepthStencil };
+
     (@clear float $v:expr) => { ClearValue::Float(pad($v)) };
     (@clear uint $v:expr) => { ClearValue::Uint(pad($v)) };
     (@clear sint $v:expr) => { ClearValue::Sint(pad($v)) };
-    // Clear values have 32 bits per component.
-    (@clear float64 $v:expr) => { ClearValue::Float(pad($v.map(|c| c as f32))) };
-    (@clear uint64 $v:expr) => {
-        ClearValue::Uint(pad($v.map(|c| u32::try_from(c).expect("a clear value fits 32 bits"))))
+    // Two words per 64-bit component (`pack_64`).
+    (@clear float64 $v:expr) => {
+        ClearValue::Float(pack_64(&$v.map(f64::to_bits)).map(f32::from_bits))
     };
+    (@clear uint64 $v:expr) => { ClearValue::Uint(pack_64(&$v)) };
     (@clear sint64 $v:expr) => {
-        ClearValue::Sint(pad($v.map(|c| i32::try_from(c).expect("a clear value fits 32 bits"))))
+        ClearValue::Sint(pack_64(&$v.map(|c: i64| c as u64)).map(|w| w as i32))
     };
     (@clear depth $v:expr) => { ClearValue::DepthStencil { depth: $v[0], stencil: 0 } };
     (@clear stencil $v:expr) => {
@@ -215,13 +391,16 @@ macro_rules! formats {
 
     (@traits $name:ident depth) => {
         impl DepthAspect for $name {}
+        impl DepthStencilAspect for $name {}
     };
     (@traits $name:ident stencil) => {
         impl StencilAspect for $name {}
+        impl DepthStencilAspect for $name {}
     };
     (@traits $name:ident depth_stencil) => {
         impl DepthAspect for $name {}
         impl StencilAspect for $name {}
+        impl DepthStencilAspect for $name {}
     };
     (@traits $name:ident $color:ident) => {
         impl ColorAspect for $name {}
@@ -263,6 +442,7 @@ macro_rules! formats {
                     texel_size: $size,
                     texels: TypeId::of::<formats!(@shader_texels $kind $($n)?)>(),
                     clear: discriminant(&formats!(@clear $kind Texels::<$name>::default())),
+                    numeric: formats!(@numeric $kind),
                 }),)*
                 _ => None,
             }
@@ -280,6 +460,11 @@ formats! {
     R5G5B5A1UnormPack16 => (R5G5B5A1_UNORM_PACK16, 2, float, 4),
     B5G5R5A1UnormPack16 => (B5G5R5A1_UNORM_PACK16, 2, float, 4),
     A1R5G5B5UnormPack16 => (A1R5G5B5_UNORM_PACK16, 2, float, 4),
+    A1B5G5R5UnormPack16 => (A1B5G5R5_UNORM_PACK16_KHR, 2, float, 4),
+    A4R4G4B4UnormPack16 => (A4R4G4B4_UNORM_PACK16, 2, float, 4),
+    A4B4G4R4UnormPack16 => (A4B4G4R4_UNORM_PACK16, 2, float, 4),
+    // Alpha alone: shaders read (0, 0, 0, a), and clears take the alpha as the fourth component.
+    A8Unorm => (A8_UNORM_KHR, 1, float, 4),
     R8Unorm => (R8_UNORM, 1, float, 1),
     R8Snorm => (R8_SNORM, 1, float, 1),
     R8Uscaled => (R8_USCALED, 1, float, 1),
@@ -352,45 +537,7 @@ formats! {
     R64G64B64Sfloat => (R64G64B64_SFLOAT, 24, float64, 3),
     R64G64B64A64Sfloat => (R64G64B64A64_SFLOAT, 32, float64, 4),
     B10G11R11UfloatPack32 => (B10G11R11_UFLOAT_PACK32, 4, float, 3),
-    E5B9G9R9UfloatPack32 => (E5B9G9R9_UFLOAT_PACK32, 4, float, 4),
-    ETC2R8G8B8UnormBlock => (ETC2_R8G8B8_UNORM_BLOCK, 0, float, 3),
-    ETC2R8G8B8SrgbBlock => (ETC2_R8G8B8_SRGB_BLOCK, 0, float, 3),
-    ETC2R8G8B8A1UnormBlock => (ETC2_R8G8B8A1_UNORM_BLOCK, 0, float, 4),
-    ETC2R8G8B8A1SrgbBlock => (ETC2_R8G8B8A1_SRGB_BLOCK, 0, float, 4),
-    ETC2R8G8B8A8UnormBlock => (ETC2_R8G8B8A8_UNORM_BLOCK, 0, float, 4),
-    ETC2R8G8B8A8SrgbBlock => (ETC2_R8G8B8A8_SRGB_BLOCK, 0, float, 4),
-    EACR11UnormBlock => (EAC_R11_UNORM_BLOCK, 0, float, 1),
-    EACR11SnormBlock => (EAC_R11_SNORM_BLOCK, 0, float, 1),
-    EACR11G11UnormBlock => (EAC_R11G11_UNORM_BLOCK, 0, float, 2),
-    EACR11G11SnormBlock => (EAC_R11G11_SNORM_BLOCK, 0, float, 2),
-    ASTC4X4UnormBlock => (ASTC_4X4_UNORM_BLOCK, 0, float, 4),
-    ASTC4X4SrgbBlock => (ASTC_4X4_SRGB_BLOCK, 0, float, 4),
-    ASTC5X4UnormBlock => (ASTC_5X4_UNORM_BLOCK, 0, float, 4),
-    ASTC5X4SrgbBlock => (ASTC_5X4_SRGB_BLOCK, 0, float, 4),
-    ASTC5X5UnormBlock => (ASTC_5X5_UNORM_BLOCK, 0, float, 4),
-    ASTC5X5SrgbBlock => (ASTC_5X5_SRGB_BLOCK, 0, float, 4),
-    ASTC6X5UnormBlock => (ASTC_6X5_UNORM_BLOCK, 0, float, 4),
-    ASTC6X5SrgbBlock => (ASTC_6X5_SRGB_BLOCK, 0, float, 4),
-    ASTC6X6UnormBlock => (ASTC_6X6_UNORM_BLOCK, 0, float, 4),
-    ASTC6X6SrgbBlock => (ASTC_6X6_SRGB_BLOCK, 0, float, 4),
-    ASTC8X5UnormBlock => (ASTC_8X5_UNORM_BLOCK, 0, float, 4),
-    ASTC8X5SrgbBlock => (ASTC_8X5_SRGB_BLOCK, 0, float, 4),
-    ASTC8X6UnormBlock => (ASTC_8X6_UNORM_BLOCK, 0, float, 4),
-    ASTC8X6SrgbBlock => (ASTC_8X6_SRGB_BLOCK, 0, float, 4),
-    ASTC8X8UnormBlock => (ASTC_8X8_UNORM_BLOCK, 0, float, 4),
-    ASTC8X8SrgbBlock => (ASTC_8X8_SRGB_BLOCK, 0, float, 4),
-    ASTC10X5UnormBlock => (ASTC_10X5_UNORM_BLOCK, 0, float, 4),
-    ASTC10X5SrgbBlock => (ASTC_10X5_SRGB_BLOCK, 0, float, 4),
-    ASTC10X6UnormBlock => (ASTC_10X6_UNORM_BLOCK, 0, float, 4),
-    ASTC10X6SrgbBlock => (ASTC_10X6_SRGB_BLOCK, 0, float, 4),
-    ASTC10X8UnormBlock => (ASTC_10X8_UNORM_BLOCK, 0, float, 4),
-    ASTC10X8SrgbBlock => (ASTC_10X8_SRGB_BLOCK, 0, float, 4),
-    ASTC10X10UnormBlock => (ASTC_10X10_UNORM_BLOCK, 0, float, 4),
-    ASTC10X10SrgbBlock => (ASTC_10X10_SRGB_BLOCK, 0, float, 4),
-    ASTC12X10UnormBlock => (ASTC_12X10_UNORM_BLOCK, 0, float, 4),
-    ASTC12X10SrgbBlock => (ASTC_12X10_SRGB_BLOCK, 0, float, 4),
-    ASTC12X12UnormBlock => (ASTC_12X12_UNORM_BLOCK, 0, float, 4),
-    ASTC12X12SrgbBlock => (ASTC_12X12_SRGB_BLOCK, 0, float, 4),
+    E5B9G9R9UfloatPack32 => (E5B9G9R9_UFLOAT_PACK32, 4, float, 3),
     R8Uint => (R8_UINT, 1, uint, 1),
     R8G8Uint => (R8G8_UINT, 2, uint, 2),
     R8G8B8Uint => (R8G8B8_UINT, 3, uint, 3),
@@ -461,4 +608,52 @@ formats! {
     BC6HSfloatBlock => (BC6H_SFLOAT_BLOCK, 0, float, 3),
     BC7UnormBlock => (BC7_UNORM_BLOCK, 0, float, 4),
     BC7SrgbBlock => (BC7_SRGB_BLOCK, 0, float, 4),
+}
+
+#[cfg(feature = "etc2-compression")]
+formats! {
+    etc2_info;
+    ETC2R8G8B8UnormBlock => (ETC2_R8G8B8_UNORM_BLOCK, 0, float, 3),
+    ETC2R8G8B8SrgbBlock => (ETC2_R8G8B8_SRGB_BLOCK, 0, float, 3),
+    ETC2R8G8B8A1UnormBlock => (ETC2_R8G8B8A1_UNORM_BLOCK, 0, float, 4),
+    ETC2R8G8B8A1SrgbBlock => (ETC2_R8G8B8A1_SRGB_BLOCK, 0, float, 4),
+    ETC2R8G8B8A8UnormBlock => (ETC2_R8G8B8A8_UNORM_BLOCK, 0, float, 4),
+    ETC2R8G8B8A8SrgbBlock => (ETC2_R8G8B8A8_SRGB_BLOCK, 0, float, 4),
+    EACR11UnormBlock => (EAC_R11_UNORM_BLOCK, 0, float, 1),
+    EACR11SnormBlock => (EAC_R11_SNORM_BLOCK, 0, float, 1),
+    EACR11G11UnormBlock => (EAC_R11G11_UNORM_BLOCK, 0, float, 2),
+    EACR11G11SnormBlock => (EAC_R11G11_SNORM_BLOCK, 0, float, 2),
+}
+
+#[cfg(feature = "astc-compression")]
+formats! {
+    astc_info;
+    ASTC4X4UnormBlock => (ASTC_4X4_UNORM_BLOCK, 0, float, 4),
+    ASTC4X4SrgbBlock => (ASTC_4X4_SRGB_BLOCK, 0, float, 4),
+    ASTC5X4UnormBlock => (ASTC_5X4_UNORM_BLOCK, 0, float, 4),
+    ASTC5X4SrgbBlock => (ASTC_5X4_SRGB_BLOCK, 0, float, 4),
+    ASTC5X5UnormBlock => (ASTC_5X5_UNORM_BLOCK, 0, float, 4),
+    ASTC5X5SrgbBlock => (ASTC_5X5_SRGB_BLOCK, 0, float, 4),
+    ASTC6X5UnormBlock => (ASTC_6X5_UNORM_BLOCK, 0, float, 4),
+    ASTC6X5SrgbBlock => (ASTC_6X5_SRGB_BLOCK, 0, float, 4),
+    ASTC6X6UnormBlock => (ASTC_6X6_UNORM_BLOCK, 0, float, 4),
+    ASTC6X6SrgbBlock => (ASTC_6X6_SRGB_BLOCK, 0, float, 4),
+    ASTC8X5UnormBlock => (ASTC_8X5_UNORM_BLOCK, 0, float, 4),
+    ASTC8X5SrgbBlock => (ASTC_8X5_SRGB_BLOCK, 0, float, 4),
+    ASTC8X6UnormBlock => (ASTC_8X6_UNORM_BLOCK, 0, float, 4),
+    ASTC8X6SrgbBlock => (ASTC_8X6_SRGB_BLOCK, 0, float, 4),
+    ASTC8X8UnormBlock => (ASTC_8X8_UNORM_BLOCK, 0, float, 4),
+    ASTC8X8SrgbBlock => (ASTC_8X8_SRGB_BLOCK, 0, float, 4),
+    ASTC10X5UnormBlock => (ASTC_10X5_UNORM_BLOCK, 0, float, 4),
+    ASTC10X5SrgbBlock => (ASTC_10X5_SRGB_BLOCK, 0, float, 4),
+    ASTC10X6UnormBlock => (ASTC_10X6_UNORM_BLOCK, 0, float, 4),
+    ASTC10X6SrgbBlock => (ASTC_10X6_SRGB_BLOCK, 0, float, 4),
+    ASTC10X8UnormBlock => (ASTC_10X8_UNORM_BLOCK, 0, float, 4),
+    ASTC10X8SrgbBlock => (ASTC_10X8_SRGB_BLOCK, 0, float, 4),
+    ASTC10X10UnormBlock => (ASTC_10X10_UNORM_BLOCK, 0, float, 4),
+    ASTC10X10SrgbBlock => (ASTC_10X10_SRGB_BLOCK, 0, float, 4),
+    ASTC12X10UnormBlock => (ASTC_12X10_UNORM_BLOCK, 0, float, 4),
+    ASTC12X10SrgbBlock => (ASTC_12X10_SRGB_BLOCK, 0, float, 4),
+    ASTC12X12UnormBlock => (ASTC_12X12_UNORM_BLOCK, 0, float, 4),
+    ASTC12X12SrgbBlock => (ASTC_12X12_SRGB_BLOCK, 0, float, 4),
 }

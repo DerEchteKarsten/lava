@@ -85,6 +85,10 @@ pub mod pipeline;
 pub mod present;
 pub mod query;
 pub mod queue;
+#[cfg(feature = "sparse-binding")]
+pub mod sparse;
+#[cfg(all(feature = "external-memory", unix))]
+pub mod external;
 pub mod state;
 mod unsized_struct;
 #[cfg(test)]

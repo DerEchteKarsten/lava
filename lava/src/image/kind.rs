@@ -70,19 +70,16 @@ impl<F: Format + StencilAspect, U: IsDepthAttachment, D: Dim2D> StencilTarget
 {
 }
 
-/// A colour view a blit or a copy to a buffer reads, through an `ImageSlice` of it.
-pub trait TransferSrcView: ImageRef<Format: ColorAspect, Usage: IsTransferSrc> {}
-impl<F: Format + ColorAspect, U: IsTransferSrc, D: Dim> TransferSrcView
-    for ImageView<'_, F, U, D>
-{
-}
+/// A view that copies to buffers and images read through an `ImageSlice` of it, and blits too
+/// if its format is a colour one (`Format: ColorAspect`).
+pub trait TransferSrcView: ImageRef<Usage: IsTransferSrc> {}
+impl<F: Format, U: IsTransferSrc, D: Dim> TransferSrcView for ImageView<'_, F, U, D> {}
 
-/// A colour view a clear, or through an `ImageSlice` a blit or a copy from a buffer, writes.
-pub trait TransferDstView: ImageRef<Format: ColorAspect, Usage: IsTransferDst> {}
-impl<F: Format + ColorAspect, U: IsTransferDst, D: Dim> TransferDstView
-    for ImageView<'_, F, U, D>
-{
-}
+/// A view that clears write (`clear_image` a colour one, `clear_depth_stencil` a depth or
+/// stencil one), and through an `ImageSlice` copies from buffers and images, and blits into a
+/// colour one.
+pub trait TransferDstView: ImageRef<Usage: IsTransferDst> {}
+impl<F: Format, U: IsTransferDst, D: Dim> TransferDstView for ImageView<'_, F, U, D> {}
 
 /// An image that can be bound with a sampled descriptor. Shaders see one aspect: depth for a combined
 /// depth-stencil format.

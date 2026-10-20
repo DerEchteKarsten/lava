@@ -31,7 +31,6 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 ----intended----
 - `PassKind` and the `kind::*` markers stay compiled whatever the features: they describe the pass map. A pass map whose SPIR-V needs a compiled-out feature fails at `init`, and its generated bindings don't compile.
 - `line-stipple` is one feature for every line mode the device has (default lines need `strictLines` and stippled rectangular lines), so a device with stippled Bresenham but not stippled smooth lines has no stippling at all.
-- The ETC2 and EAC format markers have no feature: lava never enables `textureCompressionETC2`, so images of them fail in the driver.
 - With `assert-present-fences`, `assert-hdr-metadata` or `assert-fifo-latest-ready` but no display, `Ctx::features()` has the feature false while the code assumes it; nothing presents headless, so nothing reads it.
 - The engine-facing `Gated` setters of `RasterState` check the capability whatever the value (`polygon_mode(FILL)` needs `fill-mode-non-solid` too).
 - Baked draw state can make many pipelines per pass on devices without the dynamic state (the 16-pipeline warning then names the pass); `dynamic-*` without `assert-` keeps that possible.
@@ -45,9 +44,17 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - A rendering has one depth-stencil image: `stencil_attachment` replaces a `depth_attachment` and the other way round (Vulkan wants the same view for both), so a separate depth image and `S8Uint` image can't be attached together; a combined format attaches both through `depth_attachment`.
 - `BufferAccess::unordered` is the application's word: lava doesn't check that unordered draws' writes commute.
 - Multiview renderings of mesh passes panic on devices without `multiviewMeshShader` (the Arc B390, Mesa 26.2, has none), so they are untested here.
-- Blending checks the attachment format's `COLOR_ATTACHMENT_BLEND` through `Ctx::format_features`, a cache of each format's optimal-tiling features filled on first use (a mutex lock per check, once per rendering whose draws blend).
+- Blending checks the attachment format's `COLOR_ATTACHMENT_BLEND` through `Ctx::format_features`, a cache of each format's features filled on first use (a mutex lock per check, once per rendering whose draws blend; blits, clears and image copies take one or two per command too).
 - Recording bench, 2026-10-21 (`taskset -c 2`, two runs alternating with the commit before): `many_draws` about 2% slower (243 vs 236 µs), `mesh` about 10% (35.6 vs 32.2 µs for 32 launches in 8 renderings, some 100 ns a draw), `compute` and `declared` within noise. Suspects: `RasterState::check` per `Draw` constructor, the larger `DrawCommand`, and the per-draw viewport and scissor comparisons; not profiled.
 - The topology class is baked only without `dynamicPrimitiveTopologyUnrestricted` on an enabled `VK_EXT_extended_dynamic_state3` (every `dynamic-*` feature off, as `gpu_missing_features` has it); the Arc B390 has the property.
+
+## lava: images, formats and transfers (2026-10-21)
+----intended----
+- `MutableFormat` images are created without a `VkImageFormatListCreateInfo` (lava doesn't know their view formats up front), so drivers may give up compression for them (Intel's CCS); give the flag only to images that need other formats. A reinterpreting view has no handle of its own, and a `Dynamic` usage never creates a `MutableFormat` image (an erased one keeps its flags).
+- `Uploader::image` refuses formats whose texel block doesn't divide the ring's 16-byte alignment (3, 6, 12, 24 and 32-byte texels): their copies need addresses that are multiples of the block. Upload those through `copy_buffer_to_image` from a buffer of your own, or with host copies.
+- `Image::fit` keeps the image's own `bind_*` slots, not the slots it was bound into with `bindless::bind` (bind the new image there too), and drops its debug name. The new descriptors reach the heap with the next graphics or compute submission, like `bind`'s.
+- Sparse resources: binds go through graphics timelines only (`Timeline<Graphics>::bind_sparse`), wait only for their own timeline (another timeline's work using the resources waits for the returned `Wait`), and allocate one gpu-allocator allocation per page or tile (64 KiB on Intel). Sparse images are colour, one layer, `Single` views; sparse buffers always have residency (no binding-only buffers). Reads of what isn't resident are undefined unless the device has `residencyNonResidentStrict`; lava doesn't check that accesses stay on resident pages.
+- External memory: Unix file descriptors only (no Win32 handles), dedicated allocations from the first device-local type of the resource's requirements (an importer in another process gets the same type only for the same description on the same driver), dma-bufs for buffers only (no DRM format modifiers for images). An imported image is a new `VkImage` that starts undefined: lava records no layout handoff or `QUEUE_FAMILY_EXTERNAL` ownership transfer, so contents shared between images aren't defined; buffers share contents.
 
 ## lava: descriptor heaps (`VK_EXT_descriptor_heap`, required since 2026-10-19)
 ----find solutions----
@@ -98,8 +105,7 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 ## lava: bugs from the second survey (2026-10-18)
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
-- Safe code reaches undefined behaviour: tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 27-37).
-- 64-bit clear values are packed as 32-bit (43).
+- Safe code reaches undefined behaviour: tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; empty indirect slices (SURVEY 28-37).
 - The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `ImageHandle` (87, 88).
 
 ## Performance

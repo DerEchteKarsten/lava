@@ -19,13 +19,6 @@ compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
 5. **Raster and draws:** dynamic rendering local read (skipped 2026-10-21, see section 5:
    input attachments don't fit lava's descriptor heaps and Slang yet).
-6. **Images and formats:** 27 (block sizes for BC, ETC2, EAC and ASTC; the compression features
-   gated and enabled), 43 (64-bit clear components as two words), 53 (a format-property cache;
-   blit, clear, address, granularity and host block checks; `with_params` asks the device), 54
-   (attachment usages with `HostCopy` don't compile; states commit only on success), 57, 58,
-   format reinterpretation views, image-to-image copies, depth and stencil clears and copies, row
-   pitch, `ImageSlice::mip(level)` on `Single` images, sparse residency, external memory,
-   `Image::fit`, `UnifiedBinding` deleted.
 7. **Buffers and acceleration structures:** 28-30 (full shapes, `built` applied when the
    recording reaches the GPU, a cheap built flag for traces), 34, 36, 37, 47, 48, 59, 4.16 (all
    of part 1 and 2: scratch type and `build_all`, compactor, arena placement,
@@ -57,10 +50,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 ## 2. Bugs
 
 ### Undefined behaviour from safe code (2026-10-18)
-27. **Host copies of ASTC and ETC2 images skip every size check** (`format.rs:357-394`). The
-    formats have no block info, so `expected_data_len` is `None`, and `copy_from(&[0u8; 1], 0)`
-    makes the driver read past the data. lava never enables `textureCompressionASTC_LDR` either
-    (STATE has the ETC2 half). Give them block sizes or drop the markers.
 28. **Tracing never checks that the TLAS was built** (`acceleration_structure.rs:352-354`,
     `mod.rs:1477`, generated `Accel` bindings): a fresh `Tlas::new` traced reads uninitialised
     memory. Update, compaction and queries check `built`; an `AtomicBool` makes this cheap.
@@ -83,32 +72,12 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     Internal; make it a method of the builder so the lifetime is its own.
 
 ### Vulkan valid usage (2026-10-18)
-43. **64-bit clear values are packed as 32-bit** (`format.rs:198-204`). Vulkan reads a 64-bit
-    component from two array elements, so `R64Sfloat` clears to garbage, `R64G64Uint [a, b]` puts
-    both into the first component, and values above 32 bits panic.
 47. **Empty work reaches the driver.** `build(&[])`, `update(&[])` and `query_compacted_sizes(&[], ..)`
     pass a count of 0 (`acceleration_structure.rs:754-945`); an empty `fill_buffer`, copy region or
     region list does too (`buffer/slice.rs:185-295`, *plausible* for the address variants). Return
     early.
 48. **Overlapping copy regions pass** *(plausible)* (`buffer/slice.rs:253-288`), and `src.len()`
     truncates a range that isn't a whole number of elements.
-53. **Image commands miss format checks.**
-    - `blit_image` (`image/slice.rs:308-367`) doesn't check `BLIT_SRC`/`BLIT_DST`, linear
-      filtering support, integer formats with linear filtering, mixed signedness, or overlap.
-    - `clear_image` accepts block-compressed formats (`:277-302`).
-    - Buffer addresses aren't checked against the texel block size outside transfer families
-      *(plausible)* (`:373-469`).
-    - `minImageTransferGranularity` is in blocks for compressed formats *(plausible)* (`:561-572`).
-    - `copy_region_from` doesn't check BC block alignment (`image/mod.rs:665-681`).
-    - `with_params` never asks `vkGetPhysicalDeviceImageFormatProperties2`
-      (`image/mod.rs:378-411`): `R8G8B8A8Srgb` storage, 3D BC or depth images and host copies of
-      formats without `HOST_IMAGE_TRANSFER` compile and are invalid.
-54. **A host layout transition starts from the tracked layout** *(plausible)* (`image/mod.rs:740`):
-    `ATTACHMENT_OPTIMAL` may not be in `pCopySrcLayouts`, and the states move before
-    `transition_image_layout` can fail.
-57. **`E5B9G9R9UfloatPack32` has 4 components** (`format.rs:356`), so a `Tex2D<float3>` refuses it.
-58. **`Dynamic::info` panics for formats outside the table** (`format.rs:77`): A4R4G4B4, A8 and
-    A1B5G5R5 are missing, and `PresentSurface::new`'s fallback could pick one *(plausible)*.
 59. **Acceleration structure limits aren't checked** (`acceleration_structure.rs:335-349`):
     `maxGeometryCount`, `maxPrimitiveCount`, `maxInstanceCount`.
 63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`.
@@ -198,15 +167,13 @@ imports, 4.22's padding, release builds without validation, and all of section 9
    `first`, UI buffers per slot, and the cull `variables` readback per slot. **Direction:**
    - `PerFrame<Buffer<T, Upload>>` whose `host_mut(&submission)` ties writes to the waited slot;
    - a growable stream buffer.
-10. **Transfers only reach a view's first mip,** so uploading mip k of a `Single` image needs a
-    `MipChain`, and there is no `generate_mips`. Take a subresource (image, mip, layers,
-    region), with several regions per call.
+10. **Transfers take one region per call,** and there is no `generate_mips` (`ImageSlice::mip`
+    reaches any mip of a `Single` image since 2026-10-21).
 11. **Mixed image types are awkward.**
     - `bind` takes one `F/U/D` for all images.
     - There is no `ImageView::erase()`.
     - The viewport target is typed like the swapchain image, so it lacks SAMPLED, and the UI
       reads it through a storage load, which is several times slower on Intel.
-    - Bound combinations repeat (`HasTexels<[f32; 4]> + ColorAspect, IsColorAttachment + IsStorage`).
 12. **Shader facts are mirrored by hand.** Workgroup sizes appear as `div_ceil(8)` and
     `div_ceil(64)`, and constants like `MESHLET_STRIDE`, `INSTANCE_FLAG_BITS` and the overflow
     bits are copied. Generate `Pass::WORKGROUP_SIZE` with a `compute_threads(extent)`, and export
@@ -215,9 +182,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     `byte_range(offset_of!..).cast::<MeshletDraw>()`. (Indirect draws and dispatches take any
     `T: StartsWith<C>` since 2026-10-21, which removes the 16→12-byte cast.)
 14. **Scope names must be `&'static str`.**
-15. **Resize and grow is hand-rolled.** `RenderResources::fit`, a `fresh` flag and
-    `grow_overflowed` could become `Image::fit(extent)` and `Buffer::reserve(len)` that keep the
-    bound slots.
+15. **Resize and grow is hand-rolled.** `grow_overflowed` could become `Buffer::reserve(len)`
+    (`Image::fit(extent)`, which keeps the bound slots, exists since 2026-10-21; core's
+    `RenderResources::fit` and its `fresh` flag can use it).
 16. **Ray tracing ergonomics.**
     - Scratch: users call `Buffer::raw(.., Some(scratch_alignment() as u32))`, sum the sizes by
       hand, and a batch that doesn't fit panics. Add a scratch type and a `build_all` that splits
@@ -241,17 +208,16 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     - Unused re-exports: `VkPipeline`, `VkShaderModule`, `ShaderHash`.
     - Public internals: `PassEntry`, `Functions`, `PhysicalDevice`, `CALLSITE`,
       `RaytracingPipeline`, `ShaderBindingTable`.
-    - Typos: `handel`, `Filter::Liniear`, `extend` for extent.
+    - Typos: `handel`, `extend` for extent.
     - Fix these before 0.1, since renames break users afterwards.
     - *2026-10-18, more public internals:* `pub use ash::vk::*` makes every ash upgrade a breaking
       lava release (`vk.rs:6`); `lava::vk` and `lava::state::raw_vulkan` are one module under two
       paths (`state.rs:35`; the engine and generated code use the second, lava the first);
       `pub mod error`, `lifetime` and `state` duplicate root re-exports; `CallsiteGuard`;
       `BindingOutput::sections()` returns an unnameable pub `Sections`; `RawImage`, `MipViews` and
-      the sealed `Views` methods expose `vk::ImageView` and the state atomics; `format::bc_block`
-      (internal use only), `Buffer::handle()` (no caller anywhere); `lava_build_slang::compile`
+      the sealed `Views` methods expose `vk::ImageView` and the state atomics; `Buffer::handle()` (no caller anywhere); `lava_build_slang::compile`
       and its re-export of shader-slang 0.1.0, which ties lava-build-slang's semver to slang-rs.
-    - *2026-10-18, unused:* `usage::UnifiedBinding`, `Features::union`, `ImageView::cast`,
+    - *2026-10-18, unused:* `Features::union`, `ImageView::cast`,
       `ImageSlice::cast`, `Image::aspect_check`/`texel_check`, `Dim::texels`,
       `SlotRange::is_empty` (always false), `Config::gpu_assisted_validation` (no user), the
       root re-exports `AccessFlags2`/`ImageLayout`.
@@ -263,7 +229,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
       lava says task; `Features::DEFAULT` means none; `copy_region_from` takes its offset as a
       `D::Extent`; `image_acceses`, `buffer_acceses`.
     - *2026-10-18, missing derives:* `RasterState` and `BufferAccess` could be `Copy`; `Filter` has
-      no `Clone`/`Copy`/`Debug` and no cubic filter; `ImageSlice` no `Debug`; `Config` has no docs or `Debug`.
+      no cubic filter; `Config` has no docs or `Debug`.
 20. **Codegen errors lack context.** Panics give no file or field (`build.rs:111,118,236`), the
     first failing pass hides the rest, and Slang warnings aren't forwarded.
 21. **Generated code leaks into its includer** (2026-10-18, `codegen.rs:511-535`). It glob-imports
@@ -313,13 +279,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 - **Images:**
   - **Types:** cube maps (arrays of 6 layers exist since 2026-10-21; a cube view and
     `TexCube` don't), 1D, MSAA.
-  - **Views:** format reinterpretation (sRGB storage through a UNORM view, R32 aliases for
-    atomics), swizzles, per-aspect depth/stencil views.
-  - **Checks:** a format-support query.
-  - **Transfers:** image-to-image copy, depth/stencil clears and copies, row pitch, mip
-    generation.
-  - **Memory:** transient (lazily allocated) attachments, aliasing in shared memory blocks,
-    sparse residency, external memory interop.
+  - **Views:** swizzles, per-aspect depth/stencil views for shaders.
+  - **Transfers:** mip generation.
+  - **Memory:** transient (lazily allocated) attachments, aliasing in shared memory blocks.
 - **Slang coverage:**
   - **Types:** `half` and 16-bit ints (panic today, though float16 is enabled), 64-bit scalars
     and `bool` vectors, non-square matrices (no glam type), `float3x3` layout vs `Mat3`
@@ -508,12 +470,13 @@ with this survey. Still wrong:
 ### Coverage gaps
 Each was checked by grep over lava-tests and `lava/src/tests.rs`.
 - **Barriers:** two timelines of one family sharing an image; `forget` on destruction; the
-  `ATTACHMENT_OPTIMAL` vs `GENERAL` choice (only through the validation layer); `make_visible` merging; the swapchain's acquire wait stage; `take_host_layouts`.
+  `ATTACHMENT_OPTIMAL` vs `GENERAL` choice (only through the validation layer); `make_visible` merging; the swapchain's acquire wait stage; `host_layouts`.
 - **Runtime-typed resources:** `format::Dynamic`, `usage::Dynamic`, `with_params`, the
   `aspect_check`/`texel_check`/`usage_check` panics,
-  the clear-value assert and `cast_check`. Pure parts (`expected_data_len`, `mip_extent`,
-  `region_fits`, `cast_check`, the format table's sizes) could be unit tests.
-- **Images:** `DepthSplitMips`, 64-bit and unusual clears, linear blits on formats without linear
+  the clear-value assert and `cast_check`. Pure parts (`mip_extent`, `region_fits`,
+  `cast_check`, the format table's sizes) could be unit tests (`format::block`, `rows_len`,
+  `pack_64` and `format::class` are).
+- **Images:** `DepthSplitMips`, unusual clears, linear blits on float formats without linear
   filtering.
 - **Draws:** `Draw::indirect` with several commands (bug 38); attachments reached through accesses;
   a draw reading an attachment of its own rendering.

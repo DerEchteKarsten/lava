@@ -1,4 +1,4 @@
-//! Global Vulkan context: instance, device ranking, selection and creation, queues, features, format properties (cached per format), validation logging, and their destruction at shutdown
+//! Global Vulkan context: instance, device ranking, selection and creation, queues, features, format properties and image format limits (cached per format and description), validation logging, and their destruction at shutdown
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -55,8 +55,32 @@ pub struct Ctx {
     pub(crate) queues: DeviceQueues,
     /// Set by the first poll that saw the device lost, which logs it.
     pub(crate) device_lost: AtomicBool,
-    /// The optimal-tiling features of each format asked so far (`Ctx::format_features`).
-    format_features: Mutex<HashMap<vk::Format, vk::FormatFeatureFlags2>>,
+    /// The features of each format asked so far (`Ctx::format_properties`).
+    format_properties: Mutex<HashMap<vk::Format, FormatProperties>>,
+    /// The limits of each image description asked so far (`Ctx::image_format_limits`).
+    image_limits: Mutex<HashMap<ImageFormatKey, Option<vk::ImageFormatProperties>>>,
+    /// Whether lava enabled `VK_EXT_external_memory_dma_buf`.
+    #[allow(dead_code)] // `external-memory`'s.
+    pub(crate) dma_buf: bool,
+}
+
+/// What a format supports in each tiling and in buffers (`VkFormatProperties3`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FormatProperties {
+    pub optimal: vk::FormatFeatureFlags2,
+    pub linear: vk::FormatFeatureFlags2,
+    pub buffer: vk::FormatFeatureFlags2,
+}
+
+/// An image description `vkGetPhysicalDeviceImageFormatProperties2` is asked about, optimal
+/// tiling implied; `external` the handle types it must export or import (none: 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ImageFormatKey {
+    pub(crate) format: vk::Format,
+    pub(crate) image_type: vk::ImageType,
+    pub(crate) usage: vk::ImageUsageFlags,
+    pub(crate) flags: vk::ImageCreateFlags,
+    pub(crate) external: vk::ExternalMemoryHandleTypeFlags,
 }
 
 static STATE: Global<Ctx> = Global::new();
@@ -242,6 +266,12 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
             strict_lines: properties.limits.strict_lines == vk::TRUE,
             dedicated_compute: families.as_ref().is_some_and(|f| f.compute.is_some()),
             dedicated_transfer: families.as_ref().is_some_and(|f| f.transfer.is_some()),
+            sparse_queue: families.as_ref().is_some_and(|f| {
+                f.graphics
+                    .handel
+                    .queue_flags
+                    .contains(vk::QueueFlags::SPARSE_BINDING)
+            }),
         };
         let mut lava_missing = chain.lava_missing(&has);
         let push_data = MAX_PUSH_CONSTANTS_SIZE as u64;
@@ -337,11 +367,16 @@ impl Ctx {
         &Ctx::get().dynamic
     }
 
-    /// What images of `format` in optimal tiling support (`VkFormatProperties3`), queried once
-    /// per format.
+    /// What images of `format` in optimal tiling support: `format_properties(format).optimal`.
     pub fn format_features(format: vk::Format) -> vk::FormatFeatureFlags2 {
+        Ctx::format_properties(format).optimal
+    }
+
+    /// What `format` supports in optimal and linear tiling and in buffers
+    /// (`VkFormatProperties3`), queried once per format and then one lock and lookup.
+    pub fn format_properties(format: vk::Format) -> FormatProperties {
         let ctx = Ctx::get();
-        let mut cache = crate::queue::lock(&ctx.format_features);
+        let mut cache = crate::queue::lock(&ctx.format_properties);
         *cache.entry(format).or_insert_with(|| {
             let mut properties3 = vk::FormatProperties3::default();
             let mut properties = vk::FormatProperties2::default().push_next(&mut properties3);
@@ -352,7 +387,55 @@ impl Ctx {
                     &mut properties,
                 )
             };
-            properties3.optimal_tiling_features
+            FormatProperties {
+                optimal: properties3.optimal_tiling_features,
+                linear: properties3.linear_tiling_features,
+                buffer: properties3.buffer_features,
+            }
+        })
+    }
+
+    /// The limits of optimal-tiling images of `key`'s description
+    /// (`vkGetPhysicalDeviceImageFormatProperties2`), `None` where the device can't make them;
+    /// queried once per description. With external handle types, also `None` unless the
+    /// device exports and imports them for it.
+    pub(crate) fn image_format_limits(key: ImageFormatKey) -> Option<vk::ImageFormatProperties> {
+        let ctx = Ctx::get();
+        let mut cache = crate::queue::lock(&ctx.image_limits);
+        *cache.entry(key).or_insert_with(|| {
+            let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::from_raw(
+                    key.external.as_raw(),
+                ));
+            let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+                .format(key.format)
+                .ty(key.image_type)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(key.usage)
+                .flags(key.flags);
+            let mut external_properties = vk::ExternalImageFormatProperties::default();
+            let mut properties = vk::ImageFormatProperties2::default();
+            if !key.external.is_empty() {
+                info = info.push_next(&mut external_info);
+                properties = properties.push_next(&mut external_properties);
+            }
+            let result = unsafe {
+                Functions::instance().get_physical_device_image_format_properties2(
+                    ctx.physical_device.handel,
+                    &info,
+                    &mut properties,
+                )
+            };
+            let limits = properties.image_format_properties;
+            let features = external_properties
+                .external_memory_properties
+                .external_memory_features;
+            let external = key.external.is_empty()
+                || features.contains(
+                    vk::ExternalMemoryFeatureFlags::EXPORTABLE
+                        | vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+                );
+            (result.is_ok() && external).then_some(limits)
         })
     }
 
@@ -549,6 +632,18 @@ impl Ctx {
         let features = features.without(config.disabled).consistent();
         let mut extensions: Vec<&CStr> = LAVA_EXTENSIONS.to_vec();
         extensions.extend(features.extensions());
+        let device_has = |name: &CStr| {
+            (physical_device.supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes())
+        };
+        // dma-bufs where the device has them, besides opaque descriptors.
+        #[cfg(feature = "external-memory")]
+        let dma_buf =
+            features.external_memory && device_has(ash::ext::external_memory_dma_buf::NAME);
+        #[cfg(not(feature = "external-memory"))]
+        let dma_buf = false;
+        if dma_buf {
+            extensions.push(ash::ext::external_memory_dma_buf::NAME);
+        }
         if display.is_some() {
             extensions.push(ash::khr::swapchain::NAME);
         }
@@ -584,9 +679,7 @@ impl Ctx {
             })
             .collect::<Vec<_>>();
         let extension_names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
-        let queried = FeatureChain::query(&instance, physical_device.handel, &|name: &CStr| {
-            (physical_device.supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes())
-        });
+        let queried = FeatureChain::query(&instance, physical_device.handel, &device_has);
         let mut enabled = FeatureChain::enabling(&features, &queried);
         let mut features2 = enabled.chain(&|name| extensions.contains(&name));
         let device_create_info = vk::DeviceCreateInfo::default()
@@ -663,6 +756,10 @@ impl Ctx {
             multi_draw: load::<gate::MultiDraw, _>(features.multi_draw, || {
                 ash::ext::multi_draw::Device::new(&instance, &device)
             }),
+            #[cfg(feature = "external-memory")]
+            external_memory_fd: load::<gate::ExternalMemory, _>(features.external_memory, || {
+                ash::khr::external_memory_fd::Device::new(&instance, &device)
+            }),
             dynamic_state2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
             dynamic_state3: ash::ext::extended_dynamic_state3::Device::new(&instance, &device),
             line_rasterization: ash::khr::line_rasterization::Device::new(&instance, &device),
@@ -700,7 +797,9 @@ impl Ctx {
             features,
             physical_device,
             device_lost: AtomicBool::new(false),
-            format_features: Mutex::new(HashMap::new()),
+            format_properties: Mutex::new(HashMap::new()),
+            image_limits: Mutex::new(HashMap::new()),
+            dma_buf,
         });
         undo_device.disarm();
         undo_messenger.disarm();
@@ -866,6 +965,8 @@ pub struct Functions {
     hdr_metadata: Loader<gate::HdrMetadata, ash::ext::hdr_metadata::Device>,
     #[cfg(feature = "multi-draw")]
     multi_draw: Loader<gate::MultiDraw, ash::ext::multi_draw::Device>,
+    #[cfg(feature = "external-memory")]
+    external_memory_fd: Loader<gate::ExternalMemory, ash::khr::external_memory_fd::Device>,
 }
 
 impl Debug for Functions {
@@ -883,6 +984,10 @@ impl Functions {
     #[cfg(feature = "host-image-copy")]
     pub(crate) fn host_image_copy() -> &'static ash::ext::host_image_copy::Device {
         loaded::<gate::HostImageCopy, _>(&get().host_image_copy)
+    }
+    #[cfg(feature = "external-memory")]
+    pub(crate) fn external_memory_fd() -> &'static ash::khr::external_memory_fd::Device {
+        loaded::<gate::ExternalMemory, _>(&get().external_memory_fd)
     }
     pub(crate) fn device_address_commands() -> &'static crate::vk::device_address_commands::Device {
         &get().device_address_commands

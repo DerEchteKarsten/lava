@@ -53,6 +53,13 @@ default = [
     "async-compute",
     "async-transfer",
     "bc-compression",
+    "etc2-compression",
+    "astc-compression",
+    "sparse-binding",
+    "sparse-residency-buffer",
+    "sparse-residency-image-2d",
+    "sparse-residency-image-3d",
+    "external-memory",
     "independent-blend",
     "dual-src-blend",
     "multi-draw",
@@ -133,6 +140,20 @@ async-transfer = []
 assert-async-transfer = ["async-transfer"]
 bc-compression = []
 assert-bc-compression = ["bc-compression"]
+etc2-compression = []
+assert-etc2-compression = ["etc2-compression"]
+astc-compression = []
+assert-astc-compression = ["astc-compression"]
+sparse-binding = []
+assert-sparse-binding = ["sparse-binding"]
+sparse-residency-buffer = ["sparse-binding"]
+assert-sparse-residency-buffer = ["sparse-residency-buffer", "assert-sparse-binding"]
+sparse-residency-image-2d = ["sparse-binding"]
+assert-sparse-residency-image-2d = ["sparse-residency-image-2d", "assert-sparse-binding"]
+sparse-residency-image-3d = ["sparse-binding"]
+assert-sparse-residency-image-3d = ["sparse-residency-image-3d", "assert-sparse-binding"]
+external-memory = []
+assert-external-memory = ["external-memory"]
 independent-blend = []
 assert-independent-blend = ["independent-blend"]
 dual-src-blend = []

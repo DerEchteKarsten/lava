@@ -830,6 +830,7 @@ impl<U: StaticUsage> PresentSurface<U> {
             handle: i.handle,
             states: std::slice::from_ref(&i.state),
             cache: None,
+            mutable: false,
             format: self.format(),
             usage: U::default(),
             dim: D2,

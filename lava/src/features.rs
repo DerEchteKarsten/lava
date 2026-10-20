@@ -295,8 +295,25 @@ features! {
     async_compute: "async-compute" / "assert-async-compute" => AsyncCompute,
     /// A queue family with transfer but neither graphics nor compute: `Timeline<Transfer>`.
     async_transfer: "async-transfer" / "assert-async-transfer" => AsyncTransfer,
-    /// BC1-7 compressed formats.
+    /// BC1-7 compressed formats (`textureCompressionBC`).
     bc_compression: "bc-compression" / "assert-bc-compression" => BcCompression,
+    /// ETC2 and EAC compressed formats (`textureCompressionETC2`).
+    etc2_compression: "etc2-compression" / "assert-etc2-compression" => Etc2Compression,
+    /// ASTC LDR compressed formats (`textureCompressionASTC_LDR`).
+    astc_compression: "astc-compression" / "assert-astc-compression" => AstcCompression,
+    /// Sparse resources (`sparseBinding`, and a graphics family that binds sparse memory),
+    /// which the residency features build on.
+    sparse_binding: "sparse-binding" / "assert-sparse-binding" => SparseBinding,
+    /// Partially resident buffers (`sparseResidencyBuffer`): `SparseBuffer`.
+    sparse_residency_buffer: "sparse-residency-buffer" / "assert-sparse-residency-buffer" => SparseResidencyBuffer,
+    /// Partially resident 2D images, arrays included (`sparseResidencyImage2D`): `SparseImage`.
+    sparse_residency_image_2d: "sparse-residency-image-2d" / "assert-sparse-residency-image-2d" => SparseResidencyImage2D,
+    /// Partially resident 3D images (`sparseResidencyImage3D`): `SparseImage<.., D3>`.
+    sparse_residency_image_3d: "sparse-residency-image-3d" / "assert-sparse-residency-image-3d" => SparseResidencyImage3D,
+    /// `VK_KHR_external_memory_fd` (Linux and other Unix systems): `ExternalBuffer` and
+    /// `ExternalImage`, memory exported to and imported from file descriptors (opaque, and
+    /// dma-bufs for buffers where the device has `VK_EXT_external_memory_dma_buf`).
+    external_memory: "external-memory" / "assert-external-memory" => ExternalMemory,
     /// Different blends and write masks for the color attachments of one draw
     /// (`RasterState::blends`, `write_masks`).
     independent_blend: "independent-blend" / "assert-independent-blend" => IndependentBlend,
@@ -489,6 +506,12 @@ impl Features {
                 self.dynamic_conservative_rasterization && self.conservative_rasterization,
             "dynamic-provoking-vertex" => dynamic_provoking_vertex =
                 self.dynamic_provoking_vertex && self.provoking_vertex,
+            "sparse-residency-buffer" => sparse_residency_buffer =
+                self.sparse_residency_buffer && self.sparse_binding,
+            "sparse-residency-image-2d" => sparse_residency_image_2d =
+                self.sparse_residency_image_2d && self.sparse_binding,
+            "sparse-residency-image-3d" => sparse_residency_image_3d =
+                self.sparse_residency_image_3d && self.sparse_binding,
         }
         self
     }
@@ -553,6 +576,7 @@ impl Features {
             ],
             "provoking-vertex" => provoking_vertex: [ash::ext::provoking_vertex::NAME],
             "multi-draw" => multi_draw: [ash::ext::multi_draw::NAME],
+            "external-memory" => external_memory: [ash::khr::external_memory_fd::NAME],
             "dynamic-blend" => dynamic_blend: [eds3],
             "dynamic-polygon-mode" => dynamic_polygon_mode: [eds3],
             "dynamic-depth-clamp" => dynamic_depth_clamp: [eds3],
@@ -588,6 +612,9 @@ pub(crate) struct DeviceFacts {
     pub(crate) dedicated_compute: bool,
     #[allow(dead_code)]
     pub(crate) dedicated_transfer: bool,
+    /// The graphics family binds sparse memory (`QUEUE_SPARSE_BINDING`).
+    #[allow(dead_code)]
+    pub(crate) sparse_queue: bool,
 }
 
 /// Every Vulkan feature struct lava queries or enables.
@@ -811,6 +838,16 @@ impl FeatureChain {
             "async-compute" => async_compute = device.dedicated_compute,
             "async-transfer" => async_transfer = device.dedicated_transfer,
             "bc-compression" => bc_compression = t(c.texture_compression_bc),
+            "etc2-compression" => etc2_compression = t(c.texture_compression_etc2),
+            "astc-compression" => astc_compression = t(c.texture_compression_astc_ldr),
+            "sparse-binding" => sparse_binding = t(c.sparse_binding) && device.sparse_queue,
+            "sparse-residency-buffer" => sparse_residency_buffer = t(c.sparse_residency_buffer),
+            "sparse-residency-image-2d" => sparse_residency_image_2d =
+                t(c.sparse_residency_image2_d),
+            "sparse-residency-image-3d" => sparse_residency_image_3d =
+                t(c.sparse_residency_image3_d),
+            "external-memory" => external_memory =
+                cfg!(unix) && has(ash::khr::external_memory_fd::NAME),
             "independent-blend" => independent_blend = t(c.independent_blend),
             "dual-src-blend" => dual_src_blend = t(c.dual_src_blend),
             "multi-draw" => multi_draw =
@@ -929,6 +966,14 @@ impl FeatureChain {
         } = &mut chain;
         set! { c:
             "bc-compression" => texture_compression_bc = on(f.bc_compression),
+            "etc2-compression" => texture_compression_etc2 = on(f.etc2_compression),
+            "astc-compression" => texture_compression_astc_ldr = on(f.astc_compression),
+            "sparse-binding" => sparse_binding = on(f.sparse_binding),
+            "sparse-residency-buffer" => sparse_residency_buffer = on(f.sparse_residency_buffer),
+            "sparse-residency-image-2d" => sparse_residency_image2_d =
+                on(f.sparse_residency_image_2d),
+            "sparse-residency-image-3d" => sparse_residency_image3_d =
+                on(f.sparse_residency_image_3d),
             "independent-blend" => independent_blend = on(f.independent_blend),
             "dual-src-blend" => dual_src_blend = on(f.dual_src_blend),
             "fill-mode-non-solid" => fill_mode_non_solid = on(f.fill_mode_non_solid),
