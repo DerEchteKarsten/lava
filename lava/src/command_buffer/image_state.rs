@@ -68,14 +68,24 @@ impl ImageState {
     }
 }
 
-/// Calls `f` per state and the mips it covers; `states` holds one for all of `mips` or one per mip.
+/// Calls `f` per state and the mips it covers; `states` are an image's, one for all its mips or
+/// one per mip of the image (mip `i` at index `i`).
 fn for_each(states: &[AtomicU64], mips: Range<u32>, mut f: impl FnMut(&AtomicU64, Range<u32>)) {
     if let [state] = states {
         return f(state, mips);
     }
-    for (mip, state) in (mips.start..).zip(states) {
-        f(state, (mip..mip + 1).into());
+    for mip in mips {
+        f(&states[mip as usize], (mip..mip + 1).into());
     }
+}
+
+/// Whether the `kind` family owns no mip of the image whose `states` these are any more: each
+/// is released, owned by another family or by none.
+pub(crate) fn released_by(states: &[AtomicU64], kind: Kind) -> bool {
+    states.iter().all(|state| {
+        let state = ImageState::load(state);
+        state.owner != Some(kind) || state.released_to.is_some()
+    })
 }
 
 /// Panics unless a recording of `kind` may access every mip of `mips`: nobody owns it, `kind`

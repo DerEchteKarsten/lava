@@ -1,11 +1,11 @@
 //! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`, `rebar` too), the functions that need them return `MissingFeature`, uploads go through staging buffers, and draw state the device can't set dynamically is baked into pipelines and renders the same
 mod common;
 
-use common::{Cmd, golden::assert_golden, gpu, zeroed_buffer};
+use common::{Cmd, Gpu, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     Error, Features,
-    buffer::{Buffer, Location, Shared},
+    buffer::{Buffer, Location, Shared, Uploads},
     command_buffer::{
         Attachment, BindingOutput, Blend, CullModeFlags, Draw, LogicOp, PolygonMode,
         RasterState, kind,
@@ -112,8 +112,8 @@ const YELLOW: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
 
 /// The same two triangles as `gpu_headless`: one front-facing in the left half, one
 /// back-facing yellow one in the right half.
-fn two_triangles() -> Buffer<TestVertex> {
-    Buffer::from_slice(&[
+fn two_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
+    gpu.buffer(&[
         vertex(-0.5, -0.8, 0.5, RED),
         vertex(-0.1, 0.8, 0.5, GREEN),
         vertex(-0.9, 0.8, 0.5, BLUE),
@@ -121,12 +121,11 @@ fn two_triangles() -> Buffer<TestVertex> {
         vertex(0.1, 0.8, 0.5, YELLOW),
         vertex(0.9, 0.8, 0.5, YELLOW),
     ])
-    .unwrap()
 }
 
 /// A far green triangle and a near red one in front of it, drawn in that order.
-fn overlapping_triangles() -> Buffer<TestVertex> {
-    Buffer::from_slice(&[
+fn overlapping_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
+    gpu.buffer(&[
         vertex(0.0, -0.8, 0.8, GREEN),
         vertex(0.8, 0.8, 0.8, GREEN),
         vertex(-0.8, 0.8, 0.8, GREEN),
@@ -134,7 +133,6 @@ fn overlapping_triangles() -> Buffer<TestVertex> {
         vertex(0.8, 0.8, 0.2, RED),
         vertex(-0.8, 0.8, 0.2, RED),
     ])
-    .unwrap()
 }
 
 fn bindings(
@@ -215,17 +213,24 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
     );
 }
 
-/// Without `rebar` or host image copies, buffers and images are filled through staging buffers.
+/// Without `rebar` or host image copies, buffers and images are filled through staging memory.
 #[test]
 fn uploads_need_neither_rebar_nor_host_image_copies() {
     let mut gpu = gpu_without();
     let data: Vec<u32> = (0..256).collect();
-    let buffer = Buffer::from_slice(&data).unwrap();
+    let mut uploads = Uploads::new();
+    let buffer = uploads.from_slice(&data).unwrap();
+    // Staged without `rebar`, unless device-local memory is mapped anyway (integrated GPUs).
+    if uploads.is_empty() {
+        eprintln!("NOTE: device-local memory is mapped here, so `init` wrote in place");
+    }
+    assert!(uploads.len() <= 1);
     let texels: Vec<u8> = (0..16 * 4).map(|i| i as u8).collect();
     let image = Image::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::new(UVec2::new(4, 4)).unwrap();
-    image.upload(0, &texels).unwrap();
+    uploads.image(&image, 0, &texels).unwrap();
     let (mut buffer_out, mut image_out) = (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u8>(texels.len()));
     gpu.submit(|cmd| {
+        cmd.record_uploads(&uploads);
         cmd.copy_buffer(buffer.range(..), buffer_out.range(..));
         cmd.copy_image_to_buffer(image.whole_view().whole(), image_out.range(..));
     });
@@ -236,7 +241,7 @@ fn uploads_need_neither_rebar_nor_host_image_copies() {
 #[test]
 fn baked_polygon_modes_draw_like_dynamic_ones() {
     let mut gpu = gpu_without();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -250,7 +255,7 @@ fn baked_polygon_modes_draw_like_dynamic_ones() {
 #[test]
 fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
     let mut gpu = gpu_without();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
@@ -267,7 +272,7 @@ fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
 #[test]
 fn baked_blends_combine_and_skip() {
     let mut gpu = gpu_without();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     // Green, then red added on top of it.
     let added = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let add = RasterState::default().blend(Blend::Add);
@@ -293,7 +298,7 @@ fn baked_logic_ops_replace_blending() {
         eprintln!("SKIPPED baked_logic_ops_replace_blending: the device lacks `logic-op`");
         return;
     }
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let pixels = render(&mut gpu, [1.0; 4], |cmd, target| {
         let xor = RasterState::default().logic_op(Some(LogicOp::XOR)).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])

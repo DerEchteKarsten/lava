@@ -1,11 +1,12 @@
 //! Headless GPU tests: buffers (memory locations, host access, uploads), images, sync, command recording, queries, and golden images per pass type
 mod common;
 
-use common::{Cmd, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer};
+use common::{Cmd, Gpu, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer};
 use glam::{IVec2, UVec2, UVec3, UVec4, Vec2, Vec4};
 use lava::{
     bindless::{self, Combined, ImageHandle, Sampler, SamplerDesc, SamplerHandle, max_image_slots},
-    buffer::{Buffer, Dynamic, Location, Memory, Readback, Shared, Upload},
+    buffer::{Buffer, Dynamic, Location, Memory, Readback, Shared, Upload, Uploads},
+    memory::memory_report,
     command_buffer::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
         BufferAccess, ColorComponentFlags, CompareOp, CullModeFlags,
@@ -84,8 +85,8 @@ const YELLOW: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
 
 /// Two triangles: a front-facing one (clockwise on screen) in the left half with one colour
 /// per corner, and a back-facing yellow one in the right half.
-fn two_triangles() -> Buffer<TestVertex> {
-    Buffer::from_slice(&[
+fn two_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
+    gpu.buffer(&[
         vertex(-0.5, -0.8, 0.5, RED),
         vertex(-0.1, 0.8, 0.5, GREEN),
         vertex(-0.9, 0.8, 0.5, BLUE),
@@ -93,7 +94,6 @@ fn two_triangles() -> Buffer<TestVertex> {
         vertex(0.1, 0.8, 0.5, YELLOW),
         vertex(0.9, 0.8, 0.5, YELLOW),
     ])
-    .unwrap()
 }
 
 /// A pixel well inside the left (front-facing) and the right (back-facing) triangle.
@@ -192,37 +192,111 @@ fn reading_past_the_buffer_panics() {
 // ---- memory locations, host access and uploads ------------------------------------------------
 
 #[test]
-fn from_slice_round_trips_through_a_readback_copy() {
+fn filled_buffers_round_trip_through_a_readback_copy() {
     let mut gpu = gpu();
     let data: Vec<u32> = (0..1000).collect();
-    let buffer = Buffer::from_slice(&data).unwrap();
+    let mut uploads = Uploads::new();
+    let buffer = uploads.from_slice(&data).unwrap();
     assert_eq!(buffer.location(), Location::Gpu);
-    let mut readback = zeroed_buffer::<u32>(data.len());
-    gpu.submit(|cmd| cmd.copy_buffer(buffer.range(..), readback.range(..)));
+    if Ctx::features().rebar {
+        assert!(uploads.is_empty(), "written in place, where its memory is mapped");
+    }
+    let addresses = uploads.init(3, |address, out: &mut [u64]| out.fill(address)).unwrap();
+    let (mut readback, mut address_out) = (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u64>(3));
+    gpu.submit(|cmd| {
+        cmd.record_uploads(&uploads);
+        cmd.copy_buffer(buffer.range(..), readback.range(..));
+        cmd.copy_buffer(addresses.range(..), address_out.range(..));
+    });
     assert_eq!(readback.host(), data);
+    assert_eq!(address_out.host(), [addresses.address(); 3]);
+    assert!(uploads.is_empty());
+}
+
+/// `dst[i] = src[i] + i` for the 4 elements of `src`.
+fn plus_index(cmd: &mut Cmd, src: &Buffer<u32>, dst: &Buffer<u32, Readback>) {
+    cmd.compute(&TestComputeBuffer::push_bindings(src.range(..), dst.range(..), 4, 1), [1, 1, 1], None);
 }
 
 #[test]
-fn writes_land_in_submission_order() {
+fn writes_land_where_their_batch_is_recorded() {
     let mut gpu = gpu();
     let buffer = Buffer::<u32>::new(4).unwrap();
-    let (mut first, mut second) = (zeroed_buffer::<u32>(4), zeroed_buffer::<u32>(4));
-    buffer.write(0, &[1, 2, 3, 4]).unwrap();
-    // Dropped with a write queued, which goes with it.
+    let outs: [_; 4] = std::array::from_fn(|_| zeroed_buffer::<u32>(4));
+    let [mut before, mut after, mut skipped, mut again] = outs;
+    gpu.submit(|cmd| cmd.fill_buffer(buffer.range(..), 0));
+    let mut uploads = Uploads::new();
+    uploads.write(&buffer, 0, &[1, 2, 3, 4]).unwrap();
+    assert_eq!(uploads.len(), 1);
+    // A submission that doesn't record the batch writes nothing.
+    gpu.submit(|cmd| plus_index(cmd, &buffer, &skipped));
+    assert_eq!(skipped.host(), [0, 1, 2, 3]);
+    // The dispatch before the batch reads the old data, the one after it the new.
+    gpu.submit(|cmd| {
+        plus_index(cmd, &buffer, &before);
+        cmd.record_uploads(&uploads);
+        plus_index(cmd, &buffer, &after);
+    });
+    assert_eq!(before.host(), [0, 1, 2, 3]);
+    assert_eq!(after.host(), [1, 3, 5, 7]);
+    assert!(uploads.is_empty());
+
+    // Filled again, the batch records only what is new.
+    uploads.write(&buffer, 2, &[30, 40]).unwrap();
+    // Dropped targets and batches take their writes with them.
     let dropped = Buffer::<u32>::new(4).unwrap();
-    dropped.write(0, &[5; 4]).unwrap();
+    uploads.write(&dropped, 0, &[5; 4]).unwrap();
     drop(dropped);
-    let submission = gpu.timeline.begin().unwrap();
-    let copied = submission
-        .submit(|cmd| cmd.copy_buffer(buffer.range(..), first.range(..)))
-        .unwrap();
-    // Queued while the first submission may still read the buffer.
-    buffer.write(2, &[30, 40]).unwrap();
-    gpu.submit(|cmd| cmd.copy_buffer(buffer.range(..), second.range(..)));
-    copied.block().unwrap();
-    assert_eq!(first.host(), [1, 2, 3, 4]);
-    assert_eq!(second.host(), [1, 2, 30, 40]);
-    assert!(panic_message(|| buffer.write(3, &[0, 0])).contains("writing 2 elements at 3"));
+    let mut discarded = Uploads::new();
+    discarded.write(&buffer, 0, &[7; 4]).unwrap();
+    drop(discarded);
+    assert_eq!(uploads.len(), 1);
+    gpu.submit(|cmd| {
+        cmd.fill_buffer(buffer.range(..), 9);
+        cmd.record_uploads(&uploads);
+        plus_index(cmd, &buffer, &again);
+    });
+    assert_eq!(again.host(), [9, 10, 32, 43]);
+    assert!(panic_message(|| uploads.write(&buffer, 3, &[0, 0])).contains("writing 2 elements at 3"));
+}
+
+/// A recording that panics after recording a batch gives its writes back to the batch.
+#[test]
+fn a_failed_recording_leaves_its_uploads_to_the_next() {
+    let mut gpu = gpu();
+    let buffer = Buffer::<u32>::new(4).unwrap();
+    let mut out = zeroed_buffer::<u32>(4);
+    let mut uploads = Uploads::new();
+    uploads.write(&buffer, 0, &[1, 2, 3, 4]).unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.record_uploads(&uploads);
+            panic!("after recording the batch");
+        })
+    });
+    assert!(message.contains("after recording the batch"), "{message}");
+    assert_eq!(uploads.len(), 1);
+    gpu.submit(|cmd| {
+        cmd.record_uploads(&uploads);
+        cmd.copy_buffer(buffer.range(..), out.range(..));
+    });
+    assert_eq!(out.host(), [1, 2, 3, 4]);
+}
+
+/// An empty batch and in-recording uploads small enough for an update allocate nothing.
+#[test]
+fn small_uploads_allocate_nothing() {
+    let mut gpu = gpu();
+    let buffer = Buffer::<u32>::new(4).unwrap();
+    gpu.submit(|cmd| cmd.upload(buffer.range(..), &[0; 4]).unwrap());
+    lava::wait_idle().unwrap();
+    let before = memory_report().allocated;
+    let uploads = Uploads::new();
+    gpu.submit(|cmd| {
+        cmd.record_uploads(&uploads);
+        cmd.upload(buffer.range(..), &[1, 2, 3, 4]).unwrap();
+    });
+    assert_eq!(memory_report().allocated, before);
 }
 
 #[test]
@@ -256,7 +330,7 @@ fn uploads_in_a_recording_use_updates_or_the_staging_ring() {
 }
 
 #[test]
-fn image_uploads_are_copied_before_the_next_submission() {
+fn image_uploads_land_where_their_batch_is_recorded() {
     let mut gpu = gpu();
     // The texture of `indexed_draw_samples_a_bindless_texture`.
     let texels: Vec<u8> = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]].concat();
@@ -264,27 +338,31 @@ fn image_uploads_are_copied_before_the_next_submission() {
         .unwrap()
         .bind_sampled()
         .unwrap();
-    assert!(texture.upload(0, &texels[..12]).is_err(), "one whole mip");
-    assert!(texture.upload(1, &texels).is_err(), "it has one mip");
-    texture.upload(0, &texels).unwrap();
-    // Dropped with an upload queued, which goes with it.
+    let mut uploads = Uploads::new();
+    assert!(uploads.image(&texture, 0, &texels[..12]).is_err(), "one whole mip");
+    assert!(uploads.image(&texture, 1, &texels).is_err(), "it has one mip");
+    uploads.image(&texture, 0, &texels).unwrap();
+    // Dropped with an upload staged, which goes with it.
     let dropped = Image::<R8G8B8A8Unorm, usage![TransferDst]>::new(UVec2::new(2, 2)).unwrap();
-    dropped.upload(0, &texels).unwrap();
+    uploads.image(&dropped, 0, &texels).unwrap();
     drop(dropped);
+    assert_eq!(uploads.len(), 1);
 
     let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
         position: Vec2::new(x, y),
         uv: Vec2::new(u, v),
     };
-    let vertices = Buffer::from_slice(&[
-        corner(-0.5, -0.5, 0.0, 0.0),
-        corner(0.5, -0.5, 1.0, 0.0),
-        corner(0.5, 0.5, 1.0, 1.0),
-        corner(-0.5, 0.5, 0.0, 1.0),
-    ])
-    .unwrap();
-    let indices = Buffer::from_slice(&[0u32, 1, 2, 0, 2, 3]).unwrap();
+    let vertices = uploads
+        .from_slice(&[
+            corner(-0.5, -0.5, 0.0, 0.0),
+            corner(0.5, -0.5, 1.0, 0.0),
+            corner(0.5, 0.5, 1.0, 1.0),
+            corner(-0.5, 0.5, 0.0, 1.0),
+        ])
+        .unwrap();
+    let indices = uploads.from_slice(&[0u32, 1, 2, 0, 2, 3]).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
+        cmd.record_uploads(&uploads);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
                 &TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), nearest()),
@@ -296,6 +374,56 @@ fn image_uploads_are_copied_before_the_next_submission() {
             .record("textured")
     });
     assert_golden("raster_textured", &pixels, [SIZE, SIZE]);
+}
+
+/// A batch recorded on the transfer family releases its images to graphics without a
+/// `release` call: a whole image and two of three mips of a chain.
+#[test]
+fn uploads_on_the_transfer_family_go_to_graphics() {
+    let mut gpu = gpu();
+    if !has_family("uploads_on_the_transfer_family_go_to_graphics", Kind::Transfer) {
+        return;
+    }
+    let mut transfer = Timeline::<Transfer>::new(2).unwrap();
+    let single = Owned::new(UVec2::splat(8)).unwrap();
+    let chain = MipChain::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::with_mip_levels(UVec2::splat(8), 3).unwrap();
+    let data: Vec<u32> = (0..64).collect();
+    let buffer = Buffer::<u32>::new(data.len()).unwrap();
+    let mut uploads = Uploads::new();
+    uploads.write(&buffer, 0, &data).unwrap();
+    uploads.image(&single, 0, &pattern(8, 8)).unwrap();
+    uploads.image(&chain, 0, &pattern(8, 8)).unwrap();
+    uploads.image(&chain, 2, &pattern(2, 2)).unwrap();
+    let uploaded = (transfer.begin().unwrap())
+        .submit(|cmd| cmd.record_uploads(&uploads))
+        .unwrap();
+    let mut buffer_out = zeroed_buffer::<u32>(data.len());
+    let mut single_out = zeroed_buffer::<u8>(8 * 8 * 4);
+    let mut mip0_out = zeroed_buffer::<u8>(8 * 8 * 4);
+    let mut mip2_out = zeroed_buffer::<u8>(2 * 2 * 4);
+    gpu.submit_after(&[uploaded], |cmd| {
+        cmd.copy_buffer(buffer.range(..), buffer_out.range(..));
+        cmd.copy_image_to_buffer(single.whole(), single_out.range(..));
+        cmd.copy_image_to_buffer(chain.mip_view(0).whole(), mip0_out.range(..));
+        cmd.copy_image_to_buffer(chain.mip_view(2).whole(), mip2_out.range(..));
+    });
+    assert_eq!(buffer_out.host(), data);
+    assert_eq!(single_out.host(), pattern(8, 8));
+    assert_eq!(mip0_out.host(), pattern(8, 8));
+    assert_eq!(mip2_out.host(), pattern(2, 2));
+
+    // Graphics owns `single` now: a batch into it panics on the transfer family before any
+    // state moves, and graphics records it without releasing anything.
+    let mut again = Uploads::new();
+    again.image(&single, 0, &vec![7; 8 * 8 * 4]).unwrap();
+    let message = panic_message(|| transfer.begin().unwrap().submit(|cmd| cmd.record_uploads(&again)));
+    assert!(message.contains("record the batch on a Graphics timeline"), "{message}");
+    assert_eq!(again.len(), 1);
+    gpu.submit(|cmd| {
+        cmd.record_uploads(&again);
+        cmd.copy_image_to_buffer(single.whole(), single_out.range(..));
+    });
+    assert_eq!(single_out.host(), vec![7; 8 * 8 * 4]);
 }
 
 #[test]
@@ -887,7 +1015,7 @@ fn statistics_queries_count_their_commands_and_keep_observers_from_nesting_one()
 #[test]
 fn occlusion_queries_count_the_samples_of_a_draw() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let depth = Image::<D32Sfloat, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
     let precise = Ctx::features().precise_occlusion;
     let pool = match precise {
@@ -1097,7 +1225,7 @@ fn attachments_are_one_mip_at_least_as_large_as_the_rendering() {
 #[test]
 fn draws_of_a_rendering_access_nothing_another_writes() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let bindings = bindings(&vertices);
     let target = Target::new(EXTENT).unwrap();
     let written = zeroed_buffer::<u32>(4);
@@ -2064,7 +2192,7 @@ fn unculled() -> RasterState<1> {
 
 /// Draws the first `vertex_count` vertices of [`two_triangles`] with backface culling on/off.
 fn draw_triangles(gpu: &mut common::Gpu, vertex_count: u32, culling: bool) -> Vec<u8> {
-    let vertices = two_triangles();
+    let vertices = two_triangles(gpu);
     render(gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(
@@ -2113,7 +2241,7 @@ fn wireframe_draws_only_the_edges() {
         eprintln!("SKIPPED wireframe_draws_only_the_edges: the device lacks `fill-mode-non-solid`");
         return;
     }
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(
@@ -2136,7 +2264,7 @@ fn wireframe_draws_only_the_edges() {
 #[test]
 fn color_attachment_clear_replaces_the_previous_content() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(
             EXTENT,
@@ -2161,7 +2289,7 @@ fn color_attachment_clear_replaces_the_previous_content() {
 #[test]
 fn instances_are_drawn_with_their_instance_index() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             // The second instance of the left triangle lands where the right one would be.
@@ -2187,7 +2315,7 @@ fn indirect_draw_matches_the_direct_one() {
     let mut gpu = gpu();
     let direct = draw_triangles(&mut gpu, 3, true);
 
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let commands = buffer_with::<DrawIndirectCommand>(&[DrawIndirectCommand {
         vertex_count: 3,
         instance_count: 1,
@@ -2210,7 +2338,7 @@ fn indirect_draw_matches_the_direct_one() {
 #[test]
 fn indirect_count_draws_only_the_counted_commands() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     // Shaders see D3D-style vertex ids (no `first_vertex`), so the commands differ in count.
     let command = |vertex_count| DrawIndirectCommand {
         vertex_count,
@@ -2242,7 +2370,7 @@ fn indirect_count_draws_only_the_counted_commands() {
 #[test]
 fn scissor_clips_and_viewport_scales_the_draw() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let full = draw_triangles(&mut gpu, 6, false);
 
     // Scissor: the full-size picture, cut to the left half.
@@ -2290,8 +2418,8 @@ fn scissor_clips_and_viewport_scales_the_draw() {
 }
 
 /// A near green triangle drawn before a far red one covering the same area.
-fn overlapping_triangles() -> Buffer<TestVertex> {
-    Buffer::from_slice(&[
+fn overlapping_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
+    gpu.buffer(&[
         vertex(0.0, -0.8, 0.8, GREEN),
         vertex(0.8, 0.8, 0.8, GREEN),
         vertex(-0.8, 0.8, 0.8, GREEN),
@@ -2299,13 +2427,12 @@ fn overlapping_triangles() -> Buffer<TestVertex> {
         vertex(0.8, 0.8, 0.2, RED),
         vertex(-0.8, 0.8, 0.2, RED),
     ])
-    .unwrap()
 }
 
 #[test]
 fn depth_attachment_keeps_the_nearer_fragment() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
 
     let without_depth = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -2341,7 +2468,7 @@ fn depth_attachment_keeps_the_nearer_fragment() {
 #[test]
 fn blend_modes_combine_overlapping_fragments() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let mut draw = |clear: [f32; 4], blend| {
         render(&mut gpu, |cmd, target| {
             cmd.raster(
@@ -2374,7 +2501,7 @@ fn skipped_attachment_keeps_its_content() {
         eprintln!("SKIPPED skipped_attachment_keeps_its_content: the device lacks `independent-blend`");
         return;
     }
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let second = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
     let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
     let pixels = render(&mut gpu, |cmd, target| {
@@ -2406,7 +2533,7 @@ fn skipped_attachment_keeps_its_content() {
 #[test]
 fn front_face_decides_which_winding_is_culled() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         let state = RasterState::default().front_face(FrontFace::COUNTER_CLOCKWISE);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -2420,7 +2547,7 @@ fn front_face_decides_which_winding_is_culled() {
 #[test]
 fn line_lists_draw_only_edges() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         let state = unculled().topology(PrimitiveTopology::LINE_LIST);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -2434,7 +2561,7 @@ fn line_lists_draw_only_edges() {
 #[test]
 fn write_masks_keep_the_masked_components() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         let blue = Attachment::color(target.whole_view(), Some([0.0, 0.0, 1.0, 1.0]));
         let state = RasterState::default().write_masks([ColorComponentFlags::R]);
@@ -2449,7 +2576,7 @@ fn write_masks_keep_the_masked_components() {
 #[test]
 fn blend_equations_take_any_factors_and_ops() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let min = BlendEquation {
         src_color: BlendFactor::ONE,
         dst_color: BlendFactor::ONE,
@@ -2477,7 +2604,7 @@ fn logic_ops_replace_blending() {
         eprintln!("SKIPPED logic_ops_replace_blending: the device lacks `logic-op`");
         return;
     }
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let pixels = render(&mut gpu, |cmd, target| {
         let white = Attachment::color(target.whole_view(), Some([1.0; 4]));
         let state = RasterState::default().logic_op(Some(LogicOp::XOR)).unwrap();
@@ -2493,7 +2620,7 @@ fn logic_ops_replace_blending() {
 #[test]
 fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let depth = Image::<D32SfloatS8Uint, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
     let mark = StencilFace {
         pass: StencilOp::REPLACE,
@@ -2533,7 +2660,7 @@ fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
 #[test]
 fn combined_depth_stencil_images_are_sampled_as_depth() {
     let mut gpu = gpu();
-    let vertices = two_triangles();
+    let vertices = two_triangles(&mut gpu);
     let depth = Image::<D32SfloatS8Uint, usage![DepthAttachment, Sampled]>::new(EXTENT)
         .unwrap()
         .bind_sampled()
@@ -2578,7 +2705,7 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
 #[test]
 fn depth_persists_between_draws_unless_cleared() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let depth = Image::<D32Sfloat, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
 
     let mut draw_far_after_near = |clear_between: Option<[f32; 1]>| {
@@ -2616,7 +2743,7 @@ fn depth_persists_between_draws_unless_cleared() {
 #[test]
 fn draws_of_one_rendering_see_the_earlier_depth() {
     let mut gpu = gpu();
-    let near = overlapping_triangles();
+    let near = overlapping_triangles(&mut gpu);
     // Larger than the near triangle, so its rim stays visible.
     let far = buffer_with::<TestVertex>(&[
         vertex(0.0, -0.95, 0.2, RED),
@@ -2721,7 +2848,7 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
 #[test]
 fn depth_clear_takes_effect_on_a_read_only_attachment() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let depth = Image::<D32Sfloat, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
         // Near triangle written, then depth cleared by a read-only pass, then the far one.
@@ -2763,7 +2890,7 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
 #[test]
 fn depth_stencil_formats_work_as_depth_attachment() {
     let mut gpu = gpu();
-    let vertices = overlapping_triangles();
+    let vertices = overlapping_triangles(&mut gpu);
     let depth = Image::<D32SfloatS8Uint, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])

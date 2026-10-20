@@ -18,7 +18,7 @@ use crate::{
     query::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
-    queue::{FamilyInfo, HasCompute, HasGraphics, QueueKind},
+    queue::{FamilyInfo, HasCompute, HasGraphics, Kind, QueueKind},
     state::{Ctx, Functions, debug_name},
 };
 use bytemuck::{Pod, Zeroable};
@@ -34,7 +34,7 @@ pub(crate) mod pending;
 mod raster_state;
 use crate::unsized_struct::unsized_struct;
 pub use binding_output::{BindingOutput, Bindings, kind};
-use image_state::{check_states, release_states, take_checked_states};
+use image_state::{check_states, release_states, released_by, take_checked_states};
 use pending::{PendingAccesses, all_read_access, all_write_access};
 pub use raster_state::*;
 
@@ -91,7 +91,7 @@ pub struct ImageAccess {
 #[derive(Debug, Clone)]
 pub struct ImageUse<'a> {
     pub access: ImageAccess,
-    /// One state for all of `access.mip_range`, or one per mip.
+    /// The image's tracked states: one for all its mips, or one per mip of the image.
     pub(crate) states: &'a [AtomicU64],
 }
 
@@ -1167,14 +1167,28 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         }
         let view = image.view();
         let aspect = view.format().aspects();
-        let (rec, image, to) = (&mut self.rec, view.image, D::KIND);
-        if to == rec.family.kind {
+        (self.rec).release(view.image, view.states, view.mip_range, aspect, D::KIND);
+    }
+}
+
+impl Recording<'_> {
+    /// Records the release of `mips` of `image`, whose tracked states are `states`, to the
+    /// family of kind `to`; mips nobody owns stay unowned. Panics unless this family owns them.
+    pub(crate) fn release(
+        &mut self,
+        image: vk::Image,
+        states: &[AtomicU64],
+        mips: Range<u32>,
+        aspect: vk::ImageAspectFlags,
+        to: Kind,
+    ) {
+        if to == self.family.kind {
             return;
         }
-        let (from, to_index) = (rec.family.index(rec.family.kind), rec.family.index(to));
+        let (from, to_index) = (self.family.index(self.family.kind), self.family.index(to));
         // It waits for this timeline's accesses of the image; the acquire waits for it through
         // the semaphore its submission signals.
-        let pending = &rec.pending_accesses;
+        let pending = &self.pending_accesses;
         let tracked = (pending.image_reads.iter())
             .chain(pending.image_writes.iter().map(|w| &w.write))
             .filter(|a| a.image == image);
@@ -1188,39 +1202,36 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
         }
         let mut images = SmallVec::new();
-        release_states(
-            view.states,
-            view.mip_range,
-            rec.family.kind,
-            to,
-            |mips, layout| {
-                images.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(stage)
-                        .src_access_mask(access)
-                        .dst_stage_mask(S2::NONE)
-                        .dst_access_mask(vk::AccessFlags2::NONE)
-                        .old_layout(layout)
-                        .new_layout(layout)
-                        .src_queue_family_index(from)
-                        .dst_queue_family_index(to_index)
-                        .image(image)
-                        .subresource_range(subresource_range(aspect, mips)),
-                )
-            },
-        );
+        release_states(states, mips, self.family.kind, to, |mips, layout| {
+            images.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(stage)
+                    .src_access_mask(access)
+                    .dst_stage_mask(S2::NONE)
+                    .dst_access_mask(vk::AccessFlags2::NONE)
+                    .old_layout(layout)
+                    .new_layout(layout)
+                    .src_queue_family_index(from)
+                    .dst_queue_family_index(to_index)
+                    .image(image)
+                    .subresource_range(subresource_range(aspect, mips)),
+            )
+        });
         if images.is_empty() {
             return;
         }
-        rec.barrier_log.push(Barriers {
+        self.barrier_log.push(Barriers {
             acquired: SmallVec::new(),
             acquires: SmallVec::new(),
             memory: None,
             images,
         });
-        rec.pipeline_barrier(rec.barrier_log.last().expect("just pushed"));
-        // The family it goes to waits for this submission as a whole.
-        rec.pending_accesses.forget_image(image);
+        self.pipeline_barrier(self.barrier_log.last().expect("just pushed"));
+        // The family it goes to waits for this submission as a whole. Mips this family still
+        // owns keep the image's accesses, which their later accesses wait for.
+        if released_by(states, self.family.kind) {
+            self.pending_accesses.forget_image(image);
+        }
     }
 }
 

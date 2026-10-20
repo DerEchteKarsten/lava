@@ -53,14 +53,16 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - `lava::init` takes one `PassMap`, so an application and a library on lava can't both bring passes; `BindingOutput` names its pass by index into that map.
 - The generated-binding tests need real buffers and images (`BufferSlice` and `ImageView` have no public constructor), so they run in `gpu_headless` instead of as unit tests.
 
-## lava: buffer memory and uploads (memory locations, 2026-10-19)
+## lava: buffer memory and uploads (memory locations 2026-10-19, explicit uploads 2026-10-20)
 ----intended----
 - Host writes racing GPU reads aren't checked: `host_mut` on an `Upload` or `Shared` range a frame in flight still reads is a logic race, not undefined behaviour, and per-frame data takes one range per frame slot by convention (the instance, gizmo and UI rings). SURVEY 4.6 (`PerFrame<Buffer<T, Upload>>`) would make it a type.
 - The host-access check (`host`, `host_mut`, `try_host`) sees the declared buffer writes of submitted recordings: not writes a pass makes through an address it doesn't declare in `Accesses` (core's shader clocks), and not writes recorded but not submitted yet (the `&mut` borrow keeps new recordings off the buffer, so only another thread's recording begun before the borrow could still reach it). `read_into` and `get` copy without checking. It reads each timeline's snapshot of its submissions' writes (`Index::writes`), never their pending accesses, so it never waits for a recording.
-- Queued writes (`Buffer::write`, `from_slice`, `Image::upload`) are copied by the next submission of any timeline; another timeline sees them only after a `Wait` on it. Image uploads wait for a timeline of the family that owns the image (graphics while nobody does), so they never hand an image to another family.
+- Uploads are explicit (2026-10-20): an `Uploads` batch is copied only where `cmd.record_uploads` records it. Another timeline sees the data only after a `Wait` on that submission, and a batch recorded on a family other than its destination releases its images, so the recording can't use them after it. An image another family owns has to be uploaded by a batch recorded on that family.
+- Ordered writes stage on ReBAR devices too: `uploads.write` and `cmd.upload` over 64 KiB copy through staging memory because a frame in flight may read the target. Only `Uploads::init`/`from_slice` write in place (a new buffer nothing reads yet); in-place edits are `Shared` + `host_mut`, one range per frame slot.
+- `Uploads::init` writes in place wherever the buffer's memory is mapped, also without `rebar` (integrated GPUs map device-local memory), so `gpu_missing_features` exercises its staged path only on discrete GPUs. Its writes into staging go through the same `stage` as `write`, which every device tests.
 
 ----future work----
-- Every `Buffer::write`/`Image::upload` creates its own staging buffer (a `vkCreateBuffer` and an allocation per write; core writes one per material change). A shared staging arena, reset like the per-slot `cmd.upload` rings, would batch them. The per-slot rings never shrink.
+- A batch's staging chunks are freed only once their last entry's submission reached the GPU; a batch that stages a little every frame keeps reallocating a 1 MiB chunk whenever its old one drained. Recycling drained chunks through a small pool would avoid that. The per-slot `cmd.upload` rings never shrink.
 - `Shared` needs `rebar`, which needs a device-local host-visible heap of more than 500 MiB; on a discrete GPU without ReBAR the 256 MiB BAR window would still serve small buffers. `Location::shared_or_upload` falls back to `Upload` there.
 
 ## lava: bugs from the publishing survey (2026-10-14)
@@ -72,7 +74,7 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 ## lava: bugs from the second survey (2026-10-18)
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
-- Layout transitions and queue family acquires aren't tracked as writes, so a later read at another stage isn't ordered after the transition (SURVEY 17). Releasing one mip of a `MipChain` forgets the pending writes of the whole image (18).
+- Layout transitions and queue family acquires aren't tracked as writes, so a later read at another stage isn't ordered after the transition (SURVEY 17).
 - Safe code reaches undefined behaviour: `Bindings::new` checks neither the pass kind nor the specialization constants' length (a `VkSpecializationInfo` with `dataSize` 0); `lava::destroy()` can run twice or before further use; `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 23-37).
 - `multiDrawIndirect`, `drawIndirectFirstInstance` and `depthBiasClamp` are never enabled, though `Draw::indirect` passes `buffer.len()` draws and `DepthBias::clamp` is public (38, 39).
 - Without extended dynamic state 3, line and point draws use a pipeline baked with `TRIANGLE_LIST` (`dynamicPrimitiveTopologyUnrestricted` is never queried) (40). `depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists (41). 64-bit clear values are packed as 32-bit (43).
@@ -92,6 +94,9 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 (hot reload is a debug feature anyways)
 
 ## Ideas
+
+### Explicit bindless rewrites (2026-10-20)
+`bindless::bind` still has an implicit queue (`Bindless::queued`), recorded by the next graphics or compute submission before its closure, like uploads were until 2026-10-20. Move it to an explicit batch the same way: `bind` writes into a `Rewrites` batch the application owns, which `cmd.record_rewrites(&batch)` records where it chooses (`flush_queued`'s barriers and `vkCmdUpdateMemoryKHR` runs), dropping a `SlotRange` forgets its entries, and a failed submission returns them, as `upload::finish` does for uploads. It would also let a transfer timeline rewrite slots, since it needs no bound heap to write heap memory.
 
 ### Transient attachments (2026-10-19)
 Image memory is always `GpuOnly`; images have no memory type parameter. Their only other useful memory is lazily allocated memory for attachments that never leave a rendering (depth of a single pass, MSAA targets once lava has them), which tilers never back with memory. It belongs in the usage set: a `Transient` flag of `Usage` (`TRANSIENT_ATTACHMENT`, allowed only with attachment flags and without sampled, storage or transfer ones), whose images allocate from `LAZILY_ALLOCATED` memory where the device has it.

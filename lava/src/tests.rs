@@ -1,13 +1,17 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
-use std::{iter, sync::atomic::AtomicU64};
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, upload staging chunks and batches, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
+use std::{
+    iter,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
 
 use crate::{
+    buffer::upload::{Cursor, Entries, Entry, MIN_CHUNK, Target, Uploads},
     bindless::{Combined, HeapLayout, ImageHandle, Ranges, Sampled, Storage},
     command_buffer::{
         BufferAccess, ImageAccess, ImageUse, compute_barriers,
-        image_state::{ImageState, check_states, release_states, take_checked_states},
+        image_state::{ImageState, check_states, release_states, released_by, take_checked_states},
         pending::PendingAccesses,
     },
     features::{DeviceFacts, FeatureChain, Features},
@@ -162,6 +166,92 @@ fn ownership_moves_through_release_and_acquire() {
     assert_eq!((acquire.src_queue_family_index, acquire.dst_queue_family_index), (1, 0));
     assert!(barriers.images.is_empty(), "same layout");
     assert_eq!(ImageState::load(&access.states[0]).owner, Some(Kind::Graphics));
+}
+
+/// Releasing one mip of a chain keeps the image's pending accesses for the mips the family
+/// still owns (`released_by`); they go once every mip is released.
+#[test]
+fn releasing_one_mip_keeps_the_others() {
+    let states: Vec<AtomicU64> =
+        [state(L::GENERAL, Some(Kind::Graphics)), state(L::GENERAL, Some(Kind::Graphics)), ImageState::UNDEFINED]
+            .map(ImageState::atomic)
+            .into();
+    let mut released = Vec::new();
+    release_states(&states, (1..2).into(), Kind::Graphics, Kind::Transfer, |mips, _| {
+        released.push((mips.start, mips.end))
+    });
+    assert_eq!(released, [(1, 2)]);
+    assert_eq!(ImageState::load(&states[0]).released_to, None);
+    assert!(!released_by(&states, Kind::Graphics), "mip 0 is still owned");
+    release_states(&states, (0..1).into(), Kind::Graphics, Kind::Transfer, |_, _| {});
+    assert!(released_by(&states, Kind::Graphics), "mip 2 is unowned, the others released");
+}
+
+/// A batch appends its staged writes to its newest chunk, gives a write larger than a chunk
+/// one of its own size without leaving the newest, and starts a new chunk once the newest is
+/// full or its last entry freed it.
+#[test]
+fn staging_chunks_are_appended_and_freed() {
+    let mut cursor = Cursor::<u64>::default();
+    let mut made = Vec::new();
+    let mut new = |capacity| {
+        made.push(capacity);
+        Ok(capacity)
+    };
+    let (first, at) = cursor.place(100, &mut new).unwrap();
+    assert_eq!((*first, at), (MIN_CHUNK, 0));
+    let (second, at) = cursor.place(3, &mut new).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(at, 112, "16-byte aligned after the first");
+    let (large, at) = cursor.place(MIN_CHUNK + 1, &mut new).unwrap();
+    assert_eq!((*large, at), (MIN_CHUNK + 1, 0));
+    let (third, at) = cursor.place(4, &mut new).unwrap();
+    assert!(Arc::ptr_eq(&first, &third) && at == 128, "still the newest chunk");
+    let (full, at) = cursor.place(MIN_CHUNK - 64, &mut new).unwrap();
+    assert!(!Arc::ptr_eq(&first, &full) && at == 0, "a new chunk once the newest is full");
+    drop(full);
+    let (fresh, _) = cursor.place(1, &mut new).unwrap();
+    assert_eq!(Arc::strong_count(&fresh), 1, "the freed chunk isn't reused");
+    assert_eq!(made, [MIN_CHUNK, MIN_CHUNK + 1, MIN_CHUNK, MIN_CHUNK]);
+}
+
+/// Staged writes go from unrecorded to recorded into a submission, back to unrecorded when it
+/// didn't reach the GPU, and away once it did; a batch records only its own unrecorded ones.
+#[test]
+fn staged_writes_move_through_recording() {
+    let entry = |batch, address| Entry {
+        batch,
+        chunk: Arc::new(()),
+        range: (0..4).into(),
+        target: Target::Buffer(address),
+        recorded: None,
+    };
+    let addresses = |entries: &mut Entries<()>, batch, submission| {
+        (entries.record(batch, submission))
+            .map(|e| match e.target {
+                Target::Buffer(address) => address,
+                Target::Image(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut entries = Entries(vec![entry(1, 10), entry(2, 20), entry(1, 11)]);
+    assert_eq!(addresses(&mut entries, 1, (0, 5)), [10, 11]);
+    assert_eq!(entries.unrecorded(1), 0);
+    assert_eq!(addresses(&mut entries, 1, (0, 6)), [] as [u64; 0], "recorded already");
+    assert!(entries.finish((0, 5), false).is_empty());
+    assert_eq!(entries.unrecorded(1), 2, "back after a failed submission");
+    assert_eq!(addresses(&mut entries, 1, (1, 7)), [10, 11]);
+    entries.0.push(entry(1, 12));
+    assert_eq!(addresses(&mut entries, 1, (1, 8)), [12], "only what is new");
+    assert_eq!(entries.finish((1, 7), true).len(), 2);
+    assert_eq!(entries.0.len(), 2);
+    assert_eq!(entries.unrecorded(2), 1, "another batch's write is untouched");
+    // A dropped batch takes its unrecorded writes; its recorded ones go with their submission,
+    // also when it fails.
+    entries.0.push(entry(1, 13));
+    assert_eq!(entries.drop_batch(1).len(), 1);
+    assert_eq!(entries.finish((1, 8), false).len(), 1);
+    assert_eq!(entries.0.len(), 1);
 }
 
 #[test]
@@ -410,3 +500,9 @@ fn host_image_copy_needs_no_rebar() {
     assert!(consistent.host_image_copy);
     let _ = consistent;
 }
+
+/// A loader thread can send a batch with what it staged for.
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<Uploads>();
+};

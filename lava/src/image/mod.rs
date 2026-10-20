@@ -1,4 +1,4 @@
-//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`; staged ones are `upload` in `buffer/upload.rs`), type erasure, and their destruction once no frame can reach them
+//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`; staged ones are `Uploads::image` in `buffer/upload.rs`), type erasure, and their destruction once no frame can reach them
 use std::{
     mem::{self, ManuallyDrop},
     range::Range,
@@ -98,10 +98,9 @@ pub trait Views: crate::sealed::Sealed + std::fmt::Debug + Send + Sync + 'static
 
 /// Views with one view per mip besides the whole one: [`PerMip`].
 pub trait MipViews: Views {
-    /// Mip `level`'s view over every aspect (null without attachment usage), its handle and
-    /// state.
+    /// Mip `level`'s view over every aspect (null without attachment usage) and its handle.
     #[doc(hidden)]
-    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle, &AtomicU64);
+    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle);
     #[doc(hidden)]
     fn mip_handle_mut(&mut self, level: u32) -> &mut ImageHandle;
 }
@@ -111,7 +110,7 @@ pub trait MipViews: Views {
 pub struct Single {
     view: vk::ImageView,
     handle: ImageHandle,
-    /// Boxed, so a queued upload reaches it while the image moves (`Image::upload`).
+    /// Boxed, so a staged upload reaches it while the image moves (`Uploads::image`).
     state: Box<AtomicU64>,
 }
 
@@ -188,9 +187,9 @@ impl Views for PerMip {
 }
 
 impl MipViews for PerMip {
-    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle, &AtomicU64) {
+    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle) {
         let mip = &self.mips[level as usize];
-        (mip.view, mip.handle, &self.layouts[level as usize])
+        (mip.view, mip.handle)
     }
     fn mip_handle_mut(&mut self, level: u32) -> &mut ImageHandle {
         &mut self.mips[level as usize].handle
@@ -496,8 +495,8 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 impl<F: Format, U: ImageUsage, D: Dim, V: MipViews> Image<F, U, D, V> {
     /// The view of mip `level` alone, sized `mip_extent(level)`.
     pub fn mip_view(&self, level: u32) -> ImageView<'_, F, U, D> {
-        let (view, handle, state) = self.views.mip(level);
-        let states = std::slice::from_ref(state);
+        let (view, handle) = self.views.mip(level);
+        let (_, _, states) = self.views.whole();
         self.view(view, (level..level + 1).into(), handle, states)
     }
 

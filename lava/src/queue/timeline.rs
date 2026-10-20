@@ -1,4 +1,4 @@
-//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight, and the submission of their recordings (queued uploads first), with the snapshot of their submitted buffer writes that host access checks
+//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight, and the submission of their recordings (queued bindless rewrites first), with the snapshot of their submitted buffer writes that host access checks
 use std::{
     fmt,
     marker::PhantomData,
@@ -354,8 +354,6 @@ impl<K: QueueKind> Submission<'_, K> {
             Kind::Transfer => Default::default(),
             _ => Bindless::flush_queued(slot.cmd),
         };
-        // Queued writes of buffers and images, ordered after the timeline's earlier commands.
-        upload::flush(&mut cmd);
         let prev = CALLSITE.replace(None);
         let was_recording = lifetime::RECORDING.replace(true);
         let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| record(&mut cmd)));

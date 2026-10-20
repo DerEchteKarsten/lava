@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use bytemuck::Pod;
 use lava::{
     bindless::{Sampler, SamplerDesc, SamplerHandle},
-    buffer::{Buffer, HostVisible, Readback, Upload},
+    buffer::{Buffer, HostVisible, Readback, Upload, Uploads},
     command_buffer::CommandBuffer,
     queue::{Graphics, Timeline, Wait},
 };
@@ -148,6 +148,17 @@ impl Gpu {
         let done = submission.submit(record).unwrap();
         done.block().unwrap();
         done
+    }
+
+    /// A device-local buffer holding `data`, its copy recorded and completed where it was
+    /// staged.
+    pub fn buffer<T: Pod>(&mut self, data: &[T]) -> Buffer<T> {
+        let mut uploads = Uploads::new();
+        let buffer = uploads.from_slice(data).unwrap();
+        if !uploads.is_empty() {
+            self.submit(|cmd| cmd.record_uploads(&uploads));
+        }
+        buffer
     }
 }
 

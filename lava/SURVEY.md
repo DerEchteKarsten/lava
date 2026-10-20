@@ -20,9 +20,6 @@ listed in `STATE.md`. Done items are removed.
     sampled at FRAGMENT, a later copy on the same family gets no barrier at all. **Fix:** after a
     transition or acquire, store the image's pending write as (destination stage, access), already
     visible to that pair.
-18. **Releasing one mip forgets the whole image** (`mod.rs:1201`). `release` calls
-    `forget_image`, which drops the pending writes of the mips this family still owns, so later
-    reads of them get no barrier. Forget only once every mip is released.
 19. **A transition after an acquire takes stale sources** *(plausible)* (`mod.rs:1599-1611`).
     With two timelines of one family, the acquiring timeline's old accesses of the image become
     the transition's source, not the acquire's destination stage. OR `to_stage` into the source

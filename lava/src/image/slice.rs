@@ -31,7 +31,7 @@ pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     /// The extent of mip `mip_range.start`.
     pub(crate) extent: D::Extent,
     pub(crate) handle: ImageHandle,
-    /// One tracked state for all of `mip_range`, or one per mip.
+    /// The image's tracked states: one for all its mips, or one per mip of the image.
     pub(crate) states: &'a [AtomicU64],
     pub(crate) format: F,
     pub(crate) usage: U,
