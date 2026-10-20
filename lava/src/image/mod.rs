@@ -18,9 +18,10 @@ use crate::{
         slice::ImageView,
         usage::{ImageUsage, StaticUsage},
     },
+    global::Live,
     lifetime,
     queue::timeline::forget_image,
-    state::Ctx,
+    state::{Ctx, Functions},
 };
 
 pub mod dim;
@@ -45,6 +46,8 @@ pub struct RawImage<F: Format, U: ImageUsage, D: Dim> {
     mip_levels: u32,
     format: F,
     usage: U,
+    /// Last, so it counts the image until its drop finished.
+    live: Live,
 }
 
 impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
@@ -262,12 +265,13 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     /// Like `with_mip_levels`, for any format and usage, `Dynamic` ones included.
     #[validation_trace]
     pub fn with_params(format: F, usage: U, extent: D::Extent, mip_levels: u32) -> Result<Self> {
+        let live = Live::new();
         check_extent::<D>(extent, mip_levels)?;
         if bc_block(format.vk_format()).is_some() {
             #[cfg(feature = "bc-compression")]
             gate::BcCompression::check()?;
             #[cfg(not(feature = "bc-compression"))]
-            return Err(Error::message(format!(
+            return Err(Error::Unsupported(format!(
                 "{:?} needs lava's `bc-compression` feature",
                 format.vk_format()
             )));
@@ -276,8 +280,8 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             #[cfg(feature = "host-image-copy")]
             gate::HostImageCopy::check()?;
             #[cfg(not(feature = "host-image-copy"))]
-            return Err(Error::message(
-                "host copy usage needs lava's `host-image-copy` feature",
+            return Err(Error::Unsupported(
+                "host copy usage needs lava's `host-image-copy` feature".into(),
             ));
         }
         let create_info = vk::ImageCreateInfo {
@@ -336,6 +340,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             mip_levels,
             format,
             usage,
+            live,
         };
         unsafe {
             Ctx::device().bind_image_memory(
@@ -348,6 +353,16 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             views: V::create(&raw)?,
             raw,
         })
+    }
+
+    /// The same image named `name`, for debuggers, the validation layer (with debug utils,
+    /// `Config::validation`) and allocator reports.
+    pub fn named(mut self, name: &str) -> Self {
+        if let Err(err) = Ctx::allocator().rename_allocation(&mut self.raw.allocation, name) {
+            tracing::warn!(%err, "failed to name an image's allocation");
+        }
+        Functions::set_debug_name(name, self.raw.image);
+        self
     }
 
     /// The extent of mip 0.
@@ -439,6 +454,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
                 mip_levels: raw.mip_levels,
                 format,
                 usage,
+                live: mem::replace(&mut raw.live, Live::internal()),
             },
         }
     }
@@ -557,7 +573,6 @@ use crate::{
     command_buffer::image_state::take_host_layouts,
     features::Feature,
     image::usage::IsHostCopy,
-    state::Functions,
 };
 
 #[cfg(feature = "host-image-copy")]
@@ -565,10 +580,13 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
     /// Writes a whole mip level from the host, right away, unsynchronised with frames in flight
     /// that read the image.
     #[validation_trace]
+    ///
+    /// Panics for a mip it doesn't have, data of another length than the mip's, and combined
+    /// depth-stencil formats.
     pub fn copy_from(&mut self, data: &[u8], mip_level: u32) -> Result<()> {
-        self.check_host_copy(data, mip_level)?;
+        self.check_host_copy(data, mip_level);
         let extent = self.mip_extent(mip_level);
-        self.check_data_len(data, extent, || format!("mip level {mip_level}"))?;
+        self.check_data_len(data, extent, || format!("mip level {mip_level}"));
         self.host_copy(data, mip_level, D::ZERO, extent)
     }
 
@@ -582,57 +600,48 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
         offset: D::Extent,
         extent: D::Extent,
     ) -> Result<()> {
-        self.check_host_copy(data, mip_level)?;
+        self.check_host_copy(data, mip_level);
         let mip_extent = self.mip_extent(mip_level);
-        if !D::region_fits(mip_extent, offset, extent) {
-            return Err(Error::message(format!(
-                "region {extent:?} at {offset:?} does not fit mip level {mip_level} of size {mip_extent:?}"
-            )));
-        }
-        self.check_data_len(data, extent, || "the region".to_string())?;
+        assert!(
+            D::region_fits(mip_extent, offset, extent),
+            "region {extent:?} at {offset:?} does not fit mip level {mip_level} of size {mip_extent:?}"
+        );
+        self.check_data_len(data, extent, || "the region".to_string());
         self.host_copy(data, mip_level, offset, extent)
     }
 
-    fn check_host_copy(&self, data: &[u8], mip_level: u32) -> Result<()> {
+    #[track_caller]
+    fn check_host_copy(&self, data: &[u8], mip_level: u32) {
         // The image exists, so the device has host copies.
         self.usage_check(vk::ImageUsageFlags::HOST_TRANSFER_EXT);
-        if mip_level >= self.raw.mip_levels {
-            return Err(Error::message(format!(
-                "mip level {mip_level} is out of range for an image with {} levels",
-                self.raw.mip_levels
-            )));
-        }
-        if data.is_empty() {
-            return Err(Error::message("no texel data to copy"));
-        }
+        assert!(
+            mip_level < self.raw.mip_levels,
+            "mip level {mip_level} is out of range for an image with {} levels",
+            self.raw.mip_levels
+        );
+        assert!(!data.is_empty(), "no texel data to copy");
         let aspects = self.raw.format.aspects();
-        if slice::single_aspect(aspects) != aspects {
-            return Err(Error::message(
-                "host copies of combined depth-stencil formats aren't supported: their texel data has no single layout",
-            ));
-        }
-        Ok(())
+        assert!(
+            slice::single_aspect(aspects) == aspects,
+            "host copies of combined depth-stencil formats aren't supported: their texel data has no single layout"
+        );
     }
 
-    fn check_data_len(
-        &self,
-        data: &[u8],
-        extent: D::Extent,
-        what: impl FnOnce() -> String,
-    ) -> Result<()> {
+    #[track_caller]
+    fn check_data_len(&self, data: &[u8], extent: D::Extent, what: impl FnOnce() -> String) {
         let format = self.raw.format;
         let expected = expected_data_len(
             D::extent_3d(extent),
             format.texel_size(),
             bc_block(format.vk_format()),
         );
-        match expected {
-            Some(expected) if data.len() != expected => Err(Error::message(format!(
+        if let Some(expected) = expected {
+            assert!(
+                data.len() == expected,
                 "{} holds {expected} bytes but {} were given",
                 what(),
                 data.len()
-            ))),
-            _ => Ok(()),
+            );
         }
     }
 
@@ -697,7 +706,7 @@ fn check_extent<D: Dim>(extent: D::Extent, mip_levels: u32) -> Result<()> {
     let e = D::extent_3d(extent);
     let largest = e.width.max(e.height).max(e.depth);
     if e.width == 0 || e.height == 0 || e.depth == 0 {
-        return Err(Error::message(format!("an image of extent {extent:?} has no texels")));
+        return Err(Error::other(format!("an image of extent {extent:?} has no texels")));
     }
     let limits = &Ctx::device_properties().limits;
     let max = match D::IMAGE_TYPE {
@@ -705,13 +714,13 @@ fn check_extent<D: Dim>(extent: D::Extent, mip_levels: u32) -> Result<()> {
         _ => limits.max_image_dimension2_d,
     };
     if largest > max {
-        return Err(Error::message(format!(
+        return Err(Error::Unsupported(format!(
             "an image of extent {extent:?} is larger than the device's {max} texels per side"
         )));
     }
     let most = largest.ilog2() + 1;
     if mip_levels == 0 || mip_levels > most {
-        return Err(Error::message(format!(
+        return Err(Error::other(format!(
             "an image of extent {extent:?} has 1 to {most} mip levels, not {mip_levels}"
         )));
     }

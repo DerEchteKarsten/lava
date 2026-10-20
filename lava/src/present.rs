@@ -30,6 +30,7 @@ use crate::{
         HasGraphics, lock,
         timeline::{completed, forget_image, poll},
     },
+    global::Live,
     state::{Ctx, Functions},
 };
 
@@ -133,6 +134,8 @@ pub struct PresentSurface<U: StaticUsage = usage![ColorAttachment, TransferDst]>
     /// The acquired image, with the submission that presented it.
     current: Option<Current>,
     _usage: PhantomData<fn() -> U>,
+    /// Last, so it counts the surface until its drop finished.
+    _live: Live,
 }
 
 /// The image a surface acquired.
@@ -156,7 +159,7 @@ impl<U: StaticUsage> fmt::Debug for PresentSurface<U> {
 
 fn surface_fn() -> Result<&'static ash::khr::surface::Instance> {
     Functions::surface().ok_or_else(|| {
-        Error::message("lava was initialised without a display handle; surfaces are unavailable")
+        Error::Unsupported("lava was initialised without a display handle; surfaces are unavailable".into())
     })
 }
 
@@ -172,6 +175,7 @@ impl<U: StaticUsage> PresentSurface<U> {
         window: &RawWindowHandle,
         preferred: &[vk::SurfaceFormatKHR],
     ) -> Result<Self> {
+        let live = Live::new();
         let surface_fn = surface_fn()?;
         let (entry, instance) = (Functions::entry(), Functions::instance());
         let surface = unsafe { ash_window::create_surface(entry, instance, *display, *window, None)? };
@@ -181,7 +185,7 @@ impl<U: StaticUsage> PresentSurface<U> {
             let can_present =
                 unsafe { surface_fn.get_physical_device_surface_support(device, family, surface)? };
             if !can_present {
-                return Err(Error::message("the graphics queue family cannot present to this surface"));
+                return Err(Error::Unsupported("the graphics queue family cannot present to this surface".into()));
             }
             let formats = unsafe { surface_fn.get_physical_device_surface_formats(device, surface)? };
             let modes = unsafe { surface_fn.get_physical_device_surface_present_modes(device, surface)? };
@@ -189,7 +193,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                 unsafe { surface_fn.get_physical_device_surface_capabilities(device, surface)? };
             let usage = U::VK;
             if !capabilities.supported_usage_flags.contains(usage) {
-                return Err(Error::message(format!(
+                return Err(Error::Unsupported(format!(
                     "the surface supports the image usages {:?}, swapchain images need {usage:?}",
                     capabilities.supported_usage_flags
                 )));
@@ -219,7 +223,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                     .find(usable),
             };
             let format = *format.ok_or_else(|| {
-                Error::message(format!("the surface has no format whose images support {usage:?}"))
+                Error::Unsupported(format!("the surface has no format whose images support {usage:?}"))
             })?;
             // FIFO is always supported.
             let present_modes = [
@@ -244,6 +248,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                 fences: Vec::new(),
                 current: None,
                 _usage: PhantomData,
+                _live: live,
             })
         })();
         if made.is_err() {
@@ -304,7 +309,7 @@ impl<U: StaticUsage> PresentSurface<U> {
         }
         let free = &mut self.free;
         self.waited.retain(|&(semaphore, t, v)| {
-            let done = completed(t) >= v || poll(t) >= v;
+            let done = completed(t) >= v || poll(t).is_ok_and(|done| done >= v);
             if done {
                 free.push(semaphore);
             }
@@ -319,7 +324,7 @@ impl<U: StaticUsage> PresentSurface<U> {
         for (swapchain, _) in self.old.extract_if(.., |(swapchain, stamp)| {
             let presented = match gate::PresentFences::on() {
                 true => swapchain.fences.iter().all(signalled),
-                false => swapchain.presenter.is_none_or(|(t, v)| poll(t) > v),
+                false => swapchain.presenter.is_none_or(|(t, v)| poll(t).is_ok_and(|done| done > v)),
             };
             presented && stamp.is_done()
         }) {
@@ -467,7 +472,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                 }
             }
         }
-        Err(Error::message("the swapchain was still out of date after three recreations"))
+        Err(Error::SurfaceOutOfDate)
     }
 
     /// The view of the current image, for the submission that draws into it and presents it.

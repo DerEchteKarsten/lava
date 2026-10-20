@@ -16,6 +16,7 @@ use crate::{
     buffer::slice::BufferSlice,
     lifetime,
     command_buffer::{BufferAccess, pending::incomplete_write},
+    global::Live,
     queue::{lock, timeline::{INDICES, completed, poll}},
     state::Ctx,
 };
@@ -67,6 +68,8 @@ pub struct Buffer<T: Copy + Pod, M: Memory = Gpu> {
     allocation: Allocation,
     memory: M,
     _type_marker: PhantomData<T>,
+    /// Last, so it counts the buffer until its drop finished.
+    live: Live,
 }
 
 impl<T: Copy + Pod, M: Memory> Drop for Buffer<T, M> {
@@ -136,7 +139,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
     #[validation_trace]
     pub fn with_memory(memory: M, len: usize) -> Result<Self> {
         let num_bytes = len.checked_mul(size_of::<T>()).ok_or_else(|| {
-            Error::message(format!("{len} elements of {} bytes overflow", size_of::<T>()))
+            Error::other(format!("{len} elements of {} bytes overflow", size_of::<T>()))
         })?;
         Self::raw(memory, num_bytes as u64, Some(align_of::<T>() as u32))
     }
@@ -145,7 +148,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
     /// device requires.
     #[validation_trace]
     pub fn raw(memory: M, num_bytes: u64, alignment: Option<u32>) -> Result<Self> {
-        Self::with_flags(USAGE, memory, num_bytes, alignment)
+        Self::create(USAGE, memory, num_bytes, alignment, Live::new())
     }
 
     /// A buffer of lava's own with `usage` instead of [`USAGE`] (a shader binding table, an
@@ -157,16 +160,26 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
         num_bytes: u64,
         alignment: Option<u32>,
     ) -> Result<Self> {
+        Self::create(usage, memory, num_bytes, alignment, Live::internal())
+    }
+
+    fn create(
+        usage: vk::BufferUsageFlags,
+        memory: M,
+        num_bytes: u64,
+        alignment: Option<u32>,
+        live: Live,
+    ) -> Result<Self> {
         let location = memory.location();
-        if location == Location::Gpu && Ctx::features().rebar {
+        if location == Location::Gpu && Ctx::features_ref().rebar {
             // Mapped, so uploaders write it in place; plain device-local memory is the
             // fallback once the BAR heap is full.
-            let shared = Self::with_memory_types(usage, memory, num_bytes, alignment, Location::Shared);
+            let shared = Self::with_memory_types(usage, memory, num_bytes, alignment, Location::Shared, &live);
             if let Ok(buffer) = shared {
                 return Ok(buffer);
             }
         }
-        Self::with_memory_types(usage, memory, num_bytes, alignment, location)
+        Self::with_memory_types(usage, memory, num_bytes, alignment, location, &live)
     }
 
     /// Like [`Self::with_flags`], allocated from the memory types of `location` instead of
@@ -177,11 +190,12 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
         num_bytes: u64,
         alignment: Option<u32>,
         location: Location,
+        live: &Live,
     ) -> Result<Self> {
         if num_bytes == 0 {
-            return Err(Error::message("a buffer can't be empty: Vulkan needs at least one byte"));
+            return Err(Error::other("a buffer can't be empty: Vulkan needs at least one byte"));
         }
-        if location == Location::Shared && !Ctx::features().rebar {
+        if location == Location::Shared && !Ctx::features_ref().rebar {
             return Err(crate::features::MissingFeature { feature: "rebar" }.into());
         }
         let mut flags = usage
@@ -268,7 +282,22 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
             allocation,
             memory,
             handle: buffer,
+            live: live.clone(),
         })
+    }
+
+    /// The same buffer named `name`, for debuggers, the validation layer (with debug utils,
+    /// `Config::validation`) and allocator reports.
+    pub fn named(mut self, name: &str) -> Self {
+        self.set_name(name);
+        self
+    }
+
+    pub(crate) fn set_name(&mut self, name: &str) {
+        if let Err(err) = Ctx::allocator().rename_allocation(&mut self.allocation, name) {
+            tracing::warn!(%err, "failed to name a buffer's allocation");
+        }
+        crate::state::Functions::set_debug_name(name, self.handle);
     }
 
     /// The device address of its first byte.
@@ -330,6 +359,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
             num_bytes: this.num_bytes,
             memory: this.memory,
             _type_marker: PhantomData,
+            live: mem::replace(&mut this.live, Live::internal()),
         }
     }
 
@@ -343,6 +373,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
             num_bytes: this.num_bytes,
             memory: Dynamic(this.memory.location()),
             _type_marker: PhantomData,
+            live: mem::replace(&mut this.live, Live::internal()),
         }
     }
 }
@@ -361,7 +392,7 @@ impl<T: Copy + Pod, M: HostVisible> Buffer<T, M> {
         let range = (self.address..self.address + self.num_bytes).into();
         (0..INDICES.len()).find_map(|i| {
             let value = incomplete_write(lock(&INDICES[i].writes).iter().copied(), range, completed(i))?;
-            (poll(i) < value).then_some((i, value))
+            (!poll(i).is_ok_and(|done| done >= value)).then_some((i, value))
         })
     }
 

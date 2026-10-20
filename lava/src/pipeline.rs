@@ -1,9 +1,12 @@
-//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups), each pass's pipelines per specialization and raster key (attachment formats and the draw state the device can't set dynamically) behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), and `reload_pass`, which replaces a pass's pipelines and retires the old ones
+//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups), each pass's pipelines per specialization and raster key (attachment formats and the draw state the device can't set dynamically) behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), `reload_pass`, which replaces a pass's pipelines and retires the old ones, and their destruction at `shutdown`
 use std::{
     ffi::CStr,
     hash::Hash,
     path::Path,
-    sync::{OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicPtr, Ordering},
+    },
 };
 
 use crate::vk;
@@ -14,6 +17,7 @@ use crate::{
     command_buffer::{Baked, ColorComponentFlags},
     error::{Error, Result},
     features::Features,
+    global::{Global, NOT_INITIALISED},
     state::{Ctx, Functions},
 };
 #[cfg(bake_blend)]
@@ -31,13 +35,27 @@ pub struct PassMap {
     pub passes: &'static [PassEntry],
 }
 
-pub(crate) static PASS_MAP: OnceLock<&'static PassMap> = OnceLock::new();
+/// The `Config::passes` of `init`; null when lava isn't initialised.
+static PASS_MAP: AtomicPtr<PassMap> = AtomicPtr::new(std::ptr::null_mut());
 
 /// The passes `lava::init` was given.
+#[track_caller]
 pub fn pass_map() -> &'static PassMap {
-    PASS_MAP
-        .get()
-        .expect("lava has no passes; call `lava::init()` first")
+    try_pass_map().expect(NOT_INITIALISED)
+}
+
+/// The passes `lava::init` was given, `None` when lava isn't initialised.
+pub(crate) fn try_pass_map() -> Option<&'static PassMap> {
+    // SAFETY: only ever a `&'static PassMap` (`set_pass_map`).
+    unsafe { PASS_MAP.load(Ordering::Acquire).as_ref() }
+}
+
+pub(crate) fn set_pass_map(passes: &'static PassMap) {
+    PASS_MAP.store(std::ptr::from_ref(passes).cast_mut(), Ordering::Release);
+}
+
+pub(crate) fn unset_pass_map() {
+    PASS_MAP.store(std::ptr::null_mut(), Ordering::Release);
 }
 
 /// A pass's entry points by stage.
@@ -166,12 +184,11 @@ impl Equivalent<RasterKey> for RasterKeyRef<'_> {
     }
 }
 
-static PIPELINES: OnceLock<PipelineManager> = OnceLock::new();
+static PIPELINES: Global<PipelineManager> = Global::new();
 
+#[track_caller]
 pub(crate) fn pipelines() -> &'static PipelineManager {
-    PIPELINES
-        .get()
-        .expect("pipelines were not initialized; call `lava::init()` first")
+    PIPELINES.get()
 }
 
 /// A lock's data even if a thread panicked while writing it: every write leaves the maps whole.
@@ -211,23 +228,27 @@ enum Cache {
     Raster(RwLock<HashMap<RasterKey, vk::Pipeline>>),
 }
 
-pub(crate) fn init(cache_path: Option<&'static Path>) -> Result<()> {
-    let passes = pass_map().passes;
-    let needs: Vec<_> = passes.iter().map(|pass| Features::of_spirv(pass.spirv)).collect();
-    let compiled_out: Vec<String> = (passes.iter().zip(&needs))
+/// `Unsupported` when a pass of `map` needs a cargo feature lava was compiled without; reads
+/// only the SPIR-V, so `init` checks it before it makes anything.
+pub(crate) fn check_compiled(map: &PassMap) -> Result<()> {
+    let compiled_out: Vec<String> = (map.passes.iter())
+        .map(|pass| (pass, Features::of_spirv(pass.spirv)))
         .filter(|(_, needs)| !needs.compiled_out.is_empty())
         .map(|(pass, needs)| format!("`{}` needs `{}`", pass.name, needs.compiled_out.join("`, `")))
         .collect();
-    if !compiled_out.is_empty() {
-        return Err(Error::message(format!(
+    match compiled_out.is_empty() {
+        true => Ok(()),
+        false => Err(Error::Unsupported(format!(
             "lava was compiled without cargo features passes need: {}",
             compiled_out.join("; ")
-        )));
+        ))),
     }
-    if PIPELINES.get().is_some() {
-        return Ok(());
-    }
-    let features = Ctx::features();
+}
+
+pub(crate) fn init(cache_path: Option<&'static Path>) -> Result<()> {
+    let passes = pass_map().passes;
+    let needs: Vec<_> = passes.iter().map(|pass| Features::of_spirv(pass.spirv)).collect();
+    let features = *Ctx::features_ref();
     let missing: Vec<Vec<String>> = (passes.iter().zip(&needs))
         .map(|(pass, needs)| {
             let mut missing: Vec<String> = (needs.features.missing_from(&features).into_iter())
@@ -256,7 +277,7 @@ pub(crate) fn init(cache_path: Option<&'static Path>) -> Result<()> {
                 Ok(module) => module,
                 Err(err) => {
                     undo(&modules, &[]);
-                    return Err(Error::message(format!("pass `{}`: {err}", pass.name)));
+                    return Err(err.context(format!("the shader module of pass `{}`", pass.name)));
                 }
             },
         };
@@ -283,7 +304,7 @@ pub(crate) fn init(cache_path: Option<&'static Path>) -> Result<()> {
     let compute_batch = unspecialized(false);
     let compute = create_compute_pipelines(cache, &compute_batch).map_err(|err| {
         undo(&modules, &[]);
-        Error::message(format!("the pipelines of `{}`: {err}", names(&compute_batch)))
+        err.context(format!("the pipelines of `{}`", names(&compute_batch)))
     })?;
     #[cfg(feature = "ray-tracing-pipeline")]
     let mut ray_tracing = {
@@ -292,7 +313,7 @@ pub(crate) fn init(cache_path: Option<&'static Path>) -> Result<()> {
             true => Vec::new(),
             false => create_raytracing_pipelines(cache, &batch).map_err(|err| {
                 undo(&modules, &compute);
-                Error::message(format!("the pipelines of `{}`: {err}", names(&batch)))
+                err.context(format!("the pipelines of `{}`", names(&batch)))
             })?,
         };
         made.into_iter()
@@ -333,12 +354,38 @@ pub(crate) fn init(cache_path: Option<&'static Path>) -> Result<()> {
             }
         })
         .collect();
-    let _ = PIPELINES.set(PipelineManager {
+    PIPELINES.set(PipelineManager {
         cache,
         cache_path,
         passes,
     });
     Ok(())
+}
+
+/// Destroys every pass's pipelines and module and the pipeline cache, at `shutdown` (after
+/// `save_cache_now`); ray tracing pipelines retire their binding tables.
+///
+/// # Safety
+/// The device is idle and nothing records (lava is closed).
+pub(crate) unsafe fn destroy() {
+    let Some(manager) = (unsafe { PIPELINES.take() }) else {
+        return;
+    };
+    let device = Ctx::device();
+    let PipelineManager { cache, passes, .. } = *manager;
+    for pass in passes {
+        match pass.cache {
+            Cache::Compute(map) => map.into_inner().unwrap_or_else(PoisonError::into_inner).into_values().for_each(destroy_pipeline),
+            #[cfg(feature = "ray-tracing-pipeline")]
+            Cache::RayTracing(map) => map.into_inner().unwrap_or_else(PoisonError::into_inner).into_values().for_each(destroy_ray_tracing),
+            Cache::Raster(map) => map.into_inner().unwrap_or_else(PoisonError::into_inner).into_values().for_each(destroy_pipeline),
+        }
+        let module = pass.module.into_inner().unwrap_or_else(PoisonError::into_inner);
+        if module != vk::ShaderModule::null() {
+            unsafe { device.destroy_shader_module(module, None) };
+        }
+    }
+    unsafe { device.destroy_pipeline_cache(cache, None) };
 }
 
 /// The device limits a pass exceeds, as what it lacks.
@@ -361,6 +408,7 @@ fn missing_limits(pass: &PassEntry) -> Option<String> {
 /// the layout the bindings were generated from; if the driver rejects it, nothing is replaced.
 /// Recordings that looked up a pipeline before keep using it; it is retired like any object.
 pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
+    let _call = crate::state::call();
     let manager = pipelines();
     let entry = &pass_map().passes[pass_index];
     let pass = &manager.passes[pass_index];
@@ -368,10 +416,10 @@ pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
         return Ok(());
     }
     let needs = Features::of_spirv(spirv);
-    let mut missing = needs.features.missing_from(&Ctx::features());
+    let mut missing = needs.features.missing_from(Ctx::features_ref());
     missing.extend(needs.compiled_out);
     if !missing.is_empty() {
-        return Err(Error::message(format!(
+        return Err(Error::Unsupported(format!(
             "the new `{}` needs `{}`, which this device lacks or lava was compiled without",
             entry.name,
             missing.join("`, `")
@@ -408,13 +456,20 @@ pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Writes the pipeline cache to `Config::pipeline_cache` (nothing without one or before init),
-/// through a temporary file beside it, so an interrupted write leaves the last one;
-/// `lava::destroy` calls it too.
+/// Writes the pipeline cache to `Config::pipeline_cache` (nothing without one), through a
+/// temporary file beside it, so an interrupted write leaves the last one; `lava::shutdown`
+/// calls it too.
 pub fn save_cache() -> Result<()> {
-    let Some((manager, path)) = PIPELINES.get().and_then(|m| Some((m, m.cache_path?))) else {
+    let _call = crate::state::call();
+    save_cache_now()
+}
+
+/// [`save_cache`] without a count, for `shutdown`.
+pub(crate) fn save_cache_now() -> Result<()> {
+    let Some((manager, path)) = PIPELINES.try_get().and_then(|m| Some((m, m.cache_path?))) else {
         return Ok(());
     };
+    let saved = (|| -> Result<()> {
     let data = unsafe { Ctx::device().get_pipeline_cache_data(manager.cache)? };
     if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
@@ -424,6 +479,8 @@ pub fn save_cache() -> Result<()> {
     std::fs::write(&temporary, &data)?;
     std::fs::rename(&temporary, path)?;
     Ok(())
+    })();
+    saved.map_err(|err| err.context(format!("the pipeline cache {}", path.display())))
 }
 
 /// Whether `data` starts with the `VkPipelineCacheHeaderVersionOne` of a device with

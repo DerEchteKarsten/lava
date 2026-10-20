@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     ops::Range,
     ptr::NonNull,
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
 };
 
 use crate::error::{Error, Result};
@@ -21,6 +21,7 @@ use crate::{
         slice::{ImageView, single_aspect},
         usage::ImageUsage,
     },
+    global::{Global, Live},
     lifetime,
     queue::{Kind, lock},
     state::{Ctx, Functions},
@@ -35,14 +36,32 @@ pub struct Bindless {
     /// The live slot ranges of `reserve`, which `bind` writes.
     reserved: Mutex<Vec<Range<u32>>>,
     free_samplers: Mutex<Ranges>,
-    resource_heap: Heap,
-    sampler_heap: Heap,
+    resource_heap: HeapBuffer,
+    sampler_heap: HeapBuffer,
     /// Descriptors `bind` wrote for reserved slots, by byte offset in the resource heap, which
     /// the next submission of a timeline with shaders copies there before its commands.
     queued: Mutex<Queued>,
 }
 
-static BINDLESS: OnceLock<Bindless> = OnceLock::new();
+static BINDLESS: Global<Bindless> = Global::new();
+
+/// lava's two descriptor heaps, as [`Error::OutOfBindlessSlots`] names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Heap {
+    /// The resource heap's image descriptors.
+    Image,
+    /// The sampler heap.
+    Sampler,
+}
+
+impl std::fmt::Display for Heap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Heap::Image => "image",
+            Heap::Sampler => "sampler",
+        })
+    }
+}
 
 /// The most image descriptors.
 const MAX_IMAGE_SLOTS: u32 = 1 << 16;
@@ -100,18 +119,18 @@ impl HeapLayout {
 
 /// A heap's mapped buffer and how command buffers bind it.
 #[derive(Debug)]
-struct Heap {
-    /// Taken by `Bindless::destroy`.
-    buffer: Mutex<Option<Buffer<u8, Upload>>>,
+struct HeapBuffer {
+    /// Owns the memory; dropped with the heap at `shutdown`.
+    _buffer: Buffer<u8, Upload>,
     mapped: NonNull<u8>,
     bind: vk::BindHeapInfoEXT<'static>,
 }
 
 // SAFETY: `mapped` is written only at slots one owner allocated, or through `vkCmdUpdateMemoryKHR`.
-unsafe impl Send for Heap {}
-unsafe impl Sync for Heap {}
+unsafe impl Send for HeapBuffer {}
+unsafe impl Sync for HeapBuffer {}
 
-impl Heap {
+impl HeapBuffer {
     fn new(layout: &HeapLayout, alignment: u64) -> Result<Self> {
         let usage = vk::BUFFER_USAGE_DESCRIPTOR_HEAP_EXT;
         let buffer = Buffer::with_flags(usage, Upload, layout.size.max(1), Some(alignment as u32))?;
@@ -125,8 +144,8 @@ impl Heap {
             })
             .reserved_range_offset(layout.reserved_offset)
             .reserved_range_size(layout.size - layout.reserved_offset);
-        Ok(Heap {
-            buffer: Mutex::new(Some(buffer)),
+        Ok(HeapBuffer {
+            _buffer: buffer,
             mapped,
             bind,
         })
@@ -204,7 +223,7 @@ pub(crate) fn allocate(n: u32) -> Result<u32> {
     lock(&Bindless::get().free)
         .take(n)
         .ok_or(Error::OutOfBindlessSlots {
-            heap: "image",
+            heap: Heap::Image,
             count: n,
         })
 }
@@ -222,14 +241,15 @@ pub(crate) fn free_handle(handle: ImageHandle) {
 }
 
 /// Image slots the application writes with [`bind`], made by [`reserve`]: `len` handles of kind
-/// `K`, each `K::WIDTH` slots. Dropping it frees them once no submission reaches them, and
-/// [`bind`] refuses them right away.
+/// `K`, each `K::WIDTH` slots (none for `reserve(0)`). Dropping it frees them once no
+/// submission reaches them, and [`bind`] refuses them right away.
 #[derive(Debug)]
 #[must_use]
 pub struct SlotRange<K: Allocatable> {
     start: u32,
     len: u32,
     kind: PhantomData<K>,
+    _live: Live,
 }
 
 impl<K: Allocatable> SlotRange<K> {
@@ -238,6 +258,7 @@ impl<K: Allocatable> SlotRange<K> {
         self.len
     }
 
+    /// Whether it holds no handle (`reserve(0)`).
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -256,6 +277,9 @@ impl<K: Allocatable> SlotRange<K> {
 
 impl<K: Allocatable> Drop for SlotRange<K> {
     fn drop(&mut self) {
+        if self.is_empty() {
+            return;
+        }
         let range = self.slots();
         let bindless = Bindless::get();
         let mut reserved = lock(&bindless.reserved);
@@ -271,14 +295,23 @@ impl<K: Allocatable> Drop for SlotRange<K> {
     }
 }
 
-/// The first `n` handles' worth of contiguous free image slots (`n * K::WIDTH`), for [`bind`].
+/// The first `n` handles' worth of contiguous free image slots (`n * K::WIDTH`), for [`bind`];
+/// an empty range for 0.
 pub fn reserve<K: Allocatable>(n: u32) -> Result<SlotRange<K>> {
-    let start = allocate(n * K::WIDTH)?;
-    lock(&Bindless::get().reserved).push(start..start + n * K::WIDTH);
+    let live = Live::new();
+    let slots = n.checked_mul(K::WIDTH).expect("too many slots");
+    let start = match n {
+        0 => 0,
+        _ => allocate(slots)?,
+    };
+    if n > 0 {
+        lock(&Bindless::get().reserved).push(start..start + slots);
+    }
     Ok(SlotRange {
         start,
         len: n,
         kind: PhantomData,
+        _live: live,
     })
 }
 
@@ -390,11 +423,10 @@ impl SamplerDesc {
             use crate::features::Feature;
             crate::features::gate::SamplerAnisotropy::check()?;
             let max = Ctx::device_properties().limits.max_sampler_anisotropy;
-            if !(1.0..=max).contains(&ratio) {
-                return Err(Error::message(format!(
-                    "a sampler's anisotropy is 1 to the device's {max}, not {ratio}"
-                )));
-            }
+            assert!(
+                (1.0..=max).contains(&ratio),
+                "a sampler's anisotropy is 1 to the device's {max}, not {ratio}"
+            );
             info = info.anisotropy_enable(true).max_anisotropy(ratio);
         }
         #[cfg(feature = "sampler-minmax")]
@@ -421,6 +453,7 @@ impl Default for SamplerDesc {
 #[derive(Debug)]
 pub struct Sampler {
     index: u32,
+    _live: Live,
 }
 
 impl Sampler {
@@ -428,15 +461,16 @@ impl Sampler {
     /// their own.
     #[validation_trace]
     pub fn new(desc: &SamplerDesc) -> Result<Self> {
+        let live = Live::new();
         let bindless = Bindless::get();
         let index = lock(&bindless.free_samplers)
             .take(1)
             .ok_or(Error::OutOfBindlessSlots {
-                heap: "sampler",
+                heap: Heap::Sampler,
                 count: 1,
             })?;
         // From here on `Drop` frees the slot.
-        let sampler = Sampler { index };
+        let sampler = Sampler { index, _live: live };
         let layout = &bindless.samplers;
         let range = bindless
             .sampler_heap
@@ -728,6 +762,7 @@ pub fn bind<'a, F: Format, U: ImageUsage, D: Dim, K: Allocatable>(
     images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
     handles: impl IntoIterator<Item = ImageHandle<K>>,
 ) {
+    let _call = crate::state::call();
     let bindless = Bindless::get();
     let reserved = lock(&bindless.reserved);
     let handles = handles.into_iter().inspect(|handle| {
@@ -851,10 +886,9 @@ pub(crate) fn bind_raw(
 }
 
 impl Bindless {
+    #[track_caller]
     fn get() -> &'static Self {
-        BINDLESS
-            .get()
-            .expect("bindless resources have not been initialized")
+        BINDLESS.get()
     }
 
     pub(crate) fn init() -> Result<()> {
@@ -876,10 +910,9 @@ impl Bindless {
             p.sampler_descriptor_alignment,
             p.max_sampler_heap_size,
         );
-        let resource_heap = Heap::new(&images, p.resource_heap_alignment)?;
-        let sampler_heap = Heap::new(&samplers, p.sampler_heap_alignment)?;
-        BINDLESS
-            .set(Self {
+        let resource_heap = HeapBuffer::new(&images, p.resource_heap_alignment)?;
+        let sampler_heap = HeapBuffer::new(&samplers, p.sampler_heap_alignment)?;
+        BINDLESS.set(Self {
                 free: Mutex::new(Ranges::all(images.count)),
                 reserved: Default::default(),
                 free_samplers: Mutex::new(Ranges::all(samplers.count)),
@@ -888,8 +921,7 @@ impl Bindless {
                 resource_heap,
                 sampler_heap,
                 queued: Mutex::new(BTreeMap::new()),
-            })
-            .map_err(|_| Error::message("bindless resources were already initialized"))?;
+            });
         Ok(())
     }
 
@@ -976,11 +1008,12 @@ impl Bindless {
         }
     }
 
-    /// Hands the heaps' buffers to [`lifetime`], which destroys them with everything else.
-    pub(crate) fn destroy() {
-        let s = Self::get();
-        for heap in [&s.resource_heap, &s.sampler_heap] {
-            drop(lock(&heap.buffer).take());
-        }
+    /// Unsets the heaps and hands their buffers to [`lifetime`], at `shutdown`.
+    ///
+    /// # Safety
+    /// Nothing records or binds (lava is closed), and every image, sampler and slot range was
+    /// destroyed.
+    pub(crate) unsafe fn destroy() {
+        drop(unsafe { BINDLESS.take() });
     }
 }

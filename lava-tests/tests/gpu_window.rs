@@ -159,7 +159,9 @@ fn run(event_loop: &ActiveEventLoop) {
     let unpresented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         submission.submit(|cmd| cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4])))
     }));
-    assert!(unpresented.is_err(), "the submission that uses the current image presents it");
+    let message = unpresented.expect_err("the submission that uses the current image presents it");
+    let message = message.downcast_ref::<&str>().copied().unwrap_or_default();
+    assert!(message.contains("must present it"), "a real panic with a message: {message:?}");
     submit_without_presenting(&mut timeline, &mut surface);
     let submission = timeline.begin().unwrap();
     let twice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -16,6 +16,7 @@ use crate::{
     features::{Feature, gate},
     query::{CompactedSize, QueryPool},
     queue::lock,
+    global::Live,
     state::{Ctx, Functions},
 };
 use std::sync::Mutex;
@@ -181,6 +182,8 @@ pub struct AccelerationStructure<L: Level> {
     /// Dropped after the structure, so destroyed after it.
     buffer: Buffer<u8>,
     _level: PhantomData<L>,
+    /// Last, so it counts the structure until its drop finished.
+    _live: Live,
 }
 
 fn round_up(value: u64, alignment: u64) -> u64 {
@@ -193,6 +196,7 @@ impl<L: Level> AccelerationStructure<L> {
         max_primitives: SmallVec<[u32; 4]>,
         flags: BuildFlags,
     ) -> Result<Self> {
+        let live = Live::new();
         let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(L::TY)
             .flags(flags.vk())
@@ -218,6 +222,7 @@ impl<L: Level> AccelerationStructure<L> {
                 0
             },
             None,
+            live,
         )
     }
 
@@ -228,6 +233,7 @@ impl<L: Level> AccelerationStructure<L> {
         build_scratch: u64,
         update_scratch: u64,
         compacted_from: Option<vk::AccelerationStructureKHR>,
+        live: Live,
     ) -> Result<Self> {
         let functions = functions()?;
         let buffer = Buffer::with_flags(
@@ -265,7 +271,16 @@ impl<L: Level> AccelerationStructure<L> {
             built: Mutex::new(SmallVec::new()),
             buffer,
             _level: PhantomData,
+            _live: live,
         })
+    }
+
+    /// The same structure named `name` (its memory too), for debuggers, the validation layer
+    /// (with debug utils, `Config::validation`) and allocator reports.
+    pub fn named(mut self, name: &str) -> Self {
+        self.buffer.set_name(name);
+        Functions::set_debug_name(name, self.handle);
+        self
     }
 
     /// Its device address, which shaders and instances use. Not its buffer's address.
@@ -303,6 +318,7 @@ impl<L: Level> AccelerationStructure<L> {
             self.build_scratch,
             self.update_scratch,
             Some(self.handle),
+            Live::new(),
         )
     }
 

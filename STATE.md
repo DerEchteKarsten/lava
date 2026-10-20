@@ -70,16 +70,16 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 Found in a read-only review; details and directions are in `lava/SURVEY.md` section 2. The rest were fixed on 2026-10-16.
 ----intended----
 - Dropping a `PresentSurface` waits at most 1 s for its present fences, then stops waiting for the ones that didn't signal (a present that failed before it was queued) and retires them with the swapchain.
+- `lava::shutdown` refuses (`Error::ObjectsAlive`) while any lava object lives, also one in a static or leaked on purpose, and then destroys nothing; it never destroys objects the application still owns. Each shutdown leaks lava's `Ctx` (a few KB: the device description and its extension names) and the counter list, so getters racing it and `&'static Counter`s stay valid memory.
 - Completed pending buffer writes are only folded (into one write of every address, which every later access is made visible to once) once there are more than 64; until then they stay, since a later submission still needs a barrier to see them.
 
 ## lava: bugs from the second survey (2026-10-18)
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
-- Safe code reaches undefined behaviour: `lava::destroy()` can run twice or before further use; `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 24-37).
+- Safe code reaches undefined behaviour: `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 25-37).
 - `multiDrawIndirect`, `drawIndirectFirstInstance` and `depthBiasClamp` are never enabled, though `Draw::indirect` passes `buffer.len()` draws and `DepthBias::clamp` is public (38, 39).
 - Without extended dynamic state 3, line and point draws use a pipeline baked with `TRIANGLE_LIST` (`dynamicPrimitiveTopologyUnrestricted` is never queried) (40). `depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists (41). 64-bit clear values are packed as 32-bit (43).
-- `wait_for` and queries use stages and query types the waiting family doesn't support (44, 45).
-- A `Timeline` dropped after `reserve()` or an unsubmitted `begin()` holds back every later destruction for good; a failed barrier-only replay leaves a value nothing signals (64, 65). The public `reclaim()` never polls (67). `init` isn't atomic: a late failure leaks the device and every retry says "already initialised" (69).
+- Queries use query types the recording family doesn't support (45).
 - `cmd.present` marks the image presented while recording, so `surface.present()` inside the submit closure presents on an unsignalled semaphore; a failed swapchain recreation keeps the retired swapchain (77, 78).
 - The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `ImageHandle` (87, 88).
 

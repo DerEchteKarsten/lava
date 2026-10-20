@@ -17,21 +17,6 @@ commits). Numbers are this survey's items. Delete a line, and its item below, wh
 Items that aren't named here stay as they are, on purpose (e.g. bug 31, MSAA, async pipeline
 compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
-3. **Timelines, lifetimes, init and errors:** 24 (a full `lava::shutdown()` that waits, drains,
-   destroys device and instance and allows re-init), 64/65 (host-signal the semaphore when a
-   timeline drops with its stamp ahead or a replay fails), 66, 67 (the public `reclaim` polls),
-   68 (a reclaim mutex), 69 (a failed init tears down through `shutdown`; pure checks before
-   device creation), 71, 74, 75 (CPU and virtual GPUs accepted, ranked last), 76 (device loss
-   propagates as a typed error), 44 (a stage set per queue family, a type parameter of `Wait`,
-   masked by features), 49, 61 (document the validation layer version that accepts GPU-assisted
-   validation with printf), 4.9 (typed `#[non_exhaustive]` errors, one `OutOfMemory`, no
-   duplicate `Display`, a heap enum, no `From<String>`, no `Lock`, the panic-vs-`Err` rule
-   documented and applied: host copy checks panic, `reserve(0)` is empty, `pipeline::init`
-   returns `Err`, statistics return `MissingFeature`, `performance(0)` checks before locking),
-   4.3 (app name and version in `Config`; `validation` honoured in release; a missing layer
-   warns), `Stamp::is_done` uses cached values first, the debug callback filters before
-   formatting, allocator block sizes in `Config`, allocation and object names, 4.29 (integer
-   `typ` and `flags`), `Wait::block_timeout` and multi-wait.
 4. **Queries, counters and presenting:** 22/26 (used-index bitset per pool; the open pool and
    index per kind; `end_query` checks them; submit fails with an open query), 25, 45 (query
    kinds bounded by queue kind at the type level; empty statistics are an error), 46
@@ -94,10 +79,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     on one index aren't refused.
 
 ### Undefined behaviour from safe code (2026-10-18)
-24. **`lava::destroy()` is safe but leaves `BINDLESS` set** (`lib.rs:151-165`): a later bind or
-    descriptor write uses the freed heaps. It also
-    sets `CALLSITE` by hand and never clears it, in release builds too, so every later validation
-    message on that thread blames `destroy`'s caller (`lib.rs:153`). Make it `unsafe` or guard it.
 25. **`QueryPool::read` overflows** (`query/mod.rs:191-197`): `first + queries` wraps in release
     and `out.len() as u32` truncates, so `read(u32::MAX, ..)` passes the assert.
 26. **`QueryRecorder::end_query` checks no pool or index** (`observer.rs:50-52`,
@@ -150,9 +131,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 43. **64-bit clear values are packed as 32-bit** (`format.rs:198-204`). Vulkan reads a 64-bit
     component from two array elements, so `R64Sfloat` clears to garbage, `R64G64Uint [a, b]` puts
     both into the first component, and values above 32 bits panic.
-44. **`wait_for` stage masks ignore the waiting queue** (`timeline.rs:289-297`): `Stage::Raster`
-    on a compute or transfer timeline, compute stages on a transfer one, and ray tracing stages
-    without the feature are all invalid. Mask by `K` and the features.
 45. **Queries ignore the family** (`query/mod.rs:29-37, 133-141`): occlusion queries compile on
     compute and transfer timelines, and compute-only statistics on transfer.
     `statistics(count, empty())` makes a pool with no statistics (`:319-335`).
@@ -165,10 +143,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     early.
 48. **Overlapping copy regions pass** *(plausible)* (`buffer/slice.rs:253-288`), and `src.len()`
     truncates a range that isn't a whole number of elements.
-49. **Unsupported device extensions are chained.** *Partly fixed 2026-10-19:* `properties2` chains
-    only the property structs of extensions the device has, and devices below Vulkan 1.4 are
-    rejected. `Vulkan13Features` is still chained into the feature query of every device,
-    including those then rejected (`features.rs:653-686`).
 53. **Image commands miss format checks.**
     - `blit_image` (`image/slice.rs:308-367`) doesn't check `BLIT_SRC`/`BLIT_DST`, linear
       filtering support, integer formats with linear filtering, mixed signedness, or overlap.
@@ -193,34 +167,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     A1B5G5R5 are missing, and `PresentSurface::new`'s fallback could pick one *(plausible)*.
 59. **Acceleration structure limits aren't checked** (`acceleration_structure.rs:335-349`):
     `maxGeometryCount`, `maxPrimitiveCount`, `maxInstanceCount`.
-61. **`GPU_ASSISTED` is enabled together with `DEBUG_PRINTF`** *(plausible)* (`state.rs:153-160`,
-    only with `Config::gpu_assisted_validation`), which older validation layers refuse.
 63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`.
-
-### Timelines, lifetimes and init (2026-10-18)
-64. **A `Timeline` dropped after `reserve()` or an unsubmitted `begin()` stops every destruction**
-    (`timeline.rs:127-141`). Its index keeps `stamp > completed`, and `latest_stamp()` covers all
-    indices, so nothing dropped afterwards is destroyed until another timeline takes the index and
-    submits. Host-signal the stamp in `Drop`.
-65. **A failed barrier-only replay leaves a value nothing signals** (`timeline.rs:423-433`): the
-    next `begin` with `in_flight == 1`, and the timeline's drop, wait forever.
-66. **The "must present it" panic has no message** (`timeline.rs:348-351, 441`): `resume_unwind`
-    skips the panic hook, so an uncaught case exits with code 101 and no text.
-67. **The public `reclaim()` never polls** (`lifetime.rs:50-67`): it compares against cached
-    values, so an application calling it alone frees nothing.
-68. **Destructors run in drop order only for one reclaimer** (`lifetime.rs:49-66`): each is popped
-    under the lock and run outside it, so two threads can run a view's and its image's destructors
-    together or swapped.
-69. **`init` isn't atomic** (`lib.rs:126-134`). `STATE` and `FUNCTIONS` are set before bindless,
-    counter and pipeline init can fail (a heap allocation, a pass needing a compiled-out
-    feature), so the device leaks and every retry says "already initialised".
-71. **Failed creations leak.** A failed command pool leaks the earlier slots' pools
-    (`timeline.rs:178-202`).
-74. **`#[validation_trace]` on `Ctx::init` always records `lib.rs:127`** (`state.rs:118`), since
-    `lava::init` isn't `track_caller`. Put it on `lava::init`.
-75. **Software and virtual GPUs are dropped silently** (`state.rs:329-332`): lavapipe never shows
-    in `rejected`, so a CI machine gets "no GPU found". The `_ => 2` sort arm is dead.
-76. **After device loss every poll logs an error** (`timeline.rs:60-68`), several per frame.
 
 ### Presenting (2026-10-18)
 77. **A surface can present before its submission exists** (`present.rs:49-57, 491-526`).
@@ -295,8 +242,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 
 ### Found 2026-10-18
 - **Small per-call costs:** a stencil change makes 8 calls where front equals back
-  (`:640-648`); `unsized_struct!` accessors walk every earlier section (`unsized_struct.rs:12-28`);
-  `Stamp::is_done` polls every timeline even when cached values suffice (`lifetime.rs:14-18`).
+  (`:640-648`); `unsized_struct!` accessors walk every earlier section (`unsized_struct.rs:12-28`).
 - **`acquire` queries surface capabilities every frame** *(plausible)* (`present.rs:331-335`), an
   X11 round trip on Mesa.
 - **`QueryPool::instant` calibrates on every call** (`query/mod.rs:252-277`) and ignores
@@ -307,16 +253,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   `BvhCull`'s buffer lengths double on overflow and `Composite`'s sky slot changes per sky, so
   each value compiles a pipeline mid-frame.
 
-### Memory
-- **Allocator settings are fixed.** Blocks start at 64 MiB of device memory and 16 MiB of
-  host-visible memory and double to 256 and 64 MiB, and every allocation is named "buffer" or
-  "ImageMemory" (`state.rs`).
-
 ### Other
 - **The ANV `MEMORY_READ` workaround on trace reads applies to every vendor.** Gate it on
   `DriverId::INTEL_OPEN_SOURCE_MESA` (`acceleration_structure.rs:25-32`).
-- **The debug callback works for every message.** It enables VERBOSE and INFO and formats each
-  message before `tracing` filters it.
 - **Shader builds.** Each pass has its own Slang session, compiled serially, and there is never
   debug info, so no source-level shader debugging. `Shaders::optimization` exists now; core
   doesn't call it.
@@ -328,13 +267,10 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 2. **`push_bindings` is positional** (15 arguments for `BvhCull`), so swapping two
    `BufferSlice<u32>`s or two `Mat4`s compiles. Generate a struct with named fields, with
    specialization constants as fields too (that removes `IncompleteX`).
-3. **`Config` lacks settings.** `lava::init(&Config)` has passes, display, validation,
-   disabled features and a pipeline cache file.
-   - **Missing settings:** app name and version, device choice (ranked by capability, user
-     override, presentation support), extra extensions and a pNext hook, validation settings
-     and queue counts.
-   - **Validation:** it is silently ignored in release builds, and init fails without the SDK's
-     layer.
+3. **`Config` lacks settings.** `lava::init(&Config)` has passes, display, app name and
+   version, validation, disabled features, a pipeline cache file and allocator block sizes.
+   - **Missing settings:** device choice (ranked by capability, user override, presentation
+     support), extra extensions and a pNext hook, validation settings and queue counts.
    - **Direction:** `lava::init(Config) -> Result<DeviceInfo>`, with `DeviceInfo` reporting
      supported vs enabled features, limits, subgroup, mesh and ray tracing properties.
 6. **Per-frame resources are a convention.** A `Timeline` owns its frame slots
@@ -342,22 +278,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
    `first`, UI buffers per slot, and the cull `variables` readback per slot. **Direction:**
    - `PerFrame<Buffer<T, Upload>>` whose `host_mut(&submission)` ties writes to the waited slot;
    - a growable stream buffer.
-9. **Errors are mostly `Message(String)`.**
-   - Out-of-date, minimised, surface lost, device lost, unsupported and invalid argument
-     can't be matched.
-   - Out-of-memory comes in two variants.
-   - Recording panics on runtime failures such as pipeline creation (`must`).
-   - **Direction:** typed `#[non_exhaustive]` variants, and the rule "panic for programmer
-     errors, `Err` for device and environment".
-   - *2026-10-18, against that rule:* host copies return `Err` for a wrong mip, region or data
-     length while GPU copies panic (`image/mod.rs:674, 683-702`); `reserve_sampled(0)` panics; `init` returns `Result` but SPIR-V,
-     module and pipeline failures panic through `must` (`pipeline.rs:157-225`); statistics
-     without `mesh-shader-queries` return `Message`, not `MissingFeature` (`query/mod.rs:319-335`);
-     `performance(0, ..)` takes the profiling lock for good before panicking (`:156, 384-402`).
-   - `Display` prints the inner error and `source()` returns it, so reporters print it twice
-     (`error.rs:30-66`). `OutOfBindlessSlots { set: &'static str }` is stringly typed.
-     `Error::message` duplicates `From<String>`/`From<&str>`, which turn any string error into
-     `Message` silently. `Error::Lock` and `From<PoisonError>` are dead (`error.rs:15, 117-121`).
 10. **Transfers only reach a view's first mip,** so uploading mip k of a `Single` image needs a
     `MipChain`, and there is no `generate_mips`. Take a subresource (image, mip, layers,
     region), with several regions per call.
@@ -462,10 +382,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     takes a reference where Vulkan's is optional (`vk.rs:466-475`);
     `dynamic-line-mode` implies no capability (`Cargo.toml:179`); `#[validation_trace(anything)]`
     compiles and the non-function error has no span (`lava-macros/src/lib.rs:10`); `Shaders` isn't
-    `#[must_use]`; device ranking lives inline in `Ctx::init` and can't be unit-tested.
-29. **Validation events have undocumented fields** (2026-10-18, `state.rs:566-580`). The engine's
-    console reads `typ` and `flags` as integers, but lava sends `typ` as a `Debug` string and no
-    `flags`, so its validation branch is dead (engine `editor/console.rs:194-203`).
+    `#[must_use]`.
 
 ---
 
@@ -496,17 +413,15 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     atomics. `MutTex2D` has only `Load`, no `Sample`; there is no `MutTex3D`.
   - **Codegen:** Rust keywords as field names, arrays over 32 (bytemuck's `Pod` limit), pass and
     struct name clashes.
-- **Memory:** per-frame transient rings (only `cmd.upload`'s internal ring exists), object and
-  allocation names.
+- **Memory:** per-frame transient rings (only `cmd.upload`'s internal ring exists).
 - **Queues:** several command buffers per submission, parallel recording (per-thread trackers
   merged by a barrier prologue at submit).
-  - `Wait` has `block()` and `is_done()`, no timeouts or multi-wait.
 - **Swapchain:** HDR (`VK_EXT_hdr_metadata`), image count, composite alpha, `FIFO_LATEST_READY`,
   present_id/present_wait for pacing, presenting several swapchains in one call, discard on
   acquire.
 - **Queries:** conditional rendering.
-- **Debug:** object names on buffers, images and structures; labels in release builds whenever
-  the extension exists; `insert_label`.
+- **Debug:** labels in release builds whenever the extension exists; `insert_label`; object
+  names on views, query pools and timelines.
 - **Escape hatches:**
   - an `unsafe` `lava::raw` with device, instance and queue;
   - `CommandBuffer::raw(declared_accesses, |vk_cmd| ..)` that flushes barriers for what it
@@ -522,9 +437,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   - **Formats:** half and snorm vertex positions.
 - **Hot reload:** per-pass include sets from Slang's module dependencies, for reloads and for
   exact `rerun-if-changed` (which would also catch imports outside the given directories).
-- **Lifecycle:** `lava::shutdown()` that waits, drains epochs, destroys everything and allows
-  re-init. Today `destroy()` destroys the bindless objects and runs the retired destructors,
-  leaves lava unusable (bug 24), and nothing calls it.
 
 ---
 
@@ -566,16 +478,11 @@ Small things, by file; none changes behaviour.
   re-exported (`:61-65`); `with_regions!` repeats `tagged!` (`:91-258`); the function pointer size
   check could be `const` (`:270`).
 - **state and init:** `get_physical_device_properties` duplicates `properties2`
-  (`state.rs:231`); `let _ = (&rt_pipeline_properties, &acc_properties);` (`:275`);
-  `pick_queue_families` runs twice per device (`:290, 340`); `sort_unstable` plus `dedup_by_key`
-  of disjoint families removes nothing (`:387-390`); `CStr::from_ptr` where ash has `*_as_c_str()`,
-  and one non-UTF-8 device name aborts init for every device (`:231-252`); the empty `Debug`
-  impls of `Ctx` and `Functions` (`:37-41, 621-625`); `Ctx::allocator` panics on poison where
-  every other lock recovers (`:103-108`), as do `LOCK_USERS` (`counters.rs:148`,
-  `query/mod.rs:385`); the `STATE.set` error path is unreachable (`:497-506`); the printf
-  detection splits into a `Vec` and drops separators (`:552-564`). `physical_device.rs`: unused
-  `PartialEq for QueueFamily`, `num_queues` duplicating `handel.queue_count`, and init-only data
-  kept for the program's lifetime.
+  (`describe_device`); `let _ = (&rt_pipeline_properties, &acc_properties);`;
+  `pick_queue_families` runs twice per device (`describe_device` and the selection loop);
+  `sort_unstable` plus `dedup_by_key` of disjoint families removes nothing.
+  `physical_device.rs`: unused `PartialEq for QueueFamily`, `num_queues` duplicating
+  `handel.queue_count`, and init-only data kept for the program's lifetime.
 - **images:** `from_raw(DEPTH.as_raw() | STENCIL.as_raw())` and casts of values already `u32`
   (`format.rs:187-210`); `PerMip` with one mip makes duplicate views (`image/mod.rs:461-464`); imports at the bottom of
   `image/mod.rs` under two cfg combinations (`:638-648`); `Dim::Offset` is signed though blit boxes must now lie inside
@@ -706,12 +613,12 @@ Each was checked by grep over lava-tests and `lava/src/tests.rs`.
 - **Slang shapes:** `Image2D`, handles or `Accel` inside structs behind a
   `Buf`; struct merging, padding and naming in codegen; the hand-copied constants
   (`MAX_PUSH_CONSTANTS_SIZE`, the clock constants) against lava and `profile.slang`.
-- **Bindless:** `OutOfBindlessSlots`, `Ranges::give`'s double-free panic.
+- **Bindless:** `Ranges::give`'s double-free panic.
 - **Features:** `Features::consistent`, `without`/`missing_from`, `extensions()` agreeing with
   `optional()`, the cargo names in `SPIRV_CAPABILITIES`; the disabled ray tracing and
   performance paths in `gpu_missing_features`.
-- **Lifetimes and timelines:** `latest_stamp`, `Stamp::is_done`, slot reuse, a timeline dropped
-  after `reserve`, two `wait_for`s on one timeline, stages other than `Transfer`.
+- **Lifetimes and timelines:** slot reuse, two `wait_for`s on one timeline, stages other than
+  `Transfer` on a GPU.
 - **Queries:** the pool-reuse panic, `QueryRecorder` misuse, `instant()` on a device that has
   it, `memory_report` with the budget.
 - **Commands and families:** `flush_all`; transfer-family alignment and granularity;

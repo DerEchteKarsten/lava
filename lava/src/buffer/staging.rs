@@ -270,12 +270,12 @@ impl Staging {
         let deadline = Instant::now().checked_add(timeout);
         loop {
             if self.closed.load(SeqCst) {
-                return Err(Error::message("the timeline of this uploader was dropped"));
+                return Err(Error::other("the timeline of this uploader was dropped"));
             }
             if let Some(reservation) = self.ring.reserve(len) {
                 return Ok(reservation);
             }
-            self.reclaim(timeline::poll(self.timeline));
+            self.reclaim(timeline::poll(self.timeline)?);
             if let Some(reservation) = self.ring.reserve(len) {
                 return Ok(reservation);
             }
@@ -412,6 +412,8 @@ pub struct Uploader {
     staging: Option<Arc<Staging>>,
     destination: Kind,
     timeout: Duration,
+    /// Counts the uploader, which uploads into lava's state without another object.
+    _live: crate::global::Live,
 }
 
 impl fmt::Debug for Uploader {
@@ -430,6 +432,7 @@ impl Uploader {
             staging,
             destination,
             timeout: Duration::from_secs(1),
+            _live: crate::global::Live::new(),
         }
     }
 
@@ -466,7 +469,7 @@ impl Uploader {
 
     fn ring(&self) -> Result<&Arc<Staging>> {
         self.staging.as_ref().ok_or_else(|| {
-            Error::message(
+            Error::other(
                 "this uploader's timeline has no staging ring: on a `rebar` device images are \
                  uploaded with `Image::copy_from` (`HostCopy` usage); elsewhere give \
                  `Timeline::new` a staging size",
@@ -565,7 +568,7 @@ impl Uploader {
             });
         }
         let Some(ptr) = buffer.coherent_mapping() else {
-            return Err(Error::message(
+            return Err(Error::other(
                 "the buffer's memory isn't mapped and the uploader's timeline has no staging \
                  ring: give `Timeline::new` a staging size",
             ));
@@ -578,7 +581,8 @@ impl Uploader {
 
     /// Stages the whole mip `level` of `image` from `data`, tightly packed; needs a ring.
     /// Drained on a family other than the uploader's destination, the image is released to
-    /// it. `Image::copy_from` writes right away instead, with host image copies.
+    /// it. `Image::copy_from` writes right away instead, with host image copies. Panics for a
+    /// mip the image doesn't have and data of another length than the mip's.
     #[validation_trace]
     pub fn image<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
         &self,
@@ -595,7 +599,8 @@ impl Uploader {
 }
 
 /// The copy of `len` bytes into the whole mip `level` of `image`, checked: a colour image with
-/// transfer destination usage, a mip it has, and the bytes the mip holds.
+/// transfer destination usage, a mip it has, and the bytes the mip holds (panics otherwise).
+#[track_caller]
 fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
     image: &Image<F, U, D, V>,
     level: u32,
@@ -603,20 +608,18 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
 ) -> Result<ImageCopy> {
     image.aspect_check(vk::ImageAspectFlags::COLOR);
     image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
-    if level >= image.mip_levels() {
-        return Err(Error::message(format!(
-            "mip level {level} is out of range for an image with {} levels",
-            image.mip_levels()
-        )));
-    }
+    assert!(
+        level < image.mip_levels(),
+        "mip level {level} is out of range for an image with {} levels",
+        image.mip_levels()
+    );
     let extent = D::extent_3d(image.mip_extent(level));
     let format = image.format();
     let expected = expected_data_len(extent, format.texel_size(), bc_block(format.vk_format()));
-    if expected != Some(len) {
-        return Err(Error::message(format!(
-            "mip level {level} holds {expected:?} bytes but {len} were given"
-        )));
-    }
+    assert!(
+        expected == Some(len),
+        "mip level {level} holds {expected:?} bytes but {len} were given"
+    );
     let states = image.whole_view().states;
     let mips = match states.len() {
         1 => 0..image.mip_levels(),

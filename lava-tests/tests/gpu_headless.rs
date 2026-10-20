@@ -23,7 +23,7 @@ use lava::{
         Performance, PipelineStatistics, PipelineStats, QueryPipelineStatisticFlags as Statistics,
         QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Timestamp, counters,
     },
-    queue::{Compute, Graphics, Kind, MAX_TIMELINES, Stage, Timeline, Transfer},
+    queue::{Compute, Graphics, Kind, MAX_TIMELINES, GraphicsStage, Timeline, Transfer},
     state::Ctx,
 };
 use lava_tests::bindings::{
@@ -245,8 +245,10 @@ fn image_uploads_land_where_the_ring_is_drained() {
         assert!(message.contains("Image::copy_from"), "{message}");
         return;
     }
-    assert!(uploader.image(&texture, 0, &texels[..12]).is_err(), "one whole mip");
-    assert!(uploader.image(&texture, 1, &texels).is_err(), "it has one mip");
+    let message = panic_message(|| uploader.image(&texture, 0, &texels[..12]));
+    assert!(message.contains("holds"), "one whole mip: {message}");
+    let message = panic_message(|| uploader.image(&texture, 1, &texels));
+    assert!(message.contains("out of range"), "it has one mip: {message}");
     uploader.image(&texture, 0, &texels).unwrap();
     // Dropped with an upload staged, which goes with it.
     let dropped = Image::<R8G8B8A8Unorm, usage![TransferDst]>::new(UVec2::new(2, 2)).unwrap();
@@ -443,7 +445,7 @@ fn a_submission_waits_for_another_timelines() {
         .submit(|cmd| cmd.fill_buffer(src.range(..), 9))
         .unwrap();
     let mut copy = gpu.timeline.begin().unwrap();
-    copy.wait_for(filled.at(Stage::Transfer));
+    copy.wait_for(filled.at(GraphicsStage::Transfer));
     // A wait on its own timeline is dropped: its submissions run in order anyway.
     copy.wait_for(own);
     let copied = copy
@@ -1441,7 +1443,7 @@ fn samplers_filter_by_their_description_and_free_their_slots() {
     if Ctx::features().sampler_anisotropy {
         let max = Ctx::device_properties().limits.max_sampler_anisotropy;
         for ratio in [0.5, max + 1.0] {
-            assert!(Sampler::new(&SamplerDesc::new().max_anisotropy(ratio)).is_err());
+            panic_message(|| Sampler::new(&SamplerDesc::new().max_anisotropy(ratio)));
         }
         Sampler::new(&SamplerDesc::new().max_anisotropy(max)).unwrap();
     }
@@ -1767,16 +1769,15 @@ fn host_copy_uploads_a_mip_level() {
     assert_eq!(readback.host(), data);
 
     image.copy_from(&pattern(4, 4), 1).unwrap();
-    assert!(
-        image.copy_from(&data, 2).is_err(),
-        "the image has two mip levels"
-    );
-    assert!(image.copy_from(&[], 0).is_err());
+    // Programmer errors panic.
+    let message = panic_message(|| image.copy_from(&data, 2));
+    assert!(message.contains("out of range"), "the image has two mip levels: {message}");
+    panic_message(|| image.copy_from(&[], 0));
 
     // The data has to be exactly one mip level.
-    assert!(image.copy_from(&data[..data.len() - 4], 0).is_err());
-    assert!(image.copy_from(&data, 1).is_err());
-    assert!(image.copy_from(&pattern(4, 4), 0).is_err());
+    panic_message(|| image.copy_from(&data[..data.len() - 4], 0));
+    panic_message(|| image.copy_from(&data, 1));
+    panic_message(|| image.copy_from(&pattern(4, 4), 0));
     // Rejected copies leave the image as it was.
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
     assert_eq!(readback.host(), data);
@@ -1799,16 +1800,8 @@ fn host_copy_writes_only_the_region() {
     image.copy_from(&data, 0).unwrap();
     image.copy_region_from(&patch, 0, offset, extent).unwrap();
 
-    assert!(
-        image
-            .copy_region_from(&patch, 0, UVec2::new(6, 5), extent)
-            .is_err()
-    );
-    assert!(
-        image
-            .copy_region_from(&patch[4..], 0, offset, extent)
-            .is_err()
-    );
+    panic_message(|| image.copy_region_from(&patch, 0, UVec2::new(6, 5), extent));
+    panic_message(|| image.copy_region_from(&patch[4..], 0, offset, extent));
 
     let mut readback = zeroed_buffer::<u8>(data.len());
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
@@ -3043,11 +3036,7 @@ fn volumes_are_uploaded_sampled_and_copied() {
         volume
             .copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 1))
             .unwrap();
-        assert!(
-            volume
-                .copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 2))
-                .is_err()
-        );
+        panic_message(|| volume.copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 2)));
         gpu.submit(|cmd| cmd.copy_image_to_buffer(volume.whole(), whole.range(..)));
         let half = texels.len() / 2;
         assert_eq!(&whole.host()[..half], &texels[..half]);
@@ -3089,10 +3078,10 @@ fn host_copy_uploads_block_compressed_mips() {
     // The smaller levels are one block each, even the ones smaller than a block.
     for level in 1..4 {
         texture.copy_from(&blocks[..16], level).unwrap();
-        assert!(texture.copy_from(&blocks[..8], level).is_err());
-        assert!(texture.copy_from(&blocks[..32], level).is_err());
+        panic_message(|| texture.copy_from(&blocks[..8], level));
+        panic_message(|| texture.copy_from(&blocks[..32], level));
     }
-    assert!(texture.copy_from(&blocks[..48], 0).is_err());
+    panic_message(|| texture.copy_from(&blocks[..48], 0));
     // A region of one block: the yellow block becomes red.
     texture
         .copy_region_from(&blocks[..16], 0, UVec2::splat(4), UVec2::splat(4))

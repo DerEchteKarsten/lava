@@ -1,5 +1,5 @@
 //! Hardware performance counters (`VK_KHR_performance_query`, the `performance-query` feature): the graphics family's counters, how many passes a selection needs, and the profiling lock counter pools hold
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use crate::vk;
 
@@ -57,7 +57,9 @@ pub struct Counter {
     pub(crate) storage: vk::PerformanceCounterStorageKHR,
 }
 
-static COUNTERS: OnceLock<Vec<Counter>> = OnceLock::new();
+/// The counters of the current context. `shutdown` leaks them, so the `&'static Counter`s of
+/// [`counters`] stay valid memory.
+static COUNTERS: crate::global::Global<Vec<Counter>> = crate::global::Global::new();
 /// How many query pools use the profiling lock; it is held while there is one.
 pub(crate) static LOCK_USERS: Mutex<usize> = Mutex::new(0);
 
@@ -116,18 +118,39 @@ pub(crate) fn init() -> Result<()> {
             }
         })
         .collect();
-    let _ = COUNTERS.set(counters);
+    COUNTERS.set(counters);
     Ok(())
+}
+
+/// Leaks the context's counters at `shutdown`.
+///
+/// # Safety
+/// Lava is closed.
+pub(crate) unsafe fn destroy() {
+    if let Some(counters) = unsafe { COUNTERS.take() } {
+        Box::leak(counters);
+    }
+}
+
+/// Panics unless every one of `selection` is a counter of the current context.
+#[track_caller]
+pub(crate) fn check_current(selection: &[&Counter]) {
+    let current = COUNTERS.try_get().map_or(&[][..], Vec::as_slice).as_ptr_range();
+    assert!(
+        selection.iter().all(|counter| current.contains(&std::ptr::from_ref(*counter))),
+        "a counter of an earlier lava context: take them from `counters()` again after `init`"
+    );
 }
 
 /// Every counter the graphics queue family offers.
 pub fn counters() -> Gated<gate::PerformanceQuery, &'static [Counter]> {
-    gate::<gate::PerformanceQuery, _>(|| COUNTERS.get().map_or(&[][..], Vec::as_slice))
+    gate::<gate::PerformanceQuery, _>(|| COUNTERS.try_get().map_or(&[][..], Vec::as_slice))
 }
 
 /// How many submissions it takes to read `selection` (0 without performance queries). Only
 /// selections of one pass can be recorded.
 pub fn passes(selection: &[&Counter]) -> u32 {
+    let _call = crate::state::call();
     if !gate::PerformanceQuery::on() {
         return 0;
     }
@@ -145,7 +168,7 @@ pub fn passes(selection: &[&Counter]) -> u32 {
 }
 
 pub(crate) fn release_lock() {
-    let mut users = LOCK_USERS.lock().unwrap();
+    let mut users = crate::queue::lock(&LOCK_USERS);
     *users -= 1;
     if *users == 0 {
         let (_, device) = Functions::performance_query();

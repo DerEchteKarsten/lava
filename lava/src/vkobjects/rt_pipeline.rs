@@ -45,7 +45,7 @@ impl RaytracingPipeline {
         if let Some(desc) =
             (descs.iter()).find(|desc| desc.max_recursion > properties.max_ray_recursion_depth)
         {
-            return Err(Error::message(format!(
+            return Err(Error::Unsupported(format!(
                 "a recursion depth of {} exceeds the device's {}",
                 desc.max_recursion, properties.max_ray_recursion_depth
             )));

@@ -1,10 +1,13 @@
-//! Global Vulkan context: instance, device selection and creation, queues, features, and validation logging
+//! Global Vulkan context: instance, device ranking, selection and creation, queues, features, validation logging, and their destruction at shutdown
 use std::{
     cell::Cell,
     ffi::{c_char, c_void},
     fmt::Debug,
     panic::Location,
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::error::{Error, Result};
@@ -14,7 +17,6 @@ use gpu_allocator::{
     AllocationSizes, AllocatorDebugSettings,
     vulkan::{Allocator, AllocatorCreateDesc},
 };
-use lava_macros::validation_trace;
 use std::ffi::{CStr, CString};
 
 #[allow(unused_imports)]
@@ -22,35 +24,39 @@ use crate::features::{Loader, gate, load, loaded};
 use crate::{
     Config,
     command_buffer::Dynamic,
-    pipeline::MAX_PUSH_CONSTANTS_SIZE,
     features::{DeviceFacts, FeatureChain, Features, LAVA_EXTENSIONS},
-    queue::{
-        Kind,
-        DeviceQueues, FamilyQueues, MAX_TIMELINES,
-    },
+    global::{Global, Live},
+    pipeline::MAX_PUSH_CONSTANTS_SIZE,
+    queue::{DeviceQueues, FamilyQueues, Kind, MAX_TIMELINES},
     vkobjects::physical_device::{PhysicalDevice, QueueFamily, pick_queue_families},
 };
 
 pub use crate::vk as raw_vulkan;
 
 impl Debug for Ctx {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ctx")
+            .field("device", &self.physical_device.name)
+            .finish_non_exhaustive()
     }
 }
 
+/// lava's device and what it knows of it. Never freed (see `global`), so its getters read valid
+/// memory even while `lava::shutdown` runs; they panic once lava isn't initialised.
 pub struct Ctx {
     features: Features,
     /// The draw state the device sets dynamically, from `features`.
     dynamic: Dynamic,
     device: Device,
     physical_device: PhysicalDevice,
-    allocator: Mutex<Allocator>,
-
+    /// `None` once `shutdown` freed its memory.
+    allocator: Mutex<Option<Allocator>>,
     pub(crate) queues: DeviceQueues,
+    /// Set by the first poll that saw the device lost, which logs it.
+    pub(crate) device_lost: AtomicBool,
 }
 
-static STATE: OnceLock<Ctx> = OnceLock::new();
+static STATE: Global<Ctx> = Global::new();
 
 /// Undoes a step of `Ctx::init` when a later one fails, unless disarmed.
 struct Undo<F: FnOnce()>(Option<F>);
@@ -69,11 +75,175 @@ impl<F: FnOnce()> Drop for Undo<F> {
     }
 }
 
+/// The allocator, locked.
+pub(crate) struct AllocatorGuard<'a>(MutexGuard<'a, Option<Allocator>>);
+
+impl std::ops::Deref for AllocatorGuard<'_> {
+    type Target = Allocator;
+    fn deref(&self) -> &Allocator {
+        self.0.as_ref().expect(crate::global::NOT_INITIALISED)
+    }
+}
+
+impl std::ops::DerefMut for AllocatorGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Allocator {
+        self.0.as_mut().expect(crate::global::NOT_INITIALISED)
+    }
+}
+
+/// Where lava tries a device of `device_type`: discrete GPUs first, then integrated ones, then
+/// virtual GPUs and CPUs (software renderers such as lavapipe) as a last resort.
+pub(crate) fn device_rank(device_type: vk::PhysicalDeviceType) -> u8 {
+    match device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+        vk::PhysicalDeviceType::CPU => 3,
+        _ => 4,
+    }
+}
+
+/// The indices of `types` in the order lava tries them: by [`device_rank`], keeping the
+/// driver's order within a rank.
+pub(crate) fn device_order(types: &[vk::PhysicalDeviceType]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..types.len()).collect();
+    order.sort_by_key(|&i| device_rank(types[i]));
+    order
+}
+
+/// The debug messenger's severities: errors always, the others where `tracing` logs them when
+/// lava is initialised (validation messages at `vulkan-validation` as warn, debug and trace;
+/// shader printf as info).
+fn enabled_severities() -> vk::DebugUtilsMessageSeverityFlagsEXT {
+    use tracing::Level;
+    use vk::DebugUtilsMessageSeverityFlagsEXT as S;
+    let mut severities = S::ERROR;
+    if tracing::enabled!(target: "vulkan-validation", Level::WARN) {
+        severities |= S::WARNING;
+    }
+    if tracing::enabled!(target: "vulkan-validation", Level::DEBUG)
+        || tracing::enabled!(Level::INFO)
+    {
+        severities |= S::INFO;
+    }
+    if tracing::enabled!(target: "vulkan-validation", Level::TRACE) {
+        severities |= S::VERBOSE;
+    }
+    severities
+}
+
+/// What `Ctx::init` learns of one physical device.
+fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Result<PhysicalDevice> {
+    let properties = unsafe { instance.get_physical_device_properties(handel) };
+    let name = properties.device_name_as_c_str().map_or_else(
+        |_| "an unnamed device".into(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(handel) }
+        .into_iter()
+        .enumerate()
+        .map(|(index, p)| QueueFamily {
+            num_queues: p.queue_count,
+            index: index as _,
+            handel: p,
+        })
+        .collect::<Vec<_>>();
+    let supported_extensions = unsafe { instance.enumerate_device_extension_properties(handel)? }
+        .iter()
+        .filter_map(|p| p.extension_name_as_c_str().ok())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<Vec<String>>();
+    let has = |name: &CStr| (supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes());
+    let mem_properties = unsafe { instance.get_physical_device_memory_properties(handel) };
+
+    let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
+    let mut rt_pipeline_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+    let mut acc_properties = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+    let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+    let mut heap_properties = vk::PhysicalDeviceDescriptorHeapPropertiesEXT::default();
+    // A device below Vulkan 1.4 is rejected for that alone: the 1.1 to 1.3 structs aren't
+    // chained into its queries, which it may not know.
+    let vulkan_1_4 = properties.api_version >= make_api_version(0, 1, 4, 0);
+    let (supported_features, lava_missing) = if !vulkan_1_4 {
+        (Features::DEFAULT, vec!["Vulkan 1.4".to_owned()])
+    } else {
+        let chain = FeatureChain::query(instance, handel, &has);
+        // Only the structs of extensions the device has.
+        let mut properties2 =
+            vk::PhysicalDeviceProperties2::default().push_next(&mut vk12_properties);
+        if has(ash::khr::ray_tracing_pipeline::NAME) {
+            properties2 = properties2.push_next(&mut rt_pipeline_properties);
+        }
+        if has(ash::khr::acceleration_structure::NAME) {
+            properties2 = properties2.push_next(&mut acc_properties);
+        }
+        if has(ash::ext::mesh_shader::NAME) {
+            properties2 = properties2.push_next(&mut mesh_shader_properties);
+        }
+        if has(vk::descriptor_heap::NAME) {
+            properties2 = properties2.push_next(&mut heap_properties);
+        }
+        unsafe { instance.get_physical_device_properties2(handel, &mut properties2) };
+        let rebar = mem_properties.memory_types[..mem_properties.memory_type_count as usize]
+            .iter()
+            .any(|e| {
+                e.property_flags.contains(
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ) && mem_properties.memory_heaps[e.heap_index as usize].size > 500 * 1024 * 1024
+            });
+        let families = pick_queue_families(&queue_families);
+        let facts = DeviceFacts {
+            rebar,
+            strict_lines: properties.limits.strict_lines == vk::TRUE,
+            dedicated_compute: families.as_ref().is_some_and(|f| f.compute.is_some()),
+            dedicated_transfer: families.as_ref().is_some_and(|f| f.transfer.is_some()),
+        };
+        let mut lava_missing = chain.lava_missing(&has);
+        let push_data = MAX_PUSH_CONSTANTS_SIZE as u64;
+        if has(vk::descriptor_heap::NAME) && heap_properties.max_push_data_size < push_data {
+            lava_missing.push(format!("{push_data} bytes of push data (maxPushDataSize)"));
+        }
+        if families.is_none() {
+            lava_missing.push("a queue family with graphics, compute and timestamps".into());
+        }
+        (chain.optional(&has, facts), lava_missing)
+    };
+    // Detach them from the chain on this stack.
+    mesh_shader_properties.p_next = std::ptr::null_mut();
+    vk12_properties.p_next = std::ptr::null_mut();
+    rt_pipeline_properties.p_next = std::ptr::null_mut();
+    acc_properties.p_next = std::ptr::null_mut();
+    heap_properties.p_next = std::ptr::null_mut();
+    let _ = (&rt_pipeline_properties, &acc_properties);
+    Ok(PhysicalDevice {
+        properties,
+        mesh_shader_properties,
+        descriptor_heap_properties: heap_properties,
+        vk12_properties,
+        mem_properties,
+        handel,
+        name,
+        queue_families,
+        supported_extensions,
+        #[cfg(feature = "acceleration-structure")]
+        acceleration_structure_properties: supported_features
+            .acceleration_structure
+            .then_some(acc_properties),
+        #[cfg(feature = "ray-tracing-pipeline")]
+        ray_tracing_pipeline_properties: supported_features
+            .ray_tracing_pipeline
+            .then_some(rt_pipeline_properties),
+        supported_features,
+        lava_missing,
+    })
+}
+
 impl Ctx {
+    #[track_caller]
     pub(crate) fn get() -> &'static Self {
-        STATE
-            .get()
-            .expect("lava isn't initialised: call `lava::init` first (and check that it succeeded)")
+        STATE.get()
     }
     pub(crate) fn device() -> &'static Device {
         &Ctx::get().device
@@ -81,13 +251,15 @@ impl Ctx {
     pub(crate) fn physical_device() -> &'static PhysicalDevice {
         &Ctx::get().physical_device
     }
+    /// The device's properties and limits.
     pub fn device_properties() -> &'static vk::PhysicalDeviceProperties {
         &Ctx::get().physical_device.properties
     }
     #[cfg(feature = "mesh-shader")]
-    pub fn mesh_shader_properties()
-    -> crate::features::Gated<gate::MeshShader, &'static vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>>
-    {
+    pub fn mesh_shader_properties() -> crate::features::Gated<
+        gate::MeshShader,
+        &'static vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>,
+    > {
         crate::features::gate::<gate::MeshShader, _>(|| {
             &Ctx::get().physical_device.mesh_shader_properties
         })
@@ -101,11 +273,8 @@ impl Ctx {
         let family = Ctx::get().queues.family(kind);
         family.map_or(0, |family| family.queues.len() as u32)
     }
-    pub(crate) fn allocator<'a>() -> MutexGuard<'a, Allocator> {
-        Ctx::get()
-            .allocator
-            .lock()
-            .expect("allocator mutex was poisoned")
+    pub(crate) fn allocator<'a>() -> AllocatorGuard<'a> {
+        AllocatorGuard(crate::queue::lock(&Ctx::get().allocator))
     }
 
     /// The optional features lava enabled: those the device has, minus `Config::disabled`.
@@ -119,42 +288,68 @@ impl Ctx {
         &Ctx::get().dynamic
     }
 
-    #[validation_trace]
+    /// Creates the instance, picks and creates the device, and sets lava's context and
+    /// functions. What it made is destroyed again when it fails.
     pub(super) fn init(config: &Config) -> Result<()> {
-        if STATE.get().is_some() {
-            return Err(Error::message("lava is already initialised"));
-        }
         let display = config.display.as_ref();
         let entry = unsafe { Entry::load()? };
-        let app_info = vk::ApplicationInfo::default().api_version(make_api_version(0, 1, 4, 0));
-        let layers_names_raw = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
+        let engine_version = make_api_version(
+            0,
+            env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0),
+            env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
+            env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
+        );
+        let [major, minor, patch] = config.app_version;
+        let mut app_info = vk::ApplicationInfo::default()
+            .api_version(make_api_version(0, 1, 4, 0))
+            .engine_name(c"lava")
+            .engine_version(engine_version)
+            .application_version(make_api_version(0, major, minor, patch));
+        if let Some(name) = config.app_name {
+            app_info = app_info.application_name(name);
+        }
+        let validation_layer = c"VK_LAYER_KHRONOS_validation";
+        let layers_names_raw = [validation_layer.as_ptr()];
 
         let mut instance_extensions = match display {
             Some(display) => ash_window::enumerate_required_extensions(*display)
-                .map_err(|err| Error::message(&format!("no surface extensions for this display: {err}")))?
+                .map_err(|err| {
+                    Error::Unsupported(format!("no surface extensions for this display: {err}"))
+                })?
                 .to_vec(),
             None => Vec::new(),
         };
 
+        let available = unsafe { entry.enumerate_instance_extension_properties(None)? };
+        let instance_has =
+            |name: &CStr| (available.iter()).any(|e| e.extension_name_as_c_str() == Ok(name));
         let surface_maintenance = [
             ash::khr::get_surface_capabilities2::NAME,
             ash::ext::surface_maintenance1::NAME,
         ];
-        let present_fences = cfg!(feature = "present-fences") && display.is_some() && {
-            let available = unsafe { entry.enumerate_instance_extension_properties(None)? };
-            surface_maintenance.iter().all(|name| {
-                (available.iter()).any(|e| e.extension_name_as_c_str() == Ok(*name))
-            })
-        };
+        let present_fences = cfg!(feature = "present-fences")
+            && display.is_some()
+            && surface_maintenance.iter().all(|name| instance_has(name));
         if present_fences {
             instance_extensions.extend(surface_maintenance.iter().map(|name| name.as_ptr()));
         }
 
-        let debug = cfg!(debug_assertions) && config.validation;
+        let validation = config.validation
+            && {
+                let layers = unsafe { entry.enumerate_instance_layer_properties()? };
+                let installed =
+                    (layers.iter()).any(|l| l.layer_name_as_c_str() == Ok(validation_layer));
+                if !installed {
+                    tracing::warn!(
+                        "`Config::validation` is set, but the Khronos validation layer isn't installed: lava runs without validation"
+                    );
+                }
+                installed
+            };
         let mut validation_features = vk::ValidationFeaturesEXT::default();
         let mut validation_f;
         let mut instance_info = vk::InstanceCreateInfo::default();
-        if debug {
+        if validation {
             instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
             validation_f = vec![
                 vk::ValidationFeatureEnableEXT::DEBUG_PRINTF,
@@ -164,9 +359,7 @@ impl Ctx {
             if config.gpu_assisted_validation {
                 validation_f.push(vk::ValidationFeatureEnableEXT::GPU_ASSISTED);
             }
-
             validation_features = validation_features.enabled_validation_features(&validation_f);
-
             instance_info = instance_info
                 .enabled_layer_names(&layers_names_raw)
                 .push_next(&mut validation_features);
@@ -180,34 +373,24 @@ impl Ctx {
             let instance = instance.clone();
             move || unsafe { instance.destroy_instance(None) }
         }));
-        let mut instance_debug_utils = None;
-        let mut messenger = vk::DebugUtilsMessengerEXT::null();
-        if debug {
-            instance_debug_utils = Some(debug_utils::Instance::new(&entry, &instance));
+        let mut debug_messenger = None;
+        if validation {
+            let debug_utils = debug_utils::Instance::new(&entry, &instance);
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE,
-                )
+                .message_severity(enabled_severities())
                 .message_type(
                     vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
                         | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 )
                 .pfn_user_callback(Some(vulkan_debug_callback));
-            messenger = unsafe {
-                instance_debug_utils
-                    .as_ref()
-                    .expect("debug utils instance was just created")
-                    .create_debug_utils_messenger(&debug_info, None)?
-            };
+            let messenger = unsafe { debug_utils.create_debug_utils_messenger(&debug_info, None)? };
+            debug_messenger = Some((debug_utils, messenger));
         }
         let undo_messenger = Undo(Some({
-            let debug_utils = instance_debug_utils.clone();
+            let debug_messenger = debug_messenger.clone();
             move || {
-                if let Some(debug_utils) = debug_utils {
+                if let Some((debug_utils, messenger)) = debug_messenger {
                     unsafe { debug_utils.destroy_debug_utils_messenger(messenger, None) };
                 }
             }
@@ -221,139 +404,21 @@ impl Ctx {
         {
             required.present_fences = display.is_some();
         }
-        let asserted = Features::asserted();
-        let asserted_and_disabled = asserted.missing_from(&asserted.without(config.disabled));
-        if !asserted_and_disabled.is_empty() {
-            return Err(Error::message(format!(
-                "`Config::disabled` names asserted features: {}",
-                asserted_and_disabled.join(", ")
-            )));
-        }
-        let mut physical_devices = unsafe { instance.enumerate_physical_devices()? }
+        let handles = unsafe { instance.enumerate_physical_devices()? };
+        let mut physical_devices = handles
             .into_iter()
-            .map(|handel| {
-                let properties = unsafe { instance.get_physical_device_properties(handel) };
-                let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
-                    .to_str()?
-                    .to_owned();
-                let queue_families =
-                    unsafe { instance.get_physical_device_queue_family_properties(handel) }
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, p)| QueueFamily {
-                            num_queues: p.queue_count,
-                            index: index as _,
-                            handel: p,
-                        })
-                        .collect::<Vec<_>>();
-                let supported_extensions =
-                    unsafe { instance.enumerate_device_extension_properties(handel)? }
-                        .into_iter()
-                        .map(|p| {
-                            let name = unsafe { CStr::from_ptr(p.extension_name.as_ptr()) };
-                            Ok(name.to_str()?.to_owned())
-                        })
-                        .collect::<Result<Vec<String>>>()?;
-                let has = |name: &CStr| {
-                    (supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes())
-                };
-                let chain = FeatureChain::query(&instance, handel, &has);
-
-                let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
-                let mut rt_pipeline_properties =
-                    vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
-                let mut acc_properties =
-                    vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
-                let mut mesh_shader_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
-                let mut heap_properties = vk::PhysicalDeviceDescriptorHeapPropertiesEXT::default();
-                // Only the structs of extensions the device has.
-                let mut properties2 =
-                    vk::PhysicalDeviceProperties2::default().push_next(&mut vk12_properties);
-                if has(ash::khr::ray_tracing_pipeline::NAME) {
-                    properties2 = properties2.push_next(&mut rt_pipeline_properties);
-                }
-                if has(ash::khr::acceleration_structure::NAME) {
-                    properties2 = properties2.push_next(&mut acc_properties);
-                }
-                if has(ash::ext::mesh_shader::NAME) {
-                    properties2 = properties2.push_next(&mut mesh_shader_properties);
-                }
-                if has(vk::descriptor_heap::NAME) {
-                    properties2 = properties2.push_next(&mut heap_properties);
-                }
-                unsafe { instance.get_physical_device_properties2(handel, &mut properties2) };
-                // Detach them from the chain on this stack.
-                mesh_shader_properties.p_next = std::ptr::null_mut();
-                vk12_properties.p_next = std::ptr::null_mut();
-                rt_pipeline_properties.p_next = std::ptr::null_mut();
-                acc_properties.p_next = std::ptr::null_mut();
-                heap_properties.p_next = std::ptr::null_mut();
-                let _ = (&rt_pipeline_properties, &acc_properties);
-
-                let mem_properties =
-                    unsafe { instance.get_physical_device_memory_properties(handel) };
-                let rebar = mem_properties.memory_types
-                    [..mem_properties.memory_type_count as usize]
-                    .iter()
-                    .any(|e| {
-                        e.property_flags.contains(
-                            vk::MemoryPropertyFlags::DEVICE_LOCAL
-                                | vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        ) && mem_properties.memory_heaps[e.heap_index as usize].size
-                            > 500 * 1024 * 1024
-                    });
-                let families = pick_queue_families(&queue_families);
-                let facts = DeviceFacts {
-                    rebar,
-                    strict_lines: properties.limits.strict_lines == vk::TRUE,
-                    dedicated_compute: families.as_ref().is_some_and(|f| f.compute.is_some()),
-                    dedicated_transfer: families.as_ref().is_some_and(|f| f.transfer.is_some()),
-                };
-                let supported_features = chain.optional(&has, facts);
-                let mut lava_missing = chain.lava_missing(&has);
-                if properties.api_version < make_api_version(0, 1, 4, 0) {
-                    lava_missing.push("Vulkan 1.4".into());
-                }
-                let push_data = MAX_PUSH_CONSTANTS_SIZE as u64;
-                if has(vk::descriptor_heap::NAME) && heap_properties.max_push_data_size < push_data {
-                    lava_missing.push(format!("{push_data} bytes of push data (maxPushDataSize)"));
-                }
-                Ok(PhysicalDevice {
-                    properties,
-                    mesh_shader_properties,
-                    descriptor_heap_properties: heap_properties,
-                    vk12_properties,
-                    mem_properties,
-                    handel,
-                    name,
-                    queue_families,
-                    supported_extensions,
-                    #[cfg(feature = "acceleration-structure")]
-                    acceleration_structure_properties: supported_features
-                        .acceleration_structure
-                        .then_some(acc_properties),
-                    #[cfg(feature = "ray-tracing-pipeline")]
-                    ray_tracing_pipeline_properties: supported_features
-                        .ray_tracing_pipeline
-                        .then_some(rt_pipeline_properties),
-                    supported_features,
-                    lava_missing,
-                })
-            })
+            .map(|handel| describe_device(&instance, handel))
             .collect::<Result<Vec<PhysicalDevice>>>()?;
-        physical_devices.sort_by_key(|pd| match pd.properties.device_type {
-            vk::PhysicalDeviceType::DISCRETE_GPU => 0,
-            vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
-            _ => 2,
-        });
+        let types: Vec<_> = physical_devices
+            .iter()
+            .map(|d| d.properties.device_type)
+            .collect();
+        let order = device_order(&types);
 
         let mut rejected = Vec::new();
         let mut selected = None;
-        for device in physical_devices.iter().filter(|device| {
-            device.properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-                || device.properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
-        }) {
+        for &i in &order {
+            let device = &physical_devices[i];
             let mut missing = device.lava_missing.clone();
             missing.extend(
                 required
@@ -361,33 +426,33 @@ impl Ctx {
                     .into_iter()
                     .map(|name| format!("`{name}` (lava asserts it)")),
             );
-            let families = pick_queue_families(&device.queue_families);
-            if families.is_none() {
-                missing.push("a queue family with graphics, compute and timestamps".into());
-            }
-            match families {
+            match pick_queue_families(&device.queue_families) {
                 Some(families) if missing.is_empty() => {
-                    selected = Some((device.clone(), families));
+                    selected = Some((i, families));
                     break;
                 }
                 _ => rejected.push(format!("{} lacks {}", device.name, missing.join(", "))),
             }
         }
-        let Some((physical_device, families)) = selected else {
-            return Err(Error::message(&if rejected.is_empty() {
-                "no GPU found".to_owned()
-            } else {
-                format!("no suitable GPU: {}", rejected.join("; "))
-            }));
+        let Some((selected, families)) = selected else {
+            return Err(Error::NoSuitableGpu { rejected });
         };
+        let physical_device = physical_devices.swap_remove(selected);
+        if device_rank(physical_device.properties.device_type) >= 2 {
+            tracing::warn!(
+                "lava picked {}, a {:?} device, since no discrete or integrated GPU has what it needs",
+                physical_device.name,
+                physical_device.properties.device_type
+            );
+        }
         #[allow(unused_mut)]
         let mut features = physical_device.supported_features;
         #[cfg(feature = "present-fences")]
         {
             features.present_fences &= present_fences;
             if required.present_fences && !features.present_fences {
-                return Err(Error::message(
-                    "`assert-present-fences` needs the instance extensions VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1",
+                return Err(Error::Unsupported(
+                    "`assert-present-fences` needs the instance extensions VK_KHR_get_surface_capabilities2 and VK_EXT_surface_maintenance1".into(),
                 ));
             }
         }
@@ -403,7 +468,10 @@ impl Ctx {
         #[cfg(not(feature = "async-compute"))]
         let compute = None;
         #[cfg(feature = "async-transfer")]
-        let transfer = families.transfer.as_ref().filter(|_| features.async_transfer);
+        let transfer = families
+            .transfer
+            .as_ref()
+            .filter(|_| features.async_transfer);
         #[cfg(not(feature = "async-transfer"))]
         let transfer = None;
         let used = [Some(&families.graphics), compute, transfer];
@@ -441,11 +509,10 @@ impl Ctx {
             let device = device.clone();
             move || unsafe { device.destroy_device(None) }
         }));
-        let mut debug_utils = None;
-        if debug {
-            debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
-        }
+        let debug_utils =
+            validation.then(|| ash::ext::debug_utils::Device::new(&instance, &device));
 
+        let blocks = config.memory_blocks;
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
@@ -459,59 +526,60 @@ impl Ctx {
                 settings
             },
             buffer_device_address: true,
-            // In bytes: blocks start at 64 MiB of device memory and 16 MiB of host-visible
-            // memory and double with every block that didn't fit an allocation, to 256 and 64.
-            allocation_sizes: AllocationSizes::new(64 << 20, 16 << 20)
-                .with_max_device_memblock_size(256 << 20)
-                .with_max_host_memblock_size(64 << 20),
+            allocation_sizes: AllocationSizes::new(blocks.device, blocks.host)
+                .with_max_device_memblock_size(blocks.max_device)
+                .with_max_host_memblock_size(blocks.max_host),
         })?;
 
-        FUNCTIONS
-            .set(Functions {
-                #[cfg(feature = "mesh-shader")]
-                mesh: load::<gate::MeshShader, _>(features.mesh_shader, || {
-                    ash::ext::mesh_shader::Device::new(&instance, &device)
-                }),
-                #[cfg(feature = "performance-query")]
-                performance_query: load::<gate::PerformanceQuery, _>(features.performance_query, || {
+        FUNCTIONS.set(Functions {
+            #[cfg(feature = "mesh-shader")]
+            mesh: load::<gate::MeshShader, _>(features.mesh_shader, || {
+                ash::ext::mesh_shader::Device::new(&instance, &device)
+            }),
+            #[cfg(feature = "performance-query")]
+            performance_query: load::<gate::PerformanceQuery, _>(
+                features.performance_query,
+                || {
                     (
                         ash::khr::performance_query::Instance::new(&entry, &instance),
                         ash::khr::performance_query::Device::new(&instance, &device),
                     )
-                }),
-                #[cfg(feature = "ray-tracing-pipeline")]
-                raytracing_pipeline: load::<gate::RayTracingPipeline, _>(features.ray_tracing_pipeline, || {
-                    ash::khr::ray_tracing_pipeline::Device::new(&instance, &device)
-                }),
-                #[cfg(feature = "acceleration-structure")]
-                acceleration_structure: load::<gate::AccelerationStructure, _>(features.acceleration_structure, || {
-                    ash::khr::acceleration_structure::Device::new(&instance, &device)
-                }),
-                #[cfg(feature = "calibrated-timestamps")]
-                calibrated_timestamps: load::<gate::CalibratedTimestamps, _>(features.calibrated_timestamps, || {
-                    ash::khr::calibrated_timestamps::Device::new(&instance, &device)
-                }),
-                #[cfg(feature = "host-image-copy")]
-                host_image_copy: load::<gate::HostImageCopy, _>(features.host_image_copy, || {
-                    ash::ext::host_image_copy::Device::new(&instance, &device)
-                }),
-                dynamic_state2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
-                dynamic_state3: ash::ext::extended_dynamic_state3::Device::new(&instance, &device),
-                line_rasterization: ash::khr::line_rasterization::Device::new(&instance, &device),
-                depth_clamp_control: crate::vk::depth_clamp_control::Device::new(
-                    &instance, &device,
-                ),
-                device_address_commands: crate::vk::device_address_commands::Device::new(
-                    &instance, &device,
-                ),
-                descriptor_heap: crate::vk::descriptor_heap::Device::new(&instance, &device),
-                swapchain: ash::khr::swapchain::Device::new(&instance, &device),
-                instance,
-                entry,
-                surface: surface_fn,
-                device_debug_utils: debug_utils,
-            })
-            .map_err(|_| Error::message("Vulkan functions were already initialized"))?;
+                },
+            ),
+            #[cfg(feature = "ray-tracing-pipeline")]
+            raytracing_pipeline: load::<gate::RayTracingPipeline, _>(
+                features.ray_tracing_pipeline,
+                || ash::khr::ray_tracing_pipeline::Device::new(&instance, &device),
+            ),
+            #[cfg(feature = "acceleration-structure")]
+            acceleration_structure: load::<gate::AccelerationStructure, _>(
+                features.acceleration_structure,
+                || ash::khr::acceleration_structure::Device::new(&instance, &device),
+            ),
+            #[cfg(feature = "calibrated-timestamps")]
+            calibrated_timestamps: load::<gate::CalibratedTimestamps, _>(
+                features.calibrated_timestamps,
+                || ash::khr::calibrated_timestamps::Device::new(&instance, &device),
+            ),
+            #[cfg(feature = "host-image-copy")]
+            host_image_copy: load::<gate::HostImageCopy, _>(features.host_image_copy, || {
+                ash::ext::host_image_copy::Device::new(&instance, &device)
+            }),
+            dynamic_state2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
+            dynamic_state3: ash::ext::extended_dynamic_state3::Device::new(&instance, &device),
+            line_rasterization: ash::khr::line_rasterization::Device::new(&instance, &device),
+            depth_clamp_control: crate::vk::depth_clamp_control::Device::new(&instance, &device),
+            device_address_commands: crate::vk::device_address_commands::Device::new(
+                &instance, &device,
+            ),
+            descriptor_heap: crate::vk::descriptor_heap::Device::new(&instance, &device),
+            swapchain: ash::khr::swapchain::Device::new(&instance, &device),
+            instance,
+            entry,
+            surface: surface_fn,
+            device_debug_utils: debug_utils,
+            debug_messenger,
+        });
 
         let kinds = [Kind::Graphics, Kind::Compute, Kind::Transfer];
         let queues = DeviceQueues(std::array::from_fn(|i| {
@@ -526,27 +594,69 @@ impl Ctx {
                 timelines: Mutex::new(vec![0; count(family) as usize].into()),
             })
         }));
-        STATE
-            .set(Ctx {
-                device,
-                allocator: Mutex::new(allocator),
-                queues,
-
-                dynamic: Dynamic::of(&features),
-                features,
-                physical_device,
-            })
-            .map_err(|_| Error::message("Vulkan context was already initialized"))?;
+        STATE.set(Ctx {
+            device,
+            allocator: Mutex::new(Some(allocator)),
+            queues,
+            dynamic: Dynamic::of(&features),
+            features,
+            physical_device,
+            device_lost: AtomicBool::new(false),
+        });
         undo_device.disarm();
         undo_messenger.disarm();
         undo_instance.disarm();
-
         Ok(())
+    }
+
+    /// Frees the allocator's memory, destroys the device, the debug messenger and the instance,
+    /// and unsets the context, which is leaked (see `global`), and the functions.
+    ///
+    /// # Safety
+    /// Everything made from the device is destroyed, and nothing reads the context any more
+    /// (`global::close`, under `global::LIFECYCLE`).
+    pub(crate) unsafe fn destroy() {
+        let Some(ctx) = (unsafe { STATE.take() }) else {
+            return;
+        };
+        let ctx: &'static Ctx = Box::leak(ctx);
+        drop(crate::queue::lock(&ctx.allocator).take());
+        unsafe { ctx.device.destroy_device(None) };
+        if let Some(functions) = unsafe { FUNCTIONS.take() } {
+            if let Some((debug_utils, messenger)) = &functions.debug_messenger {
+                unsafe { debug_utils.destroy_debug_utils_messenger(*messenger, None) };
+            }
+            unsafe { functions.instance.destroy_instance(None) };
+        }
+    }
+
+    /// Whether lava's context exists (between `Ctx::init` and `destroy`).
+    pub(crate) fn exists() -> bool {
+        STATE.try_get().is_some()
     }
 }
 
+/// `err` as lava's error; the first call that sees the device lost logs it.
+pub(crate) fn vk_error(err: vk::Result) -> Error {
+    if err == vk::Result::ERROR_DEVICE_LOST
+        && let Some(ctx) = STATE.try_get()
+        && !ctx.device_lost.swap(true, Ordering::Relaxed)
+    {
+        tracing::error!(
+            "the device was lost: lava's calls fail with `Error::DeviceLost` from now on"
+        );
+    }
+    err.into()
+}
+
+/// A count for a public call that isn't a method of a lava object: see `global`.
+#[track_caller]
+pub(crate) fn call() -> Live {
+    Live::new()
+}
+
 thread_local! {
-    pub static CALLSITE: Cell<Option<Location<'static>>> = Cell::new(None);
+    pub static CALLSITE: Cell<Option<Location<'static>>> = const { Cell::new(None) };
 }
 
 /// Holds the caller location in [`CALLSITE`] while a `#[validation_trace]` function runs; only
@@ -573,46 +683,47 @@ impl Drop for CallsiteGuard {
     }
 }
 
+/// Logs the layers' messages as `tracing` events, formatted only where they are logged.
+///
+/// Validation messages are events of target `vulkan-validation`, at `error`, `warn`, `debug`
+/// or `trace` by severity, with the fields `message` (the layer's text), `typ` (the raw
+/// `VkDebugUtilsMessageTypeFlagsEXT` bits, an integer), `flags` (the raw
+/// `VkDebugUtilsMessageSeverityFlagsEXT` bit, an integer) and `validation_location` (the
+/// caller of the `#[validation_trace]` lava function the message came from, if any). Shader
+/// `printf` output is an `info` event of target `lava::state` with only a message.
 unsafe extern "system" fn vulkan_debug_callback(
     flag: vk::DebugUtilsMessageSeverityFlagsEXT,
     typ: vk::DebugUtilsMessageTypeFlagsEXT,
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _: *mut c_void,
 ) -> vk::Bool32 {
-    unsafe {
-        if p_callback_data != std::ptr::null() && (*p_callback_data).p_message != std::ptr::null() {
-            let message = CStr::from_ptr((*p_callback_data).p_message).to_string_lossy();
-            #[cfg(debug_assertions)]
-            {
-                let split = message.split("DebugPrintf:\n").collect::<Vec<_>>();
-                if split.len() > 1 {
-                    let printf_message = split[1..]
-                        .iter()
-                        .map(|s| s.chars())
-                        .flatten()
-                        .collect::<String>();
-                    tracing::info!("{}", printf_message);
-                    return vk::FALSE;
-                }
-            }
-            let typ = format!("{typ:?}");
-            let location = CALLSITE.get().map(|loc| loc.to_string());
-            let location = location.as_deref();
-            match flag {
-                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
-                    tracing::error!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
-                }
-                vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
-                    tracing::warn!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
-                }
-                vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
-                    tracing::debug!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
-                }
-                _ => {
-                    tracing::trace!(target: "vulkan-validation", typ, validation_location = location, "{}", message)
-                }
-            }
-        }
+    use vk::DebugUtilsMessageSeverityFlagsEXT as S;
+    if p_callback_data.is_null() || unsafe { (*p_callback_data).p_message.is_null() } {
+        return vk::FALSE;
+    }
+    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) }.to_bytes();
+    const PRINTF: &[u8] = b"DebugPrintf:\n";
+    if let Some(at) = message.windows(PRINTF.len()).position(|w| w == PRINTF) {
+        let printed = &message[at + PRINTF.len()..];
+        tracing::info!("{}", String::from_utf8_lossy(printed));
+        return vk::FALSE;
+    }
+    let text = || String::from_utf8_lossy(message);
+    let location = || CALLSITE.get().map(tracing::field::display);
+    let (typ, flags) = (typ.as_raw(), flag.as_raw());
+    match flag {
+        S::ERROR => tracing::error!(
+            target: "vulkan-validation", typ, flags, validation_location = location(), "{}", text()
+        ),
+        S::WARNING => tracing::warn!(
+            target: "vulkan-validation", typ, flags, validation_location = location(), "{}", text()
+        ),
+        S::INFO => tracing::debug!(
+            target: "vulkan-validation", typ, flags, validation_location = location(), "{}", text()
+        ),
+        _ => tracing::trace!(
+            target: "vulkan-validation", typ, flags, validation_location = location(), "{}", text()
+        ),
     }
     vk::FALSE
 }
@@ -632,6 +743,8 @@ pub struct Functions {
     swapchain: ash::khr::swapchain::Device,
     surface: Option<ash::khr::surface::Instance>,
     device_debug_utils: Option<ash::ext::debug_utils::Device>,
+    /// The validation layer's messenger, destroyed at shutdown.
+    debug_messenger: Option<(debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     #[cfg(feature = "mesh-shader")]
     mesh: Loader<gate::MeshShader, ash::ext::mesh_shader::Device>,
     #[cfg(feature = "performance-query")]
@@ -653,12 +766,12 @@ pub struct Functions {
 }
 
 impl Debug for Functions {
-    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Functions").finish_non_exhaustive()
     }
 }
 
-static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
+static FUNCTIONS: Global<Functions> = Global::new();
 
 impl Functions {
     pub(crate) fn surface() -> Option<&'static ash::khr::surface::Instance> {
@@ -722,6 +835,7 @@ impl Functions {
         loaded::<gate::AccelerationStructure, _>(&get().acceleration_structure)
     }
 
+    /// Names `object` for debuggers and the validation layer, where debug utils are loaded.
     pub(crate) fn set_debug_name<T>(name: &str, object: T)
     where
         T: Handle,
@@ -753,8 +867,7 @@ pub(crate) fn with_debug_name<R>(name: &str, f: impl FnOnce(&CStr) -> R) -> R {
     }
 }
 
+#[track_caller]
 fn get() -> &'static Functions {
-    FUNCTIONS
-        .get()
-        .expect("Vulkan functions have not been initialized")
+    FUNCTIONS.get()
 }

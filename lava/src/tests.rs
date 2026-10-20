@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking and the layouts the GPU reads
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init and the layouts the GPU reads
 use std::{
     iter,
     sync::atomic::AtomicU64,
@@ -639,4 +639,73 @@ fn pipeline_caches_load_only_for_their_device() {
     assert!(!cache_header_matches(&header(16, 1, 0x8086, [7; 16]), &properties), "size");
     assert!(!cache_header_matches(&header(32, 1, 0x8086, [7; 16])[..20], &properties), "cut");
     assert!(!cache_header_matches(&[], &properties));
+}
+
+/// Discrete GPUs first, then integrated ones, then virtual and CPU ones; the driver's order
+/// within a rank.
+#[test]
+fn devices_are_tried_by_type() {
+    use vk::PhysicalDeviceType as T;
+    let types = [T::CPU, T::OTHER, T::INTEGRATED_GPU, T::DISCRETE_GPU, T::VIRTUAL_GPU, T::DISCRETE_GPU];
+    assert_eq!(crate::state::device_order(&types), [3, 5, 2, 4, 0, 1]);
+    assert!(crate::state::device_rank(T::CPU) > crate::state::device_rank(T::INTEGRATED_GPU));
+    assert_eq!(crate::state::device_order(&[]), Vec::<usize>::new());
+}
+
+/// Each family's stages, masked by the features: ray tracing shaders only with ray tracing
+/// pipelines.
+#[test]
+fn wait_stages_are_masked_by_features() {
+    use crate::queue::{AllStages, ComputeStage, GraphicsStage, StageSet, TransferStage};
+    let none = Features::DEFAULT;
+    assert_eq!(AllStages.mask(&none), S::ALL_COMMANDS);
+    assert_eq!(GraphicsStage::Raster.mask(&none), S::ALL_GRAPHICS);
+    assert_eq!(ComputeStage::Compute.mask(&none), S::COMPUTE_SHADER | S::DRAW_INDIRECT);
+    assert_eq!(TransferStage::Transfer.mask(&none), S::ALL_TRANSFER);
+    assert_eq!(GraphicsStage::RayTracing.mask(&none), S::DRAW_INDIRECT);
+    #[cfg(feature = "ray-tracing-pipeline")]
+    {
+        let rt = Features {
+            ray_tracing_pipeline: true,
+            ..Features::DEFAULT
+        };
+        let traced = S::RAY_TRACING_SHADER_KHR | S::DRAW_INDIRECT;
+        assert_eq!(ComputeStage::RayTracing.mask(&rt), traced);
+        assert_eq!(GraphicsStage::RayTracing.mask(&rt), traced);
+    }
+}
+
+/// Errors map Vulkan's typed results, keep their context apart from their source, and leave
+/// typed variants without context.
+#[test]
+fn errors_are_typed_and_display_once() {
+    use crate::Error;
+    use std::error::Error as _;
+    assert!(matches!(Error::from(vk::Result::ERROR_DEVICE_LOST), Error::DeviceLost));
+    assert!(matches!(Error::from(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY), Error::OutOfMemory));
+    assert!(matches!(
+        Error::from(gpu_allocator::AllocationError::OutOfMemory),
+        Error::OutOfMemory
+    ));
+    assert!(matches!(Error::from(vk::Result::ERROR_OUT_OF_DATE_KHR), Error::SurfaceOutOfDate));
+    let wrapped = Error::from(vk::Result::ERROR_UNKNOWN).context("the pipelines of `Pass`");
+    assert_eq!(wrapped.to_string(), "the pipelines of `Pass`");
+    let source = wrapped.source().expect("the Vulkan error").to_string();
+    assert!(source.contains("ERROR_UNKNOWN"), "{source}");
+    assert!(matches!(Error::DeviceLost.context("anything"), Error::DeviceLost));
+    let slots = Error::OutOfBindlessSlots {
+        heap: crate::bindless::Heap::Sampler,
+        count: 2,
+    };
+    assert_eq!(slots.to_string(), "the bindless sampler heap has no 2 contiguous free slots");
+    assert!(slots.source().is_none());
+}
+
+/// Without `lava::init`, lava's calls panic with one message, and shutdown does nothing.
+#[test]
+fn calls_before_init_panic() {
+    let panicked = std::panic::catch_unwind(crate::state::call).unwrap_err();
+    let message = panicked.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(message.contains("lava is not initialised"), "{message}");
+    assert!(crate::shutdown().is_ok());
 }

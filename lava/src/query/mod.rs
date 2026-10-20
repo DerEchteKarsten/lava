@@ -149,10 +149,13 @@ pub struct QueryPool<K: QueryKind> {
     /// none.
     last: AtomicU64,
     pub(crate) kind: K,
+    /// Last, so it counts the pool until its drop finished.
+    _live: crate::global::Live,
 }
 
 impl<K: QueryKind> QueryPool<K> {
     fn create(count: u32, info: vk::QueryPoolCreateInfo, kind: K) -> Result<Self> {
+        let live = crate::global::Live::new();
         assert!(count > 0, "a query pool holds at least one query");
         let info = info.query_type(K::TYPE).query_count(count);
         let handle = unsafe { Ctx::device().create_query_pool(&info, None)? };
@@ -163,6 +166,7 @@ impl<K: QueryKind> QueryPool<K> {
             count,
             last: AtomicU64::new(0),
             kind,
+            _live: live,
         })
     }
 
@@ -181,7 +185,7 @@ impl<K: QueryKind> QueryPool<K> {
         }
         let (timeline, value) = ((last & 7) as usize, last >> 3);
         assert!(
-            last == 0 || poll(timeline) >= value,
+            last == 0 || poll(timeline).is_ok_and(|done| done >= value),
             "a query pool is recorded into while an earlier submission that recorded into it \
              still runs: keep one pool per frame slot"
         );
@@ -324,9 +328,10 @@ impl QueryPool<PipelineStatistics> {
             #[cfg(feature = "mesh-shader-queries")]
             gate::MeshShaderQueries::check()?;
             #[cfg(not(feature = "mesh-shader-queries"))]
-            return Err(Error::message(
-                "task and mesh shader invocations need lava's `mesh-shader-queries` feature",
-            ));
+            return Err(crate::features::MissingFeature {
+                feature: "mesh-shader-queries",
+            }
+            .into());
         }
         assert!(statistics.as_raw().count_ones() as usize <= STATISTICS);
         let info = vk::QueryPoolCreateInfo::default().pipeline_statistics(statistics);
@@ -367,26 +372,31 @@ impl QueryPool<Performance> {
     /// Queries of the hardware counters `counters` (at most [`MAX_COUNTERS`], read in one
     /// submission: [`counters::passes`] is 1), recorded on the graphics family. Holds the
     /// profiling lock until it is destroyed, and fails if another process holds it.
+    ///
+    /// Panics for a `count` of 0, for no or more than [`MAX_COUNTERS`] counters, and for counters
+    /// of an earlier lava context.
     pub fn performance(count: u32, counters: &[&'static Counter]) -> Result<Self> {
+        let _call = crate::state::call();
         gate::PerformanceQuery::check()?;
-        if counters.is_empty() || counters.len() > MAX_COUNTERS {
-            return Err(Error::message(format!(
-                "{} counters selected, 1 to {MAX_COUNTERS} fit",
-                counters.len()
-            )));
-        }
+        assert!(count > 0, "a query pool holds at least one query");
+        assert!(
+            !counters.is_empty() && counters.len() <= MAX_COUNTERS,
+            "{} counters selected, 1 to {MAX_COUNTERS} fit",
+            counters.len()
+        );
+        counters::check_current(counters);
         let passes = counters::passes(counters);
         if passes != 1 {
-            return Err(Error::message(format!(
+            return Err(Error::Unsupported(format!(
                 "the counters need {passes} submissions, only selections of one can be recorded"
             )));
         }
         {
-            let mut users = counters::LOCK_USERS.lock().unwrap();
+            let mut users = crate::queue::lock(&counters::LOCK_USERS);
             if *users == 0 {
                 let info = vk::AcquireProfilingLockInfoKHR::default().timeout(0);
                 if let Err(err) = unsafe { Functions::performance_query().1.acquire_profiling_lock(&info) } {
-                    return Err(Error::message(format!("the profiling lock is taken by another process ({err})")));
+                    return Err(Error::from(err).context("the profiling lock is taken by another process"));
                 }
             }
             *users += 1;

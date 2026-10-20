@@ -106,7 +106,7 @@ impl<'a, K> BindingOutput<'a, K> {
 /// The pass map entry of `pass` once lava is initialised, for the debug checks of the generator
 /// contract.
 fn entry(pass: usize) -> Option<&'static crate::pipeline::PassEntry> {
-    crate::pipeline::PASS_MAP.get()?.passes.get(pass)
+    crate::pipeline::try_pass_map()?.passes.get(pass)
 }
 
 impl<'a, K: kind::Kind, const P: usize, const I: usize, const B: usize>
