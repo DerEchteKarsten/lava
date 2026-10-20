@@ -282,8 +282,15 @@ features! {
     /// `VK_KHR_calibrated_timestamps`: timestamps on the host's clock (`QueryPool::instant`).
     calibrated_timestamps: "calibrated-timestamps" / "assert-calibrated-timestamps" => CalibratedTimestamps,
     /// `VK_EXT_swapchain_maintenance1` with a display: presents signal fences, so what they use
-    /// is destroyed once they are done. Asserting it requires it only with a display.
+    /// is destroyed once they are done. Windows need it (`PresentSurface::new`); asserting it
+    /// requires it only with a display.
     present_fences: "present-fences" / "assert-present-fences" => PresentFences,
+    /// `VK_EXT_hdr_metadata` with a display: `PresentSurface::set_hdr_metadata`. Asserting it
+    /// requires it only with a display.
+    hdr_metadata: "hdr-metadata" / "assert-hdr-metadata" => HdrMetadata,
+    /// `VK_EXT_present_mode_fifo_latest_ready` with a display: `PresentMode::FifoLatestReady`.
+    /// Asserting it requires it only with a display.
+    fifo_latest_ready: "fifo-latest-ready" / "assert-fifo-latest-ready" => FifoLatestReady,
     /// A queue family with compute but no graphics: `Timeline<Compute>`.
     async_compute: "async-compute" / "assert-async-compute" => AsyncCompute,
     /// A queue family with transfer but neither graphics nor compute: `Timeline<Transfer>`.
@@ -519,6 +526,8 @@ impl Features {
             "performance-query" => performance_query: [ash::khr::performance_query::NAME],
             "calibrated-timestamps" => calibrated_timestamps: [ash::khr::calibrated_timestamps::NAME],
             "present-fences" => present_fences: [ash::ext::swapchain_maintenance1::NAME],
+            "hdr-metadata" => hdr_metadata: [ash::ext::hdr_metadata::NAME],
+            "fifo-latest-ready" => fifo_latest_ready: [crate::vk::present_mode_fifo_latest_ready::NAME],
             "acceleration-structure" => acceleration_structure: [
                 ash::khr::deferred_host_operations::NAME,
                 ash::khr::acceleration_structure::NAME
@@ -594,6 +603,7 @@ pub(crate) struct FeatureChain {
     clock: vk::PhysicalDeviceShaderClockFeaturesKHR<'static>,
     performance: vk::PhysicalDevicePerformanceQueryFeaturesKHR<'static>,
     swapchain_maintenance1: vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>,
+    fifo_latest_ready: vk::PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT<'static>,
 }
 
 impl FeatureChain {
@@ -634,6 +644,7 @@ impl FeatureChain {
             clock,
             performance,
             swapchain_maintenance1,
+            fifo_latest_ready,
         } = self;
         // ash 0.38's `push_next` links the pushed struct's whole chain, so unlink a queried one.
         macro_rules! unlink {
@@ -662,7 +673,8 @@ impl FeatureChain {
             host_image_copy,
             clock,
             performance,
-            swapchain_maintenance1
+            swapchain_maintenance1,
+            fifo_latest_ready
         );
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(*core)
@@ -695,6 +707,7 @@ impl FeatureChain {
             ash::khr::shader_clock::NAME => clock,
             ash::khr::performance_query::NAME => performance,
             ash::ext::swapchain_maintenance1::NAME => swapchain_maintenance1,
+            crate::vk::present_mode_fifo_latest_ready::NAME => fifo_latest_ready,
         }
         features
     }
@@ -767,6 +780,9 @@ impl FeatureChain {
                 has(ash::khr::calibrated_timestamps::NAME),
             "present-fences" => present_fences =
                 t(self.swapchain_maintenance1.swapchain_maintenance1),
+            "hdr-metadata" => hdr_metadata = has(ash::ext::hdr_metadata::NAME),
+            "fifo-latest-ready" => fifo_latest_ready =
+                t(self.fifo_latest_ready.present_mode_fifo_latest_ready),
             "async-compute" => async_compute = device.dedicated_compute,
             "async-transfer" => async_transfer = device.dedicated_transfer,
             "bc-compression" => bc_compression = t(c.texture_compression_bc),
@@ -980,6 +996,8 @@ impl FeatureChain {
                 on(f.performance_query),
             "present-fences" => swapchain_maintenance1.swapchain_maintenance1 =
                 on(f.present_fences),
+            "fifo-latest-ready" => fifo_latest_ready.present_mode_fifo_latest_ready =
+                on(f.fifo_latest_ready),
         }
         chain
     }

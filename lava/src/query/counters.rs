@@ -1,4 +1,4 @@
-//! Hardware performance counters (`VK_KHR_performance_query`, the `performance-query` feature): the graphics family's counters, how many passes a selection needs, and the profiling lock counter pools hold
+//! Hardware performance counters (`VK_KHR_performance_query`, the `performance-query` feature): the graphics family's counters with their units and scopes, how many passes a selection needs, and the profiling lock counter pools hold
 use std::sync::Mutex;
 
 use crate::vk;
@@ -9,8 +9,32 @@ use crate::{
     state::{Ctx, Functions},
 };
 
-/// The most counters a performance query pool can hold.
+/// The most counters a performance query pool holds: lava's own cap, not a Vulkan limit, so a
+/// query's values fit a fixed array. Selections of more than one pass are recorded by
+/// `Timeline::capture`; this cap stays.
 pub const MAX_COUNTERS: usize = 8;
+
+/// What a counter's query may span (`VkPerformanceCounterScopeKHR`), narrowest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CounterScope {
+    /// A whole recording: its query begins as the recording's first command and ends as its last
+    /// (`Submission::submit_profiled`, `Timeline::capture`).
+    CommandBuffer,
+    /// Commands outside renderings: its query can't begin or end inside one.
+    RenderPass,
+    /// Any commands.
+    Command,
+}
+
+impl CounterScope {
+    pub(crate) fn vk(self) -> vk::PerformanceCounterScopeKHR {
+        match self {
+            Self::CommandBuffer => vk::PerformanceCounterScopeKHR::COMMAND_BUFFER,
+            Self::RenderPass => vk::PerformanceCounterScopeKHR::RENDER_PASS,
+            Self::Command => vk::PerformanceCounterScopeKHR::COMMAND,
+        }
+    }
+}
 
 /// What a counter's value measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +76,7 @@ pub struct Counter {
     pub category: String,
     pub description: String,
     pub unit: CounterUnit,
+    pub scope: CounterScope,
     /// Its index in the device's list, which query pools are created with.
     pub(crate) index: u32,
     pub(crate) storage: vk::PerformanceCounterStorageKHR,
@@ -108,11 +133,17 @@ pub(crate) fn init() -> Result<()> {
                 U::CYCLES => CounterUnit::Cycles,
                 _ => CounterUnit::Generic,
             };
+            let scope = match counter.scope {
+                vk::PerformanceCounterScopeKHR::COMMAND_BUFFER => CounterScope::CommandBuffer,
+                vk::PerformanceCounterScopeKHR::RENDER_PASS => CounterScope::RenderPass,
+                _ => CounterScope::Command,
+            };
             Counter {
                 name: to_string(&description.name),
                 category: to_string(&description.category),
                 description: to_string(&description.description),
                 unit,
+                scope,
                 index: index as u32,
                 storage: counter.storage,
             }
@@ -147,11 +178,12 @@ pub fn counters() -> Gated<gate::PerformanceQuery, &'static [Counter]> {
     gate::<gate::PerformanceQuery, _>(|| COUNTERS.try_get().map_or(&[][..], Vec::as_slice))
 }
 
-/// How many submissions it takes to read `selection` (0 without performance queries). Only
-/// selections of one pass can be recorded.
+/// How many submissions it takes to read `selection` (0 without performance queries or
+/// counters). [`fits`] selections are recorded like any query; `Timeline::capture` records the
+/// others.
 pub fn passes(selection: &[&Counter]) -> u32 {
     let _call = crate::state::call();
-    if !gate::PerformanceQuery::on() {
+    if !gate::PerformanceQuery::on() || selection.is_empty() {
         return 0;
     }
     let (instance, _) = Functions::performance_query();
@@ -165,6 +197,13 @@ pub fn passes(selection: &[&Counter]) -> u32 {
             &info,
         )
     }
+}
+
+/// Whether `selection` can be counted in one submission, so `CommandBuffer::query`, scope
+/// observers and `Submission::submit_profiled` can record its pool: one pass, and at most
+/// [`MAX_COUNTERS`] counters.
+pub fn fits(selection: &[&Counter]) -> bool {
+    selection.len() <= MAX_COUNTERS && passes(selection) == 1
 }
 
 pub(crate) fn release_lock() {

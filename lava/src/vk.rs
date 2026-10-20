@@ -1,4 +1,4 @@
-//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands`, `VK_EXT_descriptor_heap`, `VK_KHR_shader_untyped_pointers` and `VK_EXT_depth_clamp_control`, their types and their device functions
+//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands`, `VK_EXT_descriptor_heap`, `VK_KHR_shader_untyped_pointers`, `VK_EXT_depth_clamp_control` and `VK_EXT_present_mode_fifo_latest_ready`, their types and their device functions
 
 use core::ffi::{CStr, c_void};
 use core::marker::PhantomData;
@@ -70,7 +70,13 @@ mod values {
         StructureType::from_raw(1_000_135_009);
     pub const PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR: StructureType =
         StructureType::from_raw(1_000_387_000);
+    pub const PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_EXT: StructureType =
+        StructureType::from_raw(1_000_361_000);
 }
+
+/// `VK_PRESENT_MODE_FIFO_LATEST_READY_EXT`: FIFO that presents the newest ready image at each
+/// vertical blank, dropping older ones.
+pub const PRESENT_MODE_FIFO_LATEST_READY_EXT: PresentModeKHR = PresentModeKHR::from_raw(1_000_361_000);
 pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
     values::DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT;
 
@@ -240,6 +246,14 @@ tagged! {
 }
 unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
+tagged! {
+    PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT =
+        PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_EXT, *mut c_void {
+        present_mode_fifo_latest_ready: Bool32,
+    }
+}
+unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT<'_> {}
+unsafe impl ExtendsDeviceCreateInfo for PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT<'_> {}
 tagged! {
     PhysicalDeviceDescriptorHeapFeaturesEXT =
         PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT, *mut c_void {
@@ -645,6 +659,13 @@ pub mod shader_untyped_pointers {
     use super::CStr;
 
     pub const NAME: &CStr = c"VK_KHR_shader_untyped_pointers";
+}
+
+/// `VK_EXT_present_mode_fifo_latest_ready`: the present mode, no commands.
+pub mod present_mode_fifo_latest_ready {
+    use super::*;
+
+    pub const NAME: &CStr = c"VK_EXT_present_mode_fifo_latest_ready";
 }
 
 /// `VK_EXT_depth_clamp_control`: a depth clamp range other than the viewport's.

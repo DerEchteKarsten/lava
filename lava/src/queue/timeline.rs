@@ -1,4 +1,4 @@
-//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (queued bindless rewrites first), with the snapshot of their submitted buffer writes that host access checks; values no submission signals (a dropped timeline's stamp, a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
+//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (queued bindless rewrites first; with `submit_profiled` inside a hardware counter query, and `capture` once per counter pass), with the snapshot of their submitted buffer writes that host access checks; values no submission signals (a dropped timeline's stamp, a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
 use std::{
     fmt,
     marker::PhantomData,
@@ -15,6 +15,12 @@ use crate::vk;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
+#[cfg(feature = "performance-query")]
+use crate::{
+    command_buffer::Profile,
+    query::{Performance, QueryPool},
+    queue::Graphics,
+};
 use crate::{
     bindless::Bindless,
     buffer::staging::{Staging, Uploader},
@@ -476,6 +482,16 @@ impl<K: QueueKind> Submission<'_, K> {
     /// then its panic continues or its error is returned.
     #[validation_trace]
     pub fn submit(self, record: impl FnOnce(&mut CommandBuffer<K>)) -> Result<Wait> {
+        self.submit_inner(None, record)
+    }
+
+    /// `submit`, inside query `index` of `profile`'s pool in counter pass `pass` when it is
+    /// given, begun as the recording's first command and ended as its last.
+    fn submit_inner(
+        self,
+        profile: ProfileArg<'_>,
+        record: impl FnOnce(&mut CommandBuffer<K>),
+    ) -> Result<Wait> {
         let inner = self.inner;
         let i = inner.index;
         let index = &INDICES[i];
@@ -500,15 +516,29 @@ impl<K: QueueKind> Submission<'_, K> {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(slot.cmd, &begin_info)? };
+        let prev = CALLSITE.replace(None);
+        let was_recording = lifetime::RECORDING.replace(true);
+        // Counters of command-buffer scope need their query's begin as the first command.
+        let begun = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(feature = "performance-query")]
+            if let Some((pool, index, pass)) = profile {
+                cmd.rec.profile = Some(Profile {
+                    pool: pool.handle,
+                    index,
+                    pass,
+                });
+                cmd.rec.profile_query(pool, index, true);
+            }
+            let _ = &profile;
+        }));
         Bindless::bind(slot.cmd, K::KIND);
         // Rewrites of reserved slots, ordered after the queue's earlier commands.
         let queued = match K::KIND {
             Kind::Transfer => Default::default(),
             _ => Bindless::flush_queued(slot.cmd),
         };
-        let prev = CALLSITE.replace(None);
-        let was_recording = lifetime::RECORDING.replace(true);
-        let recorded = std::panic::catch_unwind(AssertUnwindSafe(|| record(&mut cmd)));
+        let recorded =
+            begun.and_then(|()| std::panic::catch_unwind(AssertUnwindSafe(|| record(&mut cmd))));
         lifetime::RECORDING.set(was_recording);
         CALLSITE.set(prev);
 
@@ -522,7 +552,8 @@ impl<K: QueueKind> Submission<'_, K> {
             .collect();
         let presents: SmallVec<[_; 1]> = rec.presents.iter().map(|p| p.present).collect();
         let queue = &inner.family.queues[inner.queue];
-        let submit = |cmd: vk::CommandBuffer| -> Result<()> {
+        // The counter pass of a profiled recording; a replay records no queries.
+        let submit = |cmd: vk::CommandBuffer, pass: Option<u32>| -> Result<()> {
             let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
             let waits: SmallVec<[_; 4]> = (self.waits.iter())
                 .map(|&(t, value, stages)| (semaphore(t), value, stages))
@@ -544,10 +575,15 @@ impl<K: QueueKind> Submission<'_, K> {
                         .stage_mask(all)
                 })
                 .collect();
-            let info = vk::SubmitInfo2::default()
+            let mut info = vk::SubmitInfo2::default()
                 .command_buffer_infos(&buffers)
                 .wait_semaphore_infos(&waits)
                 .signal_semaphore_infos(&signals);
+            let mut performance = vk::PerformanceQuerySubmitInfoKHR::default();
+            if let Some(pass) = pass {
+                performance = performance.counter_pass_index(pass);
+                info = info.push_next(&mut performance);
+            }
             unsafe { device.queue_submit2(*lock(queue), &[info], vk::Fence::null()) }
                 .map_err(vk_error)
         };
@@ -555,11 +591,22 @@ impl<K: QueueKind> Submission<'_, K> {
         enum Failed {
             Panicked(Box<dyn std::any::Any + Send>),
             Unpresented,
+            OpenQuery(u32),
+            ProfileEnded,
             Error(Error),
         }
+        let profiled = rec.profile;
         let result = match recorded {
             Err(panic) => Err(Failed::Panicked(panic)),
             Ok(()) if unpresented => Err(Failed::Unpresented),
+            Ok(()) if let Some(index) = rec.left_open() => Err(Failed::OpenQuery(index)),
+            Ok(())
+                if profiled.is_some_and(|p| {
+                    !rec.open_queries.iter().flatten().any(|&q| q == (p.pool, p.index))
+                }) =>
+            {
+                Err(Failed::ProfileEnded)
+            }
             Ok(()) => {
                 let barrier = [vk::MemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -568,9 +615,14 @@ impl<K: QueueKind> Submission<'_, K> {
                     .dst_access_mask(vk::AccessFlags2::HOST_READ)];
                 let info = vk::DependencyInfo::default().memory_barriers(&barrier);
                 unsafe { device.cmd_pipeline_barrier2(rec.handle, &info) };
+                // The profile's query ends as the last command.
+                #[cfg(feature = "performance-query")]
+                if let Some((pool, index, _)) = profile {
+                    rec.profile_query(pool, index, false);
+                }
                 unsafe { device.end_command_buffer(rec.handle) }
                     .map_err(vk_error)
-                    .and_then(|()| submit(rec.handle))
+                    .and_then(|()| submit(rec.handle, profiled.map(|p| p.pass)))
                     .map_err(Failed::Error)
             }
         };
@@ -594,7 +646,7 @@ impl<K: QueueKind> Submission<'_, K> {
                     }
                     device.end_command_buffer(rec.handle)?;
                 }
-                submit(rec.handle)
+                submit(rec.handle, None)
             })();
             if let Err(err) = replayed {
                 if !matches!(err, Error::DeviceLost) {
@@ -633,6 +685,71 @@ impl<K: QueueKind> Submission<'_, K> {
             Err(Failed::Unpresented) => {
                 panic!("a submission that uses an acquired swapchain image must present it")
             }
+            Err(Failed::OpenQuery(index)) => panic!(
+                "a recording ended with query {index} still active: end every query it begins"
+            ),
+            Err(Failed::ProfileEnded) => {
+                panic!("the counter query around a profiled recording was ended inside it")
+            }
         }
+    }
+}
+
+/// The counter pool, query and pass of `Submission::submit_profiled` and `Timeline::capture`.
+#[cfg(feature = "performance-query")]
+type ProfileArg<'a> = Option<(&'a QueryPool<Performance>, u32, u32)>;
+#[cfg(not(feature = "performance-query"))]
+type ProfileArg<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(feature = "performance-query")]
+impl Submission<'_, Graphics> {
+    /// [`Self::submit`], inside query `index` of the hardware counter pool `pool`, begun as the
+    /// recording's first command and ended as its last: what counters of
+    /// [`CounterScope::CommandBuffer`](crate::query::CounterScope::CommandBuffer) need, and
+    /// any others count the whole recording this way too. Observers see the query as active.
+    /// Panics if `pool`'s counters take more than one pass ([`Timeline::capture`] records those).
+    #[validation_trace]
+    pub fn submit_profiled(
+        self,
+        pool: &QueryPool<Performance>,
+        index: u32,
+        record: impl FnOnce(&mut CommandBuffer<Graphics>),
+    ) -> Result<Wait> {
+        assert!(index < pool.count(), "query {index} of a pool of {}", pool.count());
+        assert!(
+            pool.passes() == 1,
+            "the counters of this pool take {} submissions: record them with `Timeline::capture`",
+            pool.passes()
+        );
+        self.submit_inner(Some((pool, index, 0)), record)
+    }
+}
+
+#[cfg(feature = "performance-query")]
+impl Timeline<Graphics> {
+    /// A capture of hardware counters for tools: records `record` once per counter pass that
+    /// `pool`'s selection needs ([`QueryPool::passes`], also more than [`counters::fits`]
+    /// allows), each time in a submission of its own inside query `index` (as
+    /// [`Submission::submit_profiled`] records it) counting that pass's counters, and blocks
+    /// until each finished before recording the next; then `pool.read(index, ..)` has every
+    /// counter. The recordings should be alike (a frame's commands, recorded again), and present
+    /// nothing, since a frame presents once. Returns the last pass's `Wait`.
+    ///
+    /// [`counters::fits`]: crate::query::counters::fits
+    #[validation_trace]
+    pub fn capture(
+        &mut self,
+        pool: &QueryPool<Performance>,
+        index: u32,
+        mut record: impl FnMut(&mut CommandBuffer<Graphics>),
+    ) -> Result<Wait> {
+        assert!(index < pool.count(), "query {index} of a pool of {}", pool.count());
+        let mut last = None;
+        for pass in 0..pool.passes() {
+            let wait = self.begin()?.submit_inner(Some((pool, index, pass)), &mut record)?;
+            wait.block()?;
+            last = Some(wait);
+        }
+        Ok(last.expect("a selection takes at least one pass"))
     }
 }

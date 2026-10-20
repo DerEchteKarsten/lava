@@ -91,6 +91,29 @@ impl std::ops::DerefMut for AllocatorGuard<'_> {
     }
 }
 
+impl AllocatorGuard<'_> {
+    /// Allocates, counting the bytes for `memory_report`.
+    pub(crate) fn allocate(
+        &mut self,
+        desc: &gpu_allocator::vulkan::AllocationCreateDesc<'_>,
+    ) -> gpu_allocator::Result<gpu_allocator::vulkan::Allocation> {
+        let allocation = std::ops::DerefMut::deref_mut(self).allocate(desc)?;
+        crate::memory::ALLOCATED.fetch_add(allocation.size(), std::sync::atomic::Ordering::Relaxed);
+        Ok(allocation)
+    }
+
+    /// Frees, counting the bytes for `memory_report`.
+    pub(crate) fn free(
+        &mut self,
+        allocation: gpu_allocator::vulkan::Allocation,
+    ) -> gpu_allocator::Result<()> {
+        let size = allocation.size();
+        std::ops::DerefMut::deref_mut(self).free(allocation)?;
+        crate::memory::ALLOCATED.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// Where lava tries a device of `device_type`: discrete GPUs first, then integrated ones, then
 /// virtual GPUs and CPUs (software renderers such as lavapipe) as a last resort.
 pub(crate) fn device_rank(device_type: vk::PhysicalDeviceType) -> u8 {
@@ -333,6 +356,11 @@ impl Ctx {
         if present_fences {
             instance_extensions.extend(surface_maintenance.iter().map(|name| name.as_ptr()));
         }
+        // The colour spaces besides sRGB (HDR among them) that surfaces then list.
+        let colorspace = ash::ext::swapchain_colorspace::NAME;
+        if display.is_some() && instance_has(colorspace) {
+            instance_extensions.push(colorspace.as_ptr());
+        }
 
         let validation = config.validation
             && {
@@ -400,9 +428,18 @@ impl Ctx {
 
         #[allow(unused_mut)]
         let mut required = Features::asserted();
+        // Presenting features are asserted only with a display.
         #[cfg(feature = "assert-present-fences")]
         {
             required.present_fences = display.is_some();
+        }
+        #[cfg(feature = "assert-hdr-metadata")]
+        {
+            required.hdr_metadata = display.is_some();
+        }
+        #[cfg(feature = "assert-fifo-latest-ready")]
+        {
+            required.fifo_latest_ready = display.is_some();
         }
         let handles = unsafe { instance.enumerate_physical_devices()? };
         let mut physical_devices = handles
@@ -447,6 +484,14 @@ impl Ctx {
         }
         #[allow(unused_mut)]
         let mut features = physical_device.supported_features;
+        #[cfg(feature = "hdr-metadata")]
+        {
+            features.hdr_metadata &= display.is_some();
+        }
+        #[cfg(feature = "fifo-latest-ready")]
+        {
+            features.fifo_latest_ready &= display.is_some();
+        }
         #[cfg(feature = "present-fences")]
         {
             features.present_fences &= present_fences;
@@ -561,6 +606,10 @@ impl Ctx {
                 features.calibrated_timestamps,
                 || ash::khr::calibrated_timestamps::Device::new(&instance, &device),
             ),
+            #[cfg(feature = "hdr-metadata")]
+            hdr_metadata: load::<gate::HdrMetadata, _>(features.hdr_metadata, || {
+                ash::ext::hdr_metadata::Device::new(&instance, &device)
+            }),
             #[cfg(feature = "host-image-copy")]
             host_image_copy: load::<gate::HostImageCopy, _>(features.host_image_copy, || {
                 ash::ext::host_image_copy::Device::new(&instance, &device)
@@ -763,6 +812,8 @@ pub struct Functions {
     #[cfg(feature = "calibrated-timestamps")]
     calibrated_timestamps:
         Loader<gate::CalibratedTimestamps, ash::khr::calibrated_timestamps::Device>,
+    #[cfg(feature = "hdr-metadata")]
+    hdr_metadata: Loader<gate::HdrMetadata, ash::ext::hdr_metadata::Device>,
 }
 
 impl Debug for Functions {
@@ -825,6 +876,10 @@ impl Functions {
     #[cfg(feature = "calibrated-timestamps")]
     pub(crate) fn calibrated_timestamps() -> &'static ash::khr::calibrated_timestamps::Device {
         loaded::<gate::CalibratedTimestamps, _>(&get().calibrated_timestamps)
+    }
+    #[cfg(feature = "hdr-metadata")]
+    pub(crate) fn hdr_metadata() -> &'static ash::ext::hdr_metadata::Device {
+        loaded::<gate::HdrMetadata, _>(&get().hdr_metadata)
     }
     #[cfg(feature = "ray-tracing-pipeline")]
     pub(crate) fn raytracing_pipeline() -> &'static ash::khr::ray_tracing_pipeline::Device {

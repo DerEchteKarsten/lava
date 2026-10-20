@@ -48,6 +48,8 @@ default = [
     "performance-query",
     "calibrated-timestamps",
     "present-fences",
+    "hdr-metadata",
+    "fifo-latest-ready",
     "async-compute",
     "async-transfer",
     "bc-compression",
@@ -118,6 +120,10 @@ calibrated-timestamps = []
 assert-calibrated-timestamps = ["calibrated-timestamps"]
 present-fences = []
 assert-present-fences = ["present-fences"]
+hdr-metadata = []
+assert-hdr-metadata = ["hdr-metadata"]
+fifo-latest-ready = []
+assert-fifo-latest-ready = ["fifo-latest-ready"]
 async-compute = []
 assert-async-compute = ["async-compute"]
 async-transfer = []

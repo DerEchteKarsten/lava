@@ -1,14 +1,17 @@
-//! Windowed GPU tests: init with a display, surfaces, swapchains, presenting, multi-window
+//! Windowed GPU tests: init with a display, surfaces, swapchains, presenting and its misuse, present modes, composite alpha, HDR metadata, surface formats and colour spaces, several windows presented at once
 mod common;
 
 use std::process::ExitCode;
 
 use lava::{
     bindless::{self, ImageHandle, Storage},
-    image::{format::ClearValue, usage::usage},
-    present::PresentSurface,
+    image::{
+        format::{self, A2B10G10R10UnormPack32, B8G8R8A8Unorm, ClearValue, R8Unorm},
+        usage::usage,
+    },
+    present::{ColorSpace, CompositeAlpha, PresentMode, PresentSurface, SurfaceFormat, present_all},
     queue::{Graphics, Timeline},
-    state::raw_vulkan as vk,
+    state::{Ctx, raw_vulkan as vk},
 };
 use lava_tests::bindings::PASS_MAP;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -25,9 +28,9 @@ const SIZE: glam::UVec2 = glam::UVec2::new(256, 256);
 type Surface = PresentSurface<usage![ColorAttachment, Storage, TransferDst]>;
 
 /// The swapchain format the tests ask for (the images are storage images too).
-const FORMATS: [vk::SurfaceFormatKHR; 1] = [vk::SurfaceFormatKHR {
-    format: vk::Format::B8G8R8A8_UNORM,
-    color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+const FORMATS: [SurfaceFormat; 1] = [SurfaceFormat {
+    format: format::Dynamic(vk::Format::B8G8R8A8_UNORM),
+    color_space: ColorSpace::SrgbNonlinear,
 }];
 
 fn create_window(event_loop: &ActiveEventLoop, title: &str) -> Window {
@@ -41,14 +44,27 @@ fn create_window(event_loop: &ActiveEventLoop, title: &str) -> Window {
 }
 
 fn surface_for(window: &Window) -> lava::Result<Surface> {
+    surface_preferring(window, &FORMATS)
+}
+
+fn surface_preferring(window: &Window, formats: &[SurfaceFormat]) -> lava::Result<Surface> {
     // SAFETY: the windows stay open until the teardown waited for the device, which destroys
     // the surfaces.
     unsafe {
         PresentSurface::new(
             &window.display_handle().unwrap().as_raw(),
             &window.window_handle().unwrap().as_raw(),
-            &FORMATS,
+            formats,
         )
+    }
+}
+
+/// What `f` panics with.
+fn panic_message(f: impl FnOnce()) -> String {
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("it panics");
+    match panic.downcast::<String>() {
+        Ok(message) => *message,
+        Err(panic) => panic.downcast_ref::<&str>().copied().unwrap_or_default().to_owned(),
     }
 }
 
@@ -104,8 +120,12 @@ fn run(event_loop: &ActiveEventLoop) {
     let mut surface = surface_for(&window).unwrap();
     assert_eq!(surface.size(), glam::UVec2::ZERO, "no swapchain before the first acquire");
     let modes = surface.present_modes();
-    assert_eq!(modes[0].0, vk::PresentModeKHR::FIFO);
+    assert_eq!(modes[0], PresentMode::Fifo);
+    assert!(surface.supports(PresentMode::Fifo));
+    assert_eq!(surface.present_mode(), PresentMode::Fifo);
     assert_eq!(surface.format().0, vk::Format::B8G8R8A8_UNORM);
+    assert_eq!(surface.surface_format(), FORMATS[0]);
+    assert!(surface.is_preferred_format());
     step("surface_reports_its_format_and_modes");
 
     let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
@@ -172,13 +192,91 @@ fn run(event_loop: &ActiveEventLoop) {
     present_frame(&mut timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
     step("misuse_panics");
 
-    let modes = surface.present_modes().len();
-    surface.set_present_mode(modes - 1);
-    present_frame(&mut timeline, &mut surface, SIZE, [1.0, 0.0, 0.0, 1.0]);
-    assert_eq!(surface.present_mode(), modes - 1);
-    surface.set_present_mode(0);
+    // Presenting or acquiring inside a submission would use a semaphore it signals.
+    let submission = timeline.begin().unwrap();
+    assert!(surface.acquire(SIZE).unwrap());
+    let message = panic_message(|| {
+        let _ = submission.submit(|cmd| {
+            cmd.present(&mut surface);
+            let _ = surface.present();
+        });
+    });
+    assert!(message.contains("call it after `submit`"), "{message}");
+    // The failed recording was replaced by its barriers and still presents the image.
+    surface.present().unwrap();
+    let submission = timeline.begin().unwrap();
+    let message = panic_message(|| {
+        let _ = submission.submit(|_| {
+            let _ = surface.acquire(SIZE);
+        });
+    });
+    assert!(message.contains("before or after `submit`"), "{message}");
+    present_frame(&mut timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
+    step("present_and_acquire_inside_a_submission_panic");
+
+    let submission = timeline.begin().unwrap();
+    assert!(surface.acquire(SIZE).unwrap());
+    let message = panic_message(|| {
+        let _ = submission.submit(|cmd| {
+            cmd.present(&mut surface);
+            cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4]));
+        });
+    });
+    assert!(message.contains("present must be the image's last command"), "{message}");
+    surface.present().unwrap();
+    present_frame(&mut timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
+    step("an_access_after_present_panics");
+
+    let modes = surface.present_modes().to_vec();
+    for &mode in &modes {
+        assert!(surface.set_present_mode(mode));
+        present_frame(&mut timeline, &mut surface, SIZE, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(surface.present_mode(), mode);
+    }
+    for &mode in PresentMode::ALL {
+        if !modes.contains(&mode) {
+            assert!(!surface.set_present_mode(mode), "{mode:?} isn't supported");
+            assert_ne!(surface.present_mode(), mode);
+        }
+    }
+    #[allow(unreachable_patterns)]
+    let latest_ready = PresentMode::ALL.iter().find(|m| !matches!(m, PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::Mailbox | PresentMode::Immediate));
+    match latest_ready {
+        Some(mode) if surface.supports(*mode) => println!("presented with {mode:?}"),
+        _ => println!("SKIPPED FifoLatestReady: the surface doesn't support it"),
+    }
+    assert!(surface.set_present_mode(PresentMode::Fifo));
     present_frame(&mut timeline, &mut surface, SIZE, [0.0, 1.0, 0.0, 1.0]);
     step("present_modes_change");
+
+    let alpha = surface.composite_alpha();
+    assert!(surface.supports_composite_alpha(alpha));
+    for other in CompositeAlpha::ALL {
+        if surface.set_composite_alpha(other) {
+            present_frame(&mut timeline, &mut surface, SIZE, [0.0, 0.0, 1.0, 0.5]);
+            assert_eq!(surface.composite_alpha(), other);
+        }
+    }
+    assert!(surface.set_composite_alpha(alpha));
+    step("composite_alpha_changes");
+
+    if Ctx::features().hdr_metadata {
+        let metadata = lava::present::HdrMetadata {
+            red: glam::Vec2::new(0.708, 0.292),
+            green: glam::Vec2::new(0.170, 0.797),
+            blue: glam::Vec2::new(0.131, 0.046),
+            white_point: glam::Vec2::new(0.3127, 0.3290),
+            max_luminance: 1000.0,
+            min_luminance: 0.001,
+            max_content_light_level: 1000.0,
+            max_frame_average_light_level: 400.0,
+        };
+        surface.set_hdr_metadata(&metadata).unwrap();
+        present_frame(&mut timeline, &mut surface, SIZE, [1.0, 1.0, 1.0, 1.0]);
+        step("hdr_metadata");
+    } else {
+        println!("SKIPPED hdr_metadata: the device has no VK_EXT_hdr_metadata");
+    }
 
     let second_window = create_window(event_loop, "lava test 2");
     let mut second = surface_for(&second_window).unwrap();
@@ -187,6 +285,57 @@ fn run(event_loop: &ActiveEventLoop) {
     let first = present_frame(&mut timeline, &mut surface, SIZE, [1.0, 0.0, 1.0, 1.0]);
     assert_ne!(other, first);
     step("second_window_has_its_own_surface");
+
+    // One submission draws into both, one call presents both.
+    for color in [[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]] {
+        let submission = timeline.begin().unwrap();
+        assert!(surface.acquire(SIZE).unwrap() && second.acquire(SIZE).unwrap());
+        submission
+            .submit(|cmd| {
+                cmd.clear_image(surface.current_image(), ClearValue::Float(color));
+                cmd.clear_image(second.current_image(), ClearValue::Float(color));
+                cmd.present(&mut surface);
+                cmd.present(&mut second);
+            })
+            .unwrap();
+        present_all(&mut [&mut surface, &mut second]).unwrap();
+    }
+    // A surface whose image no submission presented keeps it.
+    let submission = timeline.begin().unwrap();
+    assert!(surface.acquire(SIZE).unwrap() && second.acquire(SIZE).unwrap());
+    let kept = second.current_image().handle::<Storage>();
+    submission
+        .submit(|cmd| {
+            cmd.clear_image(surface.current_image(), ClearValue::Float([0.0; 4]));
+            cmd.present(&mut surface);
+        })
+        .unwrap();
+    present_all(&mut [&mut surface, &mut second]).unwrap();
+    assert!(second.acquire(SIZE).unwrap());
+    assert_eq!(second.current_image().handle::<Storage>(), kept);
+    present_frame(&mut timeline, &mut second, SIZE, [0.0; 4]);
+    step("present_all_presents_several_surfaces_at_once");
+
+    // HDR first where the surface has it, else sRGB.
+    let hdr = [
+        SurfaceFormat::of::<A2B10G10R10UnormPack32>(ColorSpace::Hdr10St2084),
+        SurfaceFormat::of::<B8G8R8A8Unorm>(ColorSpace::SrgbNonlinear),
+    ];
+    let third_window = create_window(event_loop, "lava test 3");
+    let mut third = surface_preferring(&third_window, &hdr).unwrap();
+    assert!(third.is_preferred_format());
+    assert!(hdr.contains(&third.surface_format()), "{:?}", third.surface_format());
+    println!("the HDR test surface presents {:?}", third.surface_format());
+    present_frame(&mut timeline, &mut third, SIZE, [0.5, 0.5, 0.5, 1.0]);
+    drop(third);
+    // A format no surface shows falls back, reported.
+    let unshown = [SurfaceFormat::of::<R8Unorm>(ColorSpace::SrgbNonlinear)];
+    let mut fallback = surface_preferring(&third_window, &unshown).unwrap();
+    assert!(!fallback.is_preferred_format());
+    assert_ne!(fallback.surface_format(), unshown[0]);
+    present_frame(&mut timeline, &mut fallback, SIZE, [0.5, 0.5, 0.5, 1.0]);
+    drop(fallback);
+    step("surface_formats_and_colour_spaces");
 
     // Destroys the surfaces while the windows are still open.
     drop(second);

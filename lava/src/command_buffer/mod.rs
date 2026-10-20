@@ -16,7 +16,8 @@ use crate::{
     pipeline::{MAX_PUSH_CONSTANTS_SIZE, RasterKeyRef, pass_map, pipelines},
     present::Present,
     query::{
-        Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
+        Occlusion, QueryPool, RecordedOn, ScopeInfo, ScopeObserver, Scoped, Timestamp,
+        observer::{Observer, Typed},
     },
     queue::{FamilyInfo, HasCompute, HasGraphics, Kind, QueueKind},
     state::{Ctx, Functions, with_debug_name},
@@ -129,10 +130,20 @@ pub(crate) struct Recording<'p> {
     pub(crate) value: u64,
     pub(crate) family: FamilyInfo,
     /// Set by `measure` for the duration of its closure, its lifetime erased.
-    observer: Option<NonNull<dyn ScopeObserver>>,
+    observer: Option<NonNull<dyn Observer>>,
     depth: u16,
-    /// One bit per kind (`query_bit`): one query of each kind can be active.
-    pub(crate) active_queries: u32,
+    /// The active query of each scoped kind (`query_slot`), with its pool: one of each kind can
+    /// be active.
+    pub(crate) open_queries: [Option<(vk::QueryPool, u32)>; 3],
+    /// The hardware counter pool the recording uses: one per recording.
+    performance_pool: Option<vk::QueryPool>,
+    /// The counter query `Submission::submit_profiled` or `Timeline::capture` wraps the whole
+    /// recording in.
+    pub(crate) profile: Option<Profile>,
+    /// Set while that query begins or ends, the one place counters of command-buffer scope can.
+    profiling: bool,
+    /// Between `vkCmdBeginRendering` and `vkCmdEndRendering`.
+    in_rendering: bool,
     /// Every barrier the tracking already counts, so a recording that never reaches the GPU is
     /// replaced by one of just these, which keeps the tracking true. The frame slot's, reused.
     pub(crate) barrier_log: &'p mut Vec<Barriers>,
@@ -201,12 +212,22 @@ impl<'p, K: QueueKind> CommandBuffer<'p, K> {
     }
 }
 
-pub(crate) fn query_bit(kind: vk::QueryType) -> u32 {
+/// The query of a hardware counter pool around a whole recording: query `index` of `pool`, in
+/// counter pass `pass` (a capture's later passes keep the pool's earlier counters).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Profile {
+    pub(crate) pool: vk::QueryPool,
+    pub(crate) index: u32,
+    pub(crate) pass: u32,
+}
+
+/// Where a recording keeps the active query of a scoped kind.
+fn query_slot(kind: vk::QueryType) -> usize {
     match kind {
-        vk::QueryType::OCCLUSION => 1,
-        vk::QueryType::PIPELINE_STATISTICS => 2,
-        vk::QueryType::PERFORMANCE_QUERY_KHR => 4,
-        _ => 0,
+        vk::QueryType::OCCLUSION => 0,
+        vk::QueryType::PIPELINE_STATISTICS => 1,
+        vk::QueryType::PERFORMANCE_QUERY_KHR => 2,
+        _ => unreachable!("{kind:?} queries aren't scoped"),
     }
 }
 
@@ -450,11 +471,6 @@ impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
 
     /// Counts the samples that pass the depth and stencil tests into query `index` of `pool`.
     pub fn count_samples(mut self, pool: &'a QueryPool<Occlusion>, index: u32) -> Self {
-        assert!(
-            index < pool.count(),
-            "query {index} of a pool of {}",
-            pool.count()
-        );
         self.samples = Some((pool, index));
         self
     }
@@ -880,6 +896,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         self.cmd_buf.enter(name, true);
         unsafe {
             device.cmd_begin_rendering(handle, &rendering_info);
+            self.cmd_buf.in_rendering = true;
             device.cmd_set_viewport_with_count(
                 handle,
                 &[vk::Viewport {
@@ -1030,6 +1047,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             }
         }
         unsafe { device.cmd_end_rendering(handle) };
+        self.cmd_buf.in_rendering = false;
         self.cmd_buf.exit(name, true);
         self.draws.clear();
     }
@@ -1291,7 +1309,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     /// inside. Doesn't nest.
     pub fn measure<R>(
         &mut self,
-        observer: Option<&mut dyn ScopeObserver>,
+        observer: Option<&mut dyn ScopeObserver<K>>,
         name: &'static str,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -1299,11 +1317,13 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             return self.scope(name, f);
         };
         assert!(self.rec.observer.is_none(), "`measure` doesn't nest");
-        // SAFETY: only the lifetime is erased. The pointer is cleared before `observer`'s borrow
-        // ends, also when `f` panics, and until then only this command buffer reaches it.
+        let mut typed = Typed(observer);
+        // SAFETY: only the lifetime is erased. The pointer is cleared before `typed` and the
+        // observer's borrow end, also when `f` panics, and until then only this command buffer
+        // reaches it.
         let observer = unsafe {
-            std::mem::transmute::<NonNull<dyn ScopeObserver + '_>, NonNull<dyn ScopeObserver>>(
-                NonNull::from(observer),
+            std::mem::transmute::<NonNull<dyn Observer + '_>, NonNull<dyn Observer>>(
+                NonNull::from(&mut typed as &mut dyn Observer),
             )
         };
         self.rec.observer = Some(observer);
@@ -1324,19 +1344,15 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         self.rec.write_timestamp(pool, index, stage);
     }
 
-    /// Records `f` inside query `index` of `pool`; one query of a kind can be active at a time.
-    /// A performance query's pool has to exist before the recording begins.
-    pub fn query<Q: Scoped, R>(
+    /// Records `f` inside query `index` of `pool`, a kind this family records ([`RecordedOn`]);
+    /// one query of a kind can be active at a time. A performance query's pool has to exist
+    /// before the recording begins.
+    pub fn query<Q: Scoped + RecordedOn<K>, R>(
         &mut self,
         pool: &QueryPool<Q>,
         index: u32,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        assert!(
-            index < pool.count(),
-            "query {index} of a pool of {}",
-            pool.count()
-        );
         self.rec.begin_query(pool, index);
         let result = f(self);
         self.rec.end_query(pool, index);
@@ -1372,6 +1388,7 @@ impl Recording<'_> {
         if to == self.family.kind {
             return;
         }
+        self.check_unpresented(image);
         let (from, to_index) = (self.family.index(self.family.kind), self.family.index(to));
         // It waits for this timeline's accesses of the image; the acquire waits for it through
         // the semaphore its submission signals.
@@ -1440,7 +1457,11 @@ impl<'p> Recording<'p> {
             family,
             observer: None,
             depth: 0,
-            active_queries: 0,
+            open_queries: [None; 3],
+            performance_pool: None,
+            profile: None,
+            profiling: false,
+            in_rendering: false,
             barrier_log,
             acquired: SmallVec::new(),
             presents: SmallVec::new(),
@@ -1495,6 +1516,11 @@ impl<'p> Recording<'p> {
         image_acceses: impl Iterator<Item = ImageUse<'a>> + Clone,
         buffer_acceses: impl Iterator<Item = BufferAccess> + Clone,
     ) {
+        if !self.presents.is_empty() {
+            for access in image_acceses.clone() {
+                self.check_unpresented(access.access.image);
+            }
+        }
         let barriers = compute_barriers(
             &self.pending_accesses,
             &self.family,
@@ -1531,7 +1557,7 @@ impl<'p> Recording<'p> {
             };
             self.depth += 1;
             // SAFETY: see `CommandBuffer::measure`.
-            unsafe { observer.as_mut() }.on_enter(&mut QueryRecorder { cmd: self }, &scope);
+            unsafe { observer.as_mut() }.on_enter(self, &scope);
         }
     }
 
@@ -1544,7 +1570,7 @@ impl<'p> Recording<'p> {
                 pass,
             };
             // SAFETY: see `CommandBuffer::measure`.
-            unsafe { observer.as_mut() }.on_exit(&mut QueryRecorder { cmd: self }, &scope);
+            unsafe { observer.as_mut() }.on_exit(self, &scope);
         }
         if let Some(debug_utils) = Functions::debug_utils() {
             unsafe { debug_utils.cmd_end_debug_utils_label(self.handle) };
@@ -1557,18 +1583,13 @@ impl<'p> Recording<'p> {
         index: u32,
         stage: vk::PipelineStageFlags2,
     ) {
-        assert!(
-            index < pool.count(),
-            "query {index} of a pool of {}",
-            pool.count()
-        );
-        pool.record(self);
         let bits = self.family.timestamp_valid_bits;
         assert!(
             bits > 0,
             "the {:?} family has no timestamps",
             self.family.kind
         );
+        pool.take(self, index, 1);
         let mask = if bits >= 64 { !0 } else { (1 << bits) - 1 };
         pool.kind
             .valid_bits
@@ -1576,27 +1597,109 @@ impl<'p> Recording<'p> {
         unsafe { Ctx::device().cmd_write_timestamp2(self.handle, stage, pool.handle, index) };
     }
 
-    pub(crate) fn begin_query<Q: Scoped>(&mut self, pool: &QueryPool<Q>, index: u32) {
-        let bit = query_bit(Q::TYPE);
-        assert!(
-            self.active_queries & bit == 0,
-            "a query of this kind is already active, and queries of one kind don't nest"
-        );
-        pool.kind.check_kind(self.family.kind);
-        pool.record(self);
-        let flags = pool.kind.control_flags();
-        unsafe { Ctx::device().cmd_begin_query(self.handle, pool.handle, index, flags) };
-        self.active_queries |= bit;
+    /// The active query of kind `Q`.
+    pub(crate) fn open_query<Q: Scoped>(&self) -> Option<(vk::QueryPool, u32)> {
+        self.open_queries[query_slot(Q::TYPE)]
     }
 
-    pub(crate) fn end_query<Q: QueryKind>(&mut self, pool: &QueryPool<Q>, index: u32) {
-        let bit = query_bit(Q::TYPE);
+    /// Panics where hardware counters of `kind` can't begin or end: those of command-buffer
+    /// scope, or of more than one pass, only around the whole recording (`profiling`), those of
+    /// render-pass scope not inside a rendering; and a recording has one counter pool.
+    fn check_counters<Q: Scoped>(&mut self, pool: vk::QueryPool, kind: &Q) {
+        if Q::TYPE != vk::QueryType::PERFORMANCE_QUERY_KHR {
+            return;
+        }
+        match self.performance_pool {
+            Some(used) => assert!(
+                used == pool,
+                "a recording records one pool of hardware counters (lava doesn't enable \
+                 `performanceCounterMultipleQueryPools`)"
+            ),
+            None => self.performance_pool = Some(pool),
+        }
+        let passes = kind.counter_passes();
         assert!(
-            self.active_queries & bit != 0,
-            "no query of this kind is active"
+            passes == 1 || self.profiling,
+            "the counters of this pool take {passes} submissions: record them with \
+             `Timeline::capture`"
         );
+        match kind.counter_scope() {
+            vk::PerformanceCounterScopeKHR::COMMAND_BUFFER => assert!(
+                self.profiling,
+                "counters of command-buffer scope count a whole recording: pass their pool to \
+                 `Submission::submit_profiled` or `Timeline::capture`"
+            ),
+            vk::PerformanceCounterScopeKHR::RENDER_PASS => assert!(
+                !self.in_rendering,
+                "counters of render-pass scope can't begin or end inside a rendering"
+            ),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn begin_query<Q: Scoped>(&mut self, pool: &QueryPool<Q>, index: u32) {
+        let slot = query_slot(Q::TYPE);
+        if let Some((_, active)) = self.open_queries[slot] {
+            panic!(
+                "query {active} of a pool of this kind is active, and queries of one kind don't \
+                 nest"
+            );
+        }
+        self.check_counters(pool.handle, &pool.kind);
+        pool.take(self, index, 1);
+        let flags = pool.kind.control_flags();
+        unsafe { Ctx::device().cmd_begin_query(self.handle, pool.handle, index, flags) };
+        self.open_queries[slot] = Some((pool.handle, index));
+    }
+
+    pub(crate) fn end_query<Q: Scoped>(&mut self, pool: &QueryPool<Q>, index: u32) {
+        let slot = query_slot(Q::TYPE);
+        match self.open_queries[slot] {
+            Some(active) if active == (pool.handle, index) => {}
+            Some((active_pool, active)) => panic!(
+                "query {index} of {} pool is ended while query {active} of {} is the active one \
+                 of its kind",
+                if active_pool == pool.handle { "the" } else { "a" },
+                if active_pool == pool.handle { "it" } else { "another pool" },
+            ),
+            None => panic!("query {index} is ended, but no query of its kind is active"),
+        }
+        self.check_counters(pool.handle, &pool.kind);
         unsafe { Ctx::device().cmd_end_query(self.handle, pool.handle, index) };
-        self.active_queries &= !bit;
+        self.open_queries[slot] = None;
+    }
+
+    /// Begins or ends the query of `Submission::submit_profiled` or `Timeline::capture`, as the
+    /// recording's first or last command.
+    #[cfg(feature = "performance-query")]
+    pub(crate) fn profile_query(
+        &mut self,
+        pool: &QueryPool<crate::query::Performance>,
+        index: u32,
+        begin: bool,
+    ) {
+        self.profiling = true;
+        match begin {
+            true => self.begin_query(pool, index),
+            false => self.end_query(pool, index),
+        }
+        self.profiling = false;
+    }
+
+    /// The queries a finished recording left active, besides its profile's.
+    pub(crate) fn left_open(&self) -> Option<u32> {
+        let profile = self.profile.map(|p| (p.pool, p.index));
+        let mut open = self.open_queries.iter().flatten();
+        open.find(|&&query| Some(query) != profile).map(|&(_, index)| index)
+    }
+
+    /// Panics if `image` was presented earlier in the recording.
+    fn check_unpresented(&self, image: vk::Image) {
+        assert!(
+            !self.presents.iter().any(|p| p.image == image),
+            "a swapchain image is accessed after `cmd.present` of it: present must be the \
+             image's last command"
+        );
     }
 }
 

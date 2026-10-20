@@ -20,8 +20,9 @@ use lava::{
         usage::usage,
     },
     query::{
-        Performance, PipelineStatistics, PipelineStats, QueryPipelineStatisticFlags as Statistics,
-        QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Timestamp, counters,
+        CounterScope, Occlusion, Performance, PipelineStatistics, PipelineStats,
+        QueryPipelineStatisticFlags as Statistics, QueryPool, QueryRecorder, ScopeInfo,
+        ScopeObserver, Timestamp, counters,
     },
     queue::{Compute, Graphics, Kind, MAX_TIMELINES, GraphicsStage, Timeline, Transfer},
     state::Ctx,
@@ -588,14 +589,33 @@ fn an_unreleased_image_panics() {
     }));
     let message = *panicked.unwrap_err().downcast::<String>().unwrap();
     assert!(message.contains("`cmd.release::<Graphics>(view)`"), "{message}");
-    // A query of graphics statistics can't be recorded on compute either.
-    if Ctx::features().pipeline_statistics {
-        let pool = QueryPool::statistics(1, Statistics::FRAGMENT_SHADER_INVOCATIONS).unwrap();
-        let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (compute.begin().unwrap()).submit(|cmd| cmd.query(&pool, 0, |_| {}))
-        }));
-        assert!(recorded.is_err());
+}
+
+/// Compute statistics count on a compute family (graphics statistics don't compile there, see
+/// `lava::query::RecordedOn`).
+#[test]
+fn compute_statistics_count_on_a_compute_family() {
+    let _gpu = gpu();
+    if !has_family("compute_statistics_count_on_a_compute_family", Kind::Compute) {
+        return;
     }
+    if !Ctx::features().pipeline_statistics {
+        eprintln!("SKIPPED compute_statistics_count_on_a_compute_family: no pipeline statistics");
+        return;
+    }
+    let mut compute = Timeline::<Compute>::new(2, 0).unwrap();
+    let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
+    let pool = QueryPool::compute_statistics(1).unwrap();
+    let counted = (compute.begin().unwrap()).submit(|cmd| {
+        cmd.query(&pool, 0, |cmd| {
+            let bindings = TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT);
+            cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1], None);
+        })
+    });
+    counted.unwrap().block().unwrap();
+    let mut invocations = [0];
+    assert!(pool.read(0, &mut invocations).unwrap());
+    assert_eq!(invocations[0], (SIZE * SIZE) as u64);
 }
 
 /// A group of two compute passes, then a rendering if the device has mesh shaders.
@@ -754,11 +774,13 @@ fn observers_count_passes_and_renderings_with_queries() {
     let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
     let features = Ctx::features();
     let mesh = features.mesh_shader;
-    // One counter always fits a single pass; a time counter can't be 0 for a pass.
+    // One counter always fits a single pass; a time counter can't be 0 for a pass. Observers
+    // count passes, so only counters of command scope.
     let all = counters::counters().unwrap_or_default();
-    let counter = (all.iter())
+    let command = || all.iter().filter(|c| c.scope == CounterScope::Command);
+    let counter = command()
         .find(|c| c.unit == counters::CounterUnit::Nanoseconds)
-        .or(all.first());
+        .or(command().next());
     let selection: Vec<&'static counters::Counter> = counter.into_iter().collect();
     let mut statistics = Statistics::empty();
     if features.pipeline_statistics {
@@ -899,6 +921,180 @@ fn occlusion_queries_count_the_samples_of_a_draw() {
     }
     assert_eq!(samples[1], 0, "the far triangle is hidden behind it");
     assert_eq!(samples[2], 0, "a skipped draw counts nothing");
+}
+
+/// Begins query `begin` of `pool` when the root scope is entered and ends `end` (if any) when it
+/// is exited.
+struct OcclusionObserver<'a> {
+    pool: &'a QueryPool<Occlusion>,
+    begin: u32,
+    end: Option<u32>,
+}
+
+impl ScopeObserver for OcclusionObserver<'_> {
+    fn on_enter(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo) {
+        if scope.depth == 0 {
+            queries.begin_query(self.pool, self.begin);
+        }
+    }
+
+    fn on_exit(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo) {
+        if let (0, Some(end)) = (scope.depth, self.end) {
+            queries.end_query(self.pool, end);
+        }
+    }
+}
+
+#[test]
+fn a_query_is_used_once_per_recording() {
+    let mut gpu = gpu();
+    let pool = QueryPool::timestamps(2).unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.write_timestamp(&pool, 0, lava::PipelineStageFlags2::NONE);
+            cmd.write_timestamp(&pool, 0, lava::PipelineStageFlags2::ALL_COMMANDS);
+        })
+    });
+    assert!(message.contains("used twice"), "{message}");
+    lava::wait_idle().unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.write_timestamp(&pool, 2, lava::PipelineStageFlags2::NONE))
+    });
+    assert!(message.contains("of a pool of 2"), "{message}");
+    lava::wait_idle().unwrap();
+    // Each recording resets the pool, so the next one takes the queries again.
+    for _ in 0..2 {
+        gpu.submit(|cmd| {
+            cmd.write_timestamp(&pool, 0, lava::PipelineStageFlags2::NONE);
+            cmd.write_timestamp(&pool, 1, lava::PipelineStageFlags2::ALL_COMMANDS);
+        });
+    }
+    let mut ticks = [0; 2];
+    assert!(pool.read(0, &mut ticks).unwrap());
+    // A query counts samples for one draw.
+    let occlusion = QueryPool::occlusion(1).unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.query(&occlusion, 0, |_| {});
+            cmd.query(&occlusion, 0, |_| {});
+        })
+    });
+    assert!(message.contains("used twice"), "{message}");
+}
+
+#[test]
+fn queries_end_where_they_began_and_before_the_recording_ends() {
+    let mut gpu = gpu();
+    let pool = QueryPool::occlusion(2).unwrap();
+    let other = QueryPool::occlusion(1).unwrap();
+    let mut wrong_index = OcclusionObserver { pool: &pool, begin: 0, end: Some(1) };
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.measure(Some(&mut wrong_index), "frame", |_| {}))
+    });
+    assert!(message.contains("query 1 of the pool is ended while query 0"), "{message}");
+    // The failed recording's replay still holds the pool until it finished.
+    lava::wait_idle().unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.query(&pool, 0, |cmd| {
+                let mut wrong_pool = OcclusionObserver { pool: &other, begin: 0, end: None };
+                cmd.measure(Some(&mut wrong_pool), "frame", |_| {})
+            })
+        })
+    });
+    assert!(message.contains("is active"), "{message}");
+    lava::wait_idle().unwrap();
+    let mut open = OcclusionObserver { pool: &pool, begin: 0, end: None };
+    let message = panic_message(|| gpu.submit(|cmd| cmd.measure(Some(&mut open), "frame", |_| {})));
+    assert!(message.contains("query 0 still active"), "{message}");
+    lava::wait_idle().unwrap();
+    // The failed recordings were replaced by their barriers; the next one records as usual.
+    let mut balanced = OcclusionObserver { pool: &pool, begin: 1, end: Some(1) };
+    gpu.submit(|cmd| cmd.measure(Some(&mut balanced), "frame", |_| {}));
+    let mut samples = [7];
+    assert!(pool.read(1, &mut samples).unwrap());
+    assert_eq!(samples[0], 0);
+}
+
+#[test]
+fn reads_stay_inside_their_pool() {
+    let _gpu = gpu();
+    let pool = QueryPool::timestamps(4).unwrap();
+    let message = panic_message(|| pool.read(u32::MAX, &mut [0; 2]));
+    assert!(message.contains("of a pool of 4"), "{message}");
+    let message = panic_message(|| pool.read(1, &mut [0; 4]));
+    assert!(message.contains("of a pool of 4"), "{message}");
+    assert!(pool.read(4, &mut []).unwrap(), "no queries are always ready");
+}
+
+/// Counters of one scope, at most `MAX_COUNTERS`.
+fn counters_of(scope: CounterScope) -> Vec<&'static counters::Counter> {
+    let all = counters::counters().unwrap_or_default();
+    all.iter().filter(|c| c.scope == scope).take(counters::MAX_COUNTERS).collect()
+}
+
+#[test]
+fn counter_selections_fit_one_pass_or_need_a_capture() {
+    let mut gpu = gpu();
+    let all = counters::counters().unwrap_or_default();
+    if all.is_empty() {
+        eprintln!("SKIPPED counter_selections_fit_one_pass_or_need_a_capture: no performance queries");
+        return;
+    }
+    assert!(!counters::fits(&[]), "an empty selection makes no pool");
+    assert!(counters::fits(&[&all[0]]));
+    let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
+    let dispatch = |cmd: &mut Cmd| {
+        let bindings = TestComputeImage::push_bindings(target.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT);
+        cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1], None);
+    };
+
+    // Counters of command-buffer scope count whole recordings, which any counter can.
+    let whole = counters_of(CounterScope::CommandBuffer);
+    let counter = whole.first().copied().unwrap_or(&all[0]);
+    let pool = QueryPool::performance(1, &[counter]).unwrap();
+    if whole.is_empty() {
+        eprintln!("SKIPPED counters of command-buffer scope in a query: the device has none");
+    } else {
+        let message = panic_message(|| gpu.submit(|cmd| cmd.query(&pool, 0, |cmd| dispatch(cmd))));
+        assert!(message.contains("submit_profiled"), "{message}");
+        lava::wait_idle().unwrap();
+    }
+    let submission = gpu.timeline.begin().unwrap();
+    let wait = submission.submit_profiled(&pool, 0, |cmd| dispatch(cmd)).unwrap();
+    wait.block().unwrap();
+    let mut value = [f64::NAN];
+    assert!(pool.read(0, &mut value).unwrap());
+    assert!(value[0].is_finite(), "{}: {}", counter.name, value[0]);
+    drop(pool);
+
+    // Two counters that need more than one pass, if the device has such.
+    let pair = (all.iter().skip(1))
+        .map(|other| vec![&all[0], other])
+        .find(|pair| counters::passes(pair) > 1);
+    let Some(selection) = pair else {
+        eprintln!("SKIPPED multi-pass capture: every counter fits one pass with the first");
+        return;
+    };
+    let passes = counters::passes(&selection);
+    assert!(!counters::fits(&selection));
+    let pool = QueryPool::performance(1, &selection).unwrap();
+    assert_eq!(pool.passes(), passes);
+    let message = panic_message(|| gpu.submit(|cmd| cmd.query(&pool, 0, |cmd| dispatch(cmd))));
+    assert!(message.contains("capture"), "{message}");
+    lava::wait_idle().unwrap();
+    let mut recorded = 0;
+    let wait = gpu.timeline.capture(&pool, 0, |cmd| {
+        recorded += 1;
+        dispatch(cmd)
+    });
+    wait.unwrap().block().unwrap();
+    assert_eq!(recorded, passes, "one recording per pass");
+    let mut values = vec![f64::NAN; selection.len()];
+    assert!(pool.read(0, &mut values).unwrap());
+    for (value, counter) in values.iter().zip(&selection) {
+        assert!(value.is_finite(), "{}: {value}", counter.name);
+    }
 }
 
 // ---- buffer commands -------------------------------------------------------------------------

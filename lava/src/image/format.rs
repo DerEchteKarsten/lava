@@ -66,6 +66,15 @@ impl From<ClearValue> for vk::ClearValue {
 pub struct Dynamic(pub vk::Format);
 
 impl Dynamic {
+    /// Whether lava has a format type for it (else its checks panic).
+    pub(crate) fn known(self) -> bool {
+        #[cfg(feature = "bc-compression")]
+        if bc_info(self.0).is_some() {
+            return true;
+        }
+        plain_info(self.0).is_some()
+    }
+
     fn info(self) -> Info {
         #[cfg(feature = "bc-compression")]
         if let Some(info) = bc_info(self.0) {

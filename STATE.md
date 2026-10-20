@@ -15,15 +15,24 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - Dropping a `PresentSurface` with a current image waits on the host for an empty submission that consumes the semaphore it left signalled.
 - A recording that uses an acquired image and fails before `cmd.present` of it (a panic, or the check that it presents what it uses) is replaced by its barriers without that image's, so its tracked layout is wrong until the next `acquire` resets it to `UNDEFINED` (also when it keeps the image current).
 - The acquire and the present of an image are in one submission: drawing into it on one timeline and presenting from another isn't supported.
-- Without present fences, a replaced swapchain waits for a later value of the timeline that presented it.
+- Windows need `present-fences` (`VK_EXT_swapchain_maintenance1` and the surface maintenance instance extensions): `PresentSurface::new` returns `MissingFeature` without them, since only a present's fence tells when a replaced swapchain is done with (2026-10-20; the coverage of `VK_EXT_swapchain_maintenance1` wasn't checked).
+- `FifoLatestReady` comes only from `VK_EXT_present_mode_fifo_latest_ready`, not its KHR promotion (a driver with the KHR one alone has no `FifoLatestReady`). It is untested here: the Arc B390 (Mesa 26.2) doesn't list it.
+- `present_all` presents on graphics queue 0 like `present`; one surface's error (other than suboptimal or out of date) is returned after every surface was handled, and the others' images were presented.
 - `VkSwapchainPresentModesCreateInfoEXT` names only the swapchain's own mode, so a present-mode change recreates the swapchain.
+
+## lava: queries and hardware counters (2026-10-20)
+----intended----
+- A query pool keeps one used bit per query, cleared when a new recording first touches the pool: a query takes one timestamp, query or compacted size per recording, and a pool one recording at a time (one pool per frame slot).
+- `Timeline::capture` records its closure once per counter pass and blocks after each pass; the passes are separate recordings of what should be the same frame, so counters of different passes come from different (if alike) work. It doesn't reset the profiled pool after the first pass (the validation layer tracks query state per pass); it presents nothing.
+- One counter pool per recording: lava doesn't enable `performanceCounterMultipleQueryPools`. `MAX_COUNTERS` (8) is lava's own cap on a pool's counters, kept so a query's values fit an array; a capture lifts only the one-pass limit.
+- The Arc B390's counters (Mesa 26.2) are all of command scope, so the `CommandBuffer`-scope refusal in `cmd.query` is tested only where a device has such counters; `submit_profiled` and a two-pass capture are tested here.
 
 ## lava: optional features (cargo features `X` / `assert-X`, 2026-10-17)
 ----intended----
 - `PassKind` and the `kind::*` markers stay compiled whatever the features: they describe the pass map. A pass map whose SPIR-V needs a compiled-out feature fails at `init`, and its generated bindings don't compile.
 - `line-stipple` is one feature for every line mode the device has (default lines need `strictLines` and stippled rectangular lines), so a device with stippled Bresenham but not stippled smooth lines has no stippling at all.
 - The ETC2 and EAC format markers have no feature: lava never enables `textureCompressionETC2`, so images of them fail in the driver.
-- With `assert-present-fences` but no display, `Ctx::features().present_fences` is false while the code assumes fences; nothing presents headless, so nothing reads it.
+- With `assert-present-fences`, `assert-hdr-metadata` or `assert-fifo-latest-ready` but no display, `Ctx::features()` has the feature false while the code assumes it; nothing presents headless, so nothing reads it.
 - The engine-facing `Gated` setters of `RasterState` check the capability whatever the value (`polygon_mode(FILL)` needs `fill-mode-non-solid` too).
 - Baked draw state can make many pipelines per pass on devices without the dynamic state (the 16-pipeline warning then names the pass); `dynamic-*` without `assert-` keeps that possible.
 
@@ -76,11 +85,9 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 ## lava: bugs from the second survey (2026-10-18)
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
-- Safe code reaches undefined behaviour: `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 25-37).
+- Safe code reaches undefined behaviour: tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 27-37).
 - `multiDrawIndirect`, `drawIndirectFirstInstance` and `depthBiasClamp` are never enabled, though `Draw::indirect` passes `buffer.len()` draws and `DepthBias::clamp` is public (38, 39).
 - Without extended dynamic state 3, line and point draws use a pipeline baked with `TRIANGLE_LIST` (`dynamicPrimitiveTopologyUnrestricted` is never queried) (40). `depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists (41). 64-bit clear values are packed as 32-bit (43).
-- Queries use query types the recording family doesn't support (45).
-- `cmd.present` marks the image presented while recording, so `surface.present()` inside the submit closure presents on an unsignalled semaphore; a failed swapchain recreation keeps the retired swapchain (77, 78).
 - The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `ImageHandle` (87, 88).
 
 ## Performance
@@ -100,9 +107,6 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 
 ### Transient attachments (2026-10-19)
 Image memory is always `GpuOnly`; images have no memory type parameter. Their only other useful memory is lazily allocated memory for attachments that never leave a rendering (depth of a single pass, MSAA targets once lava has them), which tilers never back with memory. It belongs in the usage set: a `Transient` flag of `Usage` (`TRANSIENT_ATTACHMENT`, allowed only with attachment flags and without sampled, storage or transfer ones), whose images allocate from `LAZILY_ALLOCATED` memory where the device has it.
-
-### Multi-pass hardware counter captures (2026-10-15)
-`QueryPool::performance` refuses selections that need more than one counter pass, since a frame is submitted once. A tool capture could record one frame's command buffer once and submit it once per pass with `VkPerformanceQuerySubmitInfoKHR.counterPassIndex` (with the per-pass resets the extension asks for), reading each pass's counters from the same pool. It needs a submission path that replays a recorded command buffer, which `Submission` doesn't have.
 
 ### lava-build-glsl beside lava-build-slang (2026-10-15)
 lava's side is already language-neutral: `PassMap`/`PassEntry` (only what lava reads), `Bindings::new`/`with_constants`, `pipeline::reload_pass` and the shader contract in lava's `lib.rs` docs. Inside lava-build-slang the seam is between reflection and emission: Slang-specific are `compile.rs` (sessions, linking, `layout_hash`) and the walk over `TypeLayout`s in `codegen.rs` (it recognises `Img`/`Buf`/`Accel`/`SCONST` by Slang generics and attributes); language-neutral are the Rust emission (structs with layout asserts, `push_bindings`/`constant_bindings`, the `PassEntry` and `PASS_MAP` literals, the hot reload's `Build`, `write_if_changed`), `ray_tracing_groups`, the pass kind from the stages, the `Shaders` builder and the hot-reload watcher. When a GLSL frontend is written, extract the neutral part into a shared `lava-build` crate whose input is a reflected pass model (entries; push-constant fields as plain/buffer/image/accel with offsets; specialization constants; a layout hash), with a hot reload that takes a `compile(pass_index) -> Result<Vec<u8>, String>`. lava-build-glsl then compiles with shaderc/glslang, reflects the SPIR-V (or GLSL annotations) into that model, and ships its own `bindless.glsl` honouring the contract (and its own clock helpers, if wanted: lava has no part in them).

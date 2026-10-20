@@ -17,16 +17,6 @@ commits). Numbers are this survey's items. Delete a line, and its item below, wh
 Items that aren't named here stay as they are, on purpose (e.g. bug 31, MSAA, async pipeline
 compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
-4. **Queries, counters and presenting:** 22/26 (used-index bitset per pool; the open pool and
-   index per kind; `end_query` checks them; submit fails with an open query), 25, 45 (query
-   kinds bounded by queue kind at the type level; empty statistics are an error), 46
-   (command-buffer-scope counters begin as the recording's first command; render-pass scope is
-   asserted outside renderings), 4.17 (`counters::fits`, and the multi-pass capture of STATE.md),
-   77/82 (`present`/`acquire` panic on a recording thread), 78, 79 (present fences required for
-   windowed use), 80, 81, 83, 4.25 (`PresentMode` enum, lava surface formats, a reported
-   fallback), composite alpha, `FIFO_LATEST_READY`, HDR metadata and colour spaces, presenting
-   several swapchains at once, discard on acquire, cached surface capabilities, cached
-   calibration in `instant`, a cheap `memory_report`.
 5. **Raster and draws:** 38 and 39 (require `multiDrawIndirect`, `drawIndirectFirstInstance`,
    `depthBiasClamp`), 40 (query `dynamicPrimitiveTopologyUnrestricted`; key by topology class
    without it), 41 (`depth_clip` defaults to not clamped), 42 (`write_mask` and gated
@@ -73,18 +63,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 
 ## 2. Bugs
 
-### Barrier tracking (2026-10-18)
-22. **One query index can be used twice in a recording** *(plausible)* (`mod.rs:723-724, 1121,
-    1137`): the pool is reset once per recording, and two `count_samples`, queries or timestamps
-    on one index aren't refused.
-
 ### Undefined behaviour from safe code (2026-10-18)
-25. **`QueryPool::read` overflows** (`query/mod.rs:191-197`): `first + queries` wraps in release
-    and `out.len() as u32` truncates, so `read(u32::MAX, ..)` passes the assert.
-26. **`QueryRecorder::end_query` checks no pool or index** (`observer.rs:50-52`,
-    `mod.rs:1343-1364`): `active_queries` knows only the kind. Nothing checks that a recording ends
-    with no query open either (`timeline.rs:389-403`), so an observer that only begins one submits
-    an active query. Track `(pool, index)` per kind and assert at submit.
 27. **Host copies of ASTC and ETC2 images skip every size check** (`format.rs:357-394`). The
     formats have no block info, so `expected_data_len` is `None`, and `copy_from(&[0u8; 1], 0)`
     makes the driver read past the data. lava never enables `textureCompressionASTC_LDR` either
@@ -131,12 +110,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 43. **64-bit clear values are packed as 32-bit** (`format.rs:198-204`). Vulkan reads a 64-bit
     component from two array elements, so `R64Sfloat` clears to garbage, `R64G64Uint [a, b]` puts
     both into the first component, and values above 32 bits panic.
-45. **Queries ignore the family** (`query/mod.rs:29-37, 133-141`): occlusion queries compile on
-    compute and transfer timelines, and compute-only statistics on transfer.
-    `statistics(count, empty())` makes a pool with no statistics (`:319-335`).
-46. **Counter scopes aren't checked** *(plausible)* (`query/mod.rs:113-125`, `counters.rs`):
-    command-buffer-scope counters must begin as the first command, but lava binds descriptors
-    first; render-pass-scope ones must not begin inside a rendering.
 47. **Empty work reaches the driver.** `build(&[])`, `update(&[])` and `query_compacted_sizes(&[], ..)`
     pass a count of 0 (`acceleration_structure.rs:754-945`); an empty `fill_buffer`, copy region or
     region list does too (`buffer/slice.rs:185-295`, *plausible* for the address variants). Return
@@ -170,24 +143,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`.
 
 ### Presenting (2026-10-18)
-77. **A surface can present before its submission exists** (`present.rs:49-57, 491-526`).
-    `cmd.present` marks the image presented while recording, and the submit closure may hold the
-    surface, so `surface.present()` or `acquire()` inside it queues a present on an unsignalled
-    semaphore. The struct doc of `Current` still says the value comes from the submission.
-78. **A failed swapchain recreation keeps the retired swapchain** (`present.rs:351-370, 427-430`).
-    With `oldSwapchain` set, Vulkan retires it even when creation fails, but it stays
-    `self.swapchain` and is passed as `oldSwapchain` again.
-79. **Dropping a surface without present fences can destroy a swapchain mid-present**
-    *(plausible)* (`present.rs:579-593`): the drop stamp covers the last submission, not the
-    `vkQueuePresentKHR` after it. Presents go on queue 0 while the timeline may use another
-    graphics queue, which weakens the "later value" rule too (`:322`).
-80. **`present()` clears `current` before its fence calls can fail** (`present.rs:495-515`): the
-    image is never presented and a popped fence leaks.
-81. **`presented` is set before `flush_pending`** *(plausible)* (`present.rs:57`): a panic between
-    them leaves the surface believing the image was presented.
-82. **`acquire` inside a submit closure deadlocks** *(plausible)* (`present.rs:319-327, 97-111`):
-    destroying an old swapchain locks every timeline's pending accesses, including the one held.
-83. **Accesses after `cmd.present` in the same recording aren't refused** (`present.rs:49`).
 84. **The engine's `Presenter::drop` waits before the surface drops** (engine
     `render/render.rs:139-147`): `PresentSurface::drop` only retires its destruction, so surface
     and swapchain outlive the window unless something reclaims later.
@@ -243,12 +198,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 ### Found 2026-10-18
 - **Small per-call costs:** a stencil change makes 8 calls where front equals back
   (`:640-648`); `unsized_struct!` accessors walk every earlier section (`unsized_struct.rs:12-28`).
-- **`acquire` queries surface capabilities every frame** *(plausible)* (`present.rs:331-335`), an
-  X11 round trip on Mesa.
-- **`QueryPool::instant` calibrates on every call** (`query/mod.rs:252-277`) and ignores
-  `max_deviation`.
-- **`memory_report` builds the full allocator report** under the allocator lock
-  (`memory.rs:32`) to read two totals, and queries the memory properties `PhysicalDevice` caches.
 - **The engine's specialization constants change at runtime** (engine `render.rs:723-729, 793`):
   `BvhCull`'s buffer lengths double on overflow and `Composite`'s sky slot changes per sky, so
   each value compiles a pipeline mid-frame.
@@ -315,10 +264,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     - `every_structure_read` picks its access by comparing the stage with `BUILD` (`:60-61`).
     - `Instances::new`'s safety contract covers tracing but not the TLAS build, which reads every
       named BLAS, which must be built (`:701-705`).
-17. **Counter selections must fit one pass,** and only the graphics family is counted.
-    **Direction:** a multi-pass capture for tools (STATE.md). The engine re-implements the
-    acceptance test (engine `profiler/mod.rs:244-247`); add `counters::fits`. `MAX_COUNTERS = 8`
-    is lava's own cap and undocumented.
 19. **The surface is messy.**
     - Deep paths (`lava::image::slice::ImageView`).
     - No prelude, and glam and bytemuck aren't re-exported.
@@ -367,10 +312,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     generated struct names sampled slot 0.
 24. **`bind` zips two iterators** (2026-10-18, `bindless.rs:308-345`): a length mismatch binds less
     silently, and core collects a `Vec` per frame to line them up. Take pairs and assert.
-25. **Presenting takes raw Vulkan** (2026-10-18, `present.rs:170-174, 269-281`):
-    `PresentSurface::new` takes `vk::SurfaceFormatKHR`s and silently falls back to any format,
-    and present modes are a `usize` into a per-device list with lava-owned strings, so a saved
-    setting means another mode elsewhere. A `PresentMode` enum with `supports(mode)` fits.
 27. **Buffer creation edges** (2026-10-18, `buffer/mod.rs:107-146, 205-207`): a zero-sized `T`
     makes `len()` divide by zero; a size that isn't a whole number of elements keeps tail bytes in
     `range(..)` but not in `range(..len())`; `alignment: Option<u32>` isn't checked for a power of
@@ -416,9 +357,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 - **Memory:** per-frame transient rings (only `cmd.upload`'s internal ring exists).
 - **Queues:** several command buffers per submission, parallel recording (per-thread trackers
   merged by a barrier prologue at submit).
-- **Swapchain:** HDR (`VK_EXT_hdr_metadata`), image count, composite alpha, `FIFO_LATEST_READY`,
-  present_id/present_wait for pacing, presenting several swapchains in one call, discard on
-  acquire.
+- **Swapchain:** image count, present_id/present_wait for pacing.
 - **Queries:** conditional rendering.
 - **Debug:** labels in release builds whenever the extension exists; `insert_label`; object
   names on views, query pools and timelines.

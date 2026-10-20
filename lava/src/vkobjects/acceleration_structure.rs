@@ -930,9 +930,10 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         sizes: &QueryPool<CompactedSize>,
         first: u32,
     ) {
-        let count = structures.len() as u32;
+        let count = u32::try_from(structures.len()).unwrap_or(u32::MAX);
+        let end = first.checked_add(count);
         assert!(
-            first + count <= sizes.count(),
+            end.is_some_and(|end| end <= sizes.count()),
             "{count} sizes from {first} on don't fit {} queries",
             sizes.count()
         );
@@ -945,7 +946,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         }
         let accesses: SmallVec<[_; 8]> = structures.iter().map(|s| s.access(BUILD, READ)).collect();
         self.rec.flush_pending(std::iter::empty(), accesses.iter().cloned());
-        sizes.record(&self.rec);
+        sizes.take(&self.rec, first, count);
         let handles: SmallVec<[_; 8]> = structures.iter().map(|s| s.handle).collect();
         unsafe {
             command_functions().cmd_write_acceleration_structures_properties(

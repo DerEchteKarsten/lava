@@ -276,6 +276,9 @@ fn transitions_wait_only_for_what_can_still_run() {
     assert!(acquired.memory.is_none(), "the acquire's semaphore covers the last frame's writes");
     assert_eq!(acquired.images[0].src_stage_mask, S::COLOR_ATTACHMENT_OUTPUT);
     assert_eq!(acquired.acquired.len(), 1);
+    // Its old contents are discarded: the transition starts from `UNDEFINED`, not from the
+    // layout its last frame left.
+    assert_eq!(acquired.images[0].old_layout, L::UNDEFINED);
 }
 
 /// Image reads of completed submissions are dropped like buffer reads, and completed buffer
