@@ -65,16 +65,14 @@ pub enum PassKind {
 }
 
 impl PassKind {
-    /// The stages its resource accesses happen in.
+    /// The stages its resource accesses happen in, its marker's `STAGES` (`command_buffer::kind`).
     pub fn stages(&self) -> vk::PipelineStageFlags2 {
-        type S = vk::PipelineStageFlags2;
+        use crate::command_buffer::kind;
         match self {
-            PassKind::Compute { .. } => S::COMPUTE_SHADER,
-            PassKind::RayTracing { .. } => S::RAY_TRACING_SHADER_KHR,
-            PassKind::RasterVertex { .. } => S::VERTEX_SHADER | S::FRAGMENT_SHADER,
-            PassKind::RasterMesh { .. } => {
-                S::TASK_SHADER_EXT | S::MESH_SHADER_EXT | S::FRAGMENT_SHADER
-            }
+            PassKind::Compute { .. } => kind::Compute::STAGES,
+            PassKind::RayTracing { .. } => kind::RayTracing::STAGES,
+            PassKind::RasterVertex { .. } => kind::RasterVertex::STAGES,
+            PassKind::RasterMesh { .. } => kind::RasterMesh::STAGES,
         }
     }
 }

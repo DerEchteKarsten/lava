@@ -1,4 +1,4 @@
-//! The accesses later commands may have to wait for: what a timeline's submissions read and wrote, each write with what barriers already made it visible to, how recording a command adds to them, and how they shrink once the GPU finished them or a resource is destroyed, and the scan host access makes for incomplete writes of a buffer
+//! The accesses later commands may have to wait for: what a timeline's submissions read and wrote (layout transitions and acquires count as writes), each write with what barriers already made it visible to, how recording a command adds to them, and how they shrink once the GPU finished them or a resource is destroyed, and the scan host access makes for incomplete writes of a buffer
 
 use std::range::Range;
 
@@ -13,24 +13,28 @@ pub(crate) const MAX_PENDING_BUFFER_WRITES: usize = 64;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PendingAccesses {
-    pub(crate) buffer_reads: SmallVec<[PendingRead; 8]>,
-    pub(crate) image_reads: SmallVec<[ImageAccess; 8]>,
+    pub(crate) buffer_reads: SmallVec<[PendingRead<BufferAccess>; 8]>,
+    pub(crate) image_reads: SmallVec<[PendingRead<ImageAccess>; 8]>,
     pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
     pub(crate) image_writes: SmallVec<[PendingWrite<ImageAccess>; 8]>,
 }
 
+/// A read with the timeline value of the latest submission it stands for.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingRead {
-    pub(crate) read: BufferAccess,
+pub(crate) struct PendingRead<A> {
+    pub(crate) read: A,
     pub(crate) value: u64,
 }
 
-impl std::ops::Deref for PendingRead {
-    type Target = BufferAccess;
-    fn deref(&self) -> &BufferAccess {
+impl<A> std::ops::Deref for PendingRead<A> {
+    type Target = A;
+    fn deref(&self) -> &A {
         &self.read
     }
 }
+
+/// How many scopes a folded write keeps; dropping one only costs a barrier.
+const MAX_VISIBLE: usize = 4;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingWrite<A> {
@@ -81,11 +85,30 @@ impl<A> PendingWrite<A> {
         }
         self.visible.push((stage, access));
     }
+
+    /// Keeps only the pairs `other` is visible to as well (each scope is a box of stages and
+    /// accesses, so the pairs both see are the boxes' intersections), at most `MAX_VISIBLE`.
+    fn intersect_visible(&mut self, other: &[(vk::PipelineStageFlags2, vk::AccessFlags2)]) {
+        let mine = std::mem::take(&mut self.visible);
+        for &(stages, accesses) in &mine {
+            for &(other_stages, other_accesses) in other {
+                let (s, a) = (stages & other_stages, accesses & other_accesses);
+                if !s.is_empty() && !a.is_empty() {
+                    self.make_visible(s, a);
+                }
+            }
+        }
+        self.visible.truncate(MAX_VISIBLE);
+    }
 }
 
 impl PendingAccesses {
-    /// A memory barrier covers every write in its source scope, also those it wasn't recorded for.
-    pub(crate) fn made_visible(&mut self, barriers: &Barriers) {
+    /// Updates the accesses after `barriers` of the command of timeline value `value`: a memory
+    /// barrier covers every write in its source scope, also those it wasn't recorded for, and a
+    /// layout transition or queue family acquire is the image's latest write, at its barrier's
+    /// destination stages and visible there. Every earlier access of the image happens before
+    /// it (the barrier waited for them, or for a semaphore that did), so they are dropped.
+    pub(crate) fn made_visible(&mut self, barriers: &Barriers, value: u64) {
         let memory = barriers.memory.map(|m| {
             (
                 m.src_stage_mask,
@@ -101,63 +124,75 @@ impl PendingAccesses {
                 }
             }
         }
-        for w in &mut self.image_writes {
-            let image = w.write.image;
-            let transitions = barriers
-                .images
-                .iter()
-                .filter(|b| b.image == image)
-                .map(|b| {
-                    (
-                        b.src_stage_mask,
-                        b.src_access_mask,
-                        b.dst_stage_mask,
-                        b.dst_access_mask,
-                    )
-                });
-            for (src_stage, src_access, dst_stage, dst_access) in
-                memory.into_iter().chain(transitions)
-            {
+        if let Some((src_stage, src_access, dst_stage, dst_access)) = memory {
+            for w in &mut self.image_writes {
                 if src_stage.contains(w.write.stage) && src_access.contains(w.write.access) {
                     w.make_visible(dst_stage, dst_access);
                 }
             }
         }
+        // Every barrier of `images` transitions a layout.
+        let moved = barriers.acquires.iter().chain(&barriers.images);
+        for (i, barrier) in moved.clone().enumerate() {
+            let image = barrier.image;
+            if moved.clone().take(i).any(|b| b.image == image) {
+                continue;
+            }
+            let range = barrier.subresource_range;
+            let mut write = PendingWrite::new(
+                ImageAccess {
+                    stage: vk::PipelineStageFlags2::NONE,
+                    access: vk::AccessFlags2::NONE,
+                    image,
+                    layout: barrier.new_layout,
+                    aspect: range.aspect_mask,
+                    mip_range: (range.base_mip_level..range.base_mip_level + range.level_count)
+                        .into(),
+                },
+                value,
+            );
+            for b in moved.clone().skip(i).filter(|b| b.image == image) {
+                let mips = b.subresource_range;
+                let mip_range = &mut write.write.mip_range;
+                mip_range.start = mip_range.start.min(mips.base_mip_level);
+                mip_range.end = mip_range.end.max(mips.base_mip_level + mips.level_count);
+                write.write.stage |= b.dst_stage_mask;
+                write.make_visible(b.dst_stage_mask, b.dst_access_mask);
+            }
+            self.forget_image(image);
+            self.image_writes.push(write);
+        }
     }
 
-    /// Drops the buffer reads up to `completed`, and once there are too many buffer writes,
-    /// folds the completed ones into one write of `EVERY_BUFFER`, which still needs visibility.
+    /// Drops the buffer and image reads up to `completed`, and once there are too many buffer
+    /// writes, folds the completed ones into one write of `EVERY_BUFFER`, which still needs
+    /// visibility, except where a barrier made every folded write visible already.
     pub(crate) fn retire(&mut self, completed: u64) {
         self.buffer_reads.retain(|read| read.value > completed);
+        self.image_reads.retain(|read| read.value > completed);
         if self.buffer_writes.len() <= MAX_PENDING_BUFFER_WRITES {
             return;
         }
-        let (mut stage, mut access) = (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE);
+        let every = (self.buffer_writes.iter()).position(|w| w.write.range == EVERY_BUFFER);
+        let mut folded = every.map(|i| self.buffer_writes.swap_remove(i));
         self.buffer_writes.retain(|w| {
-            let fold = w.value <= completed && w.write.range != EVERY_BUFFER;
+            let fold = w.value <= completed;
             if fold {
-                stage |= w.write.stage;
-                access |= w.write.access;
+                match &mut folded {
+                    None => folded = Some(w.clone()),
+                    Some(f) => {
+                        f.write.stage |= w.write.stage;
+                        f.write.access |= w.write.access;
+                        f.intersect_visible(&w.visible);
+                    }
+                }
             }
             !fold
         });
-        if stage.is_empty() && access.is_empty() {
-            return;
-        }
-        match (self.buffer_writes.iter_mut()).find(|w| w.write.range == EVERY_BUFFER) {
-            Some(every) => {
-                every.write.stage |= stage;
-                every.write.access |= access;
-                every.visible.clear();
-            }
-            None => {
-                let write = BufferAccess {
-                    stage,
-                    access,
-                    range: EVERY_BUFFER,
-                };
-                self.buffer_writes.push(PendingWrite::new(write, 0));
-            }
+        if let Some(mut folded) = folded {
+            folded.write.range = EVERY_BUFFER;
+            folded.value = 0;
+            self.buffer_writes.push(folded);
         }
     }
 
@@ -228,7 +263,7 @@ impl PendingAccesses {
                     }
                     !same
                 });
-                self.image_reads.push(read);
+                self.image_reads.push(PendingRead { read, value });
             }
         }
     }

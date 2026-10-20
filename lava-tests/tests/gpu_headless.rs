@@ -1532,7 +1532,7 @@ fn run_combined(
     ];
     reads.extend((1..levels).map(|level| ImageUse::sampled_read(chain.mip_view(level))));
     let both = lava::AccessFlags2::SHADER_SAMPLED_READ | lava::AccessFlags2::SHADER_STORAGE_WRITE;
-    reads.extend(pair.map(|(_, image)| image.whole_view().access(lava::PipelineStageFlags2::NONE, both, lava::ImageLayout::GENERAL)));
+    reads.extend(pair.map(|(_, image)| image.whole_view().access(lava::PipelineStageFlags2::NONE, both)));
     gpu.submit(|cmd| {
         let bindings = TestCombined::push_bindings(
             target.whole_view(),
@@ -2319,6 +2319,65 @@ fn depth_attachment_keeps_the_nearer_fragment() {
     });
     assert_pixel(&with_depth, 32, 40, [0, 255, 0, 255]);
     assert_golden("raster_depth", &with_depth, [SIZE, SIZE]);
+
+    // A depth buffer only the rendering tests against needs no store, and a later depth
+    // attachment replaces an earlier one, stencil aspect included (validation checks it).
+    let stencil = Image::<D32SfloatS8Uint, usage![DepthAttachment]>::new(EXTENT).unwrap();
+    let discarded = render(&mut gpu, |cmd, target| {
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .depth_attachment(stencil.whole_view(), Some((0.0, 0)))
+            .depth_attachment(depth.whole_view(), Some([0.0]))
+            .discard_depth_after()
+            .draw(&Draw::new(&bindings(&vertices), 6, 1, RasterState::default(), None))
+            .record("discarded depth")
+    });
+    assert_eq!(discarded, with_depth);
+}
+
+/// `DONT_CARE` loads and stores: a target the draw covers needn't be loaded, and a scratch
+/// attachment needn't be stored.
+#[test]
+fn attachments_discard_their_contents() {
+    let mut gpu = gpu();
+    let chain =
+        MipChain::<R8G8B8A8Unorm, usage![ColorAttachment, Sampled, TransferSrc, TransferDst]>::with_mip_levels(
+            UVec2::new(16, 16),
+            2,
+        )
+        .unwrap()
+        .bind_mips_sampled()
+        .unwrap();
+    let scratch = Target::new(UVec2::new(8, 8)).unwrap();
+    let corner = |x: f32, y: f32| TestTexturedVertex { position: Vec2::new(x, y), uv: Vec2::splat(0.5) };
+    let quad = buffer_with::<TestTexturedVertex>(&[corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)]);
+    let indices = buffer_with::<u32>(&[0, 1, 2, 0, 2, 3]);
+    let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
+
+    let cleared = panic_message(|| Attachment::color(scratch.whole_view(), Some([0.0; 4])).discard_before());
+    assert!(cleared.contains("loads nothing anyway"), "{cleared}");
+    gpu.submit(|cmd| {
+        let message = panic_message(|| {
+            cmd.raster(UVec2::new(8, 8), [Attachment::color(scratch.whole_view(), None)])
+                .discard_depth_after();
+        });
+        assert!(message.contains("needs a `depth_attachment`"), "{message}");
+        cmd.clear_image(chain.mip_view(0), [0.0, 1.0, 0.0, 1.0]);
+        let sample = TestRasterTextured::push_bindings(quad.range(..), chain.mip_view(0), nearest());
+        cmd.raster(
+            chain.mip_extent(1),
+            [Attachment::color(chain.mip_view(1), None).discard_before()],
+        )
+        .draw(&Draw::indexed(&sample, indices.range(..), 1, RasterState::default(), None))
+        .record("discard before");
+        cmd.raster(
+            UVec2::new(8, 8),
+            [Attachment::color(scratch.whole_view(), Some([1.0; 4])).discard_after()],
+        )
+        .draw(&Draw::indexed(&sample, indices.range(..), 1, RasterState::default(), None))
+        .record("discard after");
+        cmd.copy_image_to_buffer(chain.mip_view(1).whole(), readback.range(..));
+    });
+    assert_eq!(readback.host(), [0, 255, 0, 255].repeat(8 * 8));
 }
 
 #[test]
@@ -3265,12 +3324,9 @@ mod generated {
             .collect::<Vec<_>>()
             .try_into()
             .expect("one image");
-        let access = &image.access;
-        assert_eq!(
-            access.access,
-            A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE
-        );
-        assert_eq!(access.stage, S::COMPUTE_SHADER);
-        assert_eq!(access.layout, L::GENERAL);
+        assert_eq!(image.access(), A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
+        assert_eq!(image.stage(), S::COMPUTE_SHADER);
+        assert_eq!(image.stage(), lava::pipeline::PassKind::Compute { entry: "" }.stages());
+        assert_eq!(image.layout(), L::GENERAL);
     }
 }

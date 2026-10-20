@@ -58,7 +58,7 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         let (index, acquire) = (current.index, current.acquire);
         let view = surface.current_image();
         self.rec.flush_pending(
-            std::iter::once(view.access(
+            std::iter::once(view.access_in(
                 vk::PipelineStageFlags2::empty(),
                 vk::AccessFlags2::empty(),
                 vk::ImageLayout::PRESENT_SRC_KHR,

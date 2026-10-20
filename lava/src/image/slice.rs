@@ -1,4 +1,4 @@
-//! Borrowed image views of a mip range (over every aspect) and their slices, the only image types commands take (bounded by the traits of `kind`), with the layouts they track for barriers, and the image transfer commands (clear, blit, copies to and from buffers)
+//! Borrowed image views of a mip range (over every aspect) and their slices, the only image types commands take (bounded by the traits of `kind`), their accesses (shaders' always in `GENERAL`), and the image transfer commands (clear, blit, copies to and from buffers; blits and copies track only the mip they touch)
 use std::{iter, range::Range, sync::atomic::AtomicU64};
 
 use crate::vk;
@@ -153,9 +153,15 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         }
     }
 
-    /// The access of a command that wants the view's mips in `layout`; their tracked states
-    /// move only when the command is recorded.
-    pub fn access(
+    /// A shader's access of the view's mips at `stage`, in `GENERAL` like every descriptor
+    /// (generated bindings make these); their tracked states move only when the command is
+    /// recorded.
+    pub fn access(&self, stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> ImageUse<'a> {
+        self.access_in(stage, access, vk::ImageLayout::GENERAL)
+    }
+
+    /// The access of a command that wants the view's mips in `layout` (attachments, presents).
+    pub(crate) fn access_in(
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
@@ -172,6 +178,20 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             },
             states: self.states,
         }
+    }
+
+    /// The `GENERAL` access of a transfer that touches only the first mip: just that mip where
+    /// the image tracks its mips one by one, else all of the view's, which share one state.
+    pub(crate) fn first_mip_access(
+        &self,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> ImageUse<'a> {
+        let mut first = self.access(stage, access);
+        if self.states.len() > 1 {
+            first.access.mip_range.end = first.access.mip_range.start + 1;
+        }
+        first
     }
 }
 
@@ -282,7 +302,6 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             std::iter::once(image.access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
-                vk::ImageLayout::GENERAL,
             )),
             std::iter::empty(),
         );
@@ -316,15 +335,13 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         check_box(&dst, false, "destination");
         self.rec.flush_pending(
             [
-                src.view.access(
+                src.view.first_mip_access(
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_READ,
-                    vk::ImageLayout::GENERAL,
                 ),
-                dst.view.access(
+                dst.view.first_mip_access(
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_WRITE,
-                    vk::ImageLayout::GENERAL,
                 ),
             ]
             .into_iter(),
@@ -378,10 +395,9 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         check_copy_size(&dst, src.size(), "source");
         check_family(&self.rec.family, &dst, src.address(), true);
         self.rec.flush_pending(
-            iter::once(dst.view.access(
+            iter::once(dst.view.first_mip_access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
-                vk::ImageLayout::GENERAL,
             )),
             iter::once(BufferAccess {
                 access: vk::AccessFlags2::TRANSFER_READ,
@@ -435,10 +451,9 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         check_copy_size(&src, dst.size(), "destination");
         check_family(&self.rec.family, &src, dst.address(), false);
         self.rec.flush_pending(
-            iter::once(src.view.access(
+            iter::once(src.view.first_mip_access(
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
-                vk::ImageLayout::GENERAL,
             )),
             iter::once(BufferAccess {
                 access: vk::AccessFlags2::TRANSFER_WRITE,

@@ -717,21 +717,30 @@ impl Functions {
         T: Handle,
     {
         if let Some(debug_utils) = Self::debug_utils() {
-            let name = debug_name(name);
-            let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
-                .object_handle(object)
-                .object_name(&name);
-            if let Err(err) = unsafe { debug_utils.set_debug_utils_object_name(&name_info) } {
-                tracing::error!(%err, "failed to set Vulkan debug name");
-            }
+            with_debug_name(name, |name| {
+                let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
+                    .object_handle(object)
+                    .object_name(name);
+                if let Err(err) = unsafe { debug_utils.set_debug_utils_object_name(&name_info) } {
+                    tracing::error!(%err, "failed to set Vulkan debug name");
+                }
+            });
         }
     }
 }
 
-/// A debug name as a C string, cut at its first NUL (pass entry names carry one).
-pub(crate) fn debug_name(name: &str) -> CString {
-    let end = name.find('\0').unwrap_or(name.len());
-    CString::new(&name[..end]).expect("interior NULs were cut off")
+/// Calls `f` with a debug name as a C string, cut at its first NUL (pass entry names carry
+/// one); one of up to 127 bytes is copied to the stack, so labels don't allocate.
+pub(crate) fn with_debug_name<R>(name: &str, f: impl FnOnce(&CStr) -> R) -> R {
+    let name = name.split('\0').next().unwrap_or_default().as_bytes();
+    let mut buffer = [0u8; 128];
+    match buffer.get_mut(..name.len()) {
+        Some(head) if name.len() < 128 => {
+            head.copy_from_slice(name);
+            f(CStr::from_bytes_until_nul(&buffer).expect("the buffer ends with a NUL"))
+        }
+        _ => f(&CString::new(name).expect("interior NULs were cut off")),
+    }
 }
 
 fn get() -> &'static Functions {

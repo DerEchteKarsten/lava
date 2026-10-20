@@ -9,26 +9,96 @@ numbers are from the working tree of 2026-10-18; older ones from 2026-10-14. Unm
 checked in the code; *(plausible)* ones follow from it but weren't reproduced. Bugs are also
 listed in `STATE.md`. Done items are removed.
 
+## 1. Decided work (2026-10-20)
+
+Every open item was re-checked on 2026-10-20; stale ones were deleted. The user decided what to
+do with each remaining one. This is the work list, in planned commit groups (at most ten lava
+commits). Numbers are this survey's items. Delete a line, and its item below, when it is done.
+Items that aren't named here stay as they are, on purpose (e.g. bug 31, MSAA, async pipeline
+compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
+
+2. **Pipelines:** 23 (`Bindings::new`/`with_constants` become `unsafe`, with the generator
+   contract documented), 72/73 (one lock per pass; compile outside the map lock, first insert
+   wins; the module's read lock is held across creation and reload takes it for writing first),
+   98 (gate check first; a recursion depth above the device limit gates the pass), 56 (map
+   `ClipDistance`, `CullDistance`, `StorageInputOutput16`, `RayTraversalPrimitiveCullingKHR`,
+   shared int64 atomics, the device clock), the last compute and ray tracing pipeline cached in
+   the recording, a `VkPipelineCache` (optional path in `Config`) and batched init creation,
+   `Dynamic::of` once, `of_spirv` once per pass with an early stop, one lock per ray tracing
+   lookup, `&'static CStr` entry names, the pass index computed from map order, pipelines named
+   after their pass, `[MaxRecursion(0)]`.
+3. **Timelines, lifetimes, init and errors:** 24 (a full `lava::shutdown()` that waits, drains,
+   destroys device and instance and allows re-init), 64/65 (host-signal the semaphore when a
+   timeline drops with its stamp ahead or a replay fails), 66, 67 (the public `reclaim` polls),
+   68 (a reclaim mutex), 69 (a failed init tears down through `shutdown`; pure checks before
+   device creation), 71, 74, 75 (CPU and virtual GPUs accepted, ranked last), 76 (device loss
+   propagates as a typed error), 44 (a stage set per queue family, a type parameter of `Wait`,
+   masked by features), 49, 61 (document the validation layer version that accepts GPU-assisted
+   validation with printf), 4.9 (typed `#[non_exhaustive]` errors, one `OutOfMemory`, no
+   duplicate `Display`, a heap enum, no `From<String>`, no `Lock`, the panic-vs-`Err` rule
+   documented and applied: host copy checks panic, `reserve(0)` is empty, `pipeline::init`
+   returns `Err`, statistics return `MissingFeature`, `performance(0)` checks before locking),
+   4.3 (app name and version in `Config`; `validation` honoured in release; a missing layer
+   warns), `Stamp::is_done` uses cached values first, the debug callback filters before
+   formatting, allocator block sizes in `Config`, allocation and object names, 4.29 (integer
+   `typ` and `flags`), `Wait::block_timeout` and multi-wait.
+4. **Queries, counters and presenting:** 22/26 (used-index bitset per pool; the open pool and
+   index per kind; `end_query` checks them; submit fails with an open query), 25, 45 (query
+   kinds bounded by queue kind at the type level; empty statistics are an error), 46
+   (command-buffer-scope counters begin as the recording's first command; render-pass scope is
+   asserted outside renderings), 4.17 (`counters::fits`, and the multi-pass capture of STATE.md),
+   77/82 (`present`/`acquire` panic on a recording thread), 78, 79 (present fences required for
+   windowed use), 80, 81, 83, 4.25 (`PresentMode` enum, lava surface formats, a reported
+   fallback), composite alpha, `FIFO_LATEST_READY`, HDR metadata and colour spaces, presenting
+   several swapchains at once, discard on acquire, cached surface capabilities, cached
+   calibration in `instant`, a cheap `memory_report`.
+5. **Raster and draws:** 38 and 39 (require `multiDrawIndirect`, `drawIndirectFirstInstance`,
+   `depthBiasClamp`), 40 (query `dynamicPrimitiveTopologyUnrestricted`; key by topology class
+   without it), 41 (`depth_clip` defaults to not clamped), 42 (`write_mask` and gated
+   `write_masks`), 55 (asserts, a `dual-src-blend` feature), render area offset, per-draw scissor
+   and viewport, vertex-only passes, array layers, layered rendering, multiview, dynamic rendering
+   local read, indexed indirect (count) and `launch_indirect_count`, u16 indices, first
+   vertex/instance and vertex offset, multi-draw, stencil attachments, `BufferAccess::unordered`,
+   4.13 (an unsafe prefix trait for indirect command structs), `Scissor`/`Viewport` merged,
+   stencil state set `FRONT_AND_BACK` when equal.
+6. **Images and formats:** 27 (block sizes for BC, ETC2, EAC and ASTC; the compression features
+   gated and enabled), 43 (64-bit clear components as two words), 53 (a format-property cache;
+   blit, clear, address, granularity and host block checks; `with_params` asks the device), 54
+   (attachment usages with `HostCopy` don't compile; states commit only on success), 57, 58,
+   format reinterpretation views, image-to-image copies, depth and stencil clears and copies, row
+   pitch, `ImageSlice::mip(level)` on `Single` images, sparse residency, external memory,
+   `Image::fit`, `UnifiedBinding` deleted.
+7. **Buffers and acceleration structures:** 28-30 (full shapes, `built` applied when the
+   recording reaches the GPU, a cheap built flag for traces), 34, 36, 37, 47, 48, 59, 4.16 (all
+   of part 1 and 2: scratch type and `build_all`, compactor, arena placement,
+   `Blas::with_capacity`, flags, sealed `VertexPosition` with `Vec3A`, getters, scopes, safety
+   docs), copies and serialization, position fetch, half and snorm positions, shader execution
+   reordering, 4.27, `Buffer::reserve`, 4.6 (`PerFrame<T>`), 4.23 (`ImageHandle` loses
+   `Zeroable`; upload and host-write bounds become `NoUninit`), the ANV workaround only on Intel
+   Mesa, stored `unsized_struct!` offsets.
+8. **lava-build-slang:** 4.2 (two generated argument structs, push constants and specialization
+   constants, plus the extra accesses as a third argument of `push_bindings`; no
+   `IncompletePass`), 4.12 (`WORKGROUP_SIZE` and exported constants), 4.20, 4.21 (qualified
+   paths, `#[track_caller]`), 4.22, 35, 63, 85-88, 90 (`Accel` allowed in `SCONST`, cost
+   documented), 91-97, debug info and parallel compiles, half and 16-bit fields, non-square
+   matrices, `r#` field names, `Gather`/`SampleGrad`/`SampleBias`, `Load` at a mip, image
+   atomics, `MutTex2D.Sample` and `MutTex3D`, dispatch base, `[WaveSize]`, several compute entry
+   points per file, `#[validation_trace]` argument check, `#[must_use]` on `Shaders`.
+9. **Surface, cleanup and docs:** 4.14, 4.19 (shallow re-exports, `lava::prelude`, glam and
+   bytemuck re-exported, internals hidden or deleted, every rename, ash as a documented public
+   dependency with only `lava::vk`, the derives), all of section 6 (bake table stays) and
+   section 7 (scope observer docs follow the code: scopes start after their barriers).
+10. **Tests:** all of section 8, plus tests for every change above, one GPU-assisted validation
+    run, and Miri for `unsized_struct!`; the tools generator fix of section 7.
+
+The engine follows in its own repository, only after the other agent's uncommitted engine work
+is committed: 84, the push constants of 3, 4.11's viewport usage, 4.15, 4.17's `fits`, 4.21's
+imports, 4.22's padding, release builds without validation, and all of section 9 (drop
+`dynamic-blend` once checked).
+
 ## 2. Bugs
 
 ### Barrier tracking (2026-10-18)
-17. **Layout transitions and acquires aren't tracked as writes** (`command_buffer/mod.rs:1593-1632`,
-    `pending.rs:209-231`). A transition happens before its own barrier's destination stages only.
-    Example: a colour target is written, then sampled at FRAGMENT (the barrier transitions it to
-    GENERAL with destination FRAGMENT), then read at COMPUTE or TRANSFER. That read's barrier has
-    source COLOR_ATTACHMENT_OUTPUT, which doesn't chain after the transition. After an acquire
-    sampled at FRAGMENT, a later copy on the same family gets no barrier at all. **Fix:** after a
-    transition or acquire, store the image's pending write as (destination stage, access), already
-    visible to that pair.
-19. **A transition after an acquire takes stale sources** *(plausible)* (`mod.rs:1599-1611`).
-    With two timelines of one family, the acquiring timeline's old accesses of the image become
-    the transition's source, not the acquire's destination stage. OR `to_stage` into the source
-    whenever an acquire was emitted, as the `waited` path does.
-20. **The releasing family can still use a released image** (`image_state.rs:87-90`). Its access
-    passes the owner check and clears `released_to`, cancelling the transfer although the release
-    barrier is recorded. The receiver then panics far from the cause.
-21. **A second `depth_attachment` call keeps the first one's stencil format** (`mod.rs:565-570`):
-    a depth-only view then becomes a stencil attachment. Reset it in the `else` branch.
 22. **One query index can be used twice in a recording** *(plausible)* (`mod.rs:723-724, 1121,
     1137`): the pool is reset once per recording, and two `count_samples`, queries or timestamps
     on one index aren't refused.
@@ -42,8 +112,8 @@ listed in `STATE.md`. Done items are removed.
       `dataSize` 0 and its map entries, so the driver reads past the slice.
     - **Fix:** assert `pass.kind` against `K` and the constants against `constants_size` (lava's
       only use for that field).
-24. **`lava::destroy()` is safe but leaves `BINDLESS` set** (`lib.rs:151-165`). A second call
-    destroys the layouts and pool twice; a later recording or bind uses destroyed handles. It also
+24. **`lava::destroy()` is safe but leaves `BINDLESS` set** (`lib.rs:151-165`): a later bind or
+    descriptor write uses the freed heaps. It also
     sets `CALLSITE` by hand and never clears it, in release builds too, so every later validation
     message on that thread blames `destroy`'s caller (`lib.rs:153`). Make it `unsafe` or guard it.
 25. **`QueryPool::read` overflows** (`query/mod.rs:191-197`): `first + queries` wraps in release
@@ -67,12 +137,6 @@ listed in `STATE.md`. Done items are removed.
     a recording that never reaches the GPU leaves the structure counted as built.
 31. **`compacted_from` stores the source's raw handle** *(plausible)* (`:181, :306, :961`): a
     handle value reused after the source's destruction passes `compact`'s check. Use an id.
-32. **Buffer slice arithmetic is unchecked** (`buffer/slice.rs:38-48`): in release a huge index
-    wraps past the `<= size` assert into a wrong in-bounds slice.
-33. **`ImageAccess`/`BufferAccess` fields and `ImageUse::access` are public** (`mod.rs:88-104`,
-    `image/slice.rs:162`): safe code can pair another image's states with any layout or mip range,
-    which desyncs the tracking. `ImageView::access(.., layout)` takes any layout although shader
-    accesses must be GENERAL.
 34. **Indirect commands read past an empty slice** (`mod.rs:958-965, 1014-1021, 1055-1062`):
     `compute_indirect` and `raytrace_indirect` pass only the address. Assert `len() >= 1`.
 35. **lava-build-slang calls an unchecked 0.1.0 accessor** (`compile.rs:61`, `codegen.rs:585, 594,
@@ -151,14 +215,8 @@ listed in `STATE.md`. Done items are removed.
     A1B5G5R5 are missing, and `PresentSurface::new`'s fallback could pick one *(plausible)*.
 59. **Acceleration structure limits aren't checked** (`acceleration_structure.rs:335-349`):
     `maxGeometryCount`, `maxPrimitiveCount`, `maxInstanceCount`.
-60. **`usage::ShaderBindingTable` and `AccelerationStructureStorage` are public and ungated**
-    (`buffer/usage.rs:37-63`): `Buffer::raw` makes buffers with flags of extensions lava didn't
-    enable.
-61. **`GPU_ASSISTED` is enabled together with `DEBUG_PRINTF`** *(plausible)* (`state.rs:160-162`),
-    which older validation layers refuse.
-62. **`VK_KHR_device_address_commands`'s dependencies aren't enabled** *(plausible)*
-    (`state.rs` `LAVA_EXTENSIONS`): if it depends on something core only in 1.4, a 1.3 driver
-    needs it enabled.
+61. **`GPU_ASSISTED` is enabled together with `DEBUG_PRINTF`** *(plausible)* (`state.rs:153-160`,
+    only with `Config::gpu_assisted_validation`), which older validation layers refuse.
 63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`.
 
 ### Timelines, lifetimes and init (2026-10-18)
@@ -179,7 +237,7 @@ listed in `STATE.md`. Done items are removed.
     counter and pipeline init can fail (a heap allocation, a pass needing a compiled-out
     feature), so the device leaks and every retry says "already initialised".
 71. **Failed creations leak.** A failed command pool leaks the earlier slots' pools
-    (`timeline.rs:178-202`); a failure part-way through bindless init leaks the resource heap.
+    (`timeline.rs:178-202`).
 72. **A failed pipeline creation poisons the cache for every pass of its kind**
     (`pipeline.rs:479-497`): `must` panics under the write guard, and every later `unwrap()` panics.
 73. **Hot reload can build from a destroyed module** (`pipeline.rs:229-307`): `cached` copies the
@@ -263,32 +321,15 @@ listed in `STATE.md`. Done items are removed.
     compiles, `VK_KHR_pipeline_binary`, and deferred host operations for ray tracing pipelines.
 - **Raster passes are coarse in barriers.** Every resource of a raster pass is accessed at
   `VERTEX|FRAGMENT` or `TASK|MESH|FRAGMENT` (`build.rs:30-41`).
-- **Fresh images transition from `ALL_COMMANDS`** (`command_buffer.rs:1301-1304`), which drains
-  the GPU once per streamed image. Only swapchain images need that.
-- **Discarding is missing.** There is no `DONT_CARE` load or store, and discarding accesses
-  (clears, full copies, the first use after acquire) don't transition from `UNDEFINED`. Core
-  loads the G-buffer and the UI target every frame.
+- **Discarding accesses don't transition from `UNDEFINED`** (clears, full copies, attachments
+  with `discard_before` that cover their whole mip), so drivers keep decompressing contents
+  nothing reads. Core loads the G-buffer and the UI target every frame (`discard_before` exists
+  now).
 - **`VK_KHR_unified_image_layouts`** would remove the per-mip layout atomics, the
   GENERAL↔ATTACHMENT round trips (four per frame for the G-buffer), and the rule that command
   buffers sharing an image be recorded in order.
-- **Per-frame allocations.** Barrier SmallVecs spill when a command transitions several images,
-  as the scene rendering does every frame, and labels allocate a `CString`.
 
 ### Found 2026-10-18
-- **Every frame's first swapchain access waits for all colour output** (`mod.rs:1564-1575`): an
-  acquire resets the image's state but leaves its pending write, so a global barrier from
-  COLOR_ATTACHMENT_OUTPUT follows, which the acquire semaphore already covers.
-- **An attachment goes to GENERAL when a draw touches any mip of its image** (`mod.rs:619-627`):
-  raster downsample and bloom chains lose `ATTACHMENT_OPTIMAL`. Compare mip ranges.
-- **Declared raster accesses use other stages than generated ones** (`mod.rs:295-298`:
-  `PRE_RASTERIZATION_SHADERS|FRAGMENT` against `VERTEX|FRAGMENT`), so a resource reached both
-  ways never matches the other's visibility and gets redundant barriers.
-- **Copies and blits track the whole view** (`image/slice.rs:285, 323-332, 385, 442`) though they
-  touch only its first mip: a slice of a `MipChain`'s whole view transitions every mip.
-- **Image reads are never retired** (`pending.rs:162-165`), unlike buffer reads, so transitions
-  keep waiting at the stages of long-finished reads.
-- **Each fold clears `EVERY_BUFFER`'s visibility** *(plausible)* (`pending.rs:145-150`), so a
-  workload above 64 pending writes re-adds global barriers every frame.
 - **Small per-call costs:** `Dynamic::of` is rebuilt per rendering and pipeline
   (`raster_state.rs:370-412`); a stencil change makes 8 calls where front equals back
   (`:640-648`); `unsized_struct!` accessors walk every earlier section (`unsized_struct.rs:12-28`);
@@ -398,27 +439,24 @@ listed in `STATE.md`. Done items are removed.
     **Direction:** a multi-pass capture for tools (STATE.md). The engine re-implements the
     acceptance test (engine `profiler/mod.rs:244-247`); add `counters::fits`. `MAX_COUNTERS = 8`
     is lava's own cap and undocumented.
-18. **Generated types belong to lava,** so users can't implement serde or `Reflect` on them
-    (the orphan rule). Generating into the user crate fixes this, with configurable derives.
 19. **The surface is messy.**
     - Deep paths (`lava::image::slice::ImageView`).
     - No prelude, and glam and bytemuck aren't re-exported.
     - Unused re-exports: `VkPipeline`, `VkShaderModule`, `ShaderHash`.
     - Public internals: `PassEntry`, `Functions`, `PhysicalDevice`, `CALLSITE`,
       `RaytracingPipeline`, `ShaderBindingTable`.
-    - Typos: `handel`, `Filter::Liniear`, `extend` for extent,
-      `enable_gpu_assited_validation`, `unsupports_extensions`.
+    - Typos: `handel`, `Filter::Liniear`, `extend` for extent.
     - Fix these before 0.1, since renames break users afterwards.
     - *2026-10-18, more public internals:* `pub use ash::vk::*` makes every ash upgrade a breaking
       lava release (`vk.rs:6`); `lava::vk` and `lava::state::raw_vulkan` are one module under two
       paths (`state.rs:35`; the engine and generated code use the second, lava the first);
       `pub mod error`, `lifetime` and `state` duplicate root re-exports; `CallsiteGuard`;
       `BindingOutput::sections()` returns an unnameable pub `Sections`; `RawImage`, `MipViews` and
-      the sealed `Views` methods expose `vk::ImageView` and the state atomics; `format::bc_block`,
-      `ImageSlice::resolve`, `Buffer::handle()` (no caller anywhere); `lava_build_slang::compile`
+      the sealed `Views` methods expose `vk::ImageView` and the state atomics; `format::bc_block`
+      (internal use only), `Buffer::handle()` (no caller anywhere); `lava_build_slang::compile`
       and its re-export of shader-slang 0.1.0, which ties lava-build-slang's semver to slang-rs.
     - *2026-10-18, unused:* `usage::UnifiedBinding`, `Features::union`, `ImageView::cast`,
-      `ImageSlice::cast`, `PassKind::stages`, `Image::aspect_check`/`texel_check`, `Dim::texels`,
+      `ImageSlice::cast`, `Image::aspect_check`/`texel_check`, `Dim::texels`,
       `SlotRange::is_empty` (always false), `Config::gpu_assisted_validation` (no user), the
       root re-exports `AccessFlags2`/`ImageLayout`, and three loaded draw commands in `vk.rs`
       (`cmd_draw_indexed_indirect2`, `..._count2`, `cmd_draw_mesh_tasks_indirect_count2`).
@@ -429,7 +467,7 @@ listed in `STATE.md`. Done items are removed.
       name of the `SLANG_DIR` variable (the SDK); `BufferSlice::get_range` returns
       `std::range::Range` where the rest uses `std::ops::Range`; `RasterMesh.amp` where
       lava says task; `Features::DEFAULT` means none; `copy_region_from` takes its offset as a
-      `D::Extent`; `pipline_layout_info`, `image_acceses`, `buffer_acceses`.
+      `D::Extent`; `image_acceses`, `buffer_acceses`.
     - *2026-10-18, missing derives:* `RasterState` and `BufferAccess` could be `Copy`; `Filter` has
       no `Clone`/`Copy`/`Debug` and no cubic filter; `ImageSlice` no `Debug`; `Scissor` and
       `Viewport` are identical structs; `Config` has no docs or `Debug`.
@@ -454,8 +492,6 @@ listed in `STATE.md`. Done items are removed.
     `PresentSurface::new` takes `vk::SurfaceFormatKHR`s and silently falls back to any format,
     and present modes are a `usize` into a per-device list with lava-owned strings, so a saved
     setting means another mode elsewhere. A `PresentMode` enum with `supports(mode)` fits.
-26. **`Buffer` has undocumented `Index`/`IndexMut`** (2026-10-18, `buffer/mod.rs:48-59`): each
-    index runs the mapping checks, and core writes per element through them.
 27. **Buffer creation edges** (2026-10-18, `buffer/mod.rs:107-146, 205-207`): a zero-sized `T`
     makes `len()` divide by zero; a size that isn't a whole number of elements keeps tail bytes in
     `range(..)` but not in `range(..len())`; `alignment: Option<u32>` isn't checked for a power of
@@ -482,7 +518,7 @@ listed in `STATE.md`. Done items are removed.
   - **Sampling:** MSAA with resolve attachments, sample shading, alpha-to-coverage.
   - **Rendering:** multiview, layered rendering, a render area offset, per-draw scissor and
     viewport (UI clipping), vertex-only passes (depth and shadow), dynamic rendering local read.
-  - **Draws:** `draw_indexed_indirect(_count)`, `launch_indirect_count`, u16 indices,
+  - **Draws:** `draw_indexed_indirect(_count)` and `launch_indirect_count` (their loaders exist), u16 indices,
     first vertex/instance and vertex offset, multi-draw.
 - **Compute:** reflected workgroup size, dispatch base, subgroup size control (`[WaveSize]` →
   `requiredSubgroupSize`), several entry points per file.
@@ -499,12 +535,12 @@ listed in `STATE.md`. Done items are removed.
   - **Types:** `half` and 16-bit ints (panic today, though float16 is enabled), 64-bit scalars
     and `bool` vectors, non-square matrices (no glam type), `float3x3` layout vs `Mat3`
     *(plausible)*.
-  - **Image ops:** `Gather`, `SampleCmp`, `SampleGrad`, `SampleBias`, `Load` at a mip, image
+  - **Image ops:** `Gather`, `SampleGrad`, `SampleBias`, `Load` at a mip, image
     atomics. `MutTex2D` has only `Load`, no `Sample`; there is no `MutTex3D`.
   - **Codegen:** Rust keywords as field names, arrays over 32 (bytemuck's `Pod` limit), pass and
     struct name clashes.
-- **Memory:** staging uploads, readback, per-frame transient rings, a budget query outside
-  profiling, object and allocation names.
+- **Memory:** per-frame transient rings (only `cmd.upload`'s internal ring exists), object and
+  allocation names.
 - **Queues:** several command buffers per submission, parallel recording (per-thread trackers
   merged by a barrier prologue at submit).
   - `Wait` has `block()` and `is_done()`, no timeouts or multi-wait.
@@ -527,8 +563,7 @@ listed in `STATE.md`. Done items are removed.
   - **Structures:** serialization and copies (BLAS disk cache, clones), position fetch
     (`ALLOW_DATA_ACCESS`), opacity micromaps.
   - **Shaders:** shader execution reordering, `NO_DUPLICATE_ANY_HIT_INVOCATION`.
-  - **Formats and instances:** half and snorm vertex positions, a documented inactive instance
-    (BLAS address 0).
+  - **Formats:** half and snorm vertex positions.
 - **Hot reload:** per-pass include sets from Slang's module dependencies, for reloads and for
   exact `rerun-if-changed` (which would also catch imports outside the given directories).
 - **Lifecycle:** `lava::shutdown()` that waits, drains epochs, destroys everything and allows
@@ -545,8 +580,7 @@ Small things, by file; none changes behaviour.
   `!= ptr::null()`, `clone()` on `Location`, a single-range `vec!` (`bindless.rs:538`, intended),
   a useless `format!` (`codegen.rs:511`), missing `# Safety` docs (`vk.rs`) and non-const
   thread-locals. Only one warning reaches `cargo check`: the deprecated `fetch_update`
-  (`image_state.rs:200`), whose `unwrap_or_else` is dead. Whether `AtomicU64::update` fits the
-  declared MSRV 1.96 is unchecked. `cargo fmt --check` reports diffs across lava and lava-tests.
+  (`image_state.rs:200`), whose `unwrap_or_else` is dead. `cargo fmt --check` reports diffs across lava and lava-tests.
 - **Manifests:** lava's `tracing-subscriber` and lava-tests' `smallvec` dev-dependencies are
   unused; glam's `mint` feature is used by nothing in the workspace; lava-build-slang's
   dev-dependency on lava has no version, so its packaged test won't compile; `quote`/`syn` aren't
@@ -588,21 +622,16 @@ Small things, by file; none changes behaviour.
   `query/mod.rs:385`); the `STATE.set` error path is unreachable (`:497-506`); the printf
   detection splits into a `Vec` and drops separators (`:552-564`). `physical_device.rs`: unused
   `PartialEq for QueueFamily`, `num_queues` duplicating `handel.queue_count`, and init-only data
-  kept for the program's lifetime, including the never-read `mem_properties`.
+  kept for the program's lifetime.
 - **images:** `from_raw(DEPTH.as_raw() | STENCIL.as_raw())` and casts of values already `u32`
-  (`format.rs:187-210`); `DepthSplit` with a wrong format fails after the image is allocated, and
-  `PerMip` with one mip makes duplicate views (`image/mod.rs:461-464`); imports at the bottom of
-  `image/mod.rs` under two cfg combinations (`:638-648`); `set.index_mut(&mut ..)` used to read
-  (`:604`, `bindless.rs:50-55`); `Dim::Offset` is signed though blit boxes must now lie inside
-  the mip (`dim.rs:11`); `region_fits` duplicates `check_box` (`dim.rs:66-104`); the
-  depth-copy-needs-graphics assert is unreachable (`image/slice.rs:545-551`); `Copy + Pod`;
+  (`format.rs:187-210`); `PerMip` with one mip makes duplicate views (`image/mod.rs:461-464`); imports at the bottom of
+  `image/mod.rs` under two cfg combinations (`:638-648`); `Dim::Offset` is signed though blit boxes must now lie inside
+  the mip (`dim.rs:11`); `region_fits` duplicates `check_box` (`dim.rs:66-104`); `Copy + Pod`;
   `subresource_layers` takes a parameter that is always `mip_range.start`; `check_copy_size`
   lacks `#[track_caller]`.
-- **buffers and bindless:** `Unknown`, `ShaderBindingTable` and `AccelerationStructureStorage`
-  repeat the `usages!` body (`buffer/usage.rs:23-63`); `iter::empty()` and `std::iter::empty()`
+- **buffers:** `iter::empty()` and `std::iter::empty()`
   mixed, `BufferAccess` built by hand beside `slice.access(..)`, `.cloned()` for `.copied()`
-  (`slice.rs:192-278`); `use crate::vk::{self}`; `Bindless::bind` takes a `Copy` handle by
-  reference (`bindless.rs:553`).
+  (`slice.rs:192-278`); `use crate::vk::{self}`.
 - **queues, present, queries:** `begin` polls its index three times (`timeline.rs:245-250`); the
   replay lacks `ONE_TIME_SUBMIT` (`:406-409`); `MAX_TIMELINES` also caps queues per family
   (`queue/mod.rs:10-11`); `Current` is `pub(crate)` but module-local (`present.rs:138-145`); a
@@ -642,16 +671,15 @@ with this survey. Still wrong:
   pass's barriers, but `compute`, `raytrace` and renderings flush the barriers before
   `rec.enter` (`command_buffer/mod.rs:640-696, 929-939, 994-1002`), so scope timestamps and debug
   labels exclude them. Change the code or the docs, whichever is meant.
-- **Item docs:** `format.rs:124-125` says `bindless::bind` checks `Dynamic`'s single aspect for
-  every bind; `PassEntry.index`'s doc is wrong for raster passes (`pipeline.rs:96-101`);
+- **Item docs:** `PassEntry.index`'s doc is wrong for raster passes (`pipeline.rs:96-101`);
   `pipeline.rs:29` names a missing `BindingOutput::pass()`; the 16-pipeline warning always blames
   constants, though raster keys grow too (`:499-507`); the `update` doc of acceleration structures
   says primitive counts where the whole shape must match (`:743-745`); `wait_idle`'s doc omits that
   it reclaims; `Config::validation`'s omits that it enables printf; `ray_tracing.slang`'s
   `__init` truncates out-of-range fields silently, where Rust asserts; `SCONST` splits on
   commas, so generic images need an alias; `Img.Load` reads mip 0 and a null index is undefined;
-  `Filter`, `range`, `byte_range`, `memory_report`, `blocks` and several `Features` items have
-  no docs.
+  `memory_report`, `blocks` and several `Features` items have no docs; `bindless.slang`'s `Accel`
+  doc names a missing `BindingOutput::acceleration_structure_read`.
 - **Tests:** `ray_scene.slang:2` and `test_write_instances.slang:2` name `gpu_headless.rs`, but the
   scene lives in `gpu_ray_tracing.rs`; `gpu_missing_features.rs:125` swaps near and far.
 - **Generated context:** the tools generator lists `pub fn` lines inside codegen's raw-string
@@ -676,8 +704,7 @@ with this survey. Still wrong:
 
 ### Tests that fail or skip wrongly
 - The `!host_image_copy` branches at `gpu_headless.rs:1305-1316, 1340-1350` can't run: the image
-  creation before them unwraps the `MissingFeature`. Their comment about host-visible memory is
-  wrong.
+  creation before them unwraps the `MissingFeature`. 
 - `volumes_are_uploaded_sampled_and_copied` (`:2489-2494`) fails without host image copy, though
   only its last part needs it; `:2555-2568` creates a BC7 image without checking `bc_compression`
   and returns silently.
@@ -701,50 +728,43 @@ with this survey. Still wrong:
 - `gpu()` discards errors gathered before its lock, including those of `lava::init`, and an init
   panic poisons the `LazyLock`, so every later test fails with "poisoned".
 - `LAVA_BLESS=0` blesses too (`golden.rs`); goldens shared by two tests or binaries are rewritten
-  by whichever runs last and race between binaries. CLAUDE.md's bless command misses
-  `gpu_ray_tracing`'s goldens.
+  by whichever runs last and race between binaries.
 - The recording bench times only the closure (`benches/recording.rs:185-191`): the end barrier,
   pending merge, `vkEndCommandBuffer` and the submit are outside, where STATE's unexplained 7%
-  may live. Its buffers are uninitialised, `begin()` throttles on GPU time, and each scenario
-  runs once.
+  may live. Its buffers are uninitialised, `begin()` throttles on GPU time, and scenarios
+  run one after another, not interleaved.
 
 ### Coverage gaps
 Each was checked by grep over lava-tests and `lava/src/tests.rs`.
-- **Barriers:** a transition triggered by a read followed by a read at another stage (bug 17);
-  partial release of a `MipChain`; two timelines of one family sharing an image; the fold into
-  `EVERY_BUFFER` above 64 writes; `forget` on destruction; the `ATTACHMENT_OPTIMAL` vs `GENERAL`
-  choice; `make_visible` merging; the swapchain's acquire wait stage; `take_host_layouts`.
+- **Barriers:** two timelines of one family sharing an image; `forget` on destruction; the
+  `ATTACHMENT_OPTIMAL` vs `GENERAL` choice (only through the validation layer); `make_visible` merging; the swapchain's acquire wait stage; `take_host_layouts`.
 - **Runtime-typed resources:** `format::Dynamic`, `usage::Dynamic`, `with_params`, the
   `aspect_check`/`texel_check`/`usage_check` panics,
   the clear-value assert and `cast_check`. Pure parts (`expected_data_len`, `mip_extent`,
   `region_fits`, `cast_check`, the format table's sizes) could be unit tests.
 - **Images:** `DepthSplitMips`, 64-bit and unusual clears, linear blits on formats without linear
   filtering.
-- **Draws:** multi-command indirect draws (bug 38); resources reached only through `Accesses`
-  (`DynImg`, `ImageUse::sampled_read`, only in the bench); attachments reached through accesses;
+- **Draws:** `Draw::indirect` with several commands (bug 38); attachments reached through accesses;
   a draw reading an attachment of its own rendering.
 - **Raster state:** depth bias, clamp and clip, conservative raster, provoking vertex, line
   width/mode/stipple, depth bounds, blend constants, any topology but `LINE_LIST`. `RasterKeyRef`
   hashing like `RasterKey` and `Baked::of` are pure and could be unit tests.
 - **Pipelines:** raster or ray tracing passes with specialization constants, mesh passes with a
   task shader, `pipeline::reload_pass` (swap, refusal, retirement).
-- **Slang shapes:** `MutTex2D`, `Image2D`, `DynImg`, handles or `Accel` inside structs behind a
+- **Slang shapes:** `Image2D`, handles or `Accel` inside structs behind a
   `Buf`; struct merging, padding and naming in codegen; the hand-copied constants
   (`MAX_PUSH_CONSTANTS_SIZE`, the clock constants) against lava and `profile.slang`.
-- **Bindless:** `OutOfBindlessSlots`, `Ranges::give`'s double-free panic, `bind` refusing an
-  unreserved or dropped slot.
+- **Bindless:** `OutOfBindlessSlots`, `Ranges::give`'s double-free panic.
 - **Features:** `Features::consistent`, `without`/`missing_from`, `extensions()` agreeing with
   `optional()`, the cargo names in `SPIRV_CAPABILITIES`; the disabled ray tracing and
   performance paths in `gpu_missing_features`.
 - **Lifetimes and timelines:** `latest_stamp`, `Stamp::is_done`, slot reuse, a timeline dropped
-  after `reserve`, two `wait_for`s on one timeline, stages other than `Transfer`, `wait_for` on
-  non-graphics timelines.
+  after `reserve`, two `wait_for`s on one timeline, stages other than `Transfer`.
 - **Queries:** the pool-reuse panic, `QueryRecorder` misuse, `instant()` on a device that has
   it, `memory_report` with the budget.
 - **Commands and families:** `flush_all`; transfer-family alignment and granularity;
   acceleration structure transforms, `Instance::flags`, building from a different geometry.
-- **Presenting:** dropping a surface with a current image, the format fallback, the "must
-  present it" panic.
+- **Presenting:** dropping a surface with a current image, the format fallback.
 - **Host access:** `host_ptr`; `Shared` memory where the device lacks `rebar` (only its error).
 - **Validation:** GPU-assisted validation is never on, so bindless indices, layouts and buffer
   address bounds go unchecked. `unsized_struct!`'s test needs no GPU and could run under Miri
@@ -759,16 +779,12 @@ Engine-side findings that don't belong to lava's code but came up in this survey
   redundant (`core/Cargo.toml:66-70`).
 - `dynamic-blend` lets no draws share a pipeline, since every pass has one blend set
   *(plausible)*.
-- The UI index buffer is `StorageIndex` though shaders never read it as storage
-  (`ui/mod.rs:381`); the swapchain and viewport target carry `TransferDst` without use
-  *(plausible)*.
+- The swapchain and viewport target carry `TransferDst` without use (`render/render.rs:122`).
 - `!Ctx::features().shader_clock` can't be true under `profiling` (`profiler/clock.rs:22`).
 - Validation is derived from `debug_assertions` in two styles (`render/headless.rs:40`,
   `render/mod.rs:263-268`).
 - Unused imports of lava internals (`render/world.rs:21-42`), and a CPU mip size computed through
   `<D2 as Dim>::mip_extent` (`assets/texture.rs:420`).
-- `Material`'s `alpha_cutoff` is read per instance per frame from write-combined memory
-  (`render/world.rs:138`).
 - Engine docs say `core/build.rs` calls `.optimization(..)`; it doesn't.
 
 ---
@@ -777,7 +793,7 @@ Engine-side findings that don't belong to lava's code but came up in this survey
 
 1. **Fix the soundness bugs:** host access (16), the undefined behaviour from safe code (23-37),
    and the hot reload's layout hash (85).
-2. **Fix the barrier tracking (17-22)** and the valid-usage bugs every device hits: multi-draw
+2. **Fix the barrier tracking (22)** and the valid-usage bugs every device hits: multi-draw
    indirect (38), the depth bias clamp (39), line topologies without extended dynamic state (40),
    depth clamp (41).
 3. **Fix the timeline and presenting hangs and leaks (64-84).**

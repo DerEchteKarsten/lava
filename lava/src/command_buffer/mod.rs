@@ -19,7 +19,7 @@ use crate::{
         Occlusion, QueryKind, QueryPool, QueryRecorder, ScopeInfo, ScopeObserver, Scoped, Timestamp,
     },
     queue::{FamilyInfo, HasCompute, HasGraphics, Kind, QueueKind},
-    state::{Ctx, Functions, debug_name},
+    state::{Ctx, Functions, with_debug_name},
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{I64Vec2, IVec2, UVec2};
@@ -34,7 +34,7 @@ pub(crate) mod pending;
 mod raster_state;
 use crate::unsized_struct::unsized_struct;
 pub use binding_output::{BindingOutput, Bindings, kind};
-use image_state::{check_states, release_states, released_by, take_checked_states};
+use image_state::{ImageState, check_states, release_states, released_by, take_checked_states};
 use pending::{PendingAccesses, all_read_access, all_write_access};
 pub use raster_state::*;
 
@@ -76,23 +76,48 @@ impl BufferAccess {
     }
 }
 
+/// What a command does to mips of an image, and the layout it needs them in.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ImageAccess {
-    pub stage: vk::PipelineStageFlags2,
-    pub access: vk::AccessFlags2,
-    pub image: vk::Image,
-    pub layout: vk::ImageLayout,
-    pub aspect: vk::ImageAspectFlags,
-    pub mip_range: Range<u32>,
+pub(crate) struct ImageAccess {
+    pub(crate) stage: vk::PipelineStageFlags2,
+    pub(crate) access: vk::AccessFlags2,
+    pub(crate) image: vk::Image,
+    pub(crate) layout: vk::ImageLayout,
+    pub(crate) aspect: vk::ImageAspectFlags,
+    pub(crate) mip_range: Range<u32>,
 }
 
 /// An image access with the tracked states of its mips, which only move when the command is
-/// recorded. Made by `ImageView::access`.
+/// recorded. Made by `ImageView::access` (shaders' accesses, always in `GENERAL`) and the
+/// constructors of `Accesses`; lava alone picks other layouts, so the tracking stays true.
 #[derive(Debug, Clone)]
 pub struct ImageUse<'a> {
-    pub access: ImageAccess,
+    pub(crate) access: ImageAccess,
     /// The image's tracked states: one for all its mips, or one per mip of the image.
     pub(crate) states: &'a [AtomicU64],
+}
+
+impl ImageUse<'_> {
+    pub fn image(&self) -> vk::Image {
+        self.access.image
+    }
+
+    pub fn stage(&self) -> vk::PipelineStageFlags2 {
+        self.access.stage
+    }
+
+    pub fn access(&self) -> vk::AccessFlags2 {
+        self.access.access
+    }
+
+    /// The layout the command wants the mips in.
+    pub fn layout(&self) -> vk::ImageLayout {
+        self.access.layout
+    }
+
+    pub fn mip_range(&self) -> Range<u32> {
+        self.access.mip_range
+    }
 }
 
 pub(crate) struct Recording<'p> {
@@ -163,17 +188,51 @@ pub struct RasterBuilder<'a, 'p, const N: usize> {
     /// Only a read; `record` adds the write.
     depth_access: Option<ImageUse<'a>>,
     clear_depth: Option<vk::ClearValue>,
+    depth_discard: Discard,
     draws: SmallVec<[NonNull<DrawOutput<'static>>; INLINE_DRAWS]>,
     marker: PhantomData<&'a DrawOutput<'a>>,
 }
 
-/// A color attachment of a rendering, cleared to `clear` first unless that is `None`.
+/// A color attachment of a rendering, cleared to `clear` first unless that is `None`, else
+/// loaded, and stored after the draws; [`Self::discard_before`] and [`Self::discard_after`]
+/// skip the load and the store.
 pub struct Attachment<'a> {
     format: vk::Format,
     view: vk::ImageView,
     extent: UVec2,
     clear: Option<vk::ClearValue>,
+    discard: Discard,
     access: ImageUse<'a>,
+}
+
+/// The contents a rendering drops of an attachment: `before` loads nothing (`DONT_CARE`, for
+/// an attachment the draws cover wherever it is read later), `after` stores nothing
+/// (`DONT_CARE`, for one only the rendering itself reads, like a depth buffer of one pass).
+/// Either leaves the texels of the render area undefined, which costs tiled GPUs no memory
+/// traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Discard {
+    before: bool,
+    after: bool,
+}
+
+impl Discard {
+    fn load_op(self, clear: Option<vk::ClearValue>) -> vk::AttachmentLoadOp {
+        match (clear, self.before) {
+            (Some(_), _) => vk::AttachmentLoadOp::CLEAR,
+            (None, true) => vk::AttachmentLoadOp::DONT_CARE,
+            (None, false) => vk::AttachmentLoadOp::LOAD,
+        }
+    }
+
+    #[track_caller]
+    fn before(&mut self, clear: Option<vk::ClearValue>) {
+        assert!(
+            clear.is_none(),
+            "a cleared attachment loads nothing anyway: `discard_before` is for one that isn't"
+        );
+        self.before = true;
+    }
 }
 
 impl<'a> Attachment<'a> {
@@ -186,7 +245,7 @@ impl<'a> Attachment<'a> {
         image.aspect_check(vk::ImageAspectFlags::COLOR);
         image.usage_check(vk::ImageUsageFlags::COLOR_ATTACHMENT);
         one_mip(image.mip_range);
-        let access = image.access(
+        let access = image.access_in(
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
                 | if clear.is_none() {
@@ -202,7 +261,32 @@ impl<'a> Attachment<'a> {
             view: image.view,
             extent: image.extent,
             clear: clear.map(|e| image.format().clear_value(e).into()),
+            discard: Discard::default(),
             access,
+        }
+    }
+
+    /// Doesn't load the attachment (`DONT_CARE`): the texels of the render area are undefined
+    /// until the draws write them. Panics for a cleared attachment, which loads nothing.
+    #[track_caller]
+    pub fn discard_before(mut self) -> Self {
+        self.discard.before(self.clear);
+        // A `DONT_CARE` load writes.
+        self.access.access.access &= !vk::AccessFlags2::COLOR_ATTACHMENT_READ;
+        self
+    }
+
+    /// Doesn't store the attachment (`DONT_CARE`): its texels in the render area are undefined
+    /// after the rendering, whose draws can still blend with them.
+    pub fn discard_after(mut self) -> Self {
+        self.discard.after = true;
+        self
+    }
+
+    fn store_op(&self) -> vk::AttachmentStoreOp {
+        match self.discard.after {
+            true => vk::AttachmentStoreOp::DONT_CARE,
+            false => vk::AttachmentStoreOp::STORE,
         }
     }
 }
@@ -226,6 +310,8 @@ unsized_struct! {
     /// A draw as a rendering borrows it, unsized.
     pub struct DrawOutput {
         bindings: &'a BindingOutput<'a, ()>,
+        /// The pass's shader stages (`PassKind::stages`), where its declared accesses happen.
+        stages: vk::PipelineStageFlags2,
         command: DrawCommand,
         state: RasterState<0>,
         samples: Option<(&'a QueryPool<Occlusion>, u32)>,
@@ -239,12 +325,12 @@ unsized_struct! {
 
 impl<'a> DrawOutput<'a> {
     fn image_accesses(&self) -> impl Iterator<Item = ImageUse<'a>> + Clone {
-        let (declared, _) = declared(self.accesses, RASTER_SHADERS);
+        let (declared, _) = declared(self.accesses, self.stages);
         self.bindings.sections().images().chain(declared)
     }
 
     fn buffer_accesses(&self) -> impl Iterator<Item = BufferAccess> + Clone + '_ {
-        let (_, declared) = declared(self.accesses, RASTER_SHADERS);
+        let (_, declared) = declared(self.accesses, self.stages);
         (self.bindings.sections().buffers())
             .chain(self.extra().iter().cloned())
             .chain(declared)
@@ -295,14 +381,10 @@ fn check_hazards<'a>(name: &str, draws: impl Iterator<Item = &'a DrawOutput<'a>>
     }
 }
 
-const RASTER_SHADERS: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
-    vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS.as_raw()
-        | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw(),
-);
-
 impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
     fn with(
         bindings: &'a BindingOutput<'a, ()>,
+        stages: vk::PipelineStageFlags2,
         command: DrawCommand,
         extra: [BufferAccess; E],
         state: RasterState<N>,
@@ -311,6 +393,7 @@ impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
         let (state, blends, write_masks) = state.split();
         Self::from_parts(
             bindings,
+            stages,
             command,
             state,
             None,
@@ -345,7 +428,14 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
             vertices,
             instances,
         };
-        Self::with(bindings.erase(), command, [], state, accesses)
+        Self::with(
+            bindings.erase(),
+            kind::RasterVertex::STAGES,
+            command,
+            [],
+            state,
+            accesses,
+        )
     }
 
     /// Launches `groups` task (or, without a task shader, mesh) workgroups.
@@ -378,6 +468,7 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         check_groups(groups, max, total as u64, stage);
         Self::with(
             bindings.erase(),
+            kind::RasterMesh::STAGES,
             DrawCommand::Launch(groups),
             [],
             state,
@@ -404,7 +495,14 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
             count: index_buffer.len() as u32,
             instances,
         };
-        Self::with(bindings.erase(), command, [index_access], state, accesses)
+        Self::with(
+            bindings.erase(),
+            kind::RasterVertex::STAGES,
+            command,
+            [index_access],
+            state,
+            accesses,
+        )
     }
 
     pub fn indirect(
@@ -420,6 +518,7 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         };
         Self::with(
             bindings.erase(),
+            kind::RasterVertex::STAGES,
             command,
             [indirect_access(buffer)],
             state,
@@ -442,6 +541,7 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         };
         Self::with(
             bindings.erase(),
+            kind::RasterMesh::STAGES,
             command,
             [indirect_access(buffer)],
             state,
@@ -466,7 +566,14 @@ impl<'a, const N: usize> Draw<'a, N, 2> {
             count_flags: count_buffer.address_flags(),
             max_count: buffer.len() as u32,
         };
-        Self::with(bindings.erase(), command, extra, state, accesses)
+        Self::with(
+            bindings.erase(),
+            kind::RasterVertex::STAGES,
+            command,
+            extra,
+            state,
+            accesses,
+        )
     }
 }
 
@@ -577,17 +684,37 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         fits(self.extent, image.extent, "depth");
         let format = image.format();
         self.depth_format = format.vk_format();
-        if format.aspects().contains(vk::ImageAspectFlags::STENCIL) {
-            self.stencil_format = format.vk_format();
-        }
+        self.stencil_format = match format.aspects().contains(vk::ImageAspectFlags::STENCIL) {
+            true => format.vk_format(),
+            false => vk::Format::UNDEFINED,
+        };
         self.depth_attachment = image.view;
         self.clear_depth = clear.map(|e| format.clear_value(e).into());
-        self.depth_access = Some(image.access(
+        self.depth_discard = Discard::default();
+        self.depth_access = Some(image.access_in(
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
             vk::ImageLayout::ATTACHMENT_OPTIMAL,
         ));
+        self
+    }
+
+    /// Doesn't load the depth attachment (`DONT_CARE`), like [`Attachment::discard_before`].
+    /// Panics without a depth attachment or for a cleared one.
+    #[track_caller]
+    pub fn discard_depth_before(&mut self) -> &mut Self {
+        assert!(self.depth_access.is_some(), "`discard_depth_before` needs a `depth_attachment`");
+        self.depth_discard.before(self.clear_depth);
+        self
+    }
+
+    /// Doesn't store the depth attachment (`DONT_CARE`), like [`Attachment::discard_after`]:
+    /// for a depth buffer only this rendering tests against. Panics without a depth attachment.
+    #[track_caller]
+    pub fn discard_depth_after(&mut self) -> &mut Self {
+        assert!(self.depth_access.is_some(), "`discard_depth_after` needs a `depth_attachment`");
+        self.depth_discard.after = true;
         self
     }
 
@@ -628,13 +755,17 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     #[validation_trace]
     pub fn record(&mut self, name: &'static str) {
         let _span = tracing::info_span!("draw", pass = name).entered();
-        // One image can't be in two layouts in one rendering, so an attachment a draw also reads
-        // is rendered in `GENERAL`, its descriptor's layout.
+        // One mip can't be in two layouts in one rendering, so an attachment whose mip a draw
+        // also accesses is rendered in `GENERAL`, its descriptor's layout.
         let in_layout = |mut access: ImageUse<'a>| {
-            let image = access.access.image;
-            if iter_draws(&self.draws)
-                .any(|draw| draw.image_accesses().any(|i| i.access.image == image))
-            {
+            let a = &access.access;
+            let overlaps = |i: ImageUse| {
+                let mips = i.access.mip_range;
+                i.access.image == a.image
+                    && mips.start < a.mip_range.end
+                    && a.mip_range.start < mips.end
+            };
+            if iter_draws(&self.draws).any(|draw| draw.image_accesses().any(overlaps)) {
                 access.access.layout = vk::ImageLayout::GENERAL;
             }
             access
@@ -644,7 +775,9 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             let writes = |d: &DrawOutput| {
                 (d.state.depth_test.is_some() && d.state.depth_write) || d.state.stencil.is_some()
             };
-            if self.clear_depth.is_some() || iter_draws(&self.draws).any(writes) {
+            // `DONT_CARE` loads and stores write too.
+            let discards = self.depth_discard.before || self.depth_discard.after;
+            if self.clear_depth.is_some() || discards || iter_draws(&self.draws).any(writes) {
                 depth.access.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
             }
             in_layout(depth)
@@ -662,16 +795,12 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
 
         let mut color_layouts = color_accesses.iter().map(|access| access.access.layout);
         let color_attachments = self.color.each_ref().map(|color| {
-            let ret = vk::RenderingAttachmentInfo::default()
+            vk::RenderingAttachmentInfo::default()
                 .image_layout(color_layouts.next().expect("a layout per attachment"))
                 .image_view(color.view)
-                .store_op(vk::AttachmentStoreOp::STORE);
-            if let Some(clear_value) = color.clear {
-                ret.clear_value(clear_value)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-            } else {
-                ret.load_op(vk::AttachmentLoadOp::LOAD)
-            }
+                .load_op(color.discard.load_op(color.clear))
+                .store_op(color.store_op())
+                .clear_value(color.clear.unwrap_or_default())
         });
         let mut rendering_info = vk::RenderingInfo::default()
             .color_attachments(&color_attachments)
@@ -679,26 +808,23 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             .render_area(rect(IVec2::ZERO, self.extent))
             .view_mask(0);
 
-        let mut depth_info;
+        let depth_info;
         if let Some(depth) = &depth_access {
             let written = depth
                 .access
                 .access
                 .contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            let store_op = match (self.depth_discard.after, written) {
+                (true, _) => vk::AttachmentStoreOp::DONT_CARE,
+                (false, true) => vk::AttachmentStoreOp::STORE,
+                (false, false) => vk::AttachmentStoreOp::NONE,
+            };
             depth_info = vk::RenderingAttachmentInfo::default()
                 .image_layout(depth.access.layout)
                 .image_view(self.depth_attachment)
-                .store_op(if written {
-                    vk::AttachmentStoreOp::STORE
-                } else {
-                    vk::AttachmentStoreOp::NONE
-                })
-                .load_op(vk::AttachmentLoadOp::LOAD);
-            if let Some(clear_value) = self.clear_depth {
-                depth_info = depth_info
-                    .clear_value(clear_value)
-                    .load_op(vk::AttachmentLoadOp::CLEAR);
-            }
+                .load_op(self.depth_discard.load_op(self.clear_depth))
+                .store_op(store_op)
+                .clear_value(self.clear_depth.unwrap_or_default());
             rendering_info = rendering_info.depth_attachment(&depth_info);
             if self.stencil_format != vk::Format::UNDEFINED {
                 rendering_info = rendering_info.stencil_attachment(&depth_info);
@@ -923,6 +1049,7 @@ impl<'p, K: HasGraphics> CommandBuffer<'p, K> {
             depth_attachment: vk::ImageView::null(),
             depth_access: None,
             clear_depth: None,
+            depth_discard: Discard::default(),
             draws: SmallVec::new(),
             marker: PhantomData,
         }
@@ -940,7 +1067,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("compute", pass = pass.name).entered();
-        let (images, buffers) = declared(accesses, vk::PipelineStageFlags2::COMPUTE_SHADER);
+        let (images, buffers) = declared(accesses, pass.kind.stages());
         let rec = &mut self.rec;
         rec.flush_pending(
             sections.images().chain(images),
@@ -1004,8 +1131,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
-        let stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
-        let (images, buffers) = declared(accesses, stage);
+        let (images, buffers) = declared(accesses, pass.kind.stages());
         let rec = &mut self.rec;
         rec.flush_pending(
             sections.images().chain(images),
@@ -1189,7 +1315,7 @@ impl Recording<'_> {
         // It waits for this timeline's accesses of the image; the acquire waits for it through
         // the semaphore its submission signals.
         let pending = &self.pending_accesses;
-        let tracked = (pending.image_reads.iter())
+        let tracked = (pending.image_reads.iter().map(|r| &r.read))
             .chain(pending.image_writes.iter().map(|w| &w.write))
             .filter(|a| a.image == image);
         let (mut stage, mut access) = (S2::NONE, vk::AccessFlags2::NONE);
@@ -1313,7 +1439,7 @@ impl<'p> Recording<'p> {
         );
         if let Some(barriers) = barriers {
             self.acquired.extend_from_slice(&barriers.acquired);
-            self.pending_accesses.made_visible(&barriers);
+            self.pending_accesses.made_visible(&barriers, self.value);
             self.barrier_log.push(barriers);
             let barriers = self.barrier_log.last().expect("just pushed");
             self.pipeline_barrier(barriers);
@@ -1328,9 +1454,10 @@ impl<'p> Recording<'p> {
 
     fn enter(&mut self, name: &'static str, pass: bool) {
         if let Some(debug_utils) = Functions::debug_utils() {
-            let name = debug_name(name);
-            let label = vk::DebugUtilsLabelEXT::default().label_name(&name);
-            unsafe { debug_utils.cmd_begin_debug_utils_label(self.handle, &label) };
+            with_debug_name(name, |name| {
+                let label = vk::DebugUtilsLabelEXT::default().label_name(name);
+                unsafe { debug_utils.cmd_begin_debug_utils_label(self.handle, &label) };
+            });
         }
         if let Some(mut observer) = self.observer {
             let scope = ScopeInfo {
@@ -1409,13 +1536,16 @@ impl<'p> Recording<'p> {
     }
 }
 
+const INLINE_BARRIERS: usize = 8;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Barriers {
     /// Acquired swapchain images with the stages that wait for their acquire.
     pub(crate) acquired: SmallVec<[(vk::Image, vk::PipelineStageFlags2); 1]>,
-    pub(crate) acquires: SmallVec<[vk::ImageMemoryBarrier2<'static>; 1]>,
+    pub(crate) acquires: SmallVec<[vk::ImageMemoryBarrier2<'static>; 2]>,
     pub(crate) memory: Option<vk::MemoryBarrier2<'static>>,
-    pub(crate) images: SmallVec<[vk::ImageMemoryBarrier2<'static>; 1]>,
+    /// A rendering transitions all its attachments and the images its draws read at once.
+    pub(crate) images: SmallVec<[vk::ImageMemoryBarrier2<'static>; INLINE_BARRIERS]>,
 }
 
 /// The resources a pass reaches without naming them in its bindings (through a bindless handle
@@ -1471,11 +1601,7 @@ impl<'a> ImageUse<'a> {
     pub fn sampled_read(image: impl SampledView + 'a) -> Self {
         let image = image.view();
         image.usage_check(vk::ImageUsageFlags::SAMPLED);
-        image.access(
-            S2::NONE,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-            vk::ImageLayout::GENERAL,
-        )
+        image.access(S2::NONE, vk::AccessFlags2::SHADER_SAMPLED_READ)
     }
 
     /// The pass loads from `image` as a storage image (`Image2D`, or a `DynImg` without a
@@ -1483,11 +1609,7 @@ impl<'a> ImageUse<'a> {
     pub fn storage_read(image: impl StorageView + 'a) -> Self {
         let image = image.view();
         image.usage_check(vk::ImageUsageFlags::STORAGE);
-        image.access(
-            S2::NONE,
-            vk::AccessFlags2::SHADER_STORAGE_READ,
-            vk::ImageLayout::GENERAL,
-        )
+        image.access(S2::NONE, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
     /// The pass loads from and stores to `image` (`MutImage2D`).
@@ -1495,7 +1617,7 @@ impl<'a> ImageUse<'a> {
         let image = image.view();
         image.usage_check(vk::ImageUsageFlags::STORAGE);
         let access = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
-        image.access(S2::NONE, access, vk::ImageLayout::GENERAL)
+        image.access(S2::NONE, access)
     }
 }
 
@@ -1563,7 +1685,15 @@ pub(crate) fn compute_barriers<'a>(
         }
     }
 
-    for image_access in image_acceses.clone().map(|image| image.access) {
+    for image in image_acceses.clone() {
+        // The first access of an acquired swapchain image (which has one state) waits for the
+        // acquire's semaphore, which comes after every earlier access of it.
+        if let [state] = image.states
+            && ImageState::load(state).acquired
+        {
+            continue;
+        }
+        let image_access = image.access;
         let is_write = image_access.access.intersects(all_write_access());
         let is_read = image_access.access.intersects(all_read_access());
 
@@ -1599,7 +1729,7 @@ pub(crate) fn compute_barriers<'a>(
         check_states(image.states, image.access.mip_range, kind);
     }
     let all = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
-    let mut image_barriers: SmallVec<[vk::ImageMemoryBarrier2; 1]> = SmallVec::new();
+    let mut image_barriers: SmallVec<[vk::ImageMemoryBarrier2; INLINE_BARRIERS]> = SmallVec::new();
     let mut acquires = SmallVec::new();
     let mut acquired = SmallVec::new();
     for image in image_acceses {
@@ -1627,9 +1757,8 @@ pub(crate) fn compute_barriers<'a>(
                     to_stage
                 });
                 // Released to this family: the acquire half of the transfer.
-                if old.released_to == Some(kind)
-                    && let Some(owner) = old.owner
-                {
+                let acquire = old.released_to == Some(kind) && old.owner.is_some();
+                if acquire && let Some(owner) = old.owner {
                     acquires.push(
                         vk::ImageMemoryBarrier2::default()
                             .src_stage_mask(S2::NONE)
@@ -1647,10 +1776,11 @@ pub(crate) fn compute_barriers<'a>(
                 if old.layout == access.layout {
                     return;
                 }
-                // The transition waits for the image's tracked accesses. Without any, an earlier
-                // submission may still use it, so it waits for everything.
+                // The transition waits for the image's tracked accesses. Without any, a
+                // submission it waited for may still use it, so it waits for everything, unless
+                // no command ever accessed it.
                 let (mut src_stage, mut src_access) = (S2::NONE, vk::AccessFlags2::NONE);
-                for p in (pending.image_reads.iter())
+                for p in (pending.image_reads.iter().map(|r| &r.read))
                     .chain(pending.image_writes.iter().map(|w| &w.write))
                     .filter(|p| p.image == access.image)
                 {
@@ -1658,13 +1788,18 @@ pub(crate) fn compute_barriers<'a>(
                     src_access |= p.access;
                 }
                 let from_present = old.layout == vk::ImageLayout::PRESENT_SRC_KHR;
-                if src_stage.is_empty() || from_present {
+                let fresh = old == ImageState::UNDEFINED;
+                if !fresh && (src_stage.is_empty() || from_present) {
                     src_stage = S2::ALL_COMMANDS;
                     src_access = if from_present {
                         vk::AccessFlags2::NONE
                     } else {
                         all
                     };
+                }
+                // It comes after the acquire, a barrier call of its own, at its stages.
+                if acquire {
+                    src_stage |= to_stage;
                 }
                 // The semaphore wait chains with the transition at the stages it waits at.
                 if let Some(stage) = waited {

@@ -10,9 +10,9 @@ use crate::{
     buffer::staging::{Reservation, Ring, STAGING_ALIGN, Uploader},
     bindless::{Combined, HeapLayout, ImageHandle, Ranges, Sampled, Storage},
     command_buffer::{
-        BufferAccess, ImageAccess, ImageUse, compute_barriers,
+        Barriers, BufferAccess, EVERY_BUFFER, ImageAccess, ImageUse, compute_barriers,
         image_state::{ImageState, check_states, release_states, released_by, take_checked_states},
-        pending::PendingAccesses,
+        pending::{MAX_PENDING_BUFFER_WRITES, PendingAccesses},
     },
     features::{DeviceFacts, FeatureChain, Features},
     image::usage::{ImageUsage, StaticUsage, Usage, usage},
@@ -58,6 +58,12 @@ fn state(layout: L, owner: Option<Kind>) -> ImageState {
 
 /// An access of image `id` with its own tracked state, which starts as `old`.
 fn image(id: u64, stage: S, access: A, old: ImageState, layout: L) -> ImageUse<'static> {
+    let states = std::slice::from_ref(Box::leak(Box::new(old.atomic())));
+    image_use(id, states, stage, access, layout)
+}
+
+/// An access of mip 0 of image `id`, whose tracked states are `states`.
+fn image_use<'a>(id: u64, states: &'a [AtomicU64], stage: S, access: A, layout: L) -> ImageUse<'a> {
     ImageUse {
         access: ImageAccess {
             stage,
@@ -67,18 +73,23 @@ fn image(id: u64, stage: S, access: A, old: ImageState, layout: L) -> ImageUse<'
             aspect: vk::ImageAspectFlags::COLOR,
             mip_range: (0..1).into(),
         },
-        states: std::slice::from_ref(Box::leak(Box::new(old.atomic()))),
+        states,
     }
 }
 
 /// Records `images` and `buffers` after the barriers they need, like `Recording::flush_pending`.
-fn flush(pending: &mut PendingAccesses, images: &[ImageUse], buffers: &[BufferAccess]) -> Option<(S, A, usize)> {
+fn flush_barriers(pending: &mut PendingAccesses, images: &[ImageUse], buffers: &[BufferAccess]) -> Option<Barriers> {
     let barriers = compute_barriers(pending, &GRAPHICS, images.iter().cloned(), buffers.iter().cloned());
     if let Some(barriers) = &barriers {
-        pending.made_visible(barriers);
+        pending.made_visible(barriers, 1);
     }
-    pending.record(0, images.iter().map(|i| i.access.clone()), buffers.iter().cloned());
-    barriers.map(|b| {
+    pending.record(1, images.iter().map(|i| i.access.clone()), buffers.iter().cloned());
+    barriers
+}
+
+/// `flush_barriers`' memory barrier's source and its number of image barriers.
+fn flush(pending: &mut PendingAccesses, images: &[ImageUse], buffers: &[BufferAccess]) -> Option<(S, A, usize)> {
+    flush_barriers(pending, images, buffers).map(|b| {
         let memory = b.memory.map_or((S::NONE, A::NONE), |m| (m.src_stage_mask, m.src_access_mask));
         (memory.0, memory.1, b.images.len())
     })
@@ -185,6 +196,111 @@ fn releasing_one_mip_keeps_the_others() {
     assert!(!released_by(&states, Kind::Graphics), "mip 0 is still owned");
     release_states(&states, (0..1).into(), Kind::Graphics, Kind::Transfer, |_, _| {});
     assert!(released_by(&states, Kind::Graphics), "mip 2 is unowned, the others released");
+}
+
+/// A layout transition is the image's latest write, at its barrier's destination: a later read
+/// at another stage waits for that stage, which chains after the transition, not for the
+/// attachment write before it.
+#[test]
+fn transitions_are_writes_at_their_destination() {
+    let states = [ImageState::UNDEFINED.atomic()];
+    let at = |stage, access, layout| image_use(1, &states, stage, access, layout);
+    let mut pending = PendingAccesses::default();
+    let target = at(S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE, L::ATTACHMENT_OPTIMAL);
+    flush(&mut pending, &[target], &[]);
+    let sampled = flush_barriers(&mut pending, &[at(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL)], &[]).unwrap();
+    let [transition] = sampled.images.as_slice() else { panic!("one transition") };
+    assert_eq!((transition.src_stage_mask, transition.dst_stage_mask), (S::COLOR_ATTACHMENT_OUTPUT, S::FRAGMENT_SHADER));
+    let [write] = pending.image_writes.as_slice() else { panic!("one write") };
+    assert_eq!((write.write.stage, write.write.access), (S::FRAGMENT_SHADER, A::NONE));
+    assert!(write.visible_to(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ));
+
+    let compute = flush_barriers(&mut pending, &[at(S::COMPUTE_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL)], &[]).unwrap();
+    let memory = compute.memory.expect("a memory barrier");
+    assert_eq!(memory.src_stage_mask, S::FRAGMENT_SHADER, "chains after the transition");
+    assert!(compute.images.is_empty());
+}
+
+/// An acquire is a write as well: a copy after an acquired image was sampled waits for it. A
+/// transition right after the acquire comes after the acquire's stages.
+#[test]
+fn acquires_are_writes_and_transitions_follow_them() {
+    let released = ImageState { released_to: Some(Kind::Graphics), ..state(L::GENERAL, Some(Kind::Compute)) };
+    let states = [released.atomic()];
+    let mut pending = PendingAccesses::default();
+    let sampled = flush_barriers(&mut pending, &[image_use(2, &states, S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ, L::GENERAL)], &[]).unwrap();
+    assert_eq!(sampled.acquires.len(), 1);
+    let copy = flush(&mut pending, &[image_use(2, &states, S::TRANSFER, A::TRANSFER_READ, L::GENERAL)], &[]);
+    assert_eq!(copy.map(|(stage, ..)| stage), Some(S::FRAGMENT_SHADER), "the copy waits for the acquire");
+
+    // A stale access of the image on this timeline doesn't stand in for the acquire.
+    let states = [released.atomic()];
+    let mut pending = PendingAccesses::default();
+    pending.record(1, iter::once(image_use(3, &states, S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE, L::GENERAL).access), iter::empty());
+    let target = image_use(3, &states, S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE, L::ATTACHMENT_OPTIMAL);
+    let barriers = flush_barriers(&mut pending, &[target], &[]).unwrap();
+    let ([acquire], [transition]) = (barriers.acquires.as_slice(), barriers.images.as_slice()) else { panic!("an acquire and a transition") };
+    assert!(transition.src_stage_mask.contains(acquire.dst_stage_mask));
+}
+
+/// The family that released an image can't use it any more: the receiver owns it now.
+#[test]
+fn a_released_image_is_the_receivers() {
+    let states = [state(L::GENERAL, Some(Kind::Graphics)).atomic()];
+    release_states(&states, (0..1).into(), Kind::Graphics, Kind::Compute, |_, _| {});
+    let panic = std::panic::catch_unwind(|| check_states(&states, (0..1).into(), Kind::Graphics)).unwrap_err();
+    let message = panic.downcast_ref::<String>().unwrap();
+    assert!(message.contains("released to the Compute family"), "{message}");
+    check_states(&states, (0..1).into(), Kind::Compute);
+}
+
+/// An image no command accessed has nothing to wait for; one with no tracked accesses may still
+/// be in use by a submission this one waited for; an acquired swapchain image waits for its
+/// semaphore, not for the accesses before its present.
+#[test]
+fn transitions_wait_only_for_what_can_still_run() {
+    let mut pending = PendingAccesses::default();
+    let fresh = flush_barriers(&mut pending, &[image(4, S::TRANSFER, A::TRANSFER_WRITE, ImageState::UNDEFINED, L::GENERAL)], &[]).unwrap();
+    assert_eq!((fresh.images[0].src_stage_mask, fresh.images[0].src_access_mask), (S::NONE, A::NONE));
+    assert!(fresh.memory.is_none());
+
+    let used = state(L::ATTACHMENT_OPTIMAL, Some(Kind::Graphics));
+    let old = flush_barriers(&mut pending, &[image(5, S::TRANSFER, A::TRANSFER_WRITE, used, L::GENERAL)], &[]).unwrap();
+    assert_eq!(old.images[0].src_stage_mask, S::ALL_COMMANDS);
+
+    let states = [state(L::GENERAL, Some(Kind::Graphics)).atomic()];
+    let target = |access| image_use(6, &states, S::COLOR_ATTACHMENT_OUTPUT, access, L::ATTACHMENT_OPTIMAL);
+    flush(&mut pending, &[target(A::COLOR_ATTACHMENT_WRITE)], &[]);
+    states[0].store(ImageState { acquired: true, ..ImageState::UNDEFINED }.pack(), std::sync::atomic::Ordering::Relaxed);
+    let acquired = flush_barriers(&mut pending, &[target(A::COLOR_ATTACHMENT_WRITE)], &[]).unwrap();
+    assert!(acquired.memory.is_none(), "the acquire's semaphore covers the last frame's writes");
+    assert_eq!(acquired.images[0].src_stage_mask, S::COLOR_ATTACHMENT_OUTPUT);
+    assert_eq!(acquired.acquired.len(), 1);
+}
+
+/// Image reads of completed submissions are dropped like buffer reads, and completed buffer
+/// writes fold into one of every buffer, which keeps the visibility all of them had.
+#[test]
+fn completed_accesses_retire_and_folds_keep_their_visibility() {
+    let mut pending = PendingAccesses::default();
+    let sampled = image(7, S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ, state(L::GENERAL, Some(Kind::Graphics)), L::GENERAL);
+    pending.record(3, iter::once(sampled.access), iter::empty());
+    pending.retire(2);
+    assert_eq!(pending.image_reads.len(), 1);
+    pending.retire(3);
+    assert!(pending.image_reads.is_empty());
+
+    let mut pending = PendingAccesses::default();
+    for i in 0..=MAX_PENDING_BUFFER_WRITES as u64 {
+        flush(&mut pending, &[], &[write(i * 16..i * 16 + 16)]);
+        flush(&mut pending, &[], &[read(i * 16..i * 16 + 16)]);
+    }
+    pending.retire(1);
+    let [every] = pending.buffer_writes.as_slice() else { panic!("one folded write") };
+    assert_eq!(every.write.range, EVERY_BUFFER);
+    assert!(every.visible_to(S::VERTEX_SHADER, A::SHADER_STORAGE_READ));
+    assert_eq!(flush(&mut pending, &[], &[read(0..16)]), None, "already visible");
+    assert!(flush(&mut pending, &[], &[buffer(S::TRANSFER, A::TRANSFER_READ, 0..16)]).is_some());
 }
 
 /// The ring hands out positions at its head: a reservation that doesn't fit before the tail

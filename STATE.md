@@ -75,7 +75,6 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 ## lava: bugs from the second survey (2026-10-18)
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
-- Layout transitions and queue family acquires aren't tracked as writes, so a later read at another stage isn't ordered after the transition (SURVEY 17).
 - Safe code reaches undefined behaviour: `Bindings::new` checks neither the pass kind nor the specialization constants' length (a `VkSpecializationInfo` with `dataSize` 0); `lava::destroy()` can run twice or before further use; `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 23-37).
 - `multiDrawIndirect`, `drawIndirectFirstInstance` and `depthBiasClamp` are never enabled, though `Draw::indirect` passes `buffer.len()` draws and `DepthBias::clamp` is public (38, 39).
 - Without extended dynamic state 3, line and point draws use a pipeline baked with `TRIANGLE_LIST` (`dynamicPrimitiveTopologyUnrestricted` is never queried) (40). `depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists (41). 64-bit clear values are packed as 32-bit (43).

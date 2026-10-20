@@ -1,4 +1,4 @@
-//! An image's tracked state, one `AtomicU64` per view or mip: its layout, the kind of queue family that owns it, the kind it was released to, and whether a swapchain image waits for its acquire; how recording an access takes it
+//! An image's tracked state, one `AtomicU64` per view or mip: its layout, the kind of queue family that owns it, the kind it was released to, and whether a swapchain image waits for its acquire; how recording an access checks and takes it (a released image is the receiver's only)
 use std::{
     range::Range,
     sync::atomic::{AtomicU64, Ordering},
@@ -89,18 +89,25 @@ pub(crate) fn released_by(states: &[AtomicU64], kind: Kind) -> bool {
 }
 
 /// Panics unless a recording of `kind` may access every mip of `mips`: nobody owns it, `kind`
-/// does, or its owner released it to `kind`.
+/// does and hasn't released it, or its owner released it to `kind`.
 #[track_caller]
 pub(crate) fn check_states(states: &[AtomicU64], mips: Range<u32>, kind: Kind) {
     for_each(states, mips, |state, _| {
         let state = ImageState::load(state);
-        if let Some(owner) = state.owner
-            && owner != kind
-            && state.released_to != Some(kind)
-        {
+        let Some(owner) = state.owner else { return };
+        if owner != kind && state.released_to != Some(kind) {
             panic!(
                 "an image the {owner:?} family owns is accessed on the {kind:?} family: record \
                  `cmd.release::<{kind:?}>(view)` on a {owner:?} timeline first, and wait for it"
+            );
+        }
+        if owner == kind
+            && let Some(to) = state.released_to
+        {
+            panic!(
+                "an image the {kind:?} family released to the {to:?} family is accessed on the \
+                 {kind:?} family: the {to:?} family's next access acquires it, so release it \
+                 back from there first (`cmd.release::<{kind:?}>(view)` on a {to:?} timeline)"
             );
         }
     });

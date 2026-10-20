@@ -1,4 +1,4 @@
-//! Pass bindings as generated code builds them (`Bindings`, sized by the pass) and as commands borrow them (`BindingOutput`, unsized, an `unsized_struct!`): the push constants, accesses and specialization constants of one pass
+//! Pass bindings as generated code builds them (`Bindings`, sized by the pass) and as commands borrow them (`BindingOutput`, unsized, an `unsized_struct!`): the push constants, accesses and specialization constants of one pass; and the pass kind markers with the stages their accesses happen in
 
 use bytemuck::{Pod, bytes_of};
 
@@ -6,12 +6,31 @@ use super::{BufferAccess, ImageUse};
 use crate::pipeline::MAX_PUSH_CONSTANTS_SIZE;
 use crate::unsized_struct::unsized_struct;
 
-/// The kind of pass a [`BindingOutput`] was made for, which decides how it can be recorded.
+/// The kind of pass a [`BindingOutput`] was made for, which decides how it can be recorded,
+/// and its shader stages (`STAGES`, also `PassKind::stages`), where the accesses of its
+/// bindings and of the `Accesses` its commands take happen.
 pub mod kind {
+    use crate::vk::PipelineStageFlags2 as S;
+
     pub struct Compute;
     pub struct RayTracing;
     pub struct RasterVertex;
     pub struct RasterMesh;
+
+    impl Compute {
+        pub const STAGES: S = S::COMPUTE_SHADER;
+    }
+    impl RayTracing {
+        pub const STAGES: S = S::RAY_TRACING_SHADER_KHR;
+    }
+    impl RasterVertex {
+        pub const STAGES: S = S::from_raw(S::VERTEX_SHADER.as_raw() | S::FRAGMENT_SHADER.as_raw());
+    }
+    impl RasterMesh {
+        pub const STAGES: S = S::from_raw(
+            S::TASK_SHADER_EXT.as_raw() | S::MESH_SHADER_EXT.as_raw() | S::FRAGMENT_SHADER.as_raw(),
+        );
+    }
 }
 
 unsized_struct! {

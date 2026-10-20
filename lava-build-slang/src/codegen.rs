@@ -407,9 +407,8 @@ fn build_new_fn<'a>(
                     3 => "vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE",
                     _ => "vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE",
                 };
-                out.image_accesses.push(format!(
-                    "{name}.access({stage}, {access}, vk::ImageLayout::GENERAL)"
-                ));
+                out.image_accesses
+                    .push(format!("{name}.access({stage}, {access})"));
             }
             FieldKind::Buffer => {
                 let ptr = t.field_by_index(0).unwrap().checked_type_layout().unwrap();
@@ -669,15 +668,12 @@ use lava::pipeline::*;
                     "entry points {other:?} in pass {pass_name} don't match any pass pattern"
                 ),
             };
+            // lava's stages for the kind, which the accesses of `Accesses` get too.
             let stage = match kind {
-                PassKind::Compute => "vk::PipelineStageFlags2::COMPUTE_SHADER",
-                PassKind::RayTracing => "vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR",
-                PassKind::RasterVertex => {
-                    "vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER"
-                }
-                PassKind::RasterMesh => {
-                    "vk::PipelineStageFlags2::TASK_SHADER_EXT | vk::PipelineStageFlags2::MESH_SHADER_EXT | vk::PipelineStageFlags2::FRAGMENT_SHADER"
-                }
+                PassKind::Compute => "kind::Compute::STAGES",
+                PassKind::RayTracing => "kind::RayTracing::STAGES",
+                PassKind::RasterVertex => "kind::RasterVertex::STAGES",
+                PassKind::RasterMesh => "kind::RasterMesh::STAGES",
             };
             let count = match (kind, !consts.is_empty()) {
                 (PassKind::Compute, false) => &mut pipelines.compute,
