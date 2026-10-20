@@ -1,13 +1,14 @@
-//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight, and the submission of their recordings (queued bindless rewrites first), with the snapshot of their submitted buffer writes that host access checks
+//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (queued bindless rewrites first), with the snapshot of their submitted buffer writes that host access checks
 use std::{
     fmt,
     marker::PhantomData,
     panic::AssertUnwindSafe,
     range::Range,
     sync::{
-        LazyLock, Mutex, OnceLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use crate::vk;
@@ -16,7 +17,7 @@ use smallvec::SmallVec;
 
 use crate::{
     bindless::Bindless,
-    buffer::upload::{self, StagingRing},
+    buffer::staging::{Staging, Uploader},
     command_buffer::{Barriers, CommandBuffer, Recording, pending::PendingAccesses},
     error::{Error, Result},
     lifetime,
@@ -36,6 +37,8 @@ pub(crate) struct Index {
     /// submitted, with their values: what host access checks (`Buffer::host`). A copy of
     /// `state`'s, so the check never waits for a recording.
     pub(crate) writes: Mutex<Vec<(Range<u64>, u64)>>,
+    /// The live timeline's staging ring, which dropped buffers and images forget their copies in.
+    pub(crate) staging: Mutex<Option<Arc<Staging>>>,
 }
 
 #[derive(Default)]
@@ -51,6 +54,7 @@ pub(crate) static INDICES: LazyLock<[Index; MAX_TIMELINES]> = LazyLock::new(|| {
         completed: AtomicU64::new(0),
         state: Mutex::default(),
         writes: Mutex::default(),
+        staging: Mutex::default(),
     })
 });
 
@@ -84,16 +88,26 @@ pub(crate) fn poll_all() {
 }
 
 pub(crate) fn wait_value(i: usize, value: u64) -> Result<()> {
+    wait_value_for(i, value, Duration::MAX).map(|_| ())
+}
+
+/// Waits up to `timeout` for `value` of timeline `i`; `false` when it ran out.
+pub(crate) fn wait_value_for(i: usize, value: u64, timeout: Duration) -> Result<bool> {
     if poll(i) >= value {
-        return Ok(());
+        return Ok(true);
     }
     let (semaphores, values) = ([semaphore(i)], [value]);
     let info = vk::SemaphoreWaitInfo::default()
         .semaphores(&semaphores)
         .values(&values);
-    unsafe { Ctx::device().wait_semaphores(&info, u64::MAX)? };
+    let timeout = timeout.as_nanos().min(u64::MAX as u128) as u64;
+    match unsafe { Ctx::device().wait_semaphores(&info, timeout) } {
+        Ok(()) => {}
+        Err(vk::Result::TIMEOUT) => return Ok(false),
+        Err(err) => return Err(err.into()),
+    }
     INDICES[i].completed.fetch_max(value, Ordering::AcqRel);
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn forget_image(image: vk::Image) {
@@ -106,7 +120,6 @@ struct Slot {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     barrier_log: Vec<Barriers>,
-    staging: StagingRing,
     signalled: u64,
 }
 
@@ -119,6 +132,8 @@ struct Inner {
     slots: Box<[Slot]>,
     /// Submissions begun so far, which take the frame slots in turn.
     begun: u64,
+    /// Its staging ring; none on `rebar` devices or with a size of 0.
+    staging: Option<Arc<Staging>>,
 }
 
 impl fmt::Debug for Inner {
@@ -142,6 +157,9 @@ impl Drop for Inner {
         for slot in &self.slots {
             unsafe { Ctx::device().destroy_command_pool(slot.pool, None) };
         }
+        if let Some(staging) = self.staging.take() {
+            staging.close();
+        }
         lock(&index.state).pending = PendingAccesses::default();
         lock(&index.writes).clear();
         lock(&self.family.timelines)[self.queue] -= 1;
@@ -151,7 +169,8 @@ impl Drop for Inner {
 }
 
 /// Submissions to the queue of family `K` the fewest timelines share, with `in_flight` frame
-/// slots. Dropping it waits for its submissions.
+/// slots and a staging ring its [`Uploader`]s fill (`uploader()`). Dropping it waits for its
+/// submissions.
 pub struct Timeline<K: QueueKind> {
     inner: Inner,
     _kind: PhantomData<fn() -> K>,
@@ -164,9 +183,12 @@ impl<K: QueueKind> fmt::Debug for Timeline<K> {
 }
 
 impl<K: QueueKind> Timeline<K> {
-    /// `MissingFeature` without a family of `K`, `OutOfTimelines` when `MAX_TIMELINES` exist.
+    /// A timeline with `in_flight` frame slots and a staging ring of `staging` bytes for its
+    /// uploaders (0: none; never one on a `rebar` device, where every `Gpu` buffer is mapped
+    /// and uploaders write in place). `MissingFeature` without a family of `K`,
+    /// `OutOfTimelines` when `MAX_TIMELINES` exist.
     #[validation_trace]
-    pub fn new(in_flight: u32) -> Result<Self> {
+    pub fn new(in_flight: u32, staging: u64) -> Result<Self> {
         assert!(in_flight > 0, "a timeline has at least one frame slot");
         K::check()?;
         let family = (Ctx::get().queues.family(K::KIND)).expect("lava has queues of every family whose feature is on");
@@ -199,13 +221,23 @@ impl<K: QueueKind> Timeline<K> {
                 pool,
                 cmd,
                 barrier_log: Vec::new(),
-                staging: StagingRing::default(),
                 signalled: 0,
             })
         });
         let slots = match slots.collect::<Result<Box<[_]>>>() {
             Ok(slots) => slots,
             Err(err) => {
+                lock(&LIVE)[index] = false;
+                return Err(err);
+            }
+        };
+        let ring = (staging > 0 && !Ctx::features().rebar).then(|| Staging::new(index, staging));
+        let staging = match ring.transpose() {
+            Ok(staging) => staging,
+            Err(err) => {
+                for slot in &slots {
+                    unsafe { device.destroy_command_pool(slot.pool, None) };
+                }
                 lock(&LIVE)[index] = false;
                 return Err(err);
             }
@@ -232,9 +264,23 @@ impl<K: QueueKind> Timeline<K> {
                 queue,
                 slots,
                 begun: 0,
+                staging,
             },
             _kind: PhantomData,
         })
+    }
+
+    /// An uploader of its ring for data this timeline's family uses; clone it for every thread
+    /// that uploads.
+    pub fn uploader(&self) -> Uploader {
+        Uploader::new(self.inner.staging.clone(), K::KIND)
+    }
+
+    /// An uploader of its ring for data the family of kind `D` uses: a drain on this timeline
+    /// releases the images it copied into to `D`. `MissingFeature` where lava has no `D`.
+    pub fn uploader_for<D: QueueKind>(&self) -> Result<Uploader> {
+        D::check()?;
+        Ok(Uploader::new(self.inner.staging.clone(), D::KIND))
     }
 
     /// Counts the stamp up: call it before reading anything the next submission will reach, so
@@ -259,7 +305,6 @@ impl<K: QueueKind> Timeline<K> {
         }
         poll_all();
         lifetime::reclaim();
-        inner.slots[slot].staging.reset();
         let pool = inner.slots[slot].pool;
         unsafe { Ctx::device().reset_command_pool(pool, vk::CommandPoolResetFlags::empty())? };
         Ok(Submission {
@@ -329,6 +374,7 @@ impl<K: QueueKind> Submission<'_, K> {
         let i = inner.index;
         let index = &INDICES[i];
         let device = Ctx::device();
+        let staging = inner.staging.as_deref();
         let slot = &mut inner.slots[self.slot];
         let mut state = lock(&index.state);
         let state = &mut *state;
@@ -343,7 +389,7 @@ impl<K: QueueKind> Submission<'_, K> {
             i,
             value,
             &mut slot.barrier_log,
-            &mut slot.staging,
+            staging,
         ));
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -419,8 +465,10 @@ impl<K: QueueKind> Submission<'_, K> {
                     .map_err(Err)
             }
         };
-        upload::finish(i, value, result.is_ok());
         if result.is_err() {
+            if let Some(staging) = staging {
+                staging.requeue(value);
+            }
             Bindless::requeue(queued);
             let replayed = (|| -> Result<()> {
                 unsafe {

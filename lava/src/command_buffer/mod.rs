@@ -1,4 +1,4 @@
-//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, `upload` with the staging in `buffer/upload.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
+//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
 use std::{
     fmt::Debug, marker::PhantomData, ops::Deref, panic::AssertUnwindSafe, ptr::NonNull,
     range::Range, sync::atomic::AtomicU64,
@@ -26,7 +26,7 @@ use glam::{I64Vec2, IVec2, UVec2};
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
-use crate::buffer::upload::StagingRing;
+use crate::buffer::staging::Staging;
 
 mod binding_output;
 pub(crate) mod image_state;
@@ -112,8 +112,8 @@ pub(crate) struct Recording<'p> {
     /// Acquired swapchain images with the stages of their first access.
     pub(crate) acquired: SmallVec<[(vk::Image, vk::PipelineStageFlags2); 1]>,
     pub(crate) presents: SmallVec<[Present; 1]>,
-    /// The frame slot's staging memory of `upload`.
-    pub(crate) staging: &'p mut StagingRing,
+    /// The timeline's staging ring, which `drain_uploads` records.
+    pub(crate) staging: Option<&'p Staging>,
 }
 
 /// A command buffer being recorded for a family of kind `K`; its methods are the commands `K`
@@ -1243,7 +1243,7 @@ impl<'p> Recording<'p> {
         timeline: usize,
         value: u64,
         barrier_log: &'p mut Vec<Barriers>,
-        staging: &'p mut StagingRing,
+        staging: Option<&'p Staging>,
     ) -> Self {
         Self {
             handle,

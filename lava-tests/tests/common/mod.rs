@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use bytemuck::Pod;
 use lava::{
     bindless::{Sampler, SamplerDesc, SamplerHandle},
-    buffer::{Buffer, HostVisible, Readback, Upload, Uploads},
+    buffer::{Buffer, HostVisible, Readback, Upload, Uploader},
     command_buffer::CommandBuffer,
     queue::{Graphics, Timeline, Wait},
 };
@@ -67,6 +67,18 @@ pub fn disable(features: lava::Features) {
     );
 }
 
+static STAGING: OnceLock<u64> = OnceLock::new();
+
+/// The size of the harness timeline's staging ring (16 MiB by default; none on a `rebar`
+/// device whatever the size); call before the first `gpu()`.
+pub fn staging(bytes: u64) {
+    assert_eq!(
+        *STAGING.get_or_init(|| bytes),
+        bytes,
+        "one ring size per process"
+    );
+}
+
 static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
     capture_validation_errors();
     let config = lava::Config {
@@ -83,8 +95,9 @@ static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
         .address_mode(lava::vk::SamplerAddressMode::CLAMP_TO_BORDER)
         .border_color(lava::vk::BorderColor::FLOAT_OPAQUE_WHITE);
     let _ = NEAREST.set(Sampler::new(&nearest).unwrap());
+    let staging = STAGING.get().copied().unwrap_or(16 << 20);
     Mutex::new(Gpu {
-        timeline: Timeline::new(2).unwrap(),
+        timeline: Timeline::new(2, staging).unwrap(),
     })
 });
 
@@ -92,7 +105,10 @@ static NEAREST: OnceLock<Sampler> = OnceLock::new();
 
 /// A sampler of the nearest texel and mip, clamped to a white border; after the first `gpu()`.
 pub fn nearest() -> SamplerHandle {
-    NEAREST.get().expect("`gpu()` creates the samplers").handle()
+    NEAREST
+        .get()
+        .expect("`gpu()` creates the samplers")
+        .handle()
 }
 
 /// Exclusive access to the GPU for one test; fails it on validation errors when dropped.
@@ -150,13 +166,20 @@ impl Gpu {
         done
     }
 
-    /// A device-local buffer holding `data`, its copy recorded and completed where it was
+    /// An uploader of the timeline's ring, for graphics.
+    pub fn uploader(&self) -> Uploader {
+        self.timeline.uploader()
+    }
+
+    /// A device-local buffer holding `data`, its copy drained and completed where it was
     /// staged.
     pub fn buffer<T: Pod>(&mut self, data: &[T]) -> Buffer<T> {
-        let mut uploads = Uploads::new();
-        let buffer = uploads.from_slice(data).unwrap();
-        if !uploads.is_empty() {
-            self.submit(|cmd| cmd.record_uploads(&uploads));
+        let uploader = self.uploader();
+        let buffer = uploader.from_slice(data).unwrap();
+        if uploader.pending() > 0 {
+            self.submit(|cmd| {
+                cmd.drain_uploads();
+            });
         }
         buffer
     }

@@ -108,7 +108,7 @@ fn run(event_loop: &ActiveEventLoop) {
     assert_eq!(surface.format().0, vk::Format::B8G8R8A8_UNORM);
     step("surface_reports_its_format_and_modes");
 
-    let mut timeline = Timeline::<Graphics>::new(2).unwrap();
+    let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
     let mut handles = Vec::new();
     for color in [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]] {
         handles.push(present_frame(&mut timeline, &mut surface, SIZE, color));

@@ -144,7 +144,7 @@ const FRAMES: usize = 3000;
 
 fn main() {
     lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
-    let mut timeline = Timeline::<Graphics>::new(2).unwrap();
+    let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
     let buffer = |len| Buffer::new(len).unwrap();
     let resources = Resources {
         sampler: Sampler::new(&SamplerDesc::new()).unwrap(),

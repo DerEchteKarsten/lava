@@ -1,4 +1,4 @@
-//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`), each with every usage lava's commands need; host access to host-visible ones, checked against GPU writes still in flight; explicit upload batches (`upload`); casts, and their destruction once no frame can reach them
+//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones, checked against GPU writes still in flight; the staging rings and uploaders (`staging`); casts, and their destruction once no frame can reach them
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -22,10 +22,10 @@ use crate::{
 
 pub mod memory;
 pub mod slice;
-pub(crate) mod upload;
+pub(crate) mod staging;
 
 pub use memory::{Dynamic, Gpu, HostVisible, Location, Memory, Readback, Shared, StaticMemory, Upload};
-pub use upload::Uploads;
+pub use staging::{UploadStats, Uploader};
 
 /// The usages of every buffer an application creates: everything lava's commands bind a buffer
 /// as (lava binds no vertex or uniform buffers). Giving every buffer every usage made no
@@ -73,7 +73,7 @@ impl<T: Copy + Pod, M: Memory> Drop for Buffer<T, M> {
     fn drop(&mut self) {
         let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
         let range = self.address..self.address + self.num_bytes;
-        upload::forget_buffer(range.clone().into());
+        staging::forget_buffer(range.clone());
         lifetime::retire(move || {
             for index in INDICES.iter() {
                 let pending = &mut lock(&index.state).pending;
@@ -97,7 +97,9 @@ impl<'a, T: Copy + Pod, M: Memory> Into<BufferSlice<'a, T>> for &'a Buffer<T, M>
 
 impl<T: Copy + Pod> Buffer<T, Gpu> {
     /// A device-local buffer of `len` elements the host can't access; fill it with commands, or
-    /// make it filled with [`Uploads::init`]/[`Uploads::from_slice`].
+    /// make it filled with [`Uploader::init`]/[`Uploader::from_slice`]. On a `rebar` device it
+    /// is allocated from [`Shared`]'s memory types where they have room (the BAR heap is all of
+    /// VRAM there), so uploaders write it in place.
     #[validation_trace]
     pub fn new(len: usize) -> Result<Self> {
         Self::with_memory(Gpu, len)
@@ -155,11 +157,20 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
         num_bytes: u64,
         alignment: Option<u32>,
     ) -> Result<Self> {
-        Self::with_memory_types(usage, memory, num_bytes, alignment, memory.location())
+        let location = memory.location();
+        if location == Location::Gpu && Ctx::features().rebar {
+            // Mapped, so uploaders write it in place; plain device-local memory is the
+            // fallback once the BAR heap is full.
+            let shared = Self::with_memory_types(usage, memory, num_bytes, alignment, Location::Shared);
+            if let Ok(buffer) = shared {
+                return Ok(buffer);
+            }
+        }
+        Self::with_memory_types(usage, memory, num_bytes, alignment, location)
     }
 
     /// Like [`Self::with_flags`], allocated from the memory types of `location` instead of
-    /// its own (`Uploads::init`'s `Gpu` buffers from `Shared` memory).
+    /// its own (`Gpu` buffers from `Shared` memory on `rebar` devices).
     pub(crate) fn with_memory_types(
         usage: vk::BufferUsageFlags,
         memory: M,
@@ -286,9 +297,9 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
         self.memory
     }
 
-    /// Its mapping, where the memory has one: host-visible locations, `Gpu` memory on devices
-    /// whose device-local memory is all host-visible (integrated GPUs), and `Gpu` buffers
-    /// `Uploads::init` allocated from `Shared` memory.
+    /// Its mapping, where the memory has one: host-visible locations, `Gpu` buffers of `rebar`
+    /// devices (allocated from `Shared`'s memory types) and `Gpu` memory in a host-visible
+    /// memory type otherwise (integrated GPUs).
     pub(crate) fn mapping(&self) -> Option<*mut T> {
         let ptr = self.allocation.mapped_ptr()?.as_ptr().cast::<T>();
         assert!(
@@ -297,6 +308,13 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
             align_of::<T>()
         );
         Some(ptr)
+    }
+
+    /// Its mapping where the memory is coherent too, which lava writes without flushing.
+    pub(crate) fn coherent_mapping(&self) -> Option<*mut T> {
+        let coherent = (self.allocation.memory_properties())
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+        coherent.then(|| self.mapping()).flatten()
     }
 
     /// The same buffer of `B`s; panics unless its size is a multiple of `B`'s and its address

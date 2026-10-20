@@ -29,6 +29,12 @@ pub enum Error {
         end: u64,
         size: u64,
     },
+    /// A staging ring of `capacity` bytes had no room for `requested` bytes within the
+    /// uploader's timeout, or the write is larger than the ring.
+    StagingFull {
+        requested: u64,
+        capacity: u64,
+    },
 }
 
 impl Error {
@@ -69,6 +75,14 @@ impl fmt::Display for Error {
                 f,
                 "buffer slice ends at byte {end} but the buffer is only {size} bytes long"
             ),
+            Error::StagingFull { requested, capacity } if requested > capacity => write!(
+                f,
+                "an upload of {requested} bytes is larger than the staging ring of {capacity} bytes"
+            ),
+            Error::StagingFull { requested, capacity } => write!(
+                f,
+                "the staging ring of {capacity} bytes had no room for {requested} bytes within the timeout: drain it or make it larger"
+            ),
         }
     }
 }
@@ -86,7 +100,8 @@ impl std::error::Error for Error {
             Error::MissingFeature(missing) => Some(missing),
             Error::OutOfBindlessSlots { .. }
             | Error::OutOfTimelines
-            | Error::SliceOutOfRange { .. } => None,
+            | Error::SliceOutOfRange { .. }
+            | Error::StagingFull { .. } => None,
         }
     }
 }

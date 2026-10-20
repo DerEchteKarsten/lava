@@ -1,4 +1,4 @@
-//! Buffer memory locations as sealed marker types (`Gpu`, `Upload`, `Readback`, `Shared`, and `Dynamic`, chosen at runtime), which of them the host may access, and the memory types each allocates from (`Gpu` buffers `Uploads::init` fills come from `Shared`'s on `rebar` devices)
+//! Buffer memory locations as sealed marker types (`Gpu`, `Upload`, `Readback`, `Shared`, and `Dynamic`, chosen at runtime), which of them the host may access, and the memory types each allocates from (`Gpu` buffers come from `Shared`'s on `rebar` devices)
 use std::fmt::Debug;
 
 use gpu_allocator::MemoryLocation;
@@ -9,8 +9,9 @@ use crate::vk;
 /// [`Dynamic`] holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Location {
-    /// Device-local memory the host can't access, never in the BAR heap except buffers
-    /// `Uploads::init` filled on a `rebar` device (the BAR heap is all of VRAM there).
+    /// Device-local memory without host access through the buffer's API. On a `rebar` device
+    /// it comes from `Shared`'s memory types where they have room (the BAR heap is all of VRAM
+    /// there), so an `Uploader` writes it in place; elsewhere it is never in the BAR heap.
     Gpu,
     /// Host-visible memory the GPU reads well, device-local where the device has some
     /// (write-combined: host reads are slow).
@@ -105,7 +106,7 @@ macro_rules! locations {
 
 locations! {
     /// Device-local memory the host can't access (meshes, cull buffers, scratch): its data
-    /// comes from commands, or from an `Uploads` batch (`init`, `from_slice`, `write`).
+    /// comes from commands, or from an `Uploader` (`init`, `from_slice`, `write`).
     Gpu,
     /// Host-visible memory the GPU reads well, for data the host writes every frame (rings,
     /// UI, staging); host reads are slow.

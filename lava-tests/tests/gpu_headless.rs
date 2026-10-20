@@ -5,8 +5,7 @@ use common::{Cmd, Gpu, buffer_with, golden::assert_golden, gpu, nearest, panic_m
 use glam::{IVec2, UVec2, UVec3, UVec4, Vec2, Vec4};
 use lava::{
     bindless::{self, Combined, ImageHandle, Sampler, SamplerDesc, SamplerHandle, max_image_slots},
-    buffer::{Buffer, Dynamic, Location, Memory, Readback, Shared, Upload, Uploads},
-    memory::memory_report,
+    buffer::{Buffer, Dynamic, Location, Memory, Readback, Shared, Upload, UploadStats},
     command_buffer::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
         BufferAccess, ColorComponentFlags, CompareOp, CullModeFlags,
@@ -191,168 +190,75 @@ fn reading_past_the_buffer_panics() {
 
 // ---- memory locations, host access and uploads ------------------------------------------------
 
+/// `init`, `from_slice` and `write` land in their buffers: through the timeline's ring where
+/// it has one, else (a `rebar` device, where every `Gpu` buffer is mapped) in place, with
+/// nothing to drain.
 #[test]
-fn filled_buffers_round_trip_through_a_readback_copy() {
+fn uploaded_buffers_round_trip_through_a_readback_copy() {
     let mut gpu = gpu();
+    let uploader = gpu.uploader();
     let data: Vec<u32> = (0..1000).collect();
-    let mut uploads = Uploads::new();
-    let buffer = uploads.from_slice(&data).unwrap();
+    let buffer = uploader.from_slice(&data).unwrap();
     assert_eq!(buffer.location(), Location::Gpu);
-    if Ctx::features().rebar {
-        assert!(uploads.is_empty(), "written in place, where its memory is mapped");
+    let addresses = uploader.init(3, |address, out: &mut [u64]| out.fill(address)).unwrap();
+    let written = Buffer::<u32>::new(4).unwrap();
+    uploader.write(&written, 1, &[7, 8]).unwrap();
+    let rebar = Ctx::features().rebar;
+    if rebar {
+        assert!(!uploader.stages() && uploader.capacity() == 0, "no ring on a rebar device");
+        assert_eq!(uploader.pending(), 0, "written in place");
     }
-    let addresses = uploads.init(3, |address, out: &mut [u64]| out.fill(address)).unwrap();
     let (mut readback, mut address_out) = (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u64>(3));
+    let mut written_out = zeroed_buffer::<u32>(4);
+    let mut stats = UploadStats::default();
     gpu.submit(|cmd| {
-        cmd.record_uploads(&uploads);
+        stats = cmd.drain_uploads();
         cmd.copy_buffer(buffer.range(..), readback.range(..));
         cmd.copy_buffer(addresses.range(..), address_out.range(..));
+        cmd.copy_buffer(written.range(..), written_out.range(..));
     });
+    match rebar {
+        true => assert_eq!(stats, UploadStats::default(), "a drain without a ring is a no-op"),
+        false => assert!(stats.copies >= 1 && stats.capacity == uploader.capacity(), "{stats:?}"),
+    }
     assert_eq!(readback.host(), data);
     assert_eq!(address_out.host(), [addresses.address(); 3]);
-    assert!(uploads.is_empty());
+    assert_eq!(written_out.host()[1..3], [7, 8]);
+    assert_eq!(uploader.pending(), 0);
+    assert!(panic_message(|| uploader.write(&written, 3, &[0, 0])).contains("writing 2 elements at 3"));
 }
 
-/// `dst[i] = src[i] + i` for the 4 elements of `src`.
-fn plus_index(cmd: &mut Cmd, src: &Buffer<u32>, dst: &Buffer<u32, Readback>) {
-    cmd.compute(&TestComputeBuffer::push_bindings(src.range(..), dst.range(..), 4, 1), [1, 1, 1], None);
-}
-
+/// Staged image uploads need a ring: a `rebar` device has none (`Image::copy_from` uploads
+/// there); with one, the texture is drawn once the ring is drained.
 #[test]
-fn writes_land_where_their_batch_is_recorded() {
+fn image_uploads_land_where_the_ring_is_drained() {
     let mut gpu = gpu();
-    let buffer = Buffer::<u32>::new(4).unwrap();
-    let outs: [_; 4] = std::array::from_fn(|_| zeroed_buffer::<u32>(4));
-    let [mut before, mut after, mut skipped, mut again] = outs;
-    gpu.submit(|cmd| cmd.fill_buffer(buffer.range(..), 0));
-    let mut uploads = Uploads::new();
-    uploads.write(&buffer, 0, &[1, 2, 3, 4]).unwrap();
-    assert_eq!(uploads.len(), 1);
-    // A submission that doesn't record the batch writes nothing.
-    gpu.submit(|cmd| plus_index(cmd, &buffer, &skipped));
-    assert_eq!(skipped.host(), [0, 1, 2, 3]);
-    // The dispatch before the batch reads the old data, the one after it the new.
-    gpu.submit(|cmd| {
-        plus_index(cmd, &buffer, &before);
-        cmd.record_uploads(&uploads);
-        plus_index(cmd, &buffer, &after);
-    });
-    assert_eq!(before.host(), [0, 1, 2, 3]);
-    assert_eq!(after.host(), [1, 3, 5, 7]);
-    assert!(uploads.is_empty());
-
-    // Filled again, the batch records only what is new.
-    uploads.write(&buffer, 2, &[30, 40]).unwrap();
-    // Dropped targets and batches take their writes with them.
-    let dropped = Buffer::<u32>::new(4).unwrap();
-    uploads.write(&dropped, 0, &[5; 4]).unwrap();
-    drop(dropped);
-    let mut discarded = Uploads::new();
-    discarded.write(&buffer, 0, &[7; 4]).unwrap();
-    drop(discarded);
-    assert_eq!(uploads.len(), 1);
-    gpu.submit(|cmd| {
-        cmd.fill_buffer(buffer.range(..), 9);
-        cmd.record_uploads(&uploads);
-        plus_index(cmd, &buffer, &again);
-    });
-    assert_eq!(again.host(), [9, 10, 32, 43]);
-    assert!(panic_message(|| uploads.write(&buffer, 3, &[0, 0])).contains("writing 2 elements at 3"));
-}
-
-/// A recording that panics after recording a batch gives its writes back to the batch.
-#[test]
-fn a_failed_recording_leaves_its_uploads_to_the_next() {
-    let mut gpu = gpu();
-    let buffer = Buffer::<u32>::new(4).unwrap();
-    let mut out = zeroed_buffer::<u32>(4);
-    let mut uploads = Uploads::new();
-    uploads.write(&buffer, 0, &[1, 2, 3, 4]).unwrap();
-    let message = panic_message(|| {
-        gpu.submit(|cmd| {
-            cmd.record_uploads(&uploads);
-            panic!("after recording the batch");
-        })
-    });
-    assert!(message.contains("after recording the batch"), "{message}");
-    assert_eq!(uploads.len(), 1);
-    gpu.submit(|cmd| {
-        cmd.record_uploads(&uploads);
-        cmd.copy_buffer(buffer.range(..), out.range(..));
-    });
-    assert_eq!(out.host(), [1, 2, 3, 4]);
-}
-
-/// An empty batch and in-recording uploads small enough for an update allocate nothing.
-#[test]
-fn small_uploads_allocate_nothing() {
-    let mut gpu = gpu();
-    let buffer = Buffer::<u32>::new(4).unwrap();
-    gpu.submit(|cmd| cmd.upload(buffer.range(..), &[0; 4]).unwrap());
-    lava::wait_idle().unwrap();
-    let before = memory_report().allocated;
-    let uploads = Uploads::new();
-    gpu.submit(|cmd| {
-        cmd.record_uploads(&uploads);
-        cmd.upload(buffer.range(..), &[1, 2, 3, 4]).unwrap();
-    });
-    assert_eq!(memory_report().allocated, before);
-}
-
-#[test]
-fn uploads_in_a_recording_use_updates_or_the_staging_ring() {
-    let mut gpu = gpu();
-    let small: Vec<u32> = (0..100).collect();
-    // 160 KB: more than an update takes.
-    let len = 40_000;
-    let buffer = Buffer::<u32>::new(len).unwrap();
-    let mut readback = zeroed_buffer::<u32>(len);
-    // Three frames on two frame slots: the third reuses the first one's staging memory.
-    for frame in 0..3u32 {
-        let large: Vec<u32> = (0..len as u32).map(|i| i * 3 + frame).collect();
-        gpu.submit(|cmd| {
-            cmd.upload(buffer.range(..), &large).unwrap();
-            cmd.upload(buffer.range(..small.len()), &small).unwrap();
-            cmd.copy_buffer(buffer.range(..), readback.range(..));
-        });
-        let host = readback.host();
-        assert_eq!(host[..small.len()], small, "frame {frame}");
-        assert_eq!(host[small.len()..], large[small.len()..], "frame {frame}");
-    }
-    // Not whole words: staged too.
-    let bytes = Buffer::<u8>::new(8).unwrap();
-    let mut out = zeroed_buffer::<u8>(8);
-    gpu.submit(|cmd| {
-        cmd.upload(bytes.range(1..), &[7, 8, 9]).unwrap();
-        cmd.copy_buffer(bytes.range(..), out.range(..));
-    });
-    assert_eq!(out.host()[1..4], [7, 8, 9]);
-}
-
-#[test]
-fn image_uploads_land_where_their_batch_is_recorded() {
-    let mut gpu = gpu();
+    let uploader = gpu.uploader();
     // The texture of `indexed_draw_samples_a_bindless_texture`.
     let texels: Vec<u8> = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]].concat();
     let texture = Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::new(2, 2))
         .unwrap()
         .bind_sampled()
         .unwrap();
-    let mut uploads = Uploads::new();
-    assert!(uploads.image(&texture, 0, &texels[..12]).is_err(), "one whole mip");
-    assert!(uploads.image(&texture, 1, &texels).is_err(), "it has one mip");
-    uploads.image(&texture, 0, &texels).unwrap();
+    if !uploader.stages() {
+        let message = uploader.image(&texture, 0, &texels).unwrap_err().to_string();
+        assert!(message.contains("Image::copy_from"), "{message}");
+        return;
+    }
+    assert!(uploader.image(&texture, 0, &texels[..12]).is_err(), "one whole mip");
+    assert!(uploader.image(&texture, 1, &texels).is_err(), "it has one mip");
+    uploader.image(&texture, 0, &texels).unwrap();
     // Dropped with an upload staged, which goes with it.
     let dropped = Image::<R8G8B8A8Unorm, usage![TransferDst]>::new(UVec2::new(2, 2)).unwrap();
-    uploads.image(&dropped, 0, &texels).unwrap();
+    uploader.image(&dropped, 0, &texels).unwrap();
     drop(dropped);
-    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploader.pending(), 1);
 
     let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
         position: Vec2::new(x, y),
         uv: Vec2::new(u, v),
     };
-    let vertices = uploads
+    let vertices = uploader
         .from_slice(&[
             corner(-0.5, -0.5, 0.0, 0.0),
             corner(0.5, -0.5, 1.0, 0.0),
@@ -360,9 +266,9 @@ fn image_uploads_land_where_their_batch_is_recorded() {
             corner(-0.5, 0.5, 0.0, 1.0),
         ])
         .unwrap();
-    let indices = uploads.from_slice(&[0u32, 1, 2, 0, 2, 3]).unwrap();
+    let indices = uploader.from_slice(&[0u32, 1, 2, 0, 2, 3]).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
-        cmd.record_uploads(&uploads);
+        cmd.drain_uploads();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
                 &TestRasterTextured::push_bindings(vertices.range(..), texture.whole_view(), nearest()),
@@ -374,56 +280,6 @@ fn image_uploads_land_where_their_batch_is_recorded() {
             .record("textured")
     });
     assert_golden("raster_textured", &pixels, [SIZE, SIZE]);
-}
-
-/// A batch recorded on the transfer family releases its images to graphics without a
-/// `release` call: a whole image and two of three mips of a chain.
-#[test]
-fn uploads_on_the_transfer_family_go_to_graphics() {
-    let mut gpu = gpu();
-    if !has_family("uploads_on_the_transfer_family_go_to_graphics", Kind::Transfer) {
-        return;
-    }
-    let mut transfer = Timeline::<Transfer>::new(2).unwrap();
-    let single = Owned::new(UVec2::splat(8)).unwrap();
-    let chain = MipChain::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::with_mip_levels(UVec2::splat(8), 3).unwrap();
-    let data: Vec<u32> = (0..64).collect();
-    let buffer = Buffer::<u32>::new(data.len()).unwrap();
-    let mut uploads = Uploads::new();
-    uploads.write(&buffer, 0, &data).unwrap();
-    uploads.image(&single, 0, &pattern(8, 8)).unwrap();
-    uploads.image(&chain, 0, &pattern(8, 8)).unwrap();
-    uploads.image(&chain, 2, &pattern(2, 2)).unwrap();
-    let uploaded = (transfer.begin().unwrap())
-        .submit(|cmd| cmd.record_uploads(&uploads))
-        .unwrap();
-    let mut buffer_out = zeroed_buffer::<u32>(data.len());
-    let mut single_out = zeroed_buffer::<u8>(8 * 8 * 4);
-    let mut mip0_out = zeroed_buffer::<u8>(8 * 8 * 4);
-    let mut mip2_out = zeroed_buffer::<u8>(2 * 2 * 4);
-    gpu.submit_after(&[uploaded], |cmd| {
-        cmd.copy_buffer(buffer.range(..), buffer_out.range(..));
-        cmd.copy_image_to_buffer(single.whole(), single_out.range(..));
-        cmd.copy_image_to_buffer(chain.mip_view(0).whole(), mip0_out.range(..));
-        cmd.copy_image_to_buffer(chain.mip_view(2).whole(), mip2_out.range(..));
-    });
-    assert_eq!(buffer_out.host(), data);
-    assert_eq!(single_out.host(), pattern(8, 8));
-    assert_eq!(mip0_out.host(), pattern(8, 8));
-    assert_eq!(mip2_out.host(), pattern(2, 2));
-
-    // Graphics owns `single` now: a batch into it panics on the transfer family before any
-    // state moves, and graphics records it without releasing anything.
-    let mut again = Uploads::new();
-    again.image(&single, 0, &vec![7; 8 * 8 * 4]).unwrap();
-    let message = panic_message(|| transfer.begin().unwrap().submit(|cmd| cmd.record_uploads(&again)));
-    assert!(message.contains("record the batch on a Graphics timeline"), "{message}");
-    assert_eq!(again.len(), 1);
-    gpu.submit(|cmd| {
-        cmd.record_uploads(&again);
-        cmd.copy_image_to_buffer(single.whole(), single_out.range(..));
-    });
-    assert_eq!(single_out.host(), vec![7; 8 * 8 * 4]);
 }
 
 #[test]
@@ -494,7 +350,7 @@ fn more_threads_than_queues_submit_in_parallel() {
             let barrier = &barrier;
             scope.spawn(move || {
                 let mut buffer = zeroed_buffer::<u32>(4);
-                let mut timeline = Timeline::<Graphics>::new(2).unwrap();
+                let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
                 barrier.wait();
                 let submission = timeline.begin().unwrap();
                 let done = submission
@@ -579,7 +435,7 @@ fn a_recording_thread_runs_no_destructors() {
 #[test]
 fn a_submission_waits_for_another_timelines() {
     let mut gpu = gpu();
-    let mut other = Timeline::<Graphics>::new(2).unwrap();
+    let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
     let (src, mut dst) = (zeroed_buffer::<u32>(4), zeroed_buffer::<u32>(4));
     let own = gpu.submit(|_| {});
     // Neither submission is waited for on the host before the second is made.
@@ -602,7 +458,7 @@ fn a_submission_waits_for_another_timelines() {
 #[test]
 fn deletions_wait_for_every_timeline() {
     let mut gpu = gpu();
-    let mut other = Timeline::<Graphics>::new(2).unwrap();
+    let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
     lava::wait_idle().unwrap();
     let bind = || {
         Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::new(4, 4))
@@ -627,7 +483,7 @@ fn timelines_are_limited_and_reused() {
     let _gpu = gpu();
     let mut timelines = Vec::new();
     let error = loop {
-        match Timeline::<Graphics>::new(1) {
+        match Timeline::<Graphics>::new(1, 0) {
             Ok(timeline) => timelines.push(timeline),
             Err(error) => break error,
         }
@@ -637,7 +493,7 @@ fn timelines_are_limited_and_reused() {
     let mut last = timelines.pop().unwrap();
     let done = last.begin().unwrap().submit(|_| {}).unwrap();
     drop(last);
-    let mut reused = Timeline::<Graphics>::new(2).unwrap();
+    let mut reused = Timeline::<Graphics>::new(2, 0).unwrap();
     assert!(done.is_done());
     reused.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
 }
@@ -660,7 +516,7 @@ fn a_compute_image_is_released_to_graphics() {
     if !has_family("a_compute_image_is_released_to_graphics", Kind::Compute) {
         return;
     }
-    let mut compute = Timeline::<Compute>::new(2).unwrap();
+    let mut compute = Timeline::<Compute>::new(2, 0).unwrap();
     let image = Owned::new(UVec2::splat(8)).unwrap().bind_storage().unwrap();
     let red = Vec4::new(1.0, 0.0, 0.0, 1.0);
     let written = (compute.begin().unwrap())
@@ -689,7 +545,7 @@ fn images_go_to_the_transfer_family_and_back() {
     if !has_family("images_go_to_the_transfer_family_and_back", Kind::Transfer) {
         return;
     }
-    let mut transfer = Timeline::<Transfer>::new(2).unwrap();
+    let mut transfer = Timeline::<Transfer>::new(2, 0).unwrap();
     let image = Owned::new(UVec2::splat(8)).unwrap();
     let upload = buffer_with::<u8>(&pattern(8, 8));
     let uploaded = (transfer.begin().unwrap())
@@ -718,7 +574,7 @@ fn an_unreleased_image_panics() {
     if !has_family("an_unreleased_image_panics", Kind::Compute) {
         return;
     }
-    let mut compute = Timeline::<Compute>::new(2).unwrap();
+    let mut compute = Timeline::<Compute>::new(2, 0).unwrap();
     let image = Owned::new(UVec2::splat(8)).unwrap();
     let cleared = (compute.begin().unwrap())
         .submit(|cmd| cmd.clear_image(image.whole_view(), [1.0; 4]))

@@ -5,7 +5,7 @@ use common::{Cmd, Gpu, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     Error, Features,
-    buffer::{Buffer, Location, Shared, Uploads},
+    buffer::{Buffer, Location, Shared},
     command_buffer::{
         Attachment, BindingOutput, Blend, CullModeFlags, Draw, LogicOp, PolygonMode,
         RasterState, kind,
@@ -155,9 +155,9 @@ fn disabled_features_are_off() {
     // Without async compute and transfer, only the graphics family gets queues.
     assert_eq!(Ctx::queue_family(Kind::Compute), None);
     assert_eq!(Ctx::queue_family(Kind::Transfer), None);
-    let compute = Timeline::<Compute>::new(2);
+    let compute = Timeline::<Compute>::new(2, 0);
     assert!(matches!(compute, Err(Error::MissingFeature(m)) if m == missing("async-compute")));
-    let transfer = Timeline::<Transfer>::new(2);
+    let transfer = Timeline::<Transfer>::new(2, 0);
     assert!(matches!(transfer, Err(Error::MissingFeature(m)) if m == missing("async-transfer")));
 }
 
@@ -213,29 +213,33 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
     );
 }
 
-/// Without `rebar` or host image copies, buffers and images are filled through staging memory.
+/// Without `rebar` or host image copies, buffers and images are filled through the timeline's
+/// staging ring.
 #[test]
 fn uploads_need_neither_rebar_nor_host_image_copies() {
     let mut gpu = gpu_without();
+    let uploader = gpu.uploader();
+    assert!(uploader.stages(), "a timeline without `rebar` has the ring it was given");
     let data: Vec<u32> = (0..256).collect();
-    let mut uploads = Uploads::new();
-    let buffer = uploads.from_slice(&data).unwrap();
+    let buffer = uploader.from_slice(&data).unwrap();
     // Staged without `rebar`, unless device-local memory is mapped anyway (integrated GPUs).
-    if uploads.is_empty() {
+    if uploader.pending() == 0 {
         eprintln!("NOTE: device-local memory is mapped here, so `init` wrote in place");
     }
-    assert!(uploads.len() <= 1);
+    assert!(uploader.pending() <= 1);
     let texels: Vec<u8> = (0..16 * 4).map(|i| i as u8).collect();
     let image = Image::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::new(UVec2::new(4, 4)).unwrap();
-    uploads.image(&image, 0, &texels).unwrap();
+    uploader.image(&image, 0, &texels).unwrap();
     let (mut buffer_out, mut image_out) = (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u8>(texels.len()));
     gpu.submit(|cmd| {
-        cmd.record_uploads(&uploads);
+        let stats = cmd.drain_uploads();
+        assert!(stats.copies >= 1 && stats.bytes >= texels.len() as u64, "{stats:?}");
         cmd.copy_buffer(buffer.range(..), buffer_out.range(..));
         cmd.copy_image_to_buffer(image.whole_view().whole(), image_out.range(..));
     });
     assert_eq!(buffer_out.host(), data);
     assert_eq!(image_out.host(), texels);
+    assert_eq!(uploader.pending(), 0);
 }
 
 #[test]

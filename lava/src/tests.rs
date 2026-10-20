@@ -1,13 +1,13 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, upload staging chunks and batches, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
 use std::{
     iter,
-    sync::{Arc, atomic::AtomicU64},
+    sync::atomic::AtomicU64,
 };
 
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
 
 use crate::{
-    buffer::upload::{Cursor, Entries, Entry, MIN_CHUNK, Target, Uploads},
+    buffer::staging::{Reservation, Ring, STAGING_ALIGN, Uploader},
     bindless::{Combined, HeapLayout, ImageHandle, Ranges, Sampled, Storage},
     command_buffer::{
         BufferAccess, ImageAccess, ImageUse, compute_barriers,
@@ -187,71 +187,55 @@ fn releasing_one_mip_keeps_the_others() {
     assert!(released_by(&states, Kind::Graphics), "mip 2 is unowned, the others released");
 }
 
-/// A batch appends its staged writes to its newest chunk, gives a write larger than a chunk
-/// one of its own size without leaving the newest, and starts a new chunk once the newest is
-/// full or its last entry freed it.
+/// The ring hands out positions at its head: a reservation that doesn't fit before the tail
+/// fails, wrapping pads to the ring's end, the tail follows what is in use, and reclaiming
+/// never passes a writer still counted in.
 #[test]
-fn staging_chunks_are_appended_and_freed() {
-    let mut cursor = Cursor::<u64>::default();
-    let mut made = Vec::new();
-    let mut new = |capacity| {
-        made.push(capacity);
-        Ok(capacity)
-    };
-    let (first, at) = cursor.place(100, &mut new).unwrap();
-    assert_eq!((*first, at), (MIN_CHUNK, 0));
-    let (second, at) = cursor.place(3, &mut new).unwrap();
-    assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(at, 112, "16-byte aligned after the first");
-    let (large, at) = cursor.place(MIN_CHUNK + 1, &mut new).unwrap();
-    assert_eq!((*large, at), (MIN_CHUNK + 1, 0));
-    let (third, at) = cursor.place(4, &mut new).unwrap();
-    assert!(Arc::ptr_eq(&first, &third) && at == 128, "still the newest chunk");
-    let (full, at) = cursor.place(MIN_CHUNK - 64, &mut new).unwrap();
-    assert!(!Arc::ptr_eq(&first, &full) && at == 0, "a new chunk once the newest is full");
-    drop(full);
-    let (fresh, _) = cursor.place(1, &mut new).unwrap();
-    assert_eq!(Arc::strong_count(&fresh), 1, "the freed chunk isn't reused");
-    assert_eq!(made, [MIN_CHUNK, MIN_CHUNK + 1, MIN_CHUNK, MIN_CHUNK]);
-}
+fn staging_ring_positions_wrap_fill_and_reclaim() {
+    let ring = Ring::new(64);
+    let reserve = |len| ring.reserve(len).map(|r| (r.range, r.offset));
+    assert_eq!(reserve(32), Some((0..32, 0)));
+    assert_eq!(reserve(16), Some((32..48, 32)));
+    assert_eq!(reserve(16), Some((48..64, 48)), "fits exactly, no padding");
+    assert_eq!(reserve(16), None, "full");
+    assert_eq!(ring.used(), 64);
+    ring.count_out();
+    ring.count_out();
+    ring.count_out();
+    // The first region is still in use: the tail moves to its start, which frees nothing.
+    ring.reclaim([0, 48].into_iter());
+    assert_eq!(reserve(16), None);
+    ring.reclaim([48].into_iter());
+    assert_eq!(ring.used(), 16);
+    assert_eq!(reserve(32), Some((64..96, 0)), "wrapped to offset 0");
+    ring.count_out();
+    // Nothing in use and no writer: the tail reaches the head.
+    ring.reclaim(iter::empty());
+    assert_eq!(ring.used(), 0);
+    assert_eq!(reserve(16), Some((96..112, 32)));
+    ring.count_out();
+    ring.reclaim(iter::empty());
+    // 32 bytes don't fit the 16 left before the end: the reservation includes that padding.
+    assert_eq!(reserve(64), None, "the padding leaves no room for a whole ring");
+    assert_eq!(reserve(32), Some((112..160, 0)));
+    ring.count_out();
+    ring.reclaim(iter::empty());
+    assert_eq!(ring.used(), 0);
 
-/// Staged writes go from unrecorded to recorded into a submission, back to unrecorded when it
-/// didn't reach the GPU, and away once it did; a batch records only its own unrecorded ones.
-#[test]
-fn staged_writes_move_through_recording() {
-    let entry = |batch, address| Entry {
-        batch,
-        chunk: Arc::new(()),
-        range: (0..4).into(),
-        target: Target::Buffer(address),
-        recorded: None,
-    };
-    let addresses = |entries: &mut Entries<()>, batch, submission| {
-        (entries.record(batch, submission))
-            .map(|e| match e.target {
-                Target::Buffer(address) => address,
-                Target::Image(_) => unreachable!(),
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut entries = Entries(vec![entry(1, 10), entry(2, 20), entry(1, 11)]);
-    assert_eq!(addresses(&mut entries, 1, (0, 5)), [10, 11]);
-    assert_eq!(entries.unrecorded(1), 0);
-    assert_eq!(addresses(&mut entries, 1, (0, 6)), [] as [u64; 0], "recorded already");
-    assert!(entries.finish((0, 5), false).is_empty());
-    assert_eq!(entries.unrecorded(1), 2, "back after a failed submission");
-    assert_eq!(addresses(&mut entries, 1, (1, 7)), [10, 11]);
-    entries.0.push(entry(1, 12));
-    assert_eq!(addresses(&mut entries, 1, (1, 8)), [12], "only what is new");
-    assert_eq!(entries.finish((1, 7), true).len(), 2);
-    assert_eq!(entries.0.len(), 2);
-    assert_eq!(entries.unrecorded(2), 1, "another batch's write is untouched");
-    // A dropped batch takes its unrecorded writes; its recorded ones go with their submission,
-    // also when it fails.
-    entries.0.push(entry(1, 13));
-    assert_eq!(entries.drop_batch(1).len(), 1);
-    assert_eq!(entries.finish((1, 8), false).len(), 1);
-    assert_eq!(entries.0.len(), 1);
+    // A writer counted in pins the tail at its reservation (its region isn't published yet),
+    // also when later writers published theirs or nothing else is in use.
+    let writing = ring.reserve(16).unwrap();
+    assert_eq!(writing, Reservation { range: 160..176, offset: 32 });
+    let published = ring.reserve(16).unwrap();
+    ring.count_out();
+    ring.reclaim([published.range.start].into_iter());
+    assert_eq!(ring.used(), 32, "the tail stayed at the writer's start");
+    ring.reclaim(iter::empty());
+    assert_eq!(ring.used(), 32);
+    ring.count_out();
+    ring.reclaim(iter::empty());
+    assert_eq!(ring.used(), 0);
+    assert_eq!(STAGING_ALIGN, 16);
 }
 
 #[test]
@@ -501,8 +485,8 @@ fn host_image_copy_needs_no_rebar() {
     let _ = consistent;
 }
 
-/// A loader thread can send a batch with what it staged for.
+/// Uploaders go to loader threads and are shared between them.
 const _: fn() = || {
-    fn send<T: Send>() {}
-    send::<Uploads>();
+    fn shared<T: Send + Sync + Clone>() {}
+    shared::<Uploader>();
 };

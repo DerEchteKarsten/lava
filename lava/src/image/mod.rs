@@ -1,4 +1,4 @@
-//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`; staged ones are `Uploads::image` in `buffer/upload.rs`), type erasure, and their destruction once no frame can reach them
+//! Format-, usage- and dimension-typed GPU images with one view over all mips or one per mip (`VkImageView`s only for attachments; bindless descriptors need none), host uploads (`host-image-copy`; staged ones are `Uploader::image` in `buffer/staging.rs`), type erasure, and their destruction once no frame can reach them
 use std::{
     mem::{self, ManuallyDrop},
     range::Range,
@@ -110,7 +110,7 @@ pub trait MipViews: Views {
 pub struct Single {
     view: vk::ImageView,
     handle: ImageHandle,
-    /// Boxed, so a staged upload reaches it while the image moves (`Uploads::image`).
+    /// Boxed, so a staged upload reaches it while the image moves (`Uploader::image`).
     state: Box<AtomicU64>,
 }
 
@@ -234,7 +234,7 @@ pub struct Image<F: Format, U: ImageUsage, D: Dim = D2, V: Views = Single> {
 impl<F: Format, U: ImageUsage, D: Dim, V: Views> Drop for Image<F, U, D, V> {
     fn drop(&mut self) {
         // Before its states go with its views.
-        crate::buffer::upload::forget_image(self.raw.image);
+        crate::buffer::staging::forget_image(self.raw.image);
     }
 }
 
