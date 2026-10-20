@@ -1,4 +1,4 @@
-//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches, scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
+//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings and dispatches (the last bound compute and ray tracing pipeline kept), scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
 use std::{
     fmt::Debug, marker::PhantomData, ops::Deref, panic::AssertUnwindSafe, ptr::NonNull,
     range::Range, sync::atomic::AtomicU64,
@@ -27,6 +27,8 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::buffer::staging::Staging;
+#[cfg(feature = "ray-tracing-pipeline")]
+use crate::vkobjects::rt_pipeline::BoundRayTracing;
 
 mod binding_output;
 pub(crate) mod image_state;
@@ -139,6 +141,48 @@ pub(crate) struct Recording<'p> {
     pub(crate) presents: SmallVec<[Present; 1]>,
     /// The timeline's staging ring, which `drain_uploads` records.
     pub(crate) staging: Option<&'p Staging>,
+    /// The compute and ray tracing pipeline bound last, so repeated dispatches skip the lookup.
+    bound_compute: Option<Bound<vk::Pipeline>>,
+    #[cfg(feature = "ray-tracing-pipeline")]
+    bound_ray_tracing: Option<Bound<BoundRayTracing>>,
+}
+
+/// A pipeline a recording bound, with the pass and constant bytes it was looked up for.
+struct Bound<P> {
+    pass: usize,
+    constants: SmallVec<[u8; 16]>,
+    pipeline: P,
+}
+
+impl<P: Copy> Bound<P> {
+    /// The pipeline of `pass` with `constants`: the bound one if it was looked up for them,
+    /// else `lookup`'s, then bound by `bind` unless it is the bound one (another pass's
+    /// specialization may share it).
+    fn get(
+        slot: &mut Option<Self>,
+        pass: usize,
+        constants: &[u8],
+        lookup: impl FnOnce() -> P,
+        same: impl Fn(&P, &P) -> bool,
+        bind: impl FnOnce(&P),
+    ) -> P {
+        if let Some(bound) = slot
+            && bound.pass == pass
+            && *bound.constants == *constants
+        {
+            return bound.pipeline;
+        }
+        let pipeline = lookup();
+        if !slot.as_ref().is_some_and(|bound| same(&bound.pipeline, &pipeline)) {
+            bind(&pipeline);
+        }
+        *slot = Some(Bound {
+            pass,
+            constants: SmallVec::from_slice(constants),
+            pipeline,
+        });
+        pipeline
+    }
 }
 
 /// A command buffer being recorded for a family of kind `K`; its methods are the commands `K`
@@ -855,7 +899,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             depth: depth_access.is_some(),
             stencil: self.stencil_format != vk::Format::UNDEFINED,
         };
-        let dynamic = Dynamic::of(Ctx::features_ref());
+        let dynamic = *Ctx::dynamic();
         let mut state: Option<DrawState> = None;
         let mut assembly: Assembly = None;
         let mut bound: Option<(usize, RasterKeyRef)> = None;
@@ -1077,11 +1121,19 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         );
         rec.push_constants(sections.push_constants);
 
-        let pipeline = pipelines().compute(sections.pass, sections.constants);
-
         rec.enter(pass.name, true);
+        let handle = rec.handle;
+        Bound::get(
+            &mut rec.bound_compute,
+            sections.pass,
+            sections.constants,
+            || pipelines().compute(sections.pass, sections.constants),
+            |a, b| a == b,
+            |pipeline| unsafe {
+                Ctx::device().cmd_bind_pipeline(handle, vk::PipelineBindPoint::COMPUTE, *pipeline)
+            },
+        );
         unsafe {
-            Ctx::device().cmd_bind_pipeline(rec.handle, vk::PipelineBindPoint::COMPUTE, pipeline);
             if let Some(slice) = indirect_buffer {
                 Functions::device_address_commands().cmd_dispatch_indirect2(
                     rec.handle,
@@ -1143,15 +1195,24 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
 
         rec.enter(pass.name, true);
         let handle = rec.handle;
-        pipelines().ray_tracing(sections.pass, sections.constants, |pipeline| unsafe {
+        let pipeline = Bound::get(
+            &mut rec.bound_ray_tracing,
+            sections.pass,
+            sections.constants,
+            || pipelines().ray_tracing(sections.pass, sections.constants),
+            |a, b| a.pipeline == b.pipeline,
+            |pipeline| unsafe {
+                Ctx::device().cmd_bind_pipeline(
+                    handle,
+                    vk::PipelineBindPoint::RAY_TRACING_KHR,
+                    pipeline.pipeline,
+                )
+            },
+        );
+        unsafe {
             // Past the pass's check: `ray_tracing` panics for hand-made bindings without it.
             let functions = Functions::raytracing_pipeline();
-            Ctx::device().cmd_bind_pipeline(
-                handle,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                pipeline.pipeline,
-            );
-            let [raygen, miss, hit, callable] = &pipeline.sbt.regions;
+            let [raygen, miss, hit, callable] = &pipeline.regions;
             match indirect_buffer {
                 Some(slice) => functions.cmd_trace_rays_indirect(
                     handle,
@@ -1165,7 +1226,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
                     handle, raygen, miss, hit, callable, rays[0], rays[1], rays[2],
                 ),
             }
-        });
+        }
         rec.exit(pass.name, true);
     }
 
@@ -1384,6 +1445,9 @@ impl<'p> Recording<'p> {
             acquired: SmallVec::new(),
             presents: SmallVec::new(),
             staging,
+            bound_compute: None,
+            #[cfg(feature = "ray-tracing-pipeline")]
+            bound_ray_tracing: None,
         }
     }
 

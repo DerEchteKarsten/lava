@@ -108,6 +108,11 @@ pub struct Config {
     pub gpu_assisted_validation: bool,
     /// Optional features lava leaves off even where the device has them (not asserted ones).
     pub disabled: Features,
+    /// A file with the data of lava's `VkPipelineCache`, which every pipeline is made through:
+    /// loaded at init where this device and driver wrote it (else ignored with a warning; a
+    /// missing file is an empty cache) and written by [`pipeline::save_cache`] and [`destroy`].
+    /// `None` keeps the cache in memory.
+    pub pipeline_cache: Option<&'static std::path::Path>,
 }
 
 impl Config {
@@ -119,6 +124,7 @@ impl Config {
             validation: false,
             gpu_assisted_validation: false,
             disabled: Features::DEFAULT,
+            pipeline_cache: None,
         }
     }
 }
@@ -132,7 +138,7 @@ pub fn init(config: &Config) -> Result<()> {
     Bindless::init()?;
     #[cfg(feature = "performance-query")]
     query::counters::init()?;
-    pipeline::init()?;
+    pipeline::init(config.pipeline_cache)?;
     Ok(())
 }
 
@@ -149,13 +155,16 @@ pub fn wait_idle() -> Result<()> {
     Ok(())
 }
 
-/// Waits for the device, then destroys everything dropped so far and the descriptor heaps; drop
-/// the timelines first.
+/// Waits for the device, saves the pipeline cache ([`pipeline::save_cache`]), then destroys
+/// everything dropped so far and the descriptor heaps; drop the timelines first.
 #[track_caller]
 pub fn destroy() {
     CALLSITE.set(Some(Location::caller().clone()));
     if let Err(err) = wait_idle() {
         tracing::error!(%err, "failed to wait for the device before destroying lava");
+    }
+    if let Err(err) = pipeline::save_cache() {
+        tracing::error!(%err, "failed to save the pipeline cache");
     }
     Bindless::destroy();
     loop {

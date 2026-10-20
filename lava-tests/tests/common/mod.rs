@@ -1,4 +1,4 @@
-//! Shared harness for lava's GPU tests: one headless context per process (with the features a test binary disables) and its graphics timeline, serialised, validation-checked
+//! Shared harness for lava's GPU tests: one headless context per process (with the features a test binary disables, its staging ring size and pipeline cache file) and its graphics timeline, serialised, validation-checked
 #![allow(dead_code)]
 
 pub mod golden;
@@ -79,11 +79,20 @@ pub fn staging(bytes: u64) {
     );
 }
 
+static PIPELINE_CACHE: OnceLock<&'static std::path::Path> = OnceLock::new();
+
+/// Makes the process's context load and save its pipeline cache at `path`
+/// (`Config::pipeline_cache`); call before the first `gpu()`.
+pub fn pipeline_cache(path: &'static std::path::Path) {
+    assert_eq!(*PIPELINE_CACHE.get_or_init(|| path), path, "one cache per process");
+}
+
 static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
     capture_validation_errors();
     let config = lava::Config {
         validation: true,
         disabled: DISABLED.get().copied().unwrap_or_default(),
+        pipeline_cache: PIPELINE_CACHE.get().copied(),
         ..lava::Config::new(&lava_tests::bindings::PASS_MAP)
     };
     lava::init(&config).expect(

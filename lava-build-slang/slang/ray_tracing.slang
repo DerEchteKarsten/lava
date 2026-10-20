@@ -9,8 +9,9 @@
 [__AttributeUsage(_AttributeTargets.Function)]
 public struct GroupAttribute { int index; };
 
-/// On the raygen entry point: how deep TraceRay calls may nest (1 without it: only the raygen
-/// traces; 2 lets a closest hit trace, e.g. shadow rays).
+/// On the raygen entry point: how deep TraceRay calls may nest, 0 to 31 (1 without it: only the
+/// raygen traces; 2 lets a closest hit trace, e.g. shadow rays; 0 traces nothing, e.g. a pass of
+/// callables). A device with a lower `maxRayRecursionDepth` gets no pipeline for the pass.
 [__AttributeUsage(_AttributeTargets.Function)]
 public struct MaxRecursionAttribute { int depth; };
 

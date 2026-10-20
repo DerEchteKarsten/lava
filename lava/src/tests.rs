@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection, queue family picking and the layouts the GPU reads
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking and the layouts the GPU reads
 use std::{
     iter,
     sync::atomic::AtomicU64,
@@ -445,8 +445,17 @@ fn image_handles_encode_their_slots_and_kind() {
 fn passes_need_the_features_of_their_capabilities() {
     let capability = |id: u32| [2 << 16 | 17, id];
     let header = [0x0723_0203u32, 0x0001_0600, 0, 1, 0];
-    let words = header.into_iter().chain([1, 39, 5283].into_iter().flat_map(capability));
+    // An `OpExtension` of two words between them, then `OpMemoryModel`, which ends the scan.
+    let extension = [3 << 16 | 10, 0x5f565053, 0];
+    let words = (header.into_iter())
+        .chain([1, 39].into_iter().flat_map(capability))
+        .chain(extension)
+        .chain(capability(5283))
+        .chain([3 << 16 | 14, 0, 1])
+        .chain(capability(4479));
     let spirv: Vec<u8> = words.flat_map(u32::to_le_bytes).collect();
+    let capabilities: Vec<u32> = crate::features::spirv_capabilities(&spirv).collect();
+    assert_eq!(capabilities, [1, 39, 5283], "the scan stops after the capabilities");
     let needs = Features::of_spirv(&spirv);
     #[cfg(feature = "shader-int8")]
     assert!(needs.features.shader_int8);
@@ -461,7 +470,9 @@ fn passes_need_the_features_of_their_capabilities() {
 /// supported.
 #[test]
 fn enabled_features_read_back_as_supported() {
-    assert!(FeatureChain::enabling(&Features::default()).lava_missing(&|_| true).is_empty());
+    let queried = FeatureChain::default();
+    let enabling = |features: &Features| FeatureChain::enabling(features, &queried);
+    assert!(enabling(&Features::default()).lava_missing(&|_| true).is_empty());
     let all = Features::from_bits(iter::repeat(true));
     let facts = DeviceFacts {
         rebar: true,
@@ -469,7 +480,7 @@ fn enabled_features_read_back_as_supported() {
         dedicated_compute: true,
         dedicated_transfer: true,
     };
-    assert_eq!(FeatureChain::enabling(&all).optional(&|_| true, facts), all);
+    assert_eq!(enabling(&all).optional(&|_| true, facts), all);
 }
 
 #[test]
@@ -606,3 +617,26 @@ const _: fn() = || {
     fn shared<T: Send + Sync + Clone>() {}
     shared::<Uploader>();
 };
+
+/// A pipeline cache loads only with this device's header: its size, version, vendor, device
+/// and cache UUID.
+#[test]
+fn pipeline_caches_load_only_for_their_device() {
+    use crate::pipeline::cache_header_matches;
+    let mut properties = vk::PhysicalDeviceProperties::default();
+    (properties.vendor_id, properties.device_id) = (0x8086, 0x56a0);
+    properties.pipeline_cache_uuid = [7; 16];
+    let header = |size: u32, version: u32, vendor: u32, uuid: [u8; 16]| {
+        let words = [size, version, vendor, 0x56a0].into_iter().flat_map(u32::to_le_bytes);
+        let mut data: Vec<u8> = words.chain(uuid).collect();
+        data.extend([0; 64]);
+        data
+    };
+    assert!(cache_header_matches(&header(32, 1, 0x8086, [7; 16]), &properties));
+    assert!(!cache_header_matches(&header(32, 1, 0x1002, [7; 16]), &properties), "vendor");
+    assert!(!cache_header_matches(&header(32, 1, 0x8086, [8; 16]), &properties), "driver");
+    assert!(!cache_header_matches(&header(32, 2, 0x8086, [7; 16]), &properties), "version");
+    assert!(!cache_header_matches(&header(16, 1, 0x8086, [7; 16]), &properties), "size");
+    assert!(!cache_header_matches(&header(32, 1, 0x8086, [7; 16])[..20], &properties), "cut");
+    assert!(!cache_header_matches(&[], &properties));
+}

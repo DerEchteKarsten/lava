@@ -452,16 +452,6 @@ struct SConst<'a> {
     layout: &'a TypeLayout,
 }
 
-/// Pipeline counts per kind; a pass with specialization constants goes to the specialized maps.
-#[derive(Default)]
-struct Pipelines {
-    compute: usize,
-    specialized_compute: usize,
-    ray_tracing: usize,
-    specialized_ray_tracing: usize,
-    raster: usize,
-}
-
 /// `<'a>`, the lifetime the views, slices and result share, where `lifetime` asks for it.
 fn fn_generics(lifetime: bool) -> &'static str {
     if lifetime { "<'a>" } else { "" }
@@ -536,7 +526,6 @@ use lava::pipeline::*;
         let mut structs = Structs::new();
         let mut pass_map: Vec<String> = Vec::new();
         let mut built_passes: Vec<String> = Vec::new();
-        let mut pipelines = Pipelines::default();
 
         let passes_dir = out_dir.join("passes");
         fs::create_dir_all(&passes_dir).unwrap();
@@ -675,42 +664,28 @@ use lava::pipeline::*;
                 PassKind::RasterVertex => "kind::RasterVertex::STAGES",
                 PassKind::RasterMesh => "kind::RasterMesh::STAGES",
             };
-            let count = match (kind, !consts.is_empty()) {
-                (PassKind::Compute, false) => &mut pipelines.compute,
-                (PassKind::Compute, true) => &mut pipelines.specialized_compute,
-                (PassKind::RayTracing, false) => &mut pipelines.ray_tracing,
-                (PassKind::RayTracing, true) => &mut pipelines.specialized_ray_tracing,
-                (PassKind::RasterVertex | PassKind::RasterMesh, _) => &mut pipelines.raster,
-            };
-            *count += 1;
-            let pipeline_index = *count - 1;
-
             let kind_fields = match kind {
                 PassKind::RasterVertex => {
                     let (vertex, fragment) =
                         (entry("vertex").unwrap(), entry("fragment").unwrap());
-                    format!(
-                        "RasterVertex {{ fragment: \"{fragment}\\0\", vertex: \"{vertex}\\0\" }}"
-                    )
+                    format!("RasterVertex {{ fragment: c{fragment:?}, vertex: c{vertex:?} }}")
                 }
                 PassKind::RasterMesh => {
                     let (mesh, fragment) = (entry("mesh").unwrap(), entry("fragment").unwrap());
                     let task = match entry("amplification") {
-                        Some(task) => format!("Some(\"{task}\\0\")"),
+                        Some(task) => format!("Some(c{task:?})"),
                         None => "None".to_string(),
                     };
-                    format!(
-                        "RasterMesh {{ fragment: \"{fragment}\\0\", mesh: \"{mesh}\\0\", amp: {task} }}"
-                    )
+                    format!("RasterMesh {{ fragment: c{fragment:?}, mesh: c{mesh:?}, amp: {task} }}")
                 }
                 PassKind::Compute => {
                     let compute = entry("compute").unwrap();
-                    format!("Compute {{ entry: \"{compute}\\0\" }}")
+                    format!("Compute {{ entry: c{compute:?} }}")
                 }
                 PassKind::RayTracing => {
                     let groups = compile::ray_tracing_groups(&entries)
                         .unwrap_or_else(|e| panic!("{source}: {e}"));
-                    let name = |name: &str| format!("\"{name}\\0\"");
+                    let name = |name: &str| format!("c{name:?}");
                     let optional = |entry: &Option<String>| match entry {
                         Some(entry) => format!("Some({})", name(entry)),
                         None => "None".to_string(),
@@ -768,7 +743,6 @@ use lava::pipeline::*;
         name: "{pass_name}",
         spirv: include_bytes!({spirv:?}),
         kind: PassKind::{kind_fields},
-        index: {pipeline_index},
         constants: {constants},
         constants_size: {constants_size},
     }},"#
@@ -850,18 +824,23 @@ pub struct {gpu_name} {{
             let incomplete = format!("Incomplete{pass_name}");
 
             let binding_output = format!(
-                r#"Bindings::new(
-            {index},
-            &{gpu_name} {{
-                {gpu_inits}
-            }},
-            [
-                {image_accesses}
-            ],
-            [
-                {buffer_accesses}
-            ],
-        )"#,
+                r#"// SAFETY: generated from the pass's reflection: pass {index} of `PASS_MAP`, of
+        // this kind, with its push constant struct and the accesses of its fields; one with
+        // specialization constants gets them in `constant_bindings` before it can be recorded.
+        unsafe {{
+            Bindings::new(
+                {index},
+                &{gpu_name} {{
+                    {gpu_inits}
+                }},
+                [
+                    {image_accesses}
+                ],
+                [
+                    {buffer_accesses}
+                ],
+            )
+        }}"#,
                 gpu_inits = push.gpu_inits.join(", "),
                 image_accesses = push.image_accesses.join(",\n"),
                 buffer_accesses = push.buffer_accesses.join(",\n"),
@@ -875,27 +854,7 @@ pub struct {gpu_name} {{
                 )
             };
 
-            const OP_CAPABILITY: u32 = 17;
-            let words: Vec<u32> = pass_spirv
-                .as_slice()
-                .chunks_exact(4)
-                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
-                .collect();
-            let mut capabilities = Vec::new();
-            // After the five header words, each instruction starts with its word count and opcode.
-            let mut i = 5;
-            while i < words.len() {
-                let (count, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
-                if opcode == OP_CAPABILITY
-                    && let Some(&capability) = words.get(i + 1)
-                {
-                    capabilities.push(capability);
-                }
-                if count == 0 {
-                    break;
-                }
-                i += count;
-            }
+            let capabilities = crate::features::capabilities(pass_spirv.as_slice());
             let mut gates: Vec<&str> = Vec::new();
             for (capability, _, gate) in crate::features::CAPABILITY_FEATURES {
                 if capabilities.contains(capability) && !gates.contains(gate) {
@@ -911,7 +870,7 @@ pub struct {gpu_name} {{
                     }
                     (
                         format!("lava::features::Gated<{gate}, {returns}>"),
-                        format!("lava::features::gate::<{gate}, _>(move || {body})"),
+                        format!("lava::features::gate::<{gate}, _>(move || {{\n        {body}\n        }})"),
                     )
                 }
             };
@@ -974,17 +933,22 @@ pub struct {incomplete}<'a>({output});
 impl<'a> {incomplete}<'a> {{
     pub fn constant_bindings{generics}(self, {params}) -> {complete} {{
         {checks}
-        self.0.with_constants(
-            &{consts_name} {{
-                {gpu_inits}
-            }},
-            [
-                {image_accesses}
-            ],
-            [
-                {buffer_accesses}
-            ],
-        )
+        // SAFETY: the pass's constants, laid out as its `PassEntry.constants` say (the
+        // struct is packed in id order and asserted to be `constants_size` bytes), with the
+        // accesses of the handles among them.
+        unsafe {{
+            self.0.with_constants(
+                &{consts_name} {{
+                    {gpu_inits}
+                }},
+                [
+                    {image_accesses}
+                ],
+                [
+                    {buffer_accesses}
+                ],
+            )
+        }}
     }}
 }}
 "#,

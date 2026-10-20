@@ -75,18 +75,18 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 ## lava: bugs from the second survey (2026-10-18)
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
-- Safe code reaches undefined behaviour: `Bindings::new` checks neither the pass kind nor the specialization constants' length (a `VkSpecializationInfo` with `dataSize` 0); `lava::destroy()` can run twice or before further use; `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 23-37).
+- Safe code reaches undefined behaviour: `lava::destroy()` can run twice or before further use; `QueryPool::read` overflows; tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; host copies of ASTC/ETC2 images skip the data length check; empty indirect slices (SURVEY 24-37).
 - `multiDrawIndirect`, `drawIndirectFirstInstance` and `depthBiasClamp` are never enabled, though `Draw::indirect` passes `buffer.len()` draws and `DepthBias::clamp` is public (38, 39).
 - Without extended dynamic state 3, line and point draws use a pipeline baked with `TRIANGLE_LIST` (`dynamicPrimitiveTopologyUnrestricted` is never queried) (40). `depth_clamp(true)` still clips where `VK_EXT_depth_clip_enable` exists (41). 64-bit clear values are packed as 32-bit (43).
 - `wait_for` and queries use stages and query types the waiting family doesn't support (44, 45).
 - A `Timeline` dropped after `reserve()` or an unsubmitted `begin()` holds back every later destruction for good; a failed barrier-only replay leaves a value nothing signals (64, 65). The public `reclaim()` never polls (67). `init` isn't atomic: a late failure leaks the device and every retry says "already initialised" (69).
-- A failed pipeline creation poisons the pipeline cache of its kind for every later recording (72).
 - `cmd.present` marks the image presented while recording, so `surface.present()` inside the submit closure presents on an unsignalled semaphore; a failed swapchain recreation keeps the retired swapchain (77, 78).
 - The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `ImageHandle` (87, 88).
 
 ## Performance
 --- find solutions ---
-- Pipelines are created synchronously on first use, under a write lock, with no `VkPipelineCache` (`command_buffer.rs:233-244`, `:405`, `:602-607`, `:768`). (Ideas: per-pass locks, a warm-up list, a `VkPipelineCache` file.)
+- Specialized and raster pipelines are created synchronously on the recording thread at first use (outside the pass's map lock, through the `VkPipelineCache`). (Ideas: a warm-up list, `FAIL_ON_PIPELINE_COMPILE_REQUIRED` for async compiles.)
+- `ray-traversal-primitive-culling` on a device with ray queries and ray tracing pipelines but without `rayTraversalPrimitiveCulling` stays on when `Config::disabled` turns ray queries off, so a ray tracing pass with culling flags would be invalid there (no known device lacks the bit).
 - Recording a draw costs about twice a dispatch on the CPU (`lava-tests` recording bench, 2026-10-16, borrowed unsized draws: 64 indexed draws in 8 renderings about 85 µs, 64 compute dispatches 40 to 55 µs, noisy). Not profiled yet. Suspects: the per-draw state diff and push constants, and each rendering's span, scope and attachment setup.
 
 --- intended ---

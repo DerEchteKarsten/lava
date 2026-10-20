@@ -1,4 +1,4 @@
-//! Pass bindings as generated code builds them (`Bindings`, sized by the pass) and as commands borrow them (`BindingOutput`, unsized, an `unsized_struct!`): the push constants, accesses and specialization constants of one pass; and the pass kind markers with the stages their accesses happen in
+//! Pass bindings as generated code builds them (`Bindings`, sized by the pass, through `unsafe` constructors whose contract generators keep) and as commands borrow them (`BindingOutput`, unsized, an `unsized_struct!`): the push constants, accesses and specialization constants of one pass; and the pass kind markers (`kind::Kind`) with the stages their accesses happen in
 
 use bytemuck::{Pod, bytes_of};
 
@@ -10,12 +10,30 @@ use crate::unsized_struct::unsized_struct;
 /// and its shader stages (`STAGES`, also `PassKind::stages`), where the accesses of its
 /// bindings and of the `Accesses` its commands take happen.
 pub mod kind {
-    use crate::vk::PipelineStageFlags2 as S;
+    use crate::{pipeline::PassKind, sealed::Sealed, vk::PipelineStageFlags2 as S};
 
     pub struct Compute;
     pub struct RayTracing;
     pub struct RasterVertex;
     pub struct RasterMesh;
+
+    /// One of the kind markers, which [`super::Bindings::new`] checks a pass against.
+    pub trait Kind: Sealed {
+        /// Whether a pass of `kind` has this marker.
+        fn is(kind: &PassKind) -> bool;
+    }
+
+    macro_rules! kinds {
+        ($($marker:ident),*) => {$(
+            impl Sealed for $marker {}
+            impl Kind for $marker {
+                fn is(kind: &PassKind) -> bool {
+                    matches!(kind, PassKind::$marker { .. })
+                }
+            }
+        )*};
+    }
+    kinds!(Compute, RayTracing, RasterVertex, RasterMesh);
 
     impl Compute {
         pub const STAGES: S = S::COMPUTE_SHADER;
@@ -85,15 +103,40 @@ impl<'a, K> BindingOutput<'a, K> {
     }
 }
 
-impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I, B, 0> {
-    /// The bindings of pass `pass` (its index in the pass map). `K` must be the pass's kind.
-    pub fn new<G: Pod>(
+/// The pass map entry of `pass` once lava is initialised, for the debug checks of the generator
+/// contract.
+fn entry(pass: usize) -> Option<&'static crate::pipeline::PassEntry> {
+    crate::pipeline::PASS_MAP.get()?.passes.get(pass)
+}
+
+impl<'a, K: kind::Kind, const P: usize, const I: usize, const B: usize>
+    Bindings<'a, K, P, I, B, 0>
+{
+    /// The bindings of pass `pass` (its index in the pass map) with `bindings` as its push
+    /// constants and the accesses they make; a pass with specialization constants is recorded
+    /// only after [`Self::with_constants`]. This is the API of binding generators.
+    ///
+    /// # Safety
+    /// What generated code guarantees, since commands and the driver trust it:
+    /// - `pass` is the index of a pass in the `PASS_MAP` given to `lava::init`, of kind `K`;
+    /// - `bindings` is the pass's push constant struct, laid out as its shaders read it;
+    /// - `images` and `buffers` name every resource the push constants reach, with the accesses
+    ///   the pass makes (the command adds what reaches it otherwise, its `Accesses`);
+    /// - a pass with specialization constants gets them with [`Self::with_constants`] before it
+    ///   is recorded.
+    ///
+    /// Debug builds check the kind once lava is initialised.
+    pub unsafe fn new<G: Pod>(
         pass: usize,
         bindings: &G,
         images: [ImageUse<'a>; I],
         buffers: [BufferAccess; B],
     ) -> Self {
-        assert!(P <= MAX_PUSH_CONSTANTS_SIZE);
+        const { assert!(P <= MAX_PUSH_CONSTANTS_SIZE) };
+        debug_assert!(
+            entry(pass).is_none_or(|entry| K::is(&entry.kind)),
+            "pass {pass} isn't of the bindings' kind"
+        );
         let push_constants = bytes_of(bindings)
             .try_into()
             .expect("`P` is the size of the push constants");
@@ -102,7 +145,13 @@ impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I
 
     /// Sets the specialization constants, laid out as `PassEntry.constants` says, and adds the
     /// accesses they make; `IO` and `BO` are `I + I2` and `B + B2`.
-    pub fn with_constants<
+    ///
+    /// # Safety
+    /// `constants` is the pass's specialization constant data: `PassEntry.constants_size`
+    /// bytes, each constant at the offset and with the size of its `PassEntry.constants` entry
+    /// (debug builds check the size once lava is initialised); `images` and `buffers` name what
+    /// the constants reach, as for [`Self::new`].
+    pub unsafe fn with_constants<
         G: Pod,
         const C: usize,
         const I2: usize,
@@ -116,6 +165,11 @@ impl<'a, K, const P: usize, const I: usize, const B: usize> Bindings<'a, K, P, I
         buffers: [BufferAccess; B2],
     ) -> Bindings<'a, K, P, IO, BO, C> {
         const { assert!(IO == I + I2 && BO == B + B2) };
+        debug_assert!(
+            entry(self.pass as usize).is_none_or(|entry| entry.constants_size == C),
+            "the constants of pass {} aren't its `constants_size`",
+            self.pass
+        );
         let Self {
             pass,
             push_constants,

@@ -21,6 +21,7 @@ use std::ffi::{CStr, CString};
 use crate::features::{Loader, gate, load, loaded};
 use crate::{
     Config,
+    command_buffer::Dynamic,
     pipeline::MAX_PUSH_CONSTANTS_SIZE,
     features::{DeviceFacts, FeatureChain, Features, LAVA_EXTENSIONS},
     queue::{
@@ -40,6 +41,8 @@ impl Debug for Ctx {
 
 pub struct Ctx {
     features: Features,
+    /// The draw state the device sets dynamically, from `features`.
+    dynamic: Dynamic,
     device: Device,
     physical_device: PhysicalDevice,
     allocator: Mutex<Allocator>,
@@ -111,6 +114,9 @@ impl Ctx {
     }
     pub(crate) fn features_ref() -> &'static Features {
         &Ctx::get().features
+    }
+    pub(crate) fn dynamic() -> &'static Dynamic {
+        &Ctx::get().dynamic
     }
 
     #[validation_trace]
@@ -420,7 +426,10 @@ impl Ctx {
             })
             .collect::<Vec<_>>();
         let extension_names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
-        let mut enabled = FeatureChain::enabling(&features);
+        let queried = FeatureChain::query(&instance, physical_device.handel, &|name: &CStr| {
+            (physical_device.supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes())
+        });
+        let mut enabled = FeatureChain::enabling(&features, &queried);
         let mut features2 = enabled.chain(&|name| extensions.contains(&name));
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
@@ -523,8 +532,9 @@ impl Ctx {
                 allocator: Mutex::new(allocator),
                 queues,
 
-                features: features,
-                physical_device: physical_device,
+                dynamic: Dynamic::of(&features),
+                features,
+                physical_device,
             })
             .map_err(|_| Error::message("Vulkan context was already initialized"))?;
         undo_device.disarm();
@@ -729,8 +739,8 @@ impl Functions {
     }
 }
 
-/// Calls `f` with a debug name as a C string, cut at its first NUL (pass entry names carry
-/// one); one of up to 127 bytes is copied to the stack, so labels don't allocate.
+/// Calls `f` with a debug name as a C string, cut at its first NUL; one of up to 127 bytes is
+/// copied to the stack, so labels don't allocate.
 pub(crate) fn with_debug_name<R>(name: &str, f: impl FnOnce(&CStr) -> R) -> R {
     let name = name.split('\0').next().unwrap_or_default().as_bytes();
     let mut buffer = [0u8; 128];

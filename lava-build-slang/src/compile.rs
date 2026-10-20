@@ -183,8 +183,8 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
                     entry.name
                 ));
             }
-            if !(1..=31).contains(&depth) {
-                return Err(format!("`MaxRecursion({depth})` isn't between 1 and 31"));
+            if !(0..=31).contains(&depth) {
+                return Err(format!("`MaxRecursion({depth})` isn't between 0 and 31"));
             }
             max_recursion = depth as u32;
         }
@@ -326,6 +326,9 @@ mod tests {
         assert!(refused(&[rg(), miss]).contains("isn't a raygen"));
         let mut deep = rg();
         deep.max_recursion = Some(32);
-        assert!(refused(&[deep]).contains("between 1 and 31"));
+        assert!(refused(&[deep]).contains("between 0 and 31"));
+        let mut flat = rg();
+        flat.max_recursion = Some(0);
+        assert_eq!(ray_tracing_groups(&[flat]).unwrap().max_recursion, 0, "Vulkan allows 0");
     }
 }

@@ -191,35 +191,22 @@ macro_rules! features {
                     features: Features::default(),
                     compiled_out: Vec::new(),
                 };
-                let words: Vec<u32> = spirv
-                    .chunks_exact(4)
-                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
-                    .collect();
-                const OP_CAPABILITY: u32 = 17;
-                // After the five header words, each instruction starts with its word count and opcode.
-                let mut i = 5;
-                while i < words.len() {
-                    let (count, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
-                    if opcode == OP_CAPABILITY
-                        && let Some(&capability) = words.get(i + 1)
-                        && let Some(&(_, cargo)) =
-                            SPIRV_CAPABILITIES.iter().find(|(id, _)| *id == capability)
-                    {
-                        let compiled = match cargo {
-                            $(#[cfg(feature = $cargo)] $cargo => {
-                                needs.features.$name = true;
-                                true
-                            })*
-                            _ => false,
-                        };
-                        if !compiled && !needs.compiled_out.contains(&cargo) {
-                            needs.compiled_out.push(cargo);
-                        }
+                for capability in spirv_capabilities(spirv) {
+                    let Some(&(_, cargo)) =
+                        SPIRV_CAPABILITIES.iter().find(|(id, _)| *id == capability)
+                    else {
+                        continue;
+                    };
+                    let compiled = match cargo {
+                        $(#[cfg(feature = $cargo)] $cargo => {
+                            needs.features.$name = true;
+                            true
+                        })*
+                        _ => false,
+                    };
+                    if !compiled && !needs.compiled_out.contains(&cargo) {
+                        needs.compiled_out.push(cargo);
                     }
-                    if count == 0 {
-                        break;
-                    }
-                    i += count;
                 }
                 needs
             }
@@ -278,13 +265,17 @@ features! {
     ray_query: "ray-query" / "assert-ray-query" => RayQuery,
     /// `VK_KHR_ray_tracing_pipeline` with indirect tracing: ray tracing passes.
     ray_tracing_pipeline: "ray-tracing-pipeline" / "assert-ray-tracing-pipeline" => RayTracingPipeline,
+    /// Ray flags that skip triangles or AABBs (`RayTraversalPrimitiveCullingKHR`): with ray
+    /// queries, or with ray tracing pipelines on a device with `rayTraversalPrimitiveCulling`.
+    ray_traversal_primitive_culling: "ray-traversal-primitive-culling" / "assert-ray-traversal-primitive-culling" => RayTraversalPrimitiveCulling,
     /// Pipeline statistics queries (invocation counts per pass).
     pipeline_statistics: "pipeline-statistics" / "assert-pipeline-statistics" => PipelineStatistics,
     /// Occlusion queries that count samples exactly (`QueryPool::precise_occlusion`).
     precise_occlusion: "precise-occlusion" / "assert-precise-occlusion" => PreciseOcclusion,
     /// `VK_EXT_memory_budget`: per-heap usage and budget in `memory_report`.
     memory_budget: "memory-budget" / "assert-memory-budget" => MemoryBudget,
-    /// `VK_KHR_shader_clock` with subgroup clocks (`OpReadClockKHR Subgroup`).
+    /// `VK_KHR_shader_clock` with subgroup clocks (`OpReadClockKHR Subgroup`), and device clocks
+    /// (`Device` scope) where the device has `shaderDeviceClock`.
     shader_clock: "shader-clock" / "assert-shader-clock" => ShaderClock,
     /// `VK_KHR_performance_query` with query pools: `query::counters`, `QueryPool::performance`.
     performance_query: "performance-query" / "assert-performance-query" => PerformanceQuery,
@@ -333,7 +324,8 @@ features! {
     smooth_lines: "smooth-lines" / "assert-smooth-lines" => SmoothLines,
     /// Stippled lines (`RasterState::line_stipple`) in every line mode the device has.
     line_stipple: "line-stipple" / "assert-line-stipple" => LineStipple,
-    /// Shader capabilities: 8-, 16- and 64-bit types and 64-bit atomics.
+    /// Shader capabilities: 8-, 16- and 64-bit types and 64-bit atomics (on buffers, and on
+    /// shared memory where the device has `shaderSharedInt64Atomics`).
     shader_int8: "shader-int8" / "assert-shader-int8" => ShaderInt8,
     shader_int16: "shader-int16" / "assert-shader-int16" => ShaderInt16,
     shader_float16: "shader-float16" / "assert-shader-float16" => ShaderFloat16,
@@ -342,6 +334,11 @@ features! {
     /// 8- and 16-bit values in storage and uniform buffers and push constants.
     storage_8bit: "storage-8bit" / "assert-storage-8bit" => Storage8Bit,
     storage_16bit: "storage-16bit" / "assert-storage-16bit" => Storage16Bit,
+    /// 16-bit values in shader inputs and outputs (`StorageInputOutput16`).
+    storage_input_output_16: "storage-input-output-16" / "assert-storage-input-output-16" => StorageInputOutput16,
+    /// Clip and cull distances written by shaders (`SV_ClipDistance`, `SV_CullDistance`).
+    clip_distance: "clip-distance" / "assert-clip-distance" => ClipDistance,
+    cull_distance: "cull-distance" / "assert-cull-distance" => CullDistance,
     /// Extended dynamic state: draws that differ in it share a pipeline; without it the state
     /// is part of the pipeline's key.
     dynamic_blend: "dynamic-blend" / "assert-dynamic-blend" => DynamicBlend,
@@ -379,18 +376,53 @@ pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
     (10, "shader-float64"),
     (12, "shader-int64-atomics"),
     (22, "shader-int16"),
+    (32, "clip-distance"),
+    (33, "cull-distance"),
     (39, "shader-int8"),
     (4433, "storage-16bit"),
     (4434, "storage-16bit"),
     (4435, "storage-16bit"),
+    (4436, "storage-input-output-16"),
     (4448, "storage-8bit"),
     (4449, "storage-8bit"),
     (4450, "storage-8bit"),
     (4472, "ray-query"),
+    (4478, "ray-traversal-primitive-culling"),
     (4479, "ray-tracing-pipeline"),
     (5055, "shader-clock"),
     (5283, "mesh-shader"),
 ];
+
+/// The operands of a SPIR-V module's `OpCapability`s, read in place: they and the
+/// `OpExtension`s come right after the header, so the scan stops at the first other instruction.
+pub(crate) fn spirv_capabilities(spirv: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    const OP_EXTENSION: u32 = 10;
+    const OP_CAPABILITY: u32 = 17;
+    let mut words = (spirv.chunks_exact(4))
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .skip(5);
+    fn skip(words: &mut impl Iterator<Item = u32>, n: usize) {
+        if n > 0 {
+            words.nth(n - 1);
+        }
+    }
+    std::iter::from_fn(move || {
+        loop {
+            // Each instruction starts with its word count and opcode.
+            let first = words.next()?;
+            let (count, opcode) = ((first >> 16) as usize, first & 0xFFFF);
+            match opcode {
+                OP_CAPABILITY if count >= 2 => {
+                    let capability = words.next()?;
+                    skip(&mut words, count - 2);
+                    return Some(capability);
+                }
+                OP_EXTENSION if count >= 1 => skip(&mut words, count - 1),
+                _ => return None,
+            }
+        }
+    })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Needs {
@@ -421,6 +453,12 @@ impl Features {
             "ray-query" => ray_query = self.ray_query && self.acceleration_structure,
             "ray-tracing-pipeline" => ray_tracing_pipeline =
                 self.ray_tracing_pipeline && self.acceleration_structure,
+            // A device with both has the capability through `rayQuery`; with ray queries
+            // disabled it would need `rayTraversalPrimitiveCulling`, which all known ones have.
+            "ray-traversal-primitive-culling" => ray_traversal_primitive_culling =
+                self.ray_traversal_primitive_culling
+                    && (crate::command_buffer::on!(&self, "ray-query", ray_query)
+                        || crate::command_buffer::on!(&self, "ray-tracing-pipeline", ray_tracing_pipeline)),
             "mesh-shader-queries" => mesh_shader_queries =
                 self.mesh_shader_queries && self.mesh_shader && self.pipeline_statistics,
             "depth-clamp-control" => depth_clamp_control =
@@ -714,6 +752,11 @@ impl FeatureChain {
             "ray-tracing-pipeline" => ray_tracing_pipeline =
                 t(self.ray_tracing_pipeline.ray_tracing_pipeline)
                     && t(self.ray_tracing_pipeline.ray_tracing_pipeline_trace_rays_indirect),
+            "ray-traversal-primitive-culling" => ray_traversal_primitive_culling =
+                acceleration_structure
+                    && (t(self.ray_query.ray_query)
+                        || t(self.ray_tracing_pipeline.ray_tracing_pipeline)
+                            && t(self.ray_tracing_pipeline.ray_traversal_primitive_culling)),
             "pipeline-statistics" => pipeline_statistics = t(c.pipeline_statistics_query),
             "precise-occlusion" => precise_occlusion = t(c.occlusion_query_precise),
             "memory-budget" => memory_budget = has(ash::ext::memory_budget::NAME),
@@ -757,6 +800,9 @@ impl FeatureChain {
             "storage-16bit" => storage_16bit = t(v11.storage_buffer16_bit_access)
                 && t(v11.uniform_and_storage_buffer16_bit_access)
                 && t(v11.storage_push_constant16),
+            "storage-input-output-16" => storage_input_output_16 = t(v11.storage_input_output16),
+            "clip-distance" => clip_distance = t(c.shader_clip_distance),
+            "cull-distance" => cull_distance = t(c.shader_cull_distance),
             "dynamic-blend" => dynamic_blend = eds3(d3.extended_dynamic_state3_color_blend_enable)
                 && t(d3.extended_dynamic_state3_color_blend_equation)
                 && t(d3.extended_dynamic_state3_color_write_mask),
@@ -792,9 +838,12 @@ impl FeatureChain {
         f.consistent()
     }
 
+    /// The chain that enables `features` and what lava always needs; `queried` is the device's
+    /// (`query`), for the bits lava enables only where the device has them.
     #[allow(unused_variables)]
-    pub(crate) fn enabling(features: &Features) -> Self {
+    pub(crate) fn enabling(features: &Features, queried: &FeatureChain) -> Self {
         let on = |b: bool| b as vk::Bool32;
+        let has = |bit: vk::Bool32| bit == vk::TRUE;
         let f = features;
         let mut chain = Self::default();
         chain.core = vk::PhysicalDeviceFeatures::default()
@@ -840,17 +889,22 @@ impl FeatureChain {
             "shader-float64" => shader_float64 = on(f.shader_float64),
             "pipeline-statistics" => pipeline_statistics_query = on(f.pipeline_statistics),
             "precise-occlusion" => occlusion_query_precise = on(f.precise_occlusion),
+            "clip-distance" => shader_clip_distance = on(f.clip_distance),
+            "cull-distance" => shader_cull_distance = on(f.cull_distance),
         }
         set! { v11:
             "storage-16bit" => storage_buffer16_bit_access = on(f.storage_16bit),
             "storage-16bit" => uniform_and_storage_buffer16_bit_access = on(f.storage_16bit),
             "storage-16bit" => storage_push_constant16 = on(f.storage_16bit),
+            "storage-input-output-16" => storage_input_output16 = on(f.storage_input_output_16),
         }
         set! { v12:
             "sampler-minmax" => sampler_filter_minmax = on(f.sampler_minmax),
             "shader-int8" => shader_int8 = on(f.shader_int8),
             "shader-float16" => shader_float16 = on(f.shader_float16),
             "shader-int64-atomics" => shader_buffer_int64_atomics = on(f.shader_int64_atomics),
+            "shader-int64-atomics" => shader_shared_int64_atomics =
+                on(f.shader_int64_atomics && has(queried.vk12.shader_shared_int64_atomics)),
             "storage-8bit" => storage_buffer8_bit_access = on(f.storage_8bit),
             "storage-8bit" => uniform_and_storage_buffer8_bit_access = on(f.storage_8bit),
             "storage-8bit" => storage_push_constant8 = on(f.storage_8bit),
@@ -912,8 +966,16 @@ impl FeatureChain {
             "ray-tracing-pipeline" =>
                 ray_tracing_pipeline.ray_tracing_pipeline_trace_rays_indirect =
                     on(f.ray_tracing_pipeline),
+            "ray-traversal-primitive-culling" =>
+                ray_tracing_pipeline.ray_traversal_primitive_culling = on(
+                    f.ray_traversal_primitive_culling
+                        && crate::command_buffer::on!(f, "ray-tracing-pipeline", ray_tracing_pipeline)
+                        && has(queried.ray_tracing_pipeline.ray_traversal_primitive_culling)
+                ),
             "host-image-copy" => host_image_copy.host_image_copy = on(f.host_image_copy),
             "shader-clock" => clock.shader_subgroup_clock = on(f.shader_clock),
+            "shader-clock" => clock.shader_device_clock =
+                on(f.shader_clock && has(queried.clock.shader_device_clock)),
             "performance-query" => performance.performance_counter_query_pools =
                 on(f.performance_query),
             "present-fences" => swapchain_maintenance1.swapchain_maintenance1 =

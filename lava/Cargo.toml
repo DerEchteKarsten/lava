@@ -40,6 +40,7 @@ default = [
     "acceleration-structure",
     "ray-query",
     "ray-tracing-pipeline",
+    "ray-traversal-primitive-culling",
     "pipeline-statistics",
     "precise-occlusion",
     "memory-budget",
@@ -74,6 +75,9 @@ default = [
     "shader-int64-atomics",
     "storage-8bit",
     "storage-16bit",
+    "storage-input-output-16",
+    "clip-distance",
+    "cull-distance",
     "dynamic-blend",
     "dynamic-polygon-mode",
     "dynamic-depth-clamp",
@@ -97,6 +101,9 @@ ray-query = ["acceleration-structure"]
 assert-ray-query = ["ray-query", "assert-acceleration-structure"]
 ray-tracing-pipeline = ["acceleration-structure"]
 assert-ray-tracing-pipeline = ["ray-tracing-pipeline", "assert-acceleration-structure"]
+# The capability comes with ray queries, or with ray tracing pipelines and its own device bit.
+ray-traversal-primitive-culling = ["acceleration-structure"]
+assert-ray-traversal-primitive-culling = ["ray-traversal-primitive-culling", "assert-acceleration-structure"]
 pipeline-statistics = []
 assert-pipeline-statistics = ["pipeline-statistics"]
 precise-occlusion = []
@@ -165,6 +172,12 @@ storage-8bit = []
 assert-storage-8bit = ["storage-8bit"]
 storage-16bit = []
 assert-storage-16bit = ["storage-16bit"]
+storage-input-output-16 = []
+assert-storage-input-output-16 = ["storage-input-output-16"]
+clip-distance = []
+assert-clip-distance = ["clip-distance"]
+cull-distance = []
+assert-cull-distance = ["cull-distance"]
 dynamic-blend = []
 assert-dynamic-blend = ["dynamic-blend"]
 dynamic-polygon-mode = ["fill-mode-non-solid"]

@@ -17,16 +17,6 @@ commits). Numbers are this survey's items. Delete a line, and its item below, wh
 Items that aren't named here stay as they are, on purpose (e.g. bug 31, MSAA, async pipeline
 compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
-2. **Pipelines:** 23 (`Bindings::new`/`with_constants` become `unsafe`, with the generator
-   contract documented), 72/73 (one lock per pass; compile outside the map lock, first insert
-   wins; the module's read lock is held across creation and reload takes it for writing first),
-   98 (gate check first; a recursion depth above the device limit gates the pass), 56 (map
-   `ClipDistance`, `CullDistance`, `StorageInputOutput16`, `RayTraversalPrimitiveCullingKHR`,
-   shared int64 atomics, the device clock), the last compute and ray tracing pipeline cached in
-   the recording, a `VkPipelineCache` (optional path in `Config`) and batched init creation,
-   `Dynamic::of` once, `of_spirv` once per pass with an early stop, one lock per ray tracing
-   lookup, `&'static CStr` entry names, the pass index computed from map order, pipelines named
-   after their pass, `[MaxRecursion(0)]`.
 3. **Timelines, lifetimes, init and errors:** 24 (a full `lava::shutdown()` that waits, drains,
    destroys device and instance and allows re-init), 64/65 (host-signal the semaphore when a
    timeline drops with its stamp ahead or a replay fails), 66, 67 (the public `reclaim` polls),
@@ -104,14 +94,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     on one index aren't refused.
 
 ### Undefined behaviour from safe code (2026-10-18)
-23. **`Bindings::new` checks neither the pass kind nor the constants** (`binding_output.rs:71-82`,
-    `pipeline.rs:336-410`). It is public and safe, the API for other generators.
-    - A raster pass recorded through `compute()` indexes `compute_pipelines` by its raster index:
-      another pass's pipeline is bound, or it panics out of bounds.
-    - A pass with constants given bindings without them builds a `VkSpecializationInfo` with
-      `dataSize` 0 and its map entries, so the driver reads past the slice.
-    - **Fix:** assert `pass.kind` against `K` and the constants against `constants_size` (lava's
-      only use for that field).
 24. **`lava::destroy()` is safe but leaves `BINDLESS` set** (`lib.rs:151-165`): a later bind or
     descriptor write uses the freed heaps. It also
     sets `CALLSITE` by hand and never clears it, in release builds too, so every later validation
@@ -206,10 +188,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     the stipple factor (1..=256); `line_width` against `lineWidthRange`; depth bounds and clamp
     ranges against [0, 1]; `UNDERESTIMATE` without `primitiveUnderestimation`
     (`features.rs:737-738`); primitive restart on list topologies.
-56. **Some SPIR-V capabilities aren't mapped** *(plausible)* (`features.rs:374-390`):
-    `ClipDistance`, `CullDistance`, `RayTraversalPrimitiveCullingKHR`, shared-memory
-    `Int64Atomics`, `StorageInputOutput16`. Such passes fail in pipeline creation, a panic, not at
-    init. `shader-clock` enables only `shaderSubgroupClock`, not `shaderDeviceClock` (`:715`).
 57. **`E5B9G9R9UfloatPack32` has 4 components** (`format.rs:356`), so a `Tex2D<float3>` refuses it.
 58. **`Dynamic::info` panics for formats outside the table** (`format.rs:77`): A4R4G4B4, A8 and
     A1B5G5R5 are missing, and `PresentSurface::new`'s fallback could pick one *(plausible)*.
@@ -238,11 +216,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     feature), so the device leaks and every retry says "already initialised".
 71. **Failed creations leak.** A failed command pool leaks the earlier slots' pools
     (`timeline.rs:178-202`).
-72. **A failed pipeline creation poisons the cache for every pass of its kind**
-    (`pipeline.rs:479-497`): `must` panics under the write guard, and every later `unwrap()` panics.
-73. **Hot reload can build from a destroyed module** (`pipeline.rs:229-307`): `cached` copies the
-    module and drops the guard before creating, so a new key used right after `rebuild` builds
-    stale SPIR-V while `reload_pass` destroys the module it reads.
 74. **`#[validation_trace]` on `Ctx::init` always records `lib.rs:127`** (`state.rs:118`), since
     `lava::init` isn't `track_caller`. Put it on `lava::init`.
 75. **Software and virtual GPUs are dropped silently** (`state.rs:329-332`): lavapipe never shows
@@ -298,27 +271,18 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     `2d_blit.slang` make invalid identifiers, and one stem in two directories overwrites a `.spv`.
 96. **Any struct named `Clock` gets the clock readout impl** (`codegen.rs:55, 180`), which doesn't
     compile without its `counters` field.
-97. **The hot reload thread dies on any panic** (`hot_reload.rs:79-123`), and one inside
-    `reload_pass` may poison a pipeline lock. The build matches lava's map by pass count only
+97. **The hot reload thread dies on any panic** (`hot_reload.rs:79-123`). The build matches lava's map by pass count only
     (`:58`); only `.slang` files trigger (`:157`), not `.slangh` includes; `reload_pass` returns
     `Ok` for a pass the device can't run, and the watcher logs a reload (`pipeline.rs:231-234`).
-98. **Ray tracing pipeline checks come in the wrong order** (`rt_pipeline.rs:26-40`): without the
-    feature the properties lookup fails with `Message` before the `MissingFeature` check, and a
-    `[MaxRecursion(n)]` above the device's limit panics in `init` instead of gating the pass.
 
 ## 3. Performance
 
 ### Recording and pipelines
-- **Per dispatch:** a compute dispatch looks up and binds its pipeline every time. Resolve it
-  once and skip redundant binds, as draws do.
-- **Compiling under locks.** A cache miss compiles while holding the write lock over every
-  pass's map (`pipeline.rs:403-419`), inside the recording that holds the queue's pending lock.
-  So one compile stalls every thread.
-  - There is no `VkPipelineCache`.
-  - Init builds every unspecialised pipeline serially.
+- **Pipeline creation.** Specialized and raster pipelines are still made synchronously on the
+  recording thread at first use (outside the pass's map lock, through the `VkPipelineCache`).
   - There is no prewarm API.
-  - Beyond `scratchpad.rs`: a per-pass `Mutex`, `FAIL_ON_PIPELINE_COMPILE_REQUIRED` for async
-    compiles, `VK_KHR_pipeline_binary`, and deferred host operations for ray tracing pipelines.
+  - Beyond `scratchpad.rs`: `FAIL_ON_PIPELINE_COMPILE_REQUIRED` for async compiles,
+    `VK_KHR_pipeline_binary`, and deferred host operations for ray tracing pipelines.
 - **Raster passes are coarse in barriers.** Every resource of a raster pass is accessed at
   `VERTEX|FRAGMENT` or `TASK|MESH|FRAGMENT` (`build.rs:30-41`).
 - **Discarding accesses don't transition from `UNDEFINED`** (clears, full copies, attachments
@@ -330,13 +294,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   buffers sharing an image be recorded in order.
 
 ### Found 2026-10-18
-- **Small per-call costs:** `Dynamic::of` is rebuilt per rendering and pipeline
-  (`raster_state.rs:370-412`); a stencil change makes 8 calls where front equals back
+- **Small per-call costs:** a stencil change makes 8 calls where front equals back
   (`:640-648`); `unsized_struct!` accessors walk every earlier section (`unsized_struct.rs:12-28`);
-  specialized ray tracing lookups take the read lock two or three times (`pipeline.rs:371-384`);
   `Stamp::is_done` polls every timeline even when cached values suffice (`lifetime.rs:14-18`).
-- **`Features::of_spirv` copies each module and runs twice per pass** (`features.rs:189-225`,
-  `pipeline.rs:158-179`); capabilities come first, so it can stop early.
 - **`acquire` queries surface capabilities every frame** *(plausible)* (`present.rs:331-335`), an
   X11 round trip on Mesa.
 - **`QueryPool::instant` calibrates on every call** (`query/mod.rs:252-277`) and ignores
@@ -368,8 +328,8 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 2. **`push_bindings` is positional** (15 arguments for `BvhCull`), so swapping two
    `BufferSlice<u32>`s or two `Mat4`s compiles. Generate a struct with named fields, with
    specialization constants as fields too (that removes `IncompleteX`).
-3. **`Config` lacks settings.** `lava::init(&Config)` has passes, display, validation and
-   disabled features.
+3. **`Config` lacks settings.** `lava::init(&Config)` has passes, display, validation,
+   disabled features and a pipeline cache file.
    - **Missing settings:** app name and version, device choice (ranked by capability, user
      override, presentation support), extra extensions and a pNext hook, validation settings
      and queue counts.
@@ -460,7 +420,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
       `SlotRange::is_empty` (always false), `Config::gpu_assisted_validation` (no user), the
       root re-exports `AccessFlags2`/`ImageLayout`, and three loaded draw commands in `vk.rs`
       (`cmd_draw_indexed_indirect2`, `..._count2`, `cmd_draw_mesh_tasks_indirect_count2`).
-      `PassEntry.constants_size` is read only by lava-tests, against "nothing lava doesn't read".
     - *2026-10-18, naming traps:* `ImageRef::view()` returns the `ImageView` while
       `ImageView::view()` returns the `vk::ImageView` (`kind.rs:18-22`); `features::gate` is a
       function and a module; `lava_build_slang::SLANG_DIR` (the shader directory) shares the
@@ -499,10 +458,8 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     (`slice.rs:217-222`).
 28. **Small API gaps** (2026-10-18): `DepthTarget` needs a depth aspect, so `S8Uint` can't be an
     attachment (`kind.rs:51-52`); `check_hazards` forbids two draws of a rendering writing one
-    buffer, ruling out atomics across draws (`mod.rs:263-293`); entry names are `&'static str`
-    with one NUL, where `&'static CStr` states the contract (`pipeline.rs:44-64, 608-618`);
-    `PassEntry.index` is a pure function of map order lava could compute (`:96-101`);
-    `depth_clamp_range`'s wrapper takes a reference where Vulkan's is optional (`vk.rs:466-475`);
+    buffer, ruling out atomics across draws (`mod.rs:263-293`); `depth_clamp_range`'s wrapper
+    takes a reference where Vulkan's is optional (`vk.rs:466-475`);
     `dynamic-line-mode` implies no capability (`Cargo.toml:179`); `#[validation_trace(anything)]`
     compiles and the non-function error has no span (`lava-macros/src/lib.rs:10`); `Shaders` isn't
     `#[must_use]`; device ranking lives inline in `Ctx::init` and can't be unit-tested.
@@ -549,8 +506,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   acquire.
 - **Queries:** conditional rendering.
 - **Debug:** object names on buffers, images and structures; labels in release builds whenever
-  the extension exists; `insert_label`. Raster and ray tracing pipelines get no debug name, and
-  compute ones are named after their entry point, not their pass (`pipeline.rs:535`).
+  the extension exists; `insert_label`.
 - **Escape hatches:**
   - an `unsafe` `lava::raw` with device, instance and queue;
   - `CommandBuffer::raw(declared_accesses, |vk_cmd| ..)` that flushes barriers for what it
@@ -559,7 +515,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   - runtime SPIR-V passes for vendor libraries, material graphs and mods.
 - **Ray tracing:**
   - **Pipelines:** deferred host operations, pipeline libraries,
-    `vkCmdSetRayTracingPipelineStackSizeKHR`, `[MaxRecursion(0)]` (Vulkan allows 0, lava 1..=31).
+    `vkCmdSetRayTracingPipelineStackSizeKHR`.
   - **Structures:** serialization and copies (BLAS disk cache, clones), position fetch
     (`ALLOW_DATA_ACCESS`), opacity micromaps.
   - **Shaders:** shader execution reordering, `NO_DUPLICATE_ANY_HIT_INVOCATION`.
@@ -600,11 +556,8 @@ Small things, by file; none changes behaviour.
   `split()` copies 21 fields by hand to make a `RasterState<0>` (`:324-351`); the `[..n]` arm of
   `changed!` and `Rendering.color_attachments` repeat known lengths, and `blends_changed` is
   computed when blends aren't dynamic (`:529-535, 658, 668`); `gated_setters!` entries repeat
-  `(state, ..)`. In `pipeline.rs`: `ray_tracing` re-implements `cached` (`:356-385`);
-  `RasterKey`/`RasterKeyRef` conversions are written out twice (`:277-289, 394-404`);
-  `Specialized` is just `HashMap`; `retire` queues no-op closures (`:420-441`);
-  `create_raster_pipeline` builds `create_info` in two steps, sets defaults and passes vertex
-  states to mesh pipelines (`:671-850`); `Error::message(&format!(..))` (`:239`).
+  `(state, ..)`. In `pipeline.rs`: `create_raster_pipeline` builds `create_info` in two steps,
+  sets defaults and passes vertex states to mesh pipelines.
 - **features and vk:** `has()` guards on bits of structs only linked when present are redundant
   (`features.rs:693-780`); `#[allow(unused_mut)]`
   looks dead (`:459`); `unlink!` guards a reuse no path makes, while `query` returns `p_next`s into
@@ -671,9 +624,7 @@ with this survey. Still wrong:
   pass's barriers, but `compute`, `raytrace` and renderings flush the barriers before
   `rec.enter` (`command_buffer/mod.rs:640-696, 929-939, 994-1002`), so scope timestamps and debug
   labels exclude them. Change the code or the docs, whichever is meant.
-- **Item docs:** `PassEntry.index`'s doc is wrong for raster passes (`pipeline.rs:96-101`);
-  `pipeline.rs:29` names a missing `BindingOutput::pass()`; the 16-pipeline warning always blames
-  constants, though raster keys grow too (`:499-507`); the `update` doc of acceleration structures
+- **Item docs:** the 16-pipeline warning always blames constants, though raster keys grow too (`:499-507`); the `update` doc of acceleration structures
   says primitive counts where the whole shape must match (`:743-745`); `wait_idle`'s doc omits that
   it reclaims; `Config::validation`'s omits that it enables printf; `ray_tracing.slang`'s
   `__init` truncates out-of-range fields silently, where Rust asserts; `SCONST` splits on
@@ -750,7 +701,8 @@ Each was checked by grep over lava-tests and `lava/src/tests.rs`.
   width/mode/stipple, depth bounds, blend constants, any topology but `LINE_LIST`. `RasterKeyRef`
   hashing like `RasterKey` and `Baked::of` are pure and could be unit tests.
 - **Pipelines:** raster or ray tracing passes with specialization constants, mesh passes with a
-  task shader, `pipeline::reload_pass` (swap, refusal, retirement).
+  task shader, a `[MaxRecursion(n)]` above the device's limit (no device here has less than 31,
+  and lava-build-slang refuses more), `reload_pass` of a ray tracing pass.
 - **Slang shapes:** `Image2D`, handles or `Accel` inside structs behind a
   `Buf`; struct merging, padding and naming in codegen; the hand-copied constants
   (`MAX_PUSH_CONSTANTS_SIZE`, the clock constants) against lava and `profile.slang`.
@@ -791,7 +743,7 @@ Engine-side findings that don't belong to lava's code but came up in this survey
 
 ## Suggested order
 
-1. **Fix the soundness bugs:** host access (16), the undefined behaviour from safe code (23-37),
+1. **Fix the soundness bugs:** host access (16), the undefined behaviour from safe code (24-37),
    and the hot reload's layout hash (85).
 2. **Fix the barrier tracking (22)** and the valid-usage bugs every device hits: multi-draw
    indirect (38), the depth bias clamp (39), line topologies without extended dynamic state (40),

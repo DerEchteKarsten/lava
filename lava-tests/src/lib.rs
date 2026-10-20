@@ -14,34 +14,17 @@ mod tests {
 
     #[test]
     fn pass_map_entries_are_consistent() {
-        let (mut compute, mut raster, mut raytracing) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut specialized_compute, mut specialized_raytracing) = (Vec::new(), Vec::new());
         for pass in PASS_MAP.passes {
-            let specialized = !pass.constants.is_empty();
             let end = pass.constants.iter().map(|c| c.offset as usize + c.size);
             assert_eq!(end.max().unwrap_or(0), pass.constants_size, "{}", pass.name);
-            let names: Vec<&str> = match pass.kind {
-                PassKind::Compute { entry } => {
-                    if specialized {
-                        &mut specialized_compute
-                    } else {
-                        &mut compute
-                    }
-                    .push(pass.index);
-                    vec![entry]
-                }
-                PassKind::RasterVertex { vertex, fragment } => {
-                    raster.push(pass.index);
-                    vec![vertex, fragment]
-                }
+            let names: Vec<&CStr> = match pass.kind {
+                PassKind::Compute { entry } => vec![entry],
+                PassKind::RasterVertex { vertex, fragment } => vec![vertex, fragment],
                 PassKind::RasterMesh {
                     amp,
                     mesh,
                     fragment,
-                } => {
-                    raster.push(pass.index);
-                    amp.into_iter().chain([mesh, fragment]).collect()
-                }
+                } => amp.into_iter().chain([mesh, fragment]).collect(),
                 PassKind::RayTracing {
                     raygen,
                     miss,
@@ -49,13 +32,7 @@ mod tests {
                     callable,
                     max_recursion,
                 } => {
-                    if specialized {
-                        &mut specialized_raytracing
-                    } else {
-                        &mut raytracing
-                    }
-                    .push(pass.index);
-                    assert!((1..=31).contains(&max_recursion));
+                    assert!((0..=31).contains(&max_recursion));
                     let hit = hit
                         .iter()
                         .flat_map(|g| [g.closest_hit, g.any_hit, g.intersection])
@@ -69,23 +46,8 @@ mod tests {
                 }
             };
             for name in names {
-                // `make_shader_stage` needs exactly one NUL, at the end.
-                assert!(
-                    CStr::from_bytes_with_nul(name.as_bytes()).is_ok(),
-                    "{name:?} in {}",
-                    pass.name
-                );
+                assert!(!name.is_empty(), "an empty entry point in {}", pass.name);
             }
-        }
-        // lava sizes each kind's pipeline array by counting.
-        for indices in [
-            compute,
-            raster,
-            raytracing,
-            specialized_compute,
-            specialized_raytracing,
-        ] {
-            assert_eq!(indices, (0..indices.len()).collect::<Vec<_>>());
         }
     }
 

@@ -3204,22 +3204,22 @@ mod generated {
         let compute = TestComputeBuffer::push_bindings(buffer.range(..), buffer.range(..), 1, 1)
             .sections()
             .pass;
-        assert!(matches!(
+        assert_eq!(
             PASS_MAP.passes[compute].kind,
             PassKind::Compute {
-                entry: "test_compute_buffer\0"
+                entry: c"test_compute_buffer"
             }
-        ));
+        );
         let raster = TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
             .sections()
             .pass;
-        assert!(matches!(
+        assert_eq!(
             PASS_MAP.passes[raster].kind,
             PassKind::RasterVertex {
-                vertex: "test_raster_vertex\0",
-                fragment: "test_raster_fragment\0"
+                vertex: c"test_raster_vertex",
+                fragment: c"test_raster_fragment"
             }
-        ));
+        );
         assert_eq!(PASS_MAP.passes[raster].name, "TestRaster");
     }
 
@@ -3326,7 +3326,7 @@ mod generated {
             .expect("one image");
         assert_eq!(image.access(), A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
         assert_eq!(image.stage(), S::COMPUTE_SHADER);
-        assert_eq!(image.stage(), lava::pipeline::PassKind::Compute { entry: "" }.stages());
+        assert_eq!(image.stage(), lava::pipeline::PassKind::Compute { entry: c"" }.stages());
         assert_eq!(image.layout(), L::GENERAL);
     }
 }
