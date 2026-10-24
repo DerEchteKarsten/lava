@@ -1,4 +1,4 @@
-//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups), each pass's pipelines per specialization and raster key (attachment formats, view mask and the draw state the device can't set dynamically, the topology class among it), raster passes with or without a fragment shader behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), `reload_pass`, which replaces a pass's pipelines and retires the old ones, and their destruction at `shutdown`
+//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups, compute passes with a required subgroup size), each pass's pipelines per specialization and raster key (attachment formats, view mask and the draw state the device can't set dynamically, the topology class among it), raster passes with or without a fragment shader behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), `reload_pass`, which replaces a pass's pipelines and retires the old ones (or skips a pass the device can't run), and their destruction at `shutdown`
 use std::{
     ffi::CStr,
     hash::Hash,
@@ -63,6 +63,10 @@ pub(crate) fn unset_pass_map() {
 pub enum PassKind {
     Compute {
         entry: &'static CStr,
+        /// The subgroup size its pipeline requires (`[WaveSize(n)]`); a device that can't
+        /// require it of compute shaders (`subgroupSizeControl`, `requiredSubgroupSizeStages`,
+        /// `minSubgroupSize` to `maxSubgroupSize`) gets no pipeline, like one missing a feature.
+        subgroup_size: Option<u32>,
     },
     /// The shader groups in binding table order (`[Group(n)]`).
     RayTracing {
@@ -397,6 +401,26 @@ pub(crate) unsafe fn destroy() {
 /// The device limits a pass exceeds, as what it lacks.
 #[allow(unused_variables)]
 fn missing_limits(pass: &PassEntry) -> Option<String> {
+    if let PassKind::Compute {
+        subgroup_size: Some(size),
+        ..
+    } = pass.kind
+    {
+        let sizes = Ctx::physical_device().subgroup_sizes;
+        let fits = sizes.is_some_and(|s| {
+            s.stages.contains(vk::ShaderStageFlags::COMPUTE) && (s.min..=s.max).contains(&size)
+        });
+        if !fits {
+            return Some(match sizes {
+                None => format!("a required subgroup size of {size} (no subgroupSizeControl)"),
+                Some(s) => format!(
+                    "a required subgroup size of {size} for compute shaders (it has {} to {}, \
+                     for {:?})",
+                    s.min, s.max, s.stages
+                ),
+            });
+        }
+    }
     #[cfg(feature = "ray-tracing-pipeline")]
     if let PassKind::RayTracing { max_recursion, .. } = pass.kind
         && let Some(properties) = Ctx::physical_device().ray_tracing_pipeline_properties
@@ -410,16 +434,25 @@ fn missing_limits(pass: &PassEntry) -> Option<String> {
     None
 }
 
+/// What [`reload_pass`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reload {
+    /// The pass's module and pipelines are the new ones.
+    Replaced,
+    /// The device can't run the pass (it has no pipelines), so there was nothing to replace.
+    Skipped,
+}
+
 /// Replaces the SPIR-V of pass `pass_index` and every pipeline made from it, which must keep
 /// the layout the bindings were generated from; if the driver rejects it, nothing is replaced.
 /// Recordings that looked up a pipeline before keep using it; it is retired like any object.
-pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
+pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<Reload> {
     let _call = crate::state::call();
     let manager = pipelines();
     let entry = &pass_map().passes[pass_index];
     let pass = &manager.passes[pass_index];
     if !pass.missing.is_empty() {
-        return Ok(());
+        return Ok(Reload::Skipped);
     }
     let needs = Features::of_spirv(spirv);
     let mut missing = needs.features.missing_from(Ctx::features_ref());
@@ -459,7 +492,7 @@ pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<()> {
     let old = std::mem::replace(&mut *module, new_module);
     // Pipelines don't need their module once created, and no creation holds this one.
     unsafe { device.destroy_shader_module(old, None) };
-    Ok(())
+    Ok(Reload::Replaced)
 }
 
 /// Writes the pipeline cache to `Config::pipeline_cache` (nothing without one), through a
@@ -711,13 +744,29 @@ fn create_compute_pipelines(
     let infos: Vec<_> = (passes.iter())
         .map(|(_, pass, constants)| specialization(pass, constants))
         .collect();
-    let mut flags: Vec<_> = passes.iter().map(|_| heap_flags()).collect();
+    // Any compute pass may be dispatched with a base (`compute_base`).
+    let mut flags: Vec<_> = (passes.iter())
+        .map(|_| heap_flags().flags(PIPELINE_HEAP | vk::PipelineCreateFlags2KHR::DISPATCH_BASE))
+        .collect();
+    let mut subgroup_sizes: Vec<_> = (passes.iter())
+        .map(|(_, pass, _)| match pass.kind {
+            PassKind::Compute { subgroup_size, .. } => subgroup_size.map(|size| {
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                    .required_subgroup_size(size)
+            }),
+            _ => unreachable!("{} is a compute pass", pass.name),
+        })
+        .collect();
     let create_infos: Vec<_> = (passes.iter().zip(&infos).zip(&mut flags))
-        .map(|(((module, pass, _), info), flags)| {
-            let PassKind::Compute { entry } = pass.kind else {
+        .zip(&mut subgroup_sizes)
+        .map(|((((module, pass, _), info), flags), subgroup_size)| {
+            let PassKind::Compute { entry, .. } = pass.kind else {
                 unreachable!("{} is a compute pass", pass.name)
             };
-            let stage = make_shader_stage(entry, vk::ShaderStageFlags::COMPUTE, *module, info);
+            let mut stage = make_shader_stage(entry, vk::ShaderStageFlags::COMPUTE, *module, info);
+            if let Some(size) = subgroup_size {
+                stage = stage.push_next(size);
+            }
             vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .push_next(flags)
@@ -830,9 +879,11 @@ fn ray_tracing_desc<'a>(
     }
 }
 
+const PIPELINE_HEAP: vk::PipelineCreateFlags2KHR = vk::PIPELINE_CREATE_2_DESCRIPTOR_HEAP_EXT;
+
 /// Every pipeline reads the descriptor heaps and has no layout.
 pub(crate) fn heap_flags() -> vk::PipelineCreateFlags2CreateInfoKHR<'static> {
-    vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PIPELINE_CREATE_2_DESCRIPTOR_HEAP_EXT)
+    vk::PipelineCreateFlags2CreateInfoKHR::default().flags(PIPELINE_HEAP)
 }
 
 /// A stage of `entry`.

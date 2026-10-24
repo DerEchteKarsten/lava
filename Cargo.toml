@@ -11,7 +11,7 @@ authors = ["Christian Keitz"]
 repository = "https://github.com/DerEchteKarsten/lava"
 
 [workspace.dependencies]
-bytemuck = { version = "1.24.0", features = ["derive"] }
+bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics"] }
 glam = { version = "0.32", features = ["bytemuck", "mint"] }
 ash = "0.38.0"
 ash-window = "0.13.0"

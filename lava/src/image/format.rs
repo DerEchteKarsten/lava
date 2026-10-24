@@ -102,6 +102,7 @@ impl Format for Dynamic {
         );
         value
     }
+    #[track_caller]
     fn aspect_check(&self, required: vk::ImageAspectFlags) {
         assert!(
             self.aspects().contains(required),
@@ -109,6 +110,7 @@ impl Format for Dynamic {
             self.0
         );
     }
+    #[track_caller]
     fn texel_check<T: 'static>(&self) {
         assert!(
             self.info().texels == TypeId::of::<T>(),

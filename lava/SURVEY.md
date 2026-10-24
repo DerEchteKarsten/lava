@@ -19,72 +19,31 @@ compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
 5. **Raster and draws:** dynamic rendering local read (skipped 2026-10-21, see section 5:
    input attachments don't fit lava's descriptor heaps and Slang yet).
-8. **lava-build-slang:** 4.2 (two generated argument structs, push constants and specialization
-   constants, plus the extra accesses as a third argument of `push_bindings`; no
-   `IncompletePass`), 4.12 (`WORKGROUP_SIZE` and exported constants), 4.20, 4.21 (qualified
-   paths, `#[track_caller]`), 4.22, 35, 63, 85-88, 90 (`Accel` allowed in `SCONST`, cost
-   documented), 91-97, debug info and parallel compiles, half and 16-bit fields, non-square
-   matrices, `r#` field names, `Gather`/`SampleGrad`/`SampleBias`, `Load` at a mip, image
-   atomics, `MutTex2D.Sample` and `MutTex3D`, dispatch base, `[WaveSize]`, several compute entry
-   points per file, `#[validation_trace]` argument check, `#[must_use]` on `Shaders`.
-9. **Surface, cleanup and docs:** 4.14, 4.19 (shallow re-exports, `lava::prelude`, glam and
-   bytemuck re-exported, internals hidden or deleted, every rename, ash as a documented public
-   dependency with only `lava::vk`, the derives), all of section 6 (bake table stays) and
+9. **Surface, cleanup and docs:** 4.14, 4.19 (shallow re-exports, `lava::prelude` (glam and
+   bytemuck are re-exported since 2026-10-24), internals hidden or deleted, every rename, ash
+   as a documented public dependency with only `lava::vk`, the derives), all of section 6
+   (bake table stays) and
    section 7 (scope observer docs follow the code: scopes start after their barriers).
 10. **Tests:** all of section 8, plus tests for every change above, one GPU-assisted validation
     run, and Miri for `unsized_struct!`; the tools generator fix of section 7.
 
 The engine follows in its own repository, only after the other agent's uncommitted engine work
-is committed: 84, the push constants of 3, 4.11's viewport usage, 4.15, 4.17's `fits`, 4.21's
-imports, 4.22's padding, release builds without validation, and all of section 9 (drop
-`dynamic-blend` once checked).
+is committed: 84, the push constants of 3, 4.11's viewport usage, 4.15, 4.17's `fits`, the
+generated API of 2026-10-24 (argument structs, extra accesses in `push_bindings`, no imports
+into `bindings.rs`, generated padding and `Default`s instead of the shaders' hand padding,
+`WORKGROUP_SIZE`/`groups`, `[RustConst]` instead of copied constants), release builds without
+validation, and all of section 9 (drop `dynamic-blend` once checked).
 
 ## 2. Bugs
 
 ### Undefined behaviour from safe code (2026-10-18)
 31. **`compacted_from` stores the source's raw handle** *(plausible)* (`:181, :306, :961`): a
     handle value reused after the source's destruction passes `compact`'s check. Use an id.
-35. **lava-build-slang calls an unchecked 0.1.0 accessor** (`compile.rs:61`, `codegen.rs:585, 594,
-    633`): `VariableLayout::category()` is `self.type_layout().parameter_category()`, the unchecked
-    `type_layout` the crate forbids. Use `checked_type_layout()`.
-
-### Vulkan valid usage (2026-10-18)
-63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`.
 
 ### Presenting (2026-10-18)
 84. **The engine's `Presenter::drop` waits before the surface drops** (engine
     `render/render.rs:139-147`): `PresentSurface::drop` only retires its destruction, so surface
     and swapchain outlive the window unless something reclaims later.
-
-### lava-build-slang (2026-10-18)
-85. **`layout_hash` ignores field types** (`compile.rs:54-101`): a hot reload from `Tex2D foo` to
-    `Buf<uint> foo` is accepted, and the shader dereferences a bindless handle as an address.
-    `float` to `uint`, an image's shape, set or element, a pointee's layout and a constant's type
-    pass too. Hash each field's generated type and kind.
-86. **`layout_hash` uses `DefaultHasher` over `usize`** (`compile.rs:58, 69-89`): a cross-compiled
-    application refuses every reload. Hash fixed-width integers.
-87. **Struct signatures hold names and offsets, not types** (`codegen.rs:132-157`): `Foo { float x }`
-    and `Foo { uint x }` from two passes, or `Pair<float>` and `Pair<uint>`, merge into the first.
-88. **Pointees and array elements skip `gpu_type`** (`codegen.rs:125-129, 402`): `Buf<Tex2D>`
-    becomes `BufferSlice<Img>` with a generated `Img` struct instead of `ImageHandle`, and so do
-    `[Img; N]`, `[Buf<T>; N]` and `[Accel; N]` behind a `Buf`.
-90. **`SCONST` rules disagree with the docs** (`codegen.rs:614-622`): `Accel` is refused for
-    run-dependent addresses while `Buf`/`MutBuf`, also addresses, pass.
-91. **Non-struct pointee strides aren't checked** *(plausible)* (`codegen.rs:401-403`):
-    `Buf<float3>` becomes 12-byte `Vec3` elements against a 16-byte std430 stride.
-92. **Matrices ignore their scalar type** (`codegen.rs:117-124`): `int4x4` becomes `Mat4`;
-    `float3x3` against `Mat3` fails the size assert *(plausible)*, where `Mat3A` would fit.
-93. **Texel types without a mapping drop the format bound** (`codegen.rs:348-370`): an image of
-    `half` or 8/16-bit integers accepts any format; a usage above 3 falls into storage.
-94. **Entry-point `uniform` parameters and a second push constant buffer are ignored**
-    *(plausible)* (`codegen.rs:583-648`), and aren't in `layout_hash`.
-95. **Pass names come unchecked from file stems** (`codegen.rs:563-568`): `my-pass.slang` or
-    `2d_blit.slang` make invalid identifiers, and one stem in two directories overwrites a `.spv`.
-96. **Any struct named `Clock` gets the clock readout impl** (`codegen.rs:55, 180`), which doesn't
-    compile without its `counters` field.
-97. **The hot reload thread dies on any panic** (`hot_reload.rs:79-123`). The build matches lava's map by pass count only
-    (`:58`); only `.slang` files trigger (`:157`), not `.slangh` includes; `reload_pass` returns
-    `Ok` for a pass the device can't run, and the watcher logs a reload (`pipeline.rs:231-234`).
 
 ## 3. Performance
 
@@ -109,18 +68,10 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   `BvhCull`'s buffer lengths double on overflow and `Composite`'s sky slot changes per sky, so
   each value compiles a pipeline mid-frame.
 
-### Other
-- **Shader builds.** Each pass has its own Slang session, compiled serially, and there is never
-  debug info, so no source-level shader debugging. `Shaders::optimization` exists now; core
-  doesn't call it.
-
 ---
 
 ## 4. API friction
 
-2. **`push_bindings` is positional** (15 arguments for `BvhCull`), so swapping two
-   `BufferSlice<u32>`s or two `Mat4`s compiles. Generate a struct with named fields, with
-   specialization constants as fields too (that removes `IncompleteX`).
 3. **`Config` lacks settings.** `lava::init(&Config)` has passes, display, app name and
    version, validation, disabled features, a pipeline cache file and allocator block sizes.
    - **Missing settings:** device choice (ranked by capability, user override, presentation
@@ -137,10 +88,6 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     - There is no `ImageView::erase()`.
     - The viewport target is typed like the swapchain image, so it lacks SAMPLED, and the UI
       reads it through a storage load, which is several times slower on Intel.
-12. **Shader facts are mirrored by hand.** Workgroup sizes appear as `div_ceil(8)` and
-    `div_ceil(64)`, and constants like `MESHLET_STRIDE`, `INSTANCE_FLAG_BITS` and the overflow
-    bits are copied. Generate `Pass::WORKGROUP_SIZE` with a `compute_threads(extent)`, and export
-    marked Slang constants.
 13. **Field projection.** Core slices a struct field out of a buffer with
     `byte_range(offset_of!..).cast::<MeshletDraw>()`. (Indirect draws and dispatches take any
     `T: StartsWith<C>` since 2026-10-21, which removes the 16→12-byte cast.)
@@ -176,26 +123,11 @@ imports, 4.22's padding, release builds without validation, and all of section 9
       `D::Extent`; `image_acceses`, `buffer_acceses`.
     - *2026-10-18, missing derives:* `RasterState` and `BufferAccess` could be `Copy`; `Filter` has
       no cubic filter; `Config` has no docs or `Debug`.
-20. **Codegen errors lack context.** Panics give no file or field (`build.rs:111,118,236`), the
-    first failing pass hides the rest, and Slang warnings aren't forwarded.
-21. **Generated code leaks into its includer** (2026-10-18, `codegen.rs:511-535`). It glob-imports
-    glam, `lava::command_buffer`, `pipeline`, `format` and `slice`, and imports `vk`, all pasted
-    into the user's module by `include_passes!`. Core relies on the leak (`Zeroable`, `Vec2`,
-    `ImageHandle` in its `bindings.rs`), and a Slang struct named `Bindings`, `Draw` or
-    `PassEntry` breaks the build. Emit `::lava::` paths. The generated functions also lack
-    `#[track_caller]`, so binding panics point into `$OUT_DIR` (`codegen.rs:932, 982`).
-22. **Only push-constant structs get `_pad` fields** (2026-10-18, `codegen.rs:171-178, 1032-1035`).
-    Structs behind a `Buf` with a gap fail `derive(Pod)` or the offset assert in the user's crate,
-    so the engine's shaders pad by hand (`datatypes.slang`, `raster_ui.slang`) and core sets `pad`.
-    A pass without push constants panics instead of getting an empty struct (`:583-588`); `i64`,
-    `f64` and `bool` vectors panic; arrays above 32 need bytemuck's `min_const_generics`.
 24. **`bind` zips two iterators** (2026-10-18, `bindless.rs:308-345`): a length mismatch binds less
     silently, and core collects a `Vec` per frame to line them up. Take pairs and assert.
 28. **Small API gaps** (2026-10-18): `depth_clamp_range`'s wrapper
     takes a reference where Vulkan's is optional (`vk.rs:466-475`);
-    `dynamic-line-mode` implies no capability (`Cargo.toml:179`); `#[validation_trace(anything)]`
-    compiles and the non-function error has no span (`lava-macros/src/lib.rs:10`); `Shaders` isn't
-    `#[must_use]`.
+    `dynamic-line-mode` implies no capability (`Cargo.toml:179`).
 
 ---
 
@@ -213,22 +145,12 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     the rendering wrote also need a by-region barrier inside it (`FRAGMENT_SHADER` from
     `COLOR_ATTACHMENT_OUTPUT`, the attachment in `RENDERING_LOCAL_READ`), which `record` would
     have to insert between them.
-- **Compute:** reflected workgroup size, dispatch base, subgroup size control (`[WaveSize]` →
-  `requiredSubgroupSize`), several entry points per file.
 - **Images:**
   - **Types:** cube maps (arrays of 6 layers exist since 2026-10-21; a cube view and
     `TexCube` don't), 1D, MSAA.
   - **Views:** swizzles, per-aspect depth/stencil views for shaders.
   - **Transfers:** mip generation.
   - **Memory:** transient (lazily allocated) attachments, aliasing in shared memory blocks.
-- **Slang coverage:**
-  - **Types:** `half` and 16-bit ints (panic today, though float16 is enabled), 64-bit scalars
-    and `bool` vectors, non-square matrices (no glam type), `float3x3` layout vs `Mat3`
-    *(plausible)*.
-  - **Image ops:** `Gather`, `SampleGrad`, `SampleBias`, `Load` at a mip, image
-    atomics. `MutTex2D` has only `Load`, no `Sample`; there is no `MutTex3D`.
-  - **Codegen:** Rust keywords as field names, arrays over 32 (bytemuck's `Pod` limit), pass and
-    struct name clashes.
 - **Memory:** per-frame transient rings (only `cmd.upload`'s internal ring exists).
 - **Queues:** several command buffers per submission, parallel recording (per-thread trackers
   merged by a barrier prologue at submit).
@@ -258,8 +180,7 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 Small things, by file; none changes behaviour.
 - **Clippy** (default lints) flags `is_multiple_of` (13 places), `From` over `Into`
   (`buffer/mod.rs:80`, `pipeline.rs:414`), redundant field names, needless borrows, `map().flatten()`,
-  `!= ptr::null()`, `clone()` on `Location`, a single-range `vec!` (`bindless.rs:538`, intended),
-  a useless `format!` (`codegen.rs:511`), missing `# Safety` docs (`vk.rs`) and non-const
+  `!= ptr::null()`, `clone()` on `Location`, a single-range `vec!` (`bindless.rs:538`, intended), missing `# Safety` docs (`vk.rs`) and non-const
   thread-locals. Only one warning reaches `cargo check`: the deprecated `fetch_update`
   (`image_state.rs:200`), whose `unwrap_or_else` is dead. `cargo fmt --check` reports diffs across lava and lava-tests.
 - **Manifests:** lava's `tracing-subscriber` and lava-tests' `smallvec` dev-dependencies are
@@ -314,11 +235,10 @@ Small things, by file; none changes behaviour.
   (`query/mod.rs:51-54, 246-250`).
 - **ray tracing:** the scratch offset is computed in two loops and the infos re-collected
   (`record_builds`); `with_geometries` checks the gate twice (and `create` again); `layout.size.max(1)` is redundant
-  (`rt_pipeline.rs:79`); the generated code calls `trace_accesses` twice per `Accel`
-  (`codegen.rs:424-427`).
-- **lava-build-slang:** `compile()` is one 570-line function (`codegen.rs:488-1057`);
-  `trim_end_matches` where `strip_suffix` and `file_stem` fit (`:565, 624`); the capability scan
-  duplicates `Features::of_spirv` (`:886-906`); stages are strings (`compile.rs:103-128`).
+  (`rt_pipeline.rs:79`).
+- **lava-build-slang:** the capability scan duplicates `Features::of_spirv`
+  (`features::capabilities`); stages are strings (`compile::stage_name`); `Shaders::compile` is
+  still some 200 lines.
 - **lava-tests:** `let _ = needs;` is dead (`tests.rs:194`); `gpu_missing_features` copies
   gpu_headless's render helpers verbatim instead of sharing them in `common`; misindented code
   and a comment inside an expression (`gpu_headless.rs:680, 2339`).
@@ -330,10 +250,8 @@ with this survey. Still wrong:
 - **README:** "a draw's raster state is dynamic state, so pipelines depend only on the shaders,
   their constants and the attachment formats" (`README.md:10`) is stale since extended dynamic
   state became optional.
-- **lava-build-slang README:** it doesn't say the application needs glam and bytemuck with
-  `derive`, or that hot reload needs lava-build-slang as a normal dependency too. Pass discovery
-  isn't recursive while `rerun-if-changed` is. `build.rs`'s comment implies `-lslang` is avoided,
-  but shader-slang-sys still emits it *(plausible)*.
+- **lava-build-slang:** `build.rs`'s comment implies `-lslang` is avoided, but shader-slang-sys
+  still emits it *(plausible)*.
 - **rustdoc:** `features::gate` is ambiguous between function and module (`features.rs:93`); the
   link to `watch` is unresolved (`lava-build-slang/src/lib.rs:31`); the links to `Instance`
   (`lib.rs:24-26`) and `Compute` (`queue/mod.rs:35-39`) break without their features.
@@ -345,10 +263,9 @@ with this survey. Still wrong:
   labels exclude them. Change the code or the docs, whichever is meant.
 - **Item docs:** the 16-pipeline warning always blames constants, though raster keys grow too (`:499-507`); `wait_idle`'s doc omits that
   it reclaims; `Config::validation`'s omits that it enables printf; `ray_tracing.slang`'s
-  `__init` truncates out-of-range fields silently, where Rust asserts; `SCONST` splits on
-  commas, so generic images need an alias; `Img.Load` reads mip 0 and a null index is undefined;
-  `memory_report`, `blocks` and several `Features` items have no docs; `bindless.slang`'s `Accel`
-  doc names a missing `BindingOutput::acceleration_structure_read`.
+  `__init` truncates out-of-range fields silently, where Rust asserts; `Img.Load(p)` reads mip 0
+  and a null index is undefined; `memory_report`, `blocks` and several `Features` items have no
+  docs.
 - **Tests:** `ray_scene.slang:2` and `test_write_instances.slang:2` name `gpu_headless.rs`, but the
   scene lives in `gpu_ray_tracing.rs`; `gpu_missing_features.rs:125` swaps near and far.
 - **Generated context:** the tools generator lists `pub fn` lines inside codegen's raw-string
@@ -421,8 +338,8 @@ Each was checked by grep over lava-tests and `lava/src/tests.rs`.
 - **Pipelines:** raster or ray tracing passes with specialization constants, mesh passes with a
   task shader, a `[MaxRecursion(n)]` above the device's limit (no device here has less than 31,
   and lava-build-slang refuses more), `reload_pass` of a ray tracing pass.
-- **Slang shapes:** `Image2D`, handles or `Accel` inside structs behind a
-  `Buf`; struct merging, padding and naming in codegen; the hand-copied constants
+- **Slang shapes:** `Image2D`, and `Accel` inside structs behind a `Buf`, on the GPU
+  (lava-build-slang's unit tests map them); the hand-copied constants
   (`MAX_PUSH_CONSTANTS_SIZE`, the clock constants) against lava and `profile.slang`.
 - **Bindless:** `Ranges::give`'s double-free panic.
 - **Features:** `Features::consistent`, `without`/`missing_from`, `extensions()` agreeing with
@@ -461,13 +378,13 @@ Engine-side findings that don't belong to lava's code but came up in this survey
 
 ## Suggested order
 
-1. **Fix the soundness bugs:** host access (16), the undefined behaviour from safe code (24-37),
-   and the hot reload's layout hash (85).
+1. **Fix the soundness bugs:** host access (16) and the undefined behaviour from safe code
+   (24-37).
 2. **Fix the barrier tracking (22)** and the valid-usage bugs every device hits: multi-draw
    indirect (38), the depth bias clamp (39), line topologies without extended dynamic state (40),
    depth clamp (41).
 3. **Fix the timeline and presenting hangs and leaks (64-84).**
-4. **Redesign the APIs users touch first:** named bindings, init config, memory locations,
+4. **Redesign the APIs users touch first:** init config, memory locations,
    frame and ring helpers, errors, naming, and the public internals of 19 before 0.1.
 5. **Make the tests able to fail** (section 8), then add features by real-world demand: arrays,
    cubes and MSAA, samplers, staging.

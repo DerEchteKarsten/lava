@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use crate::half::f16_bits;
 use crate::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Affine3A, Vec2, Vec3, Vec3A, Vec4};
@@ -965,36 +966,6 @@ impl Snorm16x4 {
 
 fn snorm16(value: f32) -> i16 {
     (value.clamp(-1.0, 1.0) * 32767.0).round() as i16
-}
-
-/// The binary16 bits of `value`, rounded to nearest, ties to even.
-pub(crate) fn f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        // Infinity, or a quiet NaN.
-        return sign | 0x7c00 | if mantissa != 0 { 0x200 } else { 0 };
-    }
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 0x1f {
-        return sign | 0x7c00;
-    }
-    let round = |value: u32, shift: u32| {
-        let (rest, halfway) = (value & ((1 << shift) - 1), 1 << (shift - 1));
-        let truncated = value >> shift;
-        truncated + (rest > halfway || (rest == halfway && truncated & 1 == 1)) as u32
-    };
-    if half_exponent <= 0 {
-        // Subnormal (or zero): units of 2^-24.
-        if half_exponent < -10 {
-            return sign;
-        }
-        return sign | round(mantissa | 0x80_0000, (14 - half_exponent) as u32) as u16;
-    }
-    // A carry out of the mantissa raises the exponent, up to infinity, as it should.
-    sign | round(((half_exponent as u32) << 23) | mantissa, 13) as u16
 }
 
 /// The index types a triangle geometry can use, those of indexed draws.

@@ -159,16 +159,19 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     }
 
     /// Panics unless the format has the `required` aspects; does nothing for a static format.
+    #[track_caller]
     pub fn aspect_check(&self, required: vk::ImageAspectFlags) {
         self.format.aspect_check(required);
     }
 
     /// Panics unless the format's texels have the type `T`; does nothing for a static format.
+    #[track_caller]
     pub fn texel_check<T: 'static>(&self) {
         self.format.texel_check::<T>();
     }
 
     /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
+    #[track_caller]
     pub fn usage_check(&self, required: vk::ImageUsageFlags) {
         self.usage.check(required);
     }

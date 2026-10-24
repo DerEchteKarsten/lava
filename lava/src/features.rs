@@ -788,6 +788,12 @@ impl FeatureChain {
         self.mesh.multiview_mesh_shader == vk::TRUE
     }
 
+    /// Whether the device sets compute passes' subgroup sizes (`[WaveSize(n)]`), which lava
+    /// enables wherever it has it.
+    pub(crate) fn subgroup_size_control(&self) -> bool {
+        self.vk13.subgroup_size_control == vk::TRUE
+    }
+
     /// What lava needs that the device lacks, by name.
     pub(crate) fn lava_missing(&self, has: &dyn Fn(&CStr) -> bool) -> Vec<String> {
         let extensions = LAVA_EXTENSIONS.iter().filter(|name| !has(name));
@@ -985,7 +991,8 @@ impl FeatureChain {
             .dynamic_rendering(true)
             .synchronization2(true)
             .maintenance4(true)
-            .shader_demote_to_helper_invocation(true);
+            .shader_demote_to_helper_invocation(true)
+            .subgroup_size_control(queried.subgroup_size_control());
         chain.address_commands.device_address_commands = vk::TRUE;
         chain.descriptor_heap.descriptor_heap = vk::TRUE;
         chain.untyped_pointers.shader_untyped_pointers = vk::TRUE;

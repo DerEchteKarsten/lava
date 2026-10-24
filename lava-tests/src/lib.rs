@@ -18,7 +18,7 @@ mod tests {
             let end = pass.constants.iter().map(|c| c.offset as usize + c.size);
             assert_eq!(end.max().unwrap_or(0), pass.constants_size, "{}", pass.name);
             let names: Vec<&CStr> = match pass.kind {
-                PassKind::Compute { entry } => vec![entry],
+                PassKind::Compute { entry, .. } => vec![entry],
                 PassKind::RasterVertex { vertex, fragment } => {
                     [vertex].into_iter().chain(fragment).collect()
                 }

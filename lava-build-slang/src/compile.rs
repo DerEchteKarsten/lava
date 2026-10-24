@@ -1,12 +1,10 @@
-//! Slang session and pass linking shared by the build script and the hot reload, plus the reflection both read: entry point stages and attributes, ray tracing groups, layout hashes
-use std::{collections::BTreeMap, ffi::CString};
+//! Slang sessions and the compilation of one pass file into its passes (SPIR-V, description and warnings), shared by the build script and the hot reload, so both compile alike: pass names and their checks, entry point stages and attributes, ray tracing groups
+use std::{collections::BTreeMap, ffi::CString, path::Path};
 
 pub use shader_slang as slang;
 
-use crate::reflect::{
-    CheckedAttributes, CheckedEntryPoint, CheckedName, CheckedShader, CheckedTypeLayout,
-    CheckedVariableLayout,
-};
+use crate::describe::{self, PassDesc};
+use crate::reflect::{self, CheckedAttributes, CheckedEntryPoint, CheckedName, CheckedShader};
 use crate::{Optimization, SLANG_DIR};
 
 pub struct Options<'a> {
@@ -14,6 +12,8 @@ pub struct Options<'a> {
     pub search_paths: &'a [&'a str],
     pub defines: &'a [(&'a str, &'a str)],
     pub optimization: Optimization,
+    /// Emit Slang's debug information (source-level debugging in RenderDoc or Nsight).
+    pub debug_info: bool,
 }
 
 /// A session that compiles passes, named by their absolute paths, to SPIR-V 1.6.
@@ -38,8 +38,14 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
         .optimization(optimization)
         .vulkan_use_entry_point_name(true)
         .matrix_layout_column(true)
+        // "Profile implicitly upgraded" for every capability a pass uses: lava reads them from
+        // the SPIR-V (`features.rs`), so they need no warning.
+        .disable_warning("41012")
         // Shaders index lava's descriptor heaps directly (`SPV_EXT_descriptor_heap`).
         .capability(global.find_capability("spvDescriptorHeapEXT"));
+    if options.debug_info {
+        compiler = compiler.debug_information(slang::DebugInfoLevel::Standard);
+    }
     for (name, value) in options.defines {
         compiler = compiler.macro_define(name, value);
     }
@@ -53,58 +59,141 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
         .expect("failed to create a slang session")
 }
 
-/// A hash of what the generated bindings of a pass depend on: its push constants,
-/// specialization constants and entry points.
-pub fn layout_hash(layout: &slang::reflection::Shader) -> u64 {
-    use slang::ParameterCategory as Cat;
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    for parameter in layout.checked_parameters() {
-        match parameter.category() {
-            Cat::PushConstantBuffer => {
-                let Some(fields) = parameter
-                    .checked_type_layout()
-                    .and_then(|t| t.checked_element_type_layout())
-                else {
-                    continue;
-                };
-                fields.size(Cat::Uniform).hash(&mut hasher);
-                for field in fields.checked_fields() {
-                    field
-                        .variable()
-                        .and_then(|v| v.checked_name())
-                        .hash(&mut hasher);
-                    field.offset(Cat::Uniform).hash(&mut hasher);
-                    field
-                        .checked_type_layout()
-                        .map(|t| t.size(Cat::Uniform))
-                        .hash(&mut hasher);
-                }
-            }
-            Cat::SpecializationConstant => {
-                parameter
-                    .offset(Cat::SpecializationConstant)
-                    .hash(&mut hasher);
-                parameter
-                    .checked_type_layout()
-                    .map(|t| t.size(Cat::Uniform))
-                    .hash(&mut hasher);
-            }
-            _ => {}
-        }
-    }
-    for entry in layout.checked_entry_points() {
-        format!("{:?}", entry.stage()).hash(&mut hasher);
-        entry.checked_name().hash(&mut hasher);
-        entry_attribute(entry, "Group").hash(&mut hasher);
-        entry_attribute(entry, "MaxRecursion").hash(&mut hasher);
-    }
-    hasher.finish()
+/// A pass of a file: all its entry points, or one of several compute entry points.
+pub struct CompiledPass {
+    /// The generated struct's name (`bvh_cull.slang` is `BvhCull`; the entry point `main` of a
+    /// file of several compute entry points `BvhCullMain`).
+    pub name: String,
+    /// The entry point it was linked with alone, for a file of several compute entry points.
+    pub entry: Option<String>,
+    pub desc: PassDesc,
+    pub spirv: Vec<u8>,
 }
 
-pub fn stage_name(stage: slang::Stage) -> &'static str {
+/// What compiling one pass file gave: its passes, or every error, and Slang's warnings.
+pub struct CompiledFile {
+    pub passes: Result<Vec<CompiledPass>, Vec<String>>,
+    pub warnings: Vec<String>,
+}
+
+/// The pass name of a file stem: `bvh_cull` is `BvhCull`. Refused unless it makes a Rust
+/// identifier: ASCII letters, digits and `_`, not starting with a digit.
+pub fn pass_name(stem: &str) -> Result<String, String> {
+    let valid = !stem.is_empty()
+        && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !stem.starts_with(|c: char| c.is_ascii_digit());
+    let name: String = stem.split('_').map(describe::capitalize_first).collect();
+    match valid && !name.is_empty() {
+        true => Ok(name),
+        false => Err(format!(
+            "the pass name `{stem}` isn't a Rust identifier: name the file with ASCII letters, \
+             digits and `_`, not starting with a digit"
+        )),
+    }
+}
+
+/// Compiles the pass file `source` (an absolute path) into its passes: one with all its entry
+/// points, or, for a file of several compute entry points, one per entry point, linked alone
+/// and named after the file and the entry point.
+pub fn compile_file(session: &slang::Session, source: &str) -> CompiledFile {
+    let mut warnings = Vec::new();
+    let passes = compile_passes(session, source, &mut warnings);
+    CompiledFile { passes, warnings }
+}
+
+fn compile_passes(
+    session: &slang::Session,
+    source: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<CompiledPass>, Vec<String>> {
+    let stem = Path::new(source)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let file_name = pass_name(stem).map_err(|e| vec![e])?;
+    let (module, diagnostics) = reflect::load_module(session, source).map_err(|e| vec![e])?;
+    warnings.extend(diagnostics);
+    // The stages of every entry point, from the module linked whole.
+    let (whole, diagnostics) = link(session, &module, None).map_err(|e| vec![e])?;
+    warnings.extend(diagnostics);
+    let layout = whole.layout(0).map_err(|e| vec![e.to_string()])?;
+    let stages: Vec<(String, slang::Stage)> = (layout.checked_entry_points())
+        .map(|ep| (ep.checked_name().unwrap_or("?").to_string(), ep.stage()))
+        .collect();
+    let split = stages.len() > 1 && stages.iter().all(|(_, s)| *s == slang::Stage::Compute);
+    let targets: Vec<(String, Option<String>)> = match split {
+        false => vec![(file_name, None)],
+        true => (stages.iter())
+            .map(|(entry, _)| match pass_name(entry) {
+                Ok(name) => Ok((file_name.clone() + &name, Some(entry.clone()))),
+                Err(_) => Err(vec![format!(
+                    "the compute entry point `{entry}` doesn't make a pass name: name it with \
+                     ASCII letters, digits and `_`"
+                )]),
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    let mut passes = Vec::new();
+    let mut errors = Vec::new();
+    for (name, entry) in targets {
+        let program = match &entry {
+            None => Ok(whole.clone()),
+            Some(entry) => link(session, &module, Some(entry)).map(|(program, diagnostics)| {
+                warnings.extend(diagnostics);
+                program
+            }),
+        };
+        let compiled = program.and_then(|program| {
+            let layout = program.layout(0).map_err(|e| e.to_string())?;
+            let desc = describe::describe(layout, &module).map_err(|e| e.join("\n"))?;
+            let (spirv, diagnostics) = reflect::target_code(&program, 0)?;
+            warnings.extend(diagnostics);
+            Ok(CompiledPass {
+                name: name.clone(),
+                entry: entry.clone(),
+                desc,
+                spirv,
+            })
+        });
+        match compiled {
+            Ok(pass) => passes.push(pass),
+            Err(e) => match &entry {
+                Some(entry) => errors.push(format!("entry point `{entry}` ({name}):\n{e}")),
+                None => errors.push(e),
+            },
+        }
+    }
+    match errors.is_empty() {
+        true => Ok(passes),
+        false => Err(errors),
+    }
+}
+
+/// `module` with all its entry points, or only `entry`, linked.
+fn link(
+    session: &slang::Session,
+    module: &slang::Module,
+    entry: Option<&str>,
+) -> Result<(slang::ComponentType, Option<String>), String> {
+    use slang::Downcast;
+    let mut components: Vec<slang::ComponentType> = vec![module.downcast().clone()];
+    match entry {
+        None => components.extend(module.entry_points().map(|entry| entry.downcast().clone())),
+        Some(name) => {
+            let entry = (module.find_entry_point_by_name(name))
+                .ok_or(format!("no entry point `{name}`"))?;
+            components.push(entry.downcast().clone());
+        }
+    }
+    let composite = session
+        .create_composite_component_type(&components)
+        .map_err(|e| e.to_string())?;
+    reflect::link(&composite)
+}
+
+pub fn stage_name(stage: slang::Stage) -> Result<&'static str, String> {
     use slang::Stage;
-    match stage {
+    Ok(match stage {
         Stage::Vertex => "vertex",
         Stage::Fragment => "fragment",
         Stage::Mesh => "mesh",
@@ -116,8 +205,8 @@ pub fn stage_name(stage: slang::Stage) -> &'static str {
         Stage::Miss => "miss",
         Stage::Intersection => "intersection",
         Stage::Callable => "callable",
-        other => panic!("unsupported stage {other:?}"),
-    }
+        other => return Err(format!("the stage {other:?} has no lava pass")),
+    })
 }
 
 pub const RAY_TRACING_STAGES: [&str; 6] = [
@@ -244,15 +333,6 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
     })
 }
 
-/// The pass at the absolute path `source` with all its entry points, linked.
-pub fn link(session: &slang::Session, source: &str) -> slang::Result<slang::ComponentType> {
-    let module = session.load_module(source)?;
-    use slang::Downcast;
-    let mut components: Vec<slang::ComponentType> = vec![module.downcast().clone()];
-    components.extend(module.entry_points().map(|entry| entry.downcast().clone()));
-    session.create_composite_component_type(&components)?.link()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +409,10 @@ mod tests {
         assert!(refused(&[deep]).contains("between 0 and 31"));
         let mut flat = rg();
         flat.max_recursion = Some(0);
-        assert_eq!(ray_tracing_groups(&[flat]).unwrap().max_recursion, 0, "Vulkan allows 0");
+        assert_eq!(
+            ray_tracing_groups(&[flat]).unwrap().max_recursion,
+            0,
+            "Vulkan allows 0"
+        );
     }
 }

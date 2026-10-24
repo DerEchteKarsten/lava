@@ -19,10 +19,7 @@ use lava::{
     state::Ctx,
     vk,
 };
-use lava_tests::bindings::{
-    TestDepthOnly, TestDrawParams, TestDualSource, TestLayered, TestMultiview, TestRaster,
-    TestSampleArray, TestVertex,
-};
+use lava_tests::bindings::*;
 
 // ---- helpers ---------------------------------------------------------------------------------
 
@@ -106,7 +103,7 @@ const IN_LEFT: (u32, u32) = (16, 44);
 const IN_RIGHT: (u32, u32) = (48, 44);
 
 fn raster(vertices: &Buffer<TestVertex>) -> impl std::ops::Deref<Target = BindingOutput<'_, kind::RasterVertex>> {
-    TestRaster::push_bindings(vertices.range(..), Vec2::ZERO)
+    TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None)
 }
 
 fn unculled<const N: usize>() -> RasterState<N> {
@@ -117,7 +114,7 @@ fn unculled<const N: usize>() -> RasterState<N> {
 fn both(gpu: &mut Gpu, vertices: &Buffer<TestVertex>) -> Vec<u8> {
     render(gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&raster(vertices), 6, 1, unculled(), None))
+            .draw(&Draw::new(&raster(vertices), 6, 1, unculled()))
             .record("both");
     })
 }
@@ -147,16 +144,16 @@ fn indirect_draws_take_several_commands_and_a_first_instance() {
             first_instance: 1,
         },
     ]);
-    let shifted = TestDrawParams::push_bindings(vertices.range(..), Vec2::new(1.0, 0.0));
+    let shifted = TestDrawParams::push_bindings(TestDrawParamsArgs { vertices: vertices.range(..), instance_offset: Vec2::new(1.0, 0.0) }, None);
     let indirect = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::indirect(&shifted, commands.range(..), RasterState::default(), None))
+            .draw(&Draw::indirect(&shifted, commands.range(..), RasterState::default()))
             .record("indirect");
     });
     let instanced = render(&mut gpu, |cmd, target| {
-        let bindings = TestRaster::push_bindings(vertices.range(..), Vec2::new(1.0, 0.0));
+        let bindings = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::new(1.0, 0.0) }, None);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&bindings, 3, 2, RasterState::default(), None))
+            .draw(&Draw::new(&bindings, 3, 2, RasterState::default()))
             .record("instanced");
     });
     assert_ne!(pixel(&indirect, IN_RIGHT.0, IN_RIGHT.1), BLACK);
@@ -188,10 +185,10 @@ fn indirect_draws_take_records_that_start_with_their_command() {
         Record { command: command(0), id: 7 },
         Record { command: command(3), id: 9 },
     ]);
-    let bindings = TestDrawParams::push_bindings(vertices.range(..), Vec2::ZERO);
+    let bindings = TestDrawParams::push_bindings(TestDrawParamsArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::indirect(&bindings, records.range(..), unculled(), None))
+            .draw(&Draw::indirect(&bindings, records.range(..), unculled()))
             .record("records");
     });
     assert_eq!(pixels, both(&mut gpu, &vertices));
@@ -201,10 +198,10 @@ fn indirect_draws_take_records_that_start_with_their_command() {
 fn direct_draws_start_at_their_first_vertex_and_instance() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
-    let shifted = TestDrawParams::push_bindings(vertices.range(..), Vec2::new(-1.0, 0.0));
+    let shifted = TestDrawParams::push_bindings(TestDrawParamsArgs { vertices: vertices.range(..), instance_offset: Vec2::new(-1.0, 0.0) }, None);
     // The right triangle (vertices 3..6) as instance 1: shifted into the left half.
     let pixels = render(&mut gpu, |cmd, target| {
-        let draw = Draw::new(&shifted, 3, 1, unculled(), None).first_vertex(3).first_instance(1);
+        let draw = Draw::new(&shifted, 3, 1, unculled()).first_vertex(3).first_instance(1);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&draw)
             .record("first vertex");
@@ -213,7 +210,7 @@ fn direct_draws_start_at_their_first_vertex_and_instance() {
     assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, BLACK);
     let message = panic_message(|| {
         let commands = buffer_with(&[DrawIndirectCommand::default()]);
-        drop(Draw::indirect(&shifted, commands.range(..), unculled::<1>(), None).first_vertex(1));
+        drop(Draw::indirect(&shifted, commands.range(..), unculled::<1>()).first_vertex(1));
     });
     assert!(message.contains("is for `Draw::new`"), "{message}");
 }
@@ -222,17 +219,17 @@ fn direct_draws_start_at_their_first_vertex_and_instance() {
 fn indexed_draws_take_u16_indices_and_a_vertex_offset() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
-    let bindings = TestDrawParams::push_bindings(vertices.range(..), Vec2::ZERO);
+    let bindings = TestDrawParams::push_bindings(TestDrawParamsArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None);
     let wide = buffer_with::<u32>(&[0, 1, 2, 3, 4, 5]);
     let narrow = buffer_with::<u16>(&[0, 1, 2]);
     let u32_indices = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::indexed(&bindings, wide.range(3..), 1, unculled(), None))
+            .draw(&Draw::indexed(&bindings, wide.range(3..), 1, unculled()))
             .record("u32");
     });
     // The same triangle through `u16` indices of the left one, offset by 3 vertices.
     let u16_indices = render(&mut gpu, |cmd, target| {
-        let draw = Draw::indexed(&bindings, narrow.range(..), 1, unculled(), None).vertex_offset(3);
+        let draw = Draw::indexed(&bindings, narrow.range(..), 1, unculled()).vertex_offset(3);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&draw)
             .record("u16");
@@ -246,7 +243,7 @@ fn indexed_draws_take_u16_indices_and_a_vertex_offset() {
 fn indexed_indirect_draws_match_the_direct_ones() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
-    let bindings = TestDrawParams::push_bindings(vertices.range(..), Vec2::ZERO);
+    let bindings = TestDrawParams::push_bindings(TestDrawParamsArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None);
     let indices = buffer_with::<u16>(&[0, 1, 2, 0, 1, 2]);
     let command = |first_index, vertex_offset| DrawIndexedIndirectCommand {
         index_count: 3,
@@ -263,9 +260,7 @@ fn indexed_indirect_draws_match_the_direct_ones() {
                 &bindings,
                 indices.range(..),
                 commands.range(..),
-                unculled(),
-                None,
-            ))
+                unculled(),))
             .record("indexed indirect");
     });
     assert_eq!(indirect, both(&mut gpu, &vertices));
@@ -279,9 +274,7 @@ fn indexed_indirect_draws_match_the_direct_ones() {
                     indices.range(..),
                     commands.range(..),
                     count.range(..),
-                    unculled(),
-                    None,
-                ))
+                    unculled(),))
                 .record("indexed indirect count");
         })
     };
@@ -298,7 +291,7 @@ fn multi_draws_draw_every_range() {
         return skip("multi_draws_draw_every_range", "the device lacks `multi-draw`");
     }
     let vertices = two_triangles(&mut gpu);
-    let bindings = TestDrawParams::push_bindings(vertices.range(..), Vec2::ZERO);
+    let bindings = TestDrawParams::push_bindings(TestDrawParamsArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None);
     let ranges = [
         lava::command_buffer::MultiDraw {
             first_vertex: 0,
@@ -310,7 +303,7 @@ fn multi_draws_draw_every_range() {
         },
     ];
     let multi = render(&mut gpu, |cmd, target| {
-        let draw = Draw::multi(&bindings, &ranges, 1, unculled(), None).unwrap();
+        let draw = Draw::multi(&bindings, &ranges, 1, unculled()).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&draw)
             .record("multi");
@@ -332,7 +325,7 @@ fn multi_draws_draw_every_range() {
         },
     ];
     let multi_indexed = render(&mut gpu, |cmd, target| {
-        let draw = Draw::multi_indexed(&bindings, indices.range(..), &indexed, 1, unculled(), None)
+        let draw = Draw::multi_indexed(&bindings, indices.range(..), &indexed, 1, unculled())
             .unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&draw)
@@ -345,7 +338,7 @@ fn multi_draws_draw_every_range() {
         vertex_offset: 0,
     }];
     let message = panic_message(|| {
-        Draw::multi_indexed(&bindings, indices.range(..), &outside, 1, unculled::<1>(), None)
+        Draw::multi_indexed(&bindings, indices.range(..), &outside, 1, unculled::<1>())
             .map(drop)
     });
     assert!(message.contains("of an index buffer of 3"), "{message}");
@@ -373,19 +366,17 @@ fn depth_bias_is_clamped() {
             slope: 0.0,
             clamp,
         };
-        let green = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
-        let red = TestRaster::push_bindings(vertices.range(3..6), Vec2::ZERO);
+        let green = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None);
+        let red = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(3..6), instance_offset: Vec2::ZERO }, None);
         render(gpu, |cmd, target| {
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
                 .depth_attachment(depth.whole_view(), Some([0.0]))
-                .draw(&Draw::new(&green, 3, 1, RasterState::default(), None))
+                .draw(&Draw::new(&green, 3, 1, RasterState::default()))
                 .draw(&Draw::new(
                     &red,
                     3,
                     1,
-                    RasterState::default().depth_bias(Some(bias)),
-                    None,
-                ))
+                    RasterState::default().depth_bias(Some(bias)),))
                 .record("depth bias");
         })
     };
@@ -405,12 +396,12 @@ fn draws_set_their_own_scissors_and_viewports() {
     let bottom = Rect::new(IVec2::new(0, half as i32), UVec2::new(SIZE, half));
     // The left triangle only in the top half, the right one only in the bottom half, and a
     // third draw back at the rendering's scissor.
-    let left = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
-    let right = TestRaster::push_bindings(vertices.range(3..6), Vec2::ZERO);
+    let left = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None);
+    let right = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(3..6), instance_offset: Vec2::ZERO }, None);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&left, 3, 1, unculled().scissor(Some(top)), None))
-            .draw(&Draw::new(&right, 3, 1, unculled().scissor(Some(bottom)), None))
+            .draw(&Draw::new(&left, 3, 1, unculled().scissor(Some(top))))
+            .draw(&Draw::new(&right, 3, 1, unculled().scissor(Some(bottom))))
             .record("scissors");
     });
     for (y, x) in (0..SIZE).flat_map(|y| (0..SIZE).map(move |x| (y, x))) {
@@ -425,8 +416,8 @@ fn draws_set_their_own_scissors_and_viewports() {
     let quarter = Rect::new(IVec2::ZERO, EXTENT / 2);
     let viewports = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&right, 3, 1, unculled().viewport(Some(quarter)), None))
-            .draw(&Draw::new(&left, 3, 1, unculled(), None))
+            .draw(&Draw::new(&right, 3, 1, unculled().viewport(Some(quarter))))
+            .draw(&Draw::new(&left, 3, 1, unculled()))
             .record("viewports");
     });
     assert_pixel(&viewports, IN_RIGHT.0 / 2, IN_RIGHT.1 / 2, [255, 255, 0, 255]);
@@ -446,7 +437,7 @@ fn a_render_area_offset_leaves_the_rest_untouched() {
         // Cleared to black inside the area only; the viewport is the area, so both triangles
         // land in the right half.
         cmd.raster(area, [Attachment::color(target.whole_view(), Some([0.0, 0.0, 0.0, 1.0]))])
-            .draw(&Draw::new(&raster(&vertices), 6, 1, unculled(), None))
+            .draw(&Draw::new(&raster(&vertices), 6, 1, unculled()))
             .record("offset area");
         cmd.copy_image_to_buffer(target.whole(), readback.range(..));
     });
@@ -480,7 +471,7 @@ fn depth_clip_follows_the_clamp_unless_set() {
     let draw = |gpu: &mut Gpu, state: RasterState<1>| {
         render(gpu, |cmd, target| {
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-                .draw(&Draw::new(&raster(&far), 3, 1, state, None))
+                .draw(&Draw::new(&raster(&far), 3, 1, state))
                 .record("far");
         })
     };
@@ -513,10 +504,10 @@ fn dual_source_blends_read_the_second_output() {
         dst_alpha: BlendFactor::ZERO,
         alpha_op: BlendOp::ADD,
     };
-    let bindings = TestDualSource::push_bindings(vertices.range(..), Vec4::new(0.25, 0.5, 0.5, 1.0));
+    let bindings = TestDualSource::push_bindings(TestDualSourceArgs { vertices: vertices.range(..), factor: Vec4::new(0.25, 0.5, 0.5, 1.0) }, None);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), Some(BLUE))])
-            .draw(&Draw::new(&bindings, 3, 1, unculled().blend(Blend::Equation(mix)), None))
+            .draw(&Draw::new(&bindings, 3, 1, unculled().blend(Blend::Equation(mix))))
             .record("dual source");
     });
     // Red at a quarter over blue at three quarters, green 0 either way, blue at a half.
@@ -525,7 +516,7 @@ fn dual_source_blends_read_the_second_output() {
     // A second attachment can't read a second output on this device (one, the limit).
     if Ctx::device_properties().limits.max_fragment_dual_src_attachments < 2 {
         let message = panic_message(|| {
-            drop(Draw::new(&bindings, 3, 1, RasterState::<2>::default().blend(Blend::Equation(mix)), None));
+            drop(Draw::new(&bindings, 3, 1, RasterState::<2>::default().blend(Blend::Equation(mix))));
         });
         assert!(message.contains("maxFragmentDualSrcAttachments"), "{message}");
     }
@@ -536,12 +527,12 @@ fn draw_state_values_are_checked() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
     let bindings = raster(&vertices);
-    let check = |state: RasterState<1>| panic_message(|| drop(Draw::new(&bindings, 3, 1, state, None)));
+    let check = |state: RasterState<1>| panic_message(|| drop(Draw::new(&bindings, 3, 1, state)));
 
     let restart = RasterState::default().primitive_restart(true);
     let message = check(restart.clone());
     assert!(message.contains("primitive restart cuts strips and fans"), "{message}");
-    drop(Draw::new(&bindings, 3, 1, restart.topology(PrimitiveTopology::TRIANGLE_STRIP), None));
+    drop(Draw::new(&bindings, 3, 1, restart.topology(PrimitiveTopology::TRIANGLE_STRIP)));
 
     if Ctx::features().line_stipple {
         let stipple = Some(LineStipple {
@@ -569,7 +560,7 @@ fn draw_state_values_are_checked() {
         let mode = vk::ConservativeRasterizationModeEXT::UNDERESTIMATE;
         let state = RasterState::<1>::default().conservative(mode).unwrap();
         let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(Draw::new(&bindings, 3, 1, state, None))
+            drop(Draw::new(&bindings, 3, 1, state))
         }));
         if let Err(payload) = drawn {
             let message = (payload.downcast_ref::<String>().cloned())
@@ -592,7 +583,7 @@ fn blending_into_a_format_that_cant_blend_panics() {
     let target = Image::<R32Uint, usage![ColorAttachment]>::new(EXTENT).unwrap();
     let message = panic_message(|| {
         gpu.submit(|cmd| {
-            let draw = Draw::new(&bindings, 3, 1, RasterState::default().blend(Blend::Alpha), None);
+            let draw = Draw::new(&bindings, 3, 1, RasterState::default().blend(Blend::Alpha));
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
                 .draw(&draw)
                 .record("integer blend");
@@ -614,15 +605,15 @@ fn vertex_only_passes_draw_depth() {
         vertex(-0.9, 0.8, 0.8, RED),
     ]);
     let depth = Image::<D32Sfloat, usage![DepthAttachment]>::new(EXTENT).unwrap();
-    let depth_only = TestDepthOnly::push_bindings(near.range(..));
+    let depth_only = TestDepthOnly::push_bindings(TestDepthOnlyArgs { vertices: near.range(..) }, None);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [])
             .depth_attachment(depth.whole_view(), Some([0.0]))
-            .draw(&Draw::new(&depth_only, 3, 1, unculled(), None))
+            .draw(&Draw::new(&depth_only, 3, 1, unculled()))
             .record("depth only");
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), None)
-            .draw(&Draw::new(&raster(&vertices), 6, 1, unculled().depth_write(false), None))
+            .draw(&Draw::new(&raster(&vertices), 6, 1, unculled().depth_write(false)))
             .record("tested");
     });
     assert_pixel(&pixels, IN_LEFT.0, IN_LEFT.1, BLACK);
@@ -646,7 +637,7 @@ fn stencil_only_attachments_mark_and_test() {
     };
     let mark = face(StencilOp::REPLACE, CompareOp::ALWAYS);
     let marked = face(StencilOp::KEEP, CompareOp::EQUAL);
-    let left = TestRaster::push_bindings(vertices.range(0..3), Vec2::ZERO);
+    let left = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None);
     let pixels = render(&mut gpu, |cmd, target| {
         let marking = unculled()
             .stencil(Some(Stencil { front: mark, back: mark }))
@@ -657,8 +648,8 @@ fn stencil_only_attachments_mark_and_test() {
         }));
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .stencil_attachment(stencil.whole_view(), Some([0]))
-            .draw(&Draw::new(&left, 3, 1, marking, None))
-            .draw(&Draw::new(&raster(&vertices), 6, 1, drawing, None))
+            .draw(&Draw::new(&left, 3, 1, marking))
+            .draw(&Draw::new(&raster(&vertices), 6, 1, drawing))
             .record("stencil only");
     });
     assert_ne!(pixel(&pixels, IN_LEFT.0, IN_LEFT.1), BLACK);
@@ -669,23 +660,25 @@ fn stencil_only_attachments_mark_and_test() {
 fn unordered_accesses_of_one_rendering_may_overlap() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
-    let bindings = raster(&vertices);
     let target = Target::new(EXTENT).unwrap();
     let counters = zeroed_buffer::<u32>(4);
     let unordered = [BufferAccess::write(counters.range(..)).unordered()];
     let ordered = [BufferAccess::write(counters.range(..))];
     assert!(unordered[0].is_unordered() && !ordered[0].is_unordered());
+    let args = || TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO };
+    let unordered = TestRaster::push_bindings(args(), Some(Accesses::buffers(&unordered)));
+    let ordered = TestRaster::push_bindings(args(), Some(Accesses::buffers(&ordered)));
     gpu.submit(|cmd| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&bindings, 3, 1, unculled(), Some(Accesses::buffers(&unordered))))
-            .draw(&Draw::new(&bindings, 3, 1, unculled(), Some(Accesses::buffers(&unordered))))
+            .draw(&Draw::new(&unordered, 3, 1, unculled()))
+            .draw(&Draw::new(&unordered, 3, 1, unculled()))
             .record("unordered");
     });
     let message = panic_message(|| {
         gpu.submit(|cmd| {
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-                .draw(&Draw::new(&bindings, 3, 1, unculled(), Some(Accesses::buffers(&unordered))))
-                .draw(&Draw::new(&bindings, 3, 1, unculled(), Some(Accesses::buffers(&ordered))))
+                .draw(&Draw::new(&unordered, 3, 1, unculled()))
+                .draw(&Draw::new(&ordered, 3, 1, unculled()))
                 .record("one ordered");
         })
     });
@@ -709,10 +702,8 @@ fn array_layers_are_sampled_and_copied_one_by_one() {
             cmd.clear_image(array.whole_view().layer(i as u32), *color);
         }
         cmd.compute(
-            &TestSampleArray::push_bindings(array.whole_view(), nearest(), texels.range(..), 3),
-            [1, 1, 1],
-            None,
-        );
+            &TestSampleArray::push_bindings(TestSampleArrayArgs { image: array.whole_view(), sampler: nearest(), texels: texels.range(..), layers: 3 }, None),
+            [1, 1, 1]);
         cmd.copy_image_to_buffer(array.whole_view().layer(1).whole(), layer.range(..));
         cmd.copy_image_to_buffer(array.whole_view().layers(1..3).whole(), all.range(..));
     });
@@ -735,7 +726,7 @@ fn a_layer_view_is_an_attachment_of_its_layer() {
     let vertices = two_triangles(&mut gpu);
     let layers = render_layers(&mut gpu, 2, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view().layer(1), None)])
-            .draw(&Draw::new(&raster(&vertices), 6, 1, unculled(), None))
+            .draw(&Draw::new(&raster(&vertices), 6, 1, unculled()))
             .record("layer 1");
     });
     assert!(layers[0].chunks_exact(4).all(|p| p == BLACK));
@@ -746,7 +737,7 @@ fn a_layer_view_is_an_attachment_of_its_layer() {
 fn layered_renderings_draw_each_instance_into_its_layer() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
-    let Ok(bindings) = TestLayered::push_bindings(vertices.range(0..3), Vec4::from_array(GREEN)) else {
+    let Ok(bindings) = TestLayered::push_bindings(TestLayeredArgs { vertices: vertices.range(0..3), second: Vec4::from_array(GREEN) }, None) else {
         return skip(
             "layered_renderings_draw_each_instance_into_its_layer",
             "the device lacks `shader-output-layer`",
@@ -755,12 +746,12 @@ fn layered_renderings_draw_each_instance_into_its_layer() {
     let layers = render_layers(&mut gpu, 3, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .layers(2)
-            .draw(&Draw::new(&bindings, 3, 2, unculled(), None))
+            .draw(&Draw::new(&bindings, 3, 2, unculled()))
             .record("layered");
     });
     let left = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&raster(&vertices), 3, 1, unculled(), None))
+            .draw(&Draw::new(&raster(&vertices), 3, 1, unculled()))
             .record("left");
     });
     assert_eq!(layers[0], left);
@@ -772,7 +763,7 @@ fn layered_renderings_draw_each_instance_into_its_layer() {
             let target = ArrayTarget::with_layers(EXTENT, 1, 2).unwrap();
             cmd.raster(EXTENT, [Attachment::color(target.whole_view().layers(0..1), None)])
                 .layers(2)
-                .draw(&Draw::new(&bindings, 3, 2, unculled(), None))
+                .draw(&Draw::new(&bindings, 3, 2, unculled()))
                 .record("too few layers");
         })
     });
@@ -783,17 +774,17 @@ fn layered_renderings_draw_each_instance_into_its_layer() {
 fn multiview_renderings_draw_every_view() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
-    let bindings = TestMultiview::push_bindings(vertices.range(0..3), Vec4::from_array(BLUE));
+    let bindings = TestMultiview::push_bindings(TestMultiviewArgs { vertices: vertices.range(0..3), other: Vec4::from_array(BLUE) }, None);
     let views = render_layers(&mut gpu, 3, |cmd, target| {
         // Views 0 and 2.
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .view_mask(0b101)
-            .draw(&Draw::new(&bindings, 3, 1, unculled(), None))
+            .draw(&Draw::new(&bindings, 3, 1, unculled()))
             .record("multiview");
     });
     let left = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&raster(&vertices), 3, 1, unculled(), None))
+            .draw(&Draw::new(&raster(&vertices), 3, 1, unculled()))
             .record("left");
     });
     assert_eq!(views[0], left);

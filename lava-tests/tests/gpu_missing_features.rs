@@ -21,7 +21,7 @@ use lava::{
     queue::{Compute, Kind, Timeline, Transfer},
     state::Ctx,
 };
-use lava_tests::bindings::{TestLayered, TestMesh, TestRaster, TestVertex};
+use lava_tests::bindings::*;
 
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
@@ -142,7 +142,7 @@ fn bindings(
     vertices: &Buffer<TestVertex>,
     range: std::ops::Range<usize>,
 ) -> impl std::ops::Deref<Target = BindingOutput<'_, kind::RasterVertex>> {
-    TestRaster::push_bindings(vertices.range(range), Vec2::ZERO)
+    TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(range), instance_offset: Vec2::ZERO }, None)
 }
 
 fn unculled() -> RasterState<1> {
@@ -167,8 +167,12 @@ fn disabled_features_are_off() {
 #[test]
 fn functions_that_need_a_disabled_feature_return_missing_feature() {
     let _gpu = gpu_without();
-    let launch = TestMesh::push_bindings(Vec4::ONE, Vec2::ZERO, 0.1);
+    let launch = TestMesh::push_bindings(TestMeshArgs { color: Vec4::ONE, group_offset: Vec2::ZERO, scale: 0.1 }, None);
     assert_eq!(launch.err(), Some(missing("mesh-shader")));
+    // A pass the device can't run has no pipelines to replace: its reload is skipped.
+    let mesh = (PASS_MAP.passes.iter()).position(|p| p.name == "TestMesh").unwrap();
+    let reloaded = lava::pipeline::reload_pass(mesh, PASS_MAP.passes[mesh].spirv);
+    assert_eq!(reloaded.unwrap(), lava::pipeline::Reload::Skipped);
     let statistics = QueryPool::statistics(1, Statistics::COMPUTE_SHADER_INVOCATIONS);
     assert!(
         matches!(statistics, Err(Error::MissingFeature(m)) if m == missing("pipeline-statistics"))
@@ -219,10 +223,10 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
         first_vertex: 0,
         vertex_count: 3,
     }];
-    let bindings = TestRaster::push_bindings(vertices.range(..), Vec2::ZERO);
-    let multi = Draw::multi(&bindings, &draws, 1, RasterState::<1>::default(), None);
+    let bindings = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None);
+    let multi = Draw::multi(&bindings, &draws, 1, RasterState::<1>::default());
     assert_eq!(multi.err(), Some(missing("multi-draw")));
-    let layered = TestLayered::push_bindings(vertices.range(..), Vec4::ONE);
+    let layered = TestLayered::push_bindings(TestLayeredArgs { vertices: vertices.range(..), second: Vec4::ONE }, None);
     assert_eq!(layered.err(), Some(missing("shader-output-layer")));
     // Draw state that needs a feature without a setter of its own panics.
     let src1 = BlendEquation {
@@ -235,7 +239,7 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
     };
     let message = common::panic_message(|| {
         let state = RasterState::<1>::default().blend(Blend::Equation(src1));
-        drop(Draw::new(&bindings, 3, 1, state, None));
+        drop(Draw::new(&bindings, 3, 1, state));
     });
     assert!(message.contains("`dual-src-blend`"), "{message}");
 }
@@ -249,7 +253,7 @@ fn baked_topology_classes_draw_like_dynamic_ones() {
     let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let lines = unculled().topology(PrimitiveTopology::LINE_LIST);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines, None))
+            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines))
             .record("lines")
     });
     // The same image as `gpu_headless`'s line list on a device without the restriction.
@@ -258,8 +262,8 @@ fn baked_topology_classes_draw_like_dynamic_ones() {
         let lines = unculled().topology(PrimitiveTopology::LINE_STRIP);
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&left, 3, 1, lines, None))
-            .draw(&Draw::new(&right, 3, 1, unculled(), None))
+            .draw(&Draw::new(&left, 3, 1, lines))
+            .draw(&Draw::new(&right, 3, 1, unculled()))
             .record("lines then triangles")
     });
     assert_pixel(&mixed, 16, 44, [0, 0, 0, 255]);
@@ -302,7 +306,7 @@ fn baked_polygon_modes_draw_like_dynamic_ones() {
     let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines, None))
+            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines))
             .record("wireframe")
     });
     // The same image as `gpu_headless`'s dynamic polygon mode.
@@ -317,8 +321,8 @@ fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&left, 3, 1, lines, None))
-            .draw(&Draw::new(&right, 3, 1, unculled(), None))
+            .draw(&Draw::new(&left, 3, 1, lines))
+            .draw(&Draw::new(&right, 3, 1, unculled()))
             .record("lines then filled")
     });
     // The left triangle is only its edges, the right one filled.
@@ -334,7 +338,7 @@ fn baked_blends_combine_and_skip() {
     let added = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
         let add = RasterState::default().blend(Blend::Add);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, add, None))
+            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, add))
             .record("added")
     });
     assert_pixel(&added, 32, 40, [255, 255, 0, 255]);
@@ -342,7 +346,7 @@ fn baked_blends_combine_and_skip() {
     let skipped = render(&mut gpu, BLUE, |cmd, target| {
         let skip = RasterState::default().blend(Blend::Skip);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, skip, None))
+            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, skip))
             .record("skipped")
     });
     assert!(skipped.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
@@ -359,7 +363,7 @@ fn baked_logic_ops_replace_blending() {
     let pixels = render(&mut gpu, [1.0; 4], |cmd, target| {
         let xor = RasterState::default().logic_op(Some(LogicOp::XOR)).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
-            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, xor, None))
+            .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, xor))
             .record("xor")
     });
     // White XOR green XOR red.

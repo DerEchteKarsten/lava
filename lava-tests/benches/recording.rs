@@ -15,10 +15,7 @@ use lava::{
     queue::{Graphics, Timeline},
     state::Ctx,
 };
-use lava_tests::bindings::{
-    PASS_MAP, TestComputeBuffer, TestComputeImage, TestConstants, TestMesh, TestRaster,
-    TestRasterTextured, TestTexturedVertex, TestVertex,
-};
+use lava_tests::bindings::*;
 
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
@@ -44,47 +41,23 @@ struct Resources {
 fn compute(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     for i in 0..32 {
         cmd.compute(
-            &TestComputeBuffer::push_bindings(
-                r.src.range(..),
-                r.dst[i % 16].range(..),
-                64,
-                i as u32,
-            ),
-            [1, 1, 1],
-            None,
-        );
+            &TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: r.src.range(..), dst: r.dst[i % 16].range(..), count: 64, multiplier: i as u32 }, None),
+            [1, 1, 1]);
     }
     for i in 0..16 {
         cmd.compute(
-            &TestConstants::push_bindings(i, 8).constant_bindings(
-                r.out.range(..),
-                r.target.whole_view(),
-                3,
-                1.0,
-            ),
-            [1, 1, 1],
-            None,
-        );
+            &TestConstants::push_bindings(TestConstantsArgs { offset: i, count: 8 }, TestConstantsConstants { out: r.out.range(..), target: r.target.whole_view(), multiplier: 3, brightness: 1.0 }, None),
+            [1, 1, 1]);
     }
     for i in 0..16 {
         cmd.compute(
-            &TestComputeImage::push_bindings(
-                r.target.whole_view(),
-                Vec4::splat(i as f32 / 16.0),
-                UVec2::ZERO,
-                UVec2::splat(8),
-            ),
-            [1, 1, 1],
-            None,
-        );
+            &TestComputeImage::push_bindings(TestComputeImageArgs { target: r.target.whole_view(), tint: Vec4::splat(i as f32 / 16.0), offset: UVec2::ZERO, size: UVec2::splat(8) }, None),
+            [1, 1, 1]);
     }
 }
 
 /// 8 renderings of 8 indexed draws, each with a vertex buffer, a texture and two declared ones.
 fn many_draws(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
-    let draw = |i: usize| {
-        TestRasterTextured::push_bindings(r.textured[i].range(..), r.textures[i].whole_view(), r.sampler.handle())
-    };
     let textures = |d: usize| {
         [(d + 1) % TEXTURES, (d + 32) % TEXTURES]
             .map(|t| ImageUse::sampled_read(r.textures[t].whole_view()))
@@ -93,15 +66,24 @@ fn many_draws(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     for j in 0..8 {
         let i = j * 8;
         let indices = r.indices.range(..);
+        let declared: [[ImageUse; 2]; 8] = std::array::from_fn(|k| textures(i + k));
+        let draws: [_; 8] = std::array::from_fn(|k| {
+            let args = TestRasterTexturedArgs {
+                vertices: r.textured[i + k].range(..),
+                tex: r.textures[i + k].whole_view(),
+                sampler: r.sampler.handle(),
+            };
+            TestRasterTextured::push_bindings(args, Some(Accesses::images(&declared[k])))
+        });
         cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
-            .draw(&Draw::indexed(&draw(i), indices, 1, state(), Some(Accesses::images(&textures(i)))))
-            .draw(&Draw::indexed(&draw(i + 1), indices, 1, state(), Some(Accesses::images(&textures(i + 1)))))
-            .draw(&Draw::indexed(&draw(i + 2), indices, 1, state(), Some(Accesses::images(&textures(i + 2)))))
-            .draw(&Draw::indexed(&draw(i + 3), indices, 1, state(), Some(Accesses::images(&textures(i + 3)))))
-            .draw(&Draw::indexed(&draw(i + 4), indices, 1, state(), Some(Accesses::images(&textures(i + 4)))))
-            .draw(&Draw::indexed(&draw(i + 5), indices, 1, state(), Some(Accesses::images(&textures(i + 5)))))
-            .draw(&Draw::indexed(&draw(i + 6), indices, 1, state(), Some(Accesses::images(&textures(i + 6)))))
-            .draw(&Draw::indexed(&draw(i + 7), indices, 1, state(), Some(Accesses::images(&textures(i + 7)))))
+            .draw(&Draw::indexed(&draws[0], indices, 1, state()))
+            .draw(&Draw::indexed(&draws[1], indices, 1, state()))
+            .draw(&Draw::indexed(&draws[2], indices, 1, state()))
+            .draw(&Draw::indexed(&draws[3], indices, 1, state()))
+            .draw(&Draw::indexed(&draws[4], indices, 1, state()))
+            .draw(&Draw::indexed(&draws[5], indices, 1, state()))
+            .draw(&Draw::indexed(&draws[6], indices, 1, state()))
+            .draw(&Draw::indexed(&draws[7], indices, 1, state()))
             .record("many_draws");
     }
 }
@@ -111,13 +93,16 @@ fn declared(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     for j in 0..4 {
         let textures: [ImageUse; 16] =
             std::array::from_fn(|k| ImageUse::sampled_read(r.textures[j * 16 + k].whole_view()));
+        let args = TestRasterArgs {
+            vertices: r.vertices.range(..),
+            instance_offset: Vec2::ZERO,
+        };
         cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
             .draw(&Draw::new(
-                &TestRaster::push_bindings(r.vertices.range(..), Vec2::ZERO),
+                &TestRaster::push_bindings(args, Some(Accesses::images(&textures))),
                 3,
                 1,
                 RasterState::default(),
-                Some(Accesses::images(&textures)),
             ))
             .record("declared");
     }
@@ -126,15 +111,15 @@ fn declared(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
 /// 8 renderings of 4 mesh-shader launches without accesses: a binding of push constants only.
 fn mesh(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     let launch = |i: u32| {
-        TestMesh::push_bindings(Vec4::ONE, Vec2::new(i as f32, 0.0), 0.1).expect("mesh shaders")
+        TestMesh::push_bindings(TestMeshArgs { color: Vec4::ONE, group_offset: Vec2::new(i as f32, 0.0), scale: 0.1 }, None).expect("mesh shaders")
     };
     let state = RasterState::default;
     for _ in 0..8 {
         cmd.raster(EXTENT, [Attachment::color(r.target.whole_view(), None)])
-            .draw(&Draw::launch(&launch(0), [1, 1, 1], state(), None))
-            .draw(&Draw::launch(&launch(1), [1, 1, 1], state(), None))
-            .draw(&Draw::launch(&launch(2), [1, 1, 1], state(), None))
-            .draw(&Draw::launch(&launch(3), [1, 1, 1], state(), None))
+            .draw(&Draw::launch(&launch(0), [1, 1, 1], state()))
+            .draw(&Draw::launch(&launch(1), [1, 1, 1], state()))
+            .draw(&Draw::launch(&launch(2), [1, 1, 1], state()))
+            .draw(&Draw::launch(&launch(3), [1, 1, 1], state()))
             .record("mesh");
     }
 }

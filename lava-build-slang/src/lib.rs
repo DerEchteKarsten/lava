@@ -3,10 +3,11 @@ use std::{env, fs, path::Path};
 
 mod codegen;
 pub mod compile;
+pub mod describe;
 mod features;
-mod reflect;
 #[cfg(feature = "hot-reload")]
 pub mod hot_reload;
+mod reflect;
 
 /// The Slang side of lava's shader contract (`bindless.slang`, `ray_tracing.slang`) and the
 /// shader clock helpers (`profile.slang`), searched by every session.
@@ -31,11 +32,13 @@ pub enum Optimization {
 /// `lava::init`; with `hot-reload`, [`watch!`] (after `lava::init`, in the same crate)
 /// recompiles them while it runs. Relative paths are resolved against the package's directory.
 #[derive(Default)]
+#[must_use = "`Shaders` does nothing until `.compile()`"]
 pub struct Shaders {
     passes: Vec<String>,
     includes: Vec<String>,
     defines: Vec<(String, String)>,
     optimization: Optimization,
+    debug_info: bool,
 }
 
 impl Shaders {
@@ -43,8 +46,10 @@ impl Shaders {
         Self::default()
     }
 
-    /// Every `*.slang` file in `dir` is a pass, named after its file (`bvh_cull.slang` is
-    /// `BvhCull`).
+    /// Every `*.slang` file in `dir` (not its subdirectories) is a pass, named after its file
+    /// (`bvh_cull.slang` is `BvhCull`; the name must make a Rust identifier, and no two files
+    /// may share one). A file of several compute entry points is one pass per entry point,
+    /// named after the file and the entry point (`main` of `cull.slang` is `CullMain`).
     pub fn passes(mut self, dir: impl AsRef<Path>) -> Self {
         self.passes.push(absolute(dir.as_ref()));
         self
@@ -62,6 +67,13 @@ impl Shaders {
 
     pub fn optimization(mut self, optimization: Optimization) -> Self {
         self.optimization = optimization;
+        self
+    }
+
+    /// Emits Slang's debug information into the SPIR-V (off by default), so RenderDoc and
+    /// Nsight debug the passes at the source level; the hot reload compiles alike.
+    pub fn debug_info(mut self, debug_info: bool) -> Self {
+        self.debug_info = debug_info;
         self
     }
 }

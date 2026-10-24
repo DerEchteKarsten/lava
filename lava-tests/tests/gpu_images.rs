@@ -19,7 +19,7 @@ use lava::{
     state::Ctx,
     vk,
 };
-use lava_tests::bindings::TestSample;
+use lava_tests::bindings::*;
 
 const NO_SAMPLER: SamplerHandle = SamplerHandle { index: !0 };
 
@@ -27,16 +27,8 @@ const NO_SAMPLER: SamplerHandle = SamplerHandle { index: !0 };
 fn sample(gpu: &mut common::Gpu, bits: u32, reads: &[ImageUse<'_>]) -> Vec4 {
     let mut out = zeroed_buffer::<Vec4>(3);
     gpu.submit(|cmd| {
-        let bindings = TestSample::push_bindings(
-            out.range(..),
-            nearest(),
-            nearest(),
-            NO_SAMPLER,
-            bits,
-            Vec2::splat(0.5),
-            0.0,
-        );
-        cmd.compute(&bindings, [1, 1, 1], Some(Accesses::images(reads)));
+        let bindings = TestSample::push_bindings(TestSampleArgs { out: out.range(..), first: nearest(), second: nearest(), compare: NO_SAMPLER, slot: bits, uv: Vec2::splat(0.5), reference: 0.0 }, Some(Accesses::images(reads)));
+        cmd.compute(&bindings, [1, 1, 1]);
     });
     out.host()[0]
 }

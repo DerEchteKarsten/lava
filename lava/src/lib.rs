@@ -62,6 +62,12 @@
 use crate::{bindless::Bindless, global::LIFECYCLE, queue::lock, state::Ctx};
 use lava_macros::validation_trace;
 
+/// The math types of generated bindings, re-exported so generated code and its users need only
+/// lava.
+pub use glam;
+/// The derives and traits of generated bindings (with `derive` and `min_const_generics`, for
+/// arrays of any length), re-exported like `glam`.
+pub use bytemuck;
 pub use crate::error::{Error, Result};
 pub use crate::features::Features;
 pub use crate::lifetime::{Stamp, latest_stamp, reclaim};
@@ -79,6 +85,7 @@ pub mod command_buffer;
 pub mod error;
 pub mod features;
 mod global;
+pub mod half;
 pub mod image;
 pub mod lifetime;
 pub mod memory;

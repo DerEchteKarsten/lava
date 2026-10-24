@@ -1,12 +1,13 @@
-//! lava-build-slang's hot reload (the `hot-reload` feature, a debugging aid): recompiles the passes whose sources change and hands their SPIR-V to lava, which replaces their pipelines right away
+//! lava-build-slang's hot reload (the `hot-reload` feature, a debugging aid): recompiles the pass files that change (every file if an include does) and hands their SPIR-V to lava, which replaces their pipelines right away; a panic fails only its file
 use std::{
     iter,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{OnceLock, mpsc},
     time::Duration,
 };
 
-use lava::pipeline::{self, pass_map};
+use lava::pipeline::{self, Reload, pass_map};
 use notify::EventHandler;
 
 use crate::{
@@ -21,15 +22,20 @@ pub struct Build {
     /// The absolute pass and include directories.
     pub watch_dirs: &'static [&'static str],
     pub optimization: Optimization,
+    pub debug_info: bool,
     /// One per pass of `PASS_MAP`, in its order.
     pub passes: &'static [BuiltPass],
 }
 
 pub struct BuiltPass {
+    /// Its name in `PASS_MAP`.
+    pub name: &'static str,
     /// The absolute path of its `.slang` file.
     pub source: &'static str,
-    /// The `compile::layout_hash` the bindings were generated from; a reload that changes it is
-    /// refused.
+    /// The entry point it was linked with alone, in a file of several compute entry points.
+    pub entry: Option<&'static str>,
+    /// The `PassDesc::layout_hash` the bindings were generated from; a reload that changes it
+    /// is refused.
     pub layout: u64,
 }
 
@@ -47,6 +53,112 @@ macro_rules! watch {
     }};
 }
 
+/// Whether `build` is the build of lava's pass map: the same passes by name, in its order.
+fn matches_pass_map(build: &Build) -> Result<(), String> {
+    let map = pass_map().passes;
+    if build.passes.len() != map.len() {
+        return Err(format!(
+            "its build has {} passes, lava's `PASS_MAP` {}",
+            build.passes.len(),
+            map.len()
+        ));
+    }
+    match (build.passes.iter().zip(map)).find(|(built, entry)| built.name != entry.name) {
+        Some((built, entry)) => Err(format!(
+            "its build's pass `{}` is `{}` in lava's `PASS_MAP`",
+            built.name, entry.name
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Recompiles the passes of `changed` files (every pass if one of them is no pass's source, an
+/// include) and replaces their pipelines, logging each result; a panic fails only its file.
+fn reload(
+    build: &Build,
+    global: &slang::GlobalSession,
+    options: &compile::Options,
+    changed: &[PathBuf],
+) {
+    let is_source_of = |path: &PathBuf, pass: &BuiltPass| path == Path::new(pass.source);
+    let all =
+        (changed.iter()).any(|path| !build.passes.iter().any(|pass| is_source_of(path, pass)));
+    let mut sources: Vec<&str> = (build.passes.iter())
+        .filter(|pass| all || changed.iter().any(|path| is_source_of(path, pass)))
+        .map(|pass| pass.source)
+        .collect();
+    sources.dedup();
+    for source in sources {
+        let reloaded = catch_unwind(AssertUnwindSafe(|| {
+            reload_file(build, global, options, source)
+        }));
+        if let Err(panic) = reloaded {
+            let message = (panic.downcast_ref::<String>().map(String::as_str))
+                .or(panic.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic");
+            tracing::error!(target: "shader_file_watcher", "{source}: the reload panicked: {message}");
+        }
+    }
+}
+
+fn reload_file(
+    build: &Build,
+    global: &slang::GlobalSession,
+    options: &compile::Options,
+    source: &str,
+) {
+    // A fresh session: a session keeps the modules it loaded.
+    let session = compile::session(global, options);
+    let compiled = compile::compile_file(&session, source);
+    for warning in &compiled.warnings {
+        tracing::warn!(target: "shader_file_watcher", "{warning}");
+    }
+    let passes = match compiled.passes {
+        Ok(passes) => passes,
+        Err(errors) => {
+            tracing::error!(target: "shader_file_watcher", "{source}:\n{}", errors.join("\n"));
+            return;
+        }
+    };
+    for (index, built) in build
+        .passes
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.source == source)
+    {
+        let Some(pass) = passes.iter().find(|p| p.name == built.name) else {
+            tracing::error!(
+                target: "shader_file_watcher",
+                "{source}: the pass `{}` is gone, which the generated bindings can't follow: run `cargo build`",
+                built.name
+            );
+            continue;
+        };
+        if pass.desc.layout_hash() != built.layout {
+            tracing::error!(
+                target: "shader_file_watcher",
+                "{source}: `{}`'s push constants, specialization constants, entry points or exports changed, \
+                 which the generated bindings can't follow: run `cargo build`",
+                built.name
+            );
+            continue;
+        }
+        match pipeline::reload_pass(index, &pass.spirv) {
+            Ok(Reload::Replaced) => {
+                tracing::info!(target: "shader_file_watcher", "Reloaded pass `{}`", built.name)
+            }
+            Ok(Reload::Skipped) => tracing::info!(
+                target: "shader_file_watcher",
+                "Skipped pass `{}`: the device can't run it",
+                built.name
+            ),
+            Err(e) => {
+                tracing::error!(target: "shader_file_watcher", "{source}: `{}`: {e}", built.name)
+            }
+        }
+    }
+}
+
 /// Watches the build's directories and [`SLANG_DIR`] and compiles changed passes on a thread of
 /// its own. Later calls do nothing.
 pub fn watch(build: &'static Build) {
@@ -55,9 +167,7 @@ pub fn watch(build: &'static Build) {
     static WATCHER: OnceLock<Option<notify::RecommendedWatcher>> = OnceLock::new();
     let _ = WATCHER.get_or_init(|| {
         let watch = || -> std::result::Result<notify::RecommendedWatcher, String> {
-            if build.passes.len() != pass_map().passes.len() {
-                return Err("its build isn't the one of lava's `PASS_MAP`".to_string());
-            }
+            matches_pass_map(build)?;
             let dirs: Vec<&Path> = (build.watch_dirs.iter().copied())
                 .chain([SLANG_DIR])
                 .map(Path::new)
@@ -85,41 +195,12 @@ pub fn watch(build: &'static Build) {
                         search_paths: build.search_paths,
                         defines: build.defines,
                         optimization: build.optimization,
+                        debug_info: build.debug_info,
                     };
-
                     while let Ok(first) = rx.recv() {
                         std::thread::sleep(Duration::from_millis(50));
                         let changed: Vec<PathBuf> = iter::once(first).chain(rx.try_iter()).collect();
-
-                        // A changed file that is no pass's source is an include: reload every pass.
-                        let is_source_of = |path: &PathBuf, pass: &BuiltPass| path == Path::new(pass.source);
-                        let all = changed
-                            .iter()
-                            .any(|path| !build.passes.iter().any(|pass| is_source_of(path, pass)));
-                        for (pass_index, pass) in build.passes.iter().enumerate() {
-                            if !(all || changed.iter().any(|path| is_source_of(path, pass))) {
-                                continue;
-                            }
-                            let reloaded = (|| {
-                                let session = compile::session(&global, &options);
-                                let program =
-                                    compile::link(&session, pass.source).map_err(|e| e.to_string())?;
-                                let layout = program.layout(0).map_err(|e| e.to_string())?;
-                                if compile::layout_hash(layout) != pass.layout {
-                                    return Err(
-                                        "its push constants, specialization constants or entry points changed, \
-                                                which the generated bindings can't follow: run `cargo build`"
-                                            .to_string(),
-                                    );
-                                }
-                                let spirv = program.target_code(0).map_err(|e| e.to_string())?;
-                                tracing::info!(target: "shader_file_watcher", "Reloading pass `{}`", pass.source);
-                                pipeline::reload_pass(pass_index, spirv.as_slice()).map_err(|e| e.to_string())
-                            })();
-                            if let Err(e) = reloaded {
-                                tracing::error!(target: "shader_file_watcher", "{}:\n{e}", pass.source);
-                            }
-                        }
+                        reload(build, &global, &options, &changed);
                     }
                 })
                 .map_err(|e| e.to_string())?;
@@ -133,6 +214,20 @@ pub fn watch(build: &'static Build) {
             }
         }
     });
+}
+
+/// Whether a changed file can change a pass: any file but hidden ones and editors' backups and
+/// swap files.
+fn may_change_passes(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    !(name.starts_with('.')
+        || name.ends_with('~')
+        || [".swp", ".swx", ".tmp", ".bak"]
+            .iter()
+            .any(|ext| name.ends_with(ext))
+        || name.chars().all(|c| c.is_ascii_digit()))
 }
 
 struct FileWatcher {
@@ -154,7 +249,7 @@ impl EventHandler for FileWatcher {
         }
 
         for path in event.paths {
-            if path.extension().is_some_and(|ext| ext == "slang") {
+            if may_change_passes(&path) {
                 let _ = self.changed.send(path);
             }
         }
@@ -166,7 +261,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn watcher_forwards_only_modified_and_created_slang_files() {
+    fn watcher_forwards_modified_and_created_files_but_backups() {
         use notify::{
             Event, EventKind,
             event::{AccessKind, CreateKind, ModifyKind, RemoveKind},
@@ -174,12 +269,25 @@ mod tests {
         let (changed, received) = mpsc::channel();
         let mut watcher = FileWatcher { changed };
         for (kind, paths) in [
-            (EventKind::Modify(ModifyKind::Any), &["/s/passes/a.slang", "/s/notes.txt"][..]),
-            (EventKind::Create(CreateKind::File), &["/s/include/new.slang"]),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                &[
+                    "/s/passes/a.slang",
+                    "/s/include/b.slangh",
+                    "/s/.a.slang.swp",
+                    "/s/a.slang~",
+                ][..],
+            ),
+            (
+                EventKind::Create(CreateKind::File),
+                &["/s/include/new.h", "/s/4913"],
+            ),
             (EventKind::Remove(RemoveKind::File), &["/s/passes/a.slang"]),
             (EventKind::Access(AccessKind::Any), &["/s/passes/a.slang"]),
         ] {
-            let event = paths.iter().fold(Event::new(kind), |e, p| e.add_path(p.into()));
+            let event = paths
+                .iter()
+                .fold(Event::new(kind), |e, p| e.add_path(p.into()));
             watcher.handle_event(Ok(event));
         }
         watcher.handle_event(Err(notify::Error::generic("watch failed")));
@@ -188,7 +296,8 @@ mod tests {
             received.iter().collect::<Vec<_>>(),
             [
                 PathBuf::from("/s/passes/a.slang"),
-                PathBuf::from("/s/include/new.slang")
+                PathBuf::from("/s/include/b.slangh"),
+                PathBuf::from("/s/include/new.h")
             ]
         );
     }

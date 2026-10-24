@@ -102,6 +102,48 @@ public extension Img<E, Shape, 0> {
     [ForceInline] public float SampleCmpLevelZero(Sampler sampler, vector<float, Shape.dimensions> uv, float reference) {
         return sampled().SampleCmpLevelZero(sampler.getCmp(), uv, reference);
     }
+    /// Sample with explicit derivatives of `uv`, which pick the mip.
+    [ForceInline] public E SampleGrad(Sampler sampler, vector<float, Shape.dimensions> uv, vector<float, Shape.dimensions> ddx, vector<float, Shape.dimensions> ddy) {
+        return sampled().SampleGrad(sampler.get(), uv, ddx, ddy);
+    }
+    /// Sample at the mip the derivatives pick plus `bias` (fragment shaders).
+    [ForceInline] public E SampleBias(Sampler sampler, vector<float, Shape.dimensions> uv, float bias) {
+        return sampled().SampleBias(sampler.get(), uv, bias);
+    }
+}
+
+/// Loads and gathers of 2D images read through the sampled descriptor.
+__generic<E : ITexelElement>
+public extension Img<E, __Shape2D, 0> {
+    /// The texel at `p` of mip `level`.
+    [ForceInline] public E Load(uint2 p, uint level) {
+        return sampled().Load(int3(int2(p), int(level)));
+    }
+    /// The red components of the four texels bilinear filtering at `uv` reads (mip 0), in the
+    /// order (-, +), (+, +), (+, -), (-, -) of their offsets from `uv`.
+    [ForceInline] public vector<E.Element, 4> Gather(Sampler sampler, float2 uv) {
+        return sampled().Gather(sampler.get(), uv);
+    }
+    [ForceInline] public vector<E.Element, 4> GatherRed(Sampler sampler, float2 uv) {
+        return sampled().GatherRed(sampler.get(), uv);
+    }
+    [ForceInline] public vector<E.Element, 4> GatherGreen(Sampler sampler, float2 uv) {
+        return sampled().GatherGreen(sampler.get(), uv);
+    }
+    [ForceInline] public vector<E.Element, 4> GatherBlue(Sampler sampler, float2 uv) {
+        return sampled().GatherBlue(sampler.get(), uv);
+    }
+    [ForceInline] public vector<E.Element, 4> GatherAlpha(Sampler sampler, float2 uv) {
+        return sampled().GatherAlpha(sampler.get(), uv);
+    }
+}
+
+__generic<E : ITexelElement>
+public extension Img<E, __Shape3D, 0> {
+    /// The texel at `p` of mip `level`.
+    [ForceInline] public E Load(uint3 p, uint level) {
+        return sampled().Load(int4(int3(p), int(level)));
+    }
 }
 
 /// Size in texels of mip 0, for every kind of `Img`: read through the descriptor it reads.
@@ -162,7 +204,56 @@ public extension Img<E, Shape, 3> {
     [ForceInline] public void Store(vector<uint, Shape.dimensions> p, E v) {
         storage().Store(p, v);
     }
+    [ForceInline] public E Sample(Sampler sampler, vector<float, Shape.dimensions> uv) {
+        return sampled().Sample(sampler.get(), uv);
+    }
+    [ForceInline] public E SampleLevel(Sampler sampler, vector<float, Shape.dimensions> uv, float level) {
+        return sampled().SampleLevel(sampler.get(), uv, level);
+    }
 }
+
+// Atomics on the texels of `uint` and `int` images written through their storage descriptor
+// (`MutImage2D<uint>`, `MutTex2D<int>`, ...; an `R32Uint` or `R32Sint` image, the format SPIR-V
+// atomics need declared: 37 and 27 are Slang's `r32ui` and `r32i`): each returns the texel's
+// value before it.
+#define LAVA_IMAGE_ATOMICS(T, U, FORMAT) \
+__generic<Shape : __ITextureShape> \
+public extension Img<T, Shape, U> { \
+    typealias AtomicTexture = _Texture<T, Shape, 0, 0, 0, 1, 0, 0, FORMAT>; \
+    [ForceInline] internal AtomicTexture atomic() { \
+        AtomicTexture texture = ResourceDescriptorHeap[handleStorageSlot(handle)]; \
+        return texture; \
+    } \
+    [ForceInline] public T InterlockedAdd(vector<uint, Shape.dimensions> p, T value) { \
+        T original; ::InterlockedAdd(atomic()[p], value, original); return original; \
+    } \
+    [ForceInline] public T InterlockedMin(vector<uint, Shape.dimensions> p, T value) { \
+        T original; ::InterlockedMin(atomic()[p], value, original); return original; \
+    } \
+    [ForceInline] public T InterlockedMax(vector<uint, Shape.dimensions> p, T value) { \
+        T original; ::InterlockedMax(atomic()[p], value, original); return original; \
+    } \
+    [ForceInline] public T InterlockedAnd(vector<uint, Shape.dimensions> p, T value) { \
+        T original; ::InterlockedAnd(atomic()[p], value, original); return original; \
+    } \
+    [ForceInline] public T InterlockedOr(vector<uint, Shape.dimensions> p, T value) { \
+        T original; ::InterlockedOr(atomic()[p], value, original); return original; \
+    } \
+    [ForceInline] public T InterlockedXor(vector<uint, Shape.dimensions> p, T value) { \
+        T original; ::InterlockedXor(atomic()[p], value, original); return original; \
+    } \
+    [ForceInline] public T InterlockedExchange(vector<uint, Shape.dimensions> p, T value) { \
+        T original; ::InterlockedExchange(atomic()[p], value, original); return original; \
+    } \
+    /** Writes `value` if the texel is `compare`. */ \
+    [ForceInline] public T InterlockedCompareExchange(vector<uint, Shape.dimensions> p, T compare, T value) { \
+        T original; ::InterlockedCompareExchange(atomic()[p], compare, value, original); return original; \
+    } \
+}
+LAVA_IMAGE_ATOMICS(uint, 2, 37)
+LAVA_IMAGE_ATOMICS(int, 2, 27)
+LAVA_IMAGE_ATOMICS(uint, 3, 37)
+LAVA_IMAGE_ATOMICS(int, 3, 27)
 
 /// A 2D array image (`lava::image::D2Array`, every layer of the view it was bound from) the pass
 /// reads through the descriptors its kind `U` names, like `Img`: 0 sampled (`Tex2DArray`), 1 and
@@ -214,6 +305,10 @@ public extension ImgArray<E, 0> {
     /// The texel at `p.xy` of layer `p.z`.
     [ForceInline] public E Load(uint3 p) {
         return sampled()[p];
+    }
+    /// The texel at `p.xy` of layer `p.z`, mip `level`.
+    [ForceInline] public E Load(uint3 p, uint level) {
+        return sampled().Load(int4(int3(p), int(level)));
     }
     /// Samples layer `uvl.z` at `uvl.xy`.
     [ForceInline] public E Sample(Sampler sampler, float3 uvl) {
@@ -311,8 +406,7 @@ public struct DynImg<E : ITexelElement = float4> {
             let size = uint2(width, height);
             return image[min(uint2(saturate(uv) * float2(size)), size - 1)];
         } else {
-            E zero = {};
-            return zero;
+            return E(E.Element(0));
         }
     }
 }
@@ -324,6 +418,7 @@ public typealias Image3D<E : ITexelElement = float4>    = Img<E, __Shape3D, 1>;
 public typealias MutImage2D<E : ITexelElement = float4> = Img<E, __Shape2D, 2>;
 public typealias MutImage3D<E : ITexelElement = float4> = Img<E, __Shape3D, 2>;
 public typealias MutTex2D<E : ITexelElement = float4>   = Img<E, __Shape2D, 3>;
+public typealias MutTex3D<E : ITexelElement = float4>   = Img<E, __Shape3D, 3>;
 public typealias Tex2DArray<E : ITexelElement = float4>      = ImgArray<E, 0>;
 public typealias Image2DArray<E : ITexelElement = float4>    = ImgArray<E, 1>;
 public typealias MutImage2DArray<E : ITexelElement = float4> = ImgArray<E, 2>;
@@ -347,23 +442,41 @@ public struct MutBuf<T> {
     }
 }
 
-/// A top-level acceleration structure by its device address: lava's `&Tlas` in push constants,
-/// a `u64` inside structs (register it with `BindingOutput::acceleration_structure_read`). Never
-/// an `SCONST`: addresses change from run to run.
+/// A top-level acceleration structure by its device address: lava's `&Tlas` in push constants
+/// and `SCONST`s, a `u64` inside structs (pass `BufferAccess::trace(&tlas)` in the bindings'
+/// `Accesses`).
 public struct Accel {
     public uint64_t address;
+
+    /// The structure behind an `SCONST`.
+    [ForceInline] public static Accel fromConst(uint64_t value) {
+        Accel accel;
+        accel.address = value;
+        return accel;
+    }
     [ForceInline] public RaytracingAccelerationStructure get() {
         return RaytracingAccelerationStructure(address);
     }
 }
 
+/// Exports a `static const` scalar (`bool`, `int`, `uint`, `int64_t`, `uint64_t`, `float`) of a
+/// pass or its includes to Rust: lava-build-slang generates `pub const NAME: T = value;` beside
+/// the passes, so shaders and the application share one value
+/// (`[RustConst] static const uint MESHLET_STRIDE = 64;`).
+[__AttributeUsage(_AttributeTargets.Var)]
+public struct RustConstAttribute {};
+
 /// Marks the `uint64_t` behind an `SCONST`; lava-build-slang reads the type from it.
 [__AttributeUsage(_AttributeTargets.Var)]
 public struct SConstAttribute { string type; };
 
-/// A specialization constant of a handle type (`Buf<T>`, `MutBuf<T>`, any `Img`): lava
-/// bakes it into the pipeline, which the generated `constant_bindings` sets. It is a `uint64_t`
-/// constant either way, an image handle zero-extended. Scalars need no macro:
+/// A specialization constant of a handle type (`Buf<T>`, `MutBuf<T>`, any `Img`, `Accel`):
+/// lava bakes it into the pipeline, set by the generated constants struct of the pass. It is a
+/// `uint64_t` constant either way, an image handle zero-extended. Scalars need no macro:
 /// `[SpecializationConstant] const uint name = 0;`. Every distinct value builds its own
-/// pipeline, so only use them for values that never change.
+/// pipeline, so only use them for values that never change. Addresses (`Buf`, `MutBuf`,
+/// `Accel`) differ from run to run, so the driver's shader cache never hits for such a
+/// pipeline and every start compiles it again; a bindless image handle that is fixed for the
+/// app's lifetime is the case they fit. `T` is split on commas, so a generic image needs an
+/// alias.
 #define SCONST(T, name) [SpecializationConstant][SConst(#T)] const uint64_t name##_sconst = 0; static T name = T.fromConst(name##_sconst);

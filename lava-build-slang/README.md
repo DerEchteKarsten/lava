@@ -1,6 +1,6 @@
 # lava-build-slang
 
-[lava](https://github.com/DerEchteKarsten/lava)'s Slang frontend. Called from an application's `build.rs`, it compiles every `.slang` file of a directory as one pass, writes the SPIR-V to `OUT_DIR`, and generates the pass's typed bindings and the `PASS_MAP` that `lava::init` takes. The application includes them with `lava::include_passes!()`.
+[lava](https://github.com/DerEchteKarsten/lava)'s Slang frontend. Called from an application's `build.rs`, it compiles every `.slang` file of a directory (not its subdirectories) as one pass, on up to four threads, writes the SPIR-V to `OUT_DIR`, and generates the pass's typed bindings and the `PASS_MAP` that `lava::init` takes. The application includes them with `lava::include_passes!()`.
 
 ```rust
 // build.rs
@@ -9,13 +9,25 @@ fn main() {
         .passes("shaders/passes")
         .include("shaders/include")
         .define("MY_DEFINE", "1")
+        .debug_info(cfg!(debug_assertions)) // source-level shader debugging in RenderDoc or Nsight
         .compile();
 }
 ```
 
+A pass is named after its file (`bvh_cull.slang` is `BvhCull`; the name must make a Rust identifier, and two files may not share one); a file of several compute entry points is one pass per entry point (`main` of `cull.slang` is `CullMain`). For each pass the bindings have an argument struct of its push constants (`BvhCullArgs`, buffers as `BufferSlice`s, images as views, TLASes as `&Tlas`) and, if it has specialization constants, one of them (`BvhCullConstants`); `BvhCull::push_bindings(args, [constants,] accesses)` returns the bindings, `accesses` naming what the pass reaches through handles and pointers in buffers. Compute passes also get `WORKGROUP_SIZE` and `groups(threads)`. Structs the passes read through pointers are generated too, padded to Slang's layout, with a `Default` that nulls image handles; `[RustConst] static const` scalars become Rust constants. Compile errors and lava-build-slang's own (with the file and field) are collected and reported together; Slang's warnings become cargo warnings.
+
+```rust
+cmd.compute(
+    &BvhCull::push_bindings(BvhCullArgs { nodes: nodes.range(..), visible: visible.range(..), count }, None),
+    BvhCull::groups([count, 1, 1]),
+);
+```
+
+The generated code names everything through lava (`::lava::glam`, `::lava::bytemuck`, which lava re-exports with bytemuck's `derive` and `min_const_generics`), so the application needs no other dependency for it.
+
 Every compilation can include `bindless.slang` (lava's bindless images, buffer pointers and specialization constants), `ray_tracing.slang` and `profile.slang`, which this crate ships.
 
-With the `hot-reload` feature, `lava_build_slang::watch!()` (called after `lava::init`) recompiles changed passes while the application runs and swaps their pipelines in.
+With the `hot-reload` feature, `lava_build_slang::watch!()` (called after `lava::init`) recompiles changed passes while the application runs and swaps their pipelines in. It needs lava-build-slang as a normal dependency with the feature, beside the build dependency.
 
 ## Setting up Slang
 

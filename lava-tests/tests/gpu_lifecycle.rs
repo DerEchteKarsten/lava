@@ -14,7 +14,7 @@ use lava::{
     queue::{Graphics, Timeline, Wait},
     state::Ctx,
 };
-use lava_tests::bindings::PASS_MAP;
+use lava_tests::bindings::*;
 
 fn config(passes: &'static PassMap) -> Config {
     Config {
@@ -132,7 +132,7 @@ static BROKEN: PassMap = PassMap {
     passes: &[PassEntry {
         name: "Broken",
         spirv: &[3, 2, 1],
-        kind: PassKind::Compute { entry: c"main" },
+        kind: PassKind::Compute { entry: c"main", subgroup_size: None },
         constants: &[],
         constants_size: 0,
     }],

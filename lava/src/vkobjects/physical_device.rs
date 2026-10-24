@@ -1,4 +1,4 @@
-//! The physical device lava picked and its queue families: the graphics family, and the dedicated compute and transfer families of `async-compute` and `async-transfer`
+//! The physical device lava picked, the subgroup sizes its compute shaders can require, and its queue families: the graphics family, and the dedicated compute and transfer families of `async-compute` and `async-transfer`
 use crate::features::Features;
 use crate::vk;
 
@@ -62,6 +62,9 @@ pub struct PhysicalDevice {
     pub max_multi_draw_count: u32,
     /// `multiviewMeshShader`: mesh passes in multiview renderings.
     pub multiview_mesh_shader: bool,
+    /// The subgroup sizes a pipeline stage can require (`subgroupSizeControl`, which lava
+    /// enables where the device has it); `None` without it.
+    pub subgroup_sizes: Option<SubgroupSizes>,
     /// The driver is Mesa's ANV, whose traces need `MEMORY_READ` to see a rebuild of a
     /// structure traced earlier in the submission (`acceleration_structure::trace_read`).
     pub stale_trace_reads: bool,
@@ -79,6 +82,17 @@ pub struct PhysicalDevice {
     #[cfg(feature = "acceleration-structure")]
     pub acceleration_structure_properties:
         Option<vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>>,
+}
+
+/// What `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` may ask for
+/// (`VkPhysicalDeviceVulkan13Properties`).
+#[derive(Clone, Copy, Debug)]
+pub struct SubgroupSizes {
+    pub min: u32,
+    pub max: u32,
+    /// The stages that can require a size.
+    pub stages: vk::ShaderStageFlags,
+    pub max_compute_workgroup_subgroups: u32,
 }
 
 /// The first graphics (with compute and timestamps), dedicated compute and dedicated transfer

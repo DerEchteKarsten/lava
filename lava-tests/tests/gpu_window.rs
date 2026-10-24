@@ -13,7 +13,7 @@ use lava::{
     queue::{Graphics, Timeline},
     state::{Ctx, raw_vulkan as vk},
 };
-use lava_tests::bindings::PASS_MAP;
+use lava_tests::bindings::*;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::{
     application::ApplicationHandler,

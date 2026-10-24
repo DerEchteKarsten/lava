@@ -29,7 +29,7 @@ use crate::{
     global::{Global, Live},
     pipeline::MAX_PUSH_CONSTANTS_SIZE,
     queue::{DeviceQueues, FamilyQueues, Kind, MAX_TIMELINES},
-    vkobjects::physical_device::{PhysicalDevice, QueueFamily, pick_queue_families},
+    vkobjects::physical_device::{PhysicalDevice, QueueFamily, SubgroupSizes, pick_queue_families},
 };
 
 pub use crate::vk as raw_vulkan;
@@ -208,6 +208,8 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
 
     let mut vk11_properties = vk::PhysicalDeviceVulkan11Properties::default();
     let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
+    let mut vk13_properties = vk::PhysicalDeviceVulkan13Properties::default();
+    let mut subgroup_size_control = false;
     let mut conservative_properties =
         vk::PhysicalDeviceConservativeRasterizationPropertiesEXT::default();
     let mut eds3_properties = vk::PhysicalDeviceExtendedDynamicState3PropertiesEXT::default();
@@ -225,10 +227,12 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
     } else {
         let chain = FeatureChain::query(instance, handel, &has);
         multiview_mesh_shader = chain.multiview_mesh_shader();
+        subgroup_size_control = chain.subgroup_size_control();
         // Only the structs of extensions the device has.
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut vk11_properties)
-            .push_next(&mut vk12_properties);
+            .push_next(&mut vk12_properties)
+            .push_next(&mut vk13_properties);
         if has(ash::ext::conservative_rasterization::NAME) {
             properties2 = properties2.push_next(&mut conservative_properties);
         }
@@ -287,6 +291,7 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
     mesh_shader_properties.p_next = std::ptr::null_mut();
     vk11_properties.p_next = std::ptr::null_mut();
     vk12_properties.p_next = std::ptr::null_mut();
+    vk13_properties.p_next = std::ptr::null_mut();
     rt_pipeline_properties.p_next = std::ptr::null_mut();
     acc_properties.p_next = std::ptr::null_mut();
     heap_properties.p_next = std::ptr::null_mut();
@@ -301,6 +306,12 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
         topology_unrestricted: eds3_properties.dynamic_primitive_topology_unrestricted == vk::TRUE,
         max_multi_draw_count: multi_draw_properties.max_multi_draw_count,
         multiview_mesh_shader,
+        subgroup_sizes: subgroup_size_control.then_some(SubgroupSizes {
+            min: vk13_properties.min_subgroup_size,
+            max: vk13_properties.max_subgroup_size,
+            stages: vk13_properties.required_subgroup_size_stages,
+            max_compute_workgroup_subgroups: vk13_properties.max_compute_workgroup_subgroups,
+        }),
         stale_trace_reads: vk12_properties.driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA,
         mem_properties,
         handel,
@@ -334,6 +345,11 @@ impl Ctx {
     /// The device's properties and limits.
     pub fn device_properties() -> &'static vk::PhysicalDeviceProperties {
         &Ctx::get().physical_device.properties
+    }
+    /// The subgroup sizes a compute pass can require (`[WaveSize(n)]`), `None` without
+    /// `subgroupSizeControl`; a pass outside them gets no pipeline.
+    pub fn subgroup_sizes() -> Option<SubgroupSizes> {
+        Ctx::get().physical_device.subgroup_sizes
     }
     #[cfg(feature = "mesh-shader")]
     pub fn mesh_shader_properties() -> crate::features::Gated<

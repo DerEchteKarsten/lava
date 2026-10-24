@@ -16,9 +16,7 @@ use lava::{
         Tlas, Triangles, TrianglesDesc, VertexPosition, scratch_alignment,
     },
 };
-use lava_tests::bindings::{
-    TestPositionFetch, TestRayQuery, TestRayTracing, TestReorder, TestWriteInstances,
-};
+use lava_tests::bindings::*;
 
 const SIZE: u32 = 64;
 const EXTENT: UVec2 = UVec2::splat(SIZE);
@@ -71,18 +69,14 @@ fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 3]) {
 
 fn trace_query(cmd: &mut Cmd, target: &Target, tlas: &Tlas) {
     cmd.compute(
-        &TestRayQuery::push_bindings(target.whole_view(), tlas, EXTENT).unwrap(),
-        [SIZE / 8, SIZE / 8, 1],
-        None,
-    );
+        &TestRayQuery::push_bindings(TestRayQueryArgs { target: target.whole_view(), tlas, size: EXTENT }, None).unwrap(),
+        [SIZE / 8, SIZE / 8, 1]);
 }
 
 fn trace_pipeline(cmd: &mut Cmd, target: &Target, tlas: &Tlas) {
     cmd.raytrace(
-        &TestRayTracing::push_bindings(target.whole_view(), tlas, EXTENT).unwrap(),
-        [SIZE, SIZE, 1],
-        None,
-    );
+        &TestRayTracing::push_bindings(TestRayTracingArgs { target: target.whole_view(), tlas, size: EXTENT }, None).unwrap(),
+        [SIZE, SIZE, 1]);
 }
 
 // Pixels of the scene (x = -1 at column 0, y = -1 at row 0).
@@ -247,10 +241,8 @@ fn indirect_traces_read_their_size_on_the_gpu() {
             }],
         );
         cmd.raytrace_indirect(
-            &TestRayTracing::push_bindings(target.whole_view(), &scene.tlas, EXTENT).unwrap(),
-            command.range(..),
-            None,
-        );
+            &TestRayTracing::push_bindings(TestRayTracingArgs { target: target.whole_view(), tlas: &scene.tlas, size: EXTENT }, None).unwrap(),
+            command.range(..),);
     });
     assert_eq!(indirect, direct);
 }
@@ -267,15 +259,8 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
     let scratch = scratch(tlas.build_scratch_size());
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.compute(
-            &TestWriteInstances::push_bindings(
-                written.range(..),
-                scene.wall.address(),
-                scene.triangle.address(),
-                scene.sphere.address(),
-            ),
-            [1, 1, 1],
-            None,
-        );
+            &TestWriteInstances::push_bindings(TestWriteInstancesArgs { instances: written.range(..), wall: scene.wall.address(), triangle: scene.triangle.address(), sphere: scene.sphere.address() }, None),
+            [1, 1, 1]);
         // SAFETY: the BLASes it names outlive the traces of this test.
         cmd.build(&[(&tlas, unsafe { Instances::new(written.range(..)) })], scratch.range(..));
         trace_query(cmd, target, &tlas);
@@ -503,8 +488,8 @@ fn traces_stay_within_the_device_limits() {
     let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
     let message = panic_message(|| {
         gpu.submit(|cmd| {
-            let bindings = TestRayTracing::push_bindings(target.whole_view(), &scene.tlas, EXTENT).unwrap();
-            cmd.raytrace(&bindings, [over, 1, 1], None)
+            let bindings = TestRayTracing::push_bindings(TestRayTracingArgs { target: target.whole_view(), tlas: &scene.tlas, size: EXTENT }, None).unwrap();
+            cmd.raytrace(&bindings, [over, 1, 1])
         })
     });
     assert!(message.contains("rays"), "{message}");
@@ -619,7 +604,7 @@ fn a_structure_counts_as_built_only_once_its_build_reaches_the_gpu() {
     let tlas = Tlas::new(4, BuildFlags::default()).unwrap();
     let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
     // Never built: its bindings refuse it (a trace would read uninitialised memory).
-    let message = panic_message(|| TestRayQuery::push_bindings(target.whole_view(), &tlas, EXTENT));
+    let message = panic_message(|| TestRayQuery::push_bindings(TestRayQueryArgs { target: target.whole_view(), tlas: &tlas, size: EXTENT }, None));
     assert!(message.contains("never built"), "{message}");
     let scratch = Scratch::for_any(&[&tlas]).unwrap();
     // A recording that fails takes its builds back.
@@ -912,7 +897,7 @@ fn hit_shaders_fetch_the_positions_of_their_triangles() {
     };
     let (tlas, _blas, _vertices, _indices) = wall_scene(&mut gpu, flags);
     let pixels = render(&mut gpu, |cmd, target| {
-        cmd.raytrace(&TestPositionFetch::push_bindings(target.whole_view(), &tlas, EXTENT).unwrap(), [SIZE, SIZE, 1], None);
+        cmd.raytrace(&TestPositionFetch::push_bindings(TestPositionFetchArgs { target: target.whole_view(), tlas: &tlas, size: EXTENT }, None).unwrap(), [SIZE, SIZE, 1]);
     });
     // The second vertex of the first triangle is (0.9, -0.9, 0), of the second (0.9, 0.9, 0).
     assert_pixel(&pixels, WALL.0, WALL.1, [242, 13, 128]);
@@ -926,12 +911,12 @@ fn reordered_traces_hit_like_plain_ones() {
     let features = Ctx::features();
     if !features.ray_tracing_invocation_reorder {
         eprintln!("SKIPPED reordered_traces_hit_like_plain_ones: the device has no shader execution reordering");
-        assert!(TestReorder::push_bindings(Target::new(EXTENT).unwrap().bind_storage().unwrap().whole_view(), &wall_scene(&mut gpu, BuildFlags::default()).0, EXTENT).is_err());
+        assert!(TestReorder::push_bindings(TestReorderArgs { target: Target::new(EXTENT).unwrap().bind_storage().unwrap().whole_view(), tlas: &wall_scene(&mut gpu, BuildFlags::default()).0, size: EXTENT }, None).is_err());
         return;
     }
     let (tlas, _blas, _vertices, _indices) = wall_scene(&mut gpu, BuildFlags::default());
     let pixels = render(&mut gpu, |cmd, target| {
-        cmd.raytrace(&TestReorder::push_bindings(target.whole_view(), &tlas, EXTENT).unwrap(), [SIZE, SIZE, 1], None);
+        cmd.raytrace(&TestReorder::push_bindings(TestReorderArgs { target: target.whole_view(), tlas: &tlas, size: EXTENT }, None).unwrap(), [SIZE, SIZE, 1]);
     });
     assert_pixel(&pixels, WALL.0, WALL.1, [204, 204, 204]);
     assert_pixel(&pixels, WALL_SECOND_TRIANGLE.0, WALL_SECOND_TRIANGLE.1, [122, 122, 122]);

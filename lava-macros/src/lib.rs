@@ -5,17 +5,20 @@ use syn::{Item, parse_macro_input};
 
 /// Records the caller's location in `crate::state::CALLSITE` while the function runs, released
 /// on every exit path by a `crate::state::CallsiteGuard`. Only in debug builds of the crate
-/// that uses it.
+/// that uses it. Takes no arguments, and only functions.
 #[proc_macro_attribute]
-pub fn validation_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn validation_trace(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Any argument is an error at its own span.
+    parse_macro_input!(attr as syn::parse::Nothing);
     let item: Item = parse_macro_input!(item as Item);
 
     let Item::Fn(mut item) = item else {
-        return quote!(compile_error!("only functions are supported");).into();
+        return syn::Error::new_spanned(&item, "`#[validation_trace]` only applies to functions")
+            .to_compile_error()
+            .into();
     };
 
-    item
-        .attrs
+    item.attrs
         .push(syn::parse_quote!(#[cfg_attr(debug_assertions, track_caller)]));
 
     item.block.stmts.insert(

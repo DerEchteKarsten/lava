@@ -308,6 +308,7 @@ impl ImageUsage for Dynamic {
     fn flags(&self) -> vk::ImageUsageFlags {
         self.0
     }
+    #[track_caller]
     fn check(&self, required: vk::ImageUsageFlags) {
         assert!(
             self.0.contains(required),

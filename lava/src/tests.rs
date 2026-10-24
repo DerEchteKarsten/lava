@@ -571,10 +571,9 @@ fn instances_have_the_layout_of_the_vulkan_struct() {
     assert!(flags.contains(InstanceFlags::FORCE_OPAQUE) && !flags.contains(InstanceFlags::FORCE_NO_OPAQUE));
 }
 
-#[cfg(feature = "acceleration-structure")]
 #[test]
 fn half_floats_round_to_nearest_even() {
-    use crate::vkobjects::acceleration_structure::f16_bits;
+    use crate::half::{F16, f16_bits};
     let cases = [
         (0.0, 0x0000),
         (-0.0, 0x8000),
@@ -599,6 +598,12 @@ fn half_floats_round_to_nearest_even() {
     }
     assert_eq!(f16_bits(f32::NAN) & 0x7C00, 0x7C00);
     assert_ne!(f16_bits(f32::NAN) & 0x3FF, 0);
+    // Back to `f32` exactly, subnormals and infinities too.
+    for (value, bits) in [(0.0, 0), (-2.0, 0xC000), (0.5, 0x3800), (65504.0, 0x7BFF), (2f32.powi(-24), 1), (-(2f32.powi(-24)), 0x8001), (f32::INFINITY, 0x7C00), (0.099975586, 0x2E66)] {
+        assert_eq!(F16(bits).to_f32(), value, "{bits:#x}");
+        assert_eq!(F16::new(value).0, bits);
+    }
+    assert!(F16::new(f32::NAN).to_f32().is_nan());
 }
 
 #[test]

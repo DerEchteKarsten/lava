@@ -1,4 +1,4 @@
-//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings (render areas, depth or stencil attachments, layered and multiview) and their draws (direct, indexed, indirect from any `StartsWith` command records, counted, multi-draws, mesh launches), dispatches (the last bound compute and ray tracing pipeline kept), scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
+//! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings (render areas, depth or stencil attachments, layered and multiview) and their draws (direct, indexed, indirect from any `StartsWith` command records, counted, multi-draws, mesh launches), dispatches (direct, from a workgroup base, indirect; the last bound compute and ray tracing pipeline kept), scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
 use std::{
     fmt::Debug, marker::PhantomData, ops::Deref, panic::AssertUnwindSafe, ptr::NonNull,
     range::Range, sync::atomic::AtomicU64,
@@ -438,12 +438,9 @@ unsized_struct! {
     /// A draw as a rendering borrows it, unsized.
     pub struct DrawOutput {
         bindings: &'a BindingOutput<'a, ()>,
-        /// The pass's shader stages (`PassKind::stages`), where its declared accesses happen.
-        stages: vk::PipelineStageFlags2,
         command: DrawCommand<'a>,
         state: RasterState<0>,
         samples: Option<(&'a QueryPool<Occlusion>, u32)>,
-        accesses: Option<Accesses<'a>>,
     } sections {
         extra: [BufferAccess; E],
         blends: [Blend; N],
@@ -453,15 +450,11 @@ unsized_struct! {
 
 impl<'a> DrawOutput<'a> {
     fn image_accesses(&self) -> impl Iterator<Item = ImageUse<'a>> + Clone {
-        let (declared, _) = declared(self.accesses, self.stages);
-        self.bindings.sections().images().chain(declared)
+        self.bindings.sections().images()
     }
 
     fn buffer_accesses(&self) -> impl Iterator<Item = BufferAccess> + Clone + '_ {
-        let (_, declared) = declared(self.accesses, self.stages);
-        (self.bindings.sections().buffers())
-            .chain(self.extra().iter().cloned())
-            .chain(declared)
+        (self.bindings.sections().buffers()).chain(self.extra().iter().cloned())
     }
 
     /// A vertex draw, which has a topology, rather than a mesh launch.
@@ -518,21 +511,17 @@ impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
     #[track_caller]
     fn with(
         bindings: &'a BindingOutput<'a, ()>,
-        stages: vk::PipelineStageFlags2,
         command: DrawCommand<'a>,
         extra: [BufferAccess; E],
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (state, blends, write_masks) = state.split();
         state.check(&blends, command.is_vertex());
         Self::from_parts(
             bindings,
-            stages,
             command,
             state,
             None,
-            accesses,
             extra,
             blends,
             write_masks,
@@ -685,7 +674,6 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         vertices: u32,
         instances: u32,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let command = DrawCommand::Draw {
             vertices,
@@ -695,11 +683,9 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         };
         Self::with(
             bindings.erase(),
-            kind::RasterVertex::STAGES,
             command,
             [],
             state,
-            accesses,
         )
     }
 
@@ -712,7 +698,6 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         draws: &'a [MultiDraw],
         instances: u32,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Gated<gate::MultiDraw, Self> {
         crate::features::gate::<gate::MultiDraw, _>(|| {
             check_multi_draws(draws.len());
@@ -723,11 +708,9 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
             };
             Self::with(
                 bindings.erase(),
-                kind::RasterVertex::STAGES,
                 command,
                 [],
                 state,
-                accesses,
             )
         })
     }
@@ -739,7 +722,6 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         bindings: &'a BindingOutput<'a, kind::RasterMesh>,
         groups: [u32; 3],
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let pass = &pass_map().passes[bindings.sections().pass];
         let task = matches!(
@@ -763,11 +745,9 @@ impl<'a, const N: usize> Draw<'a, N, 0> {
         check_groups(groups, max, total as u64, stage);
         Self::with(
             bindings.erase(),
-            kind::RasterMesh::STAGES,
             DrawCommand::Launch(groups),
             [],
             state,
-            accesses,
         )
     }
 }
@@ -781,7 +761,6 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         index_buffer: BufferSlice<'a, I>,
         instances: u32,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (indices, index_access) = Indices::of(index_buffer);
         let command = DrawCommand::Indexed {
@@ -793,11 +772,9 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         };
         Self::with(
             bindings.erase(),
-            kind::RasterVertex::STAGES,
             command,
             [index_access],
             state,
-            accesses,
         )
     }
 
@@ -812,7 +789,6 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         draws: &'a [MultiDrawIndexed],
         instances: u32,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Gated<gate::MultiDraw, Self> {
         crate::features::gate::<gate::MultiDraw, _>(|| {
             check_multi_draws(draws.len());
@@ -834,11 +810,9 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
             };
             Self::with(
                 bindings.erase(),
-                kind::RasterVertex::STAGES,
                 command,
                 [index_access],
                 state,
-                accesses,
             )
         })
     }
@@ -850,16 +824,13 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         bindings: &'a BindingOutput<'a, kind::RasterVertex>,
         buffer: BufferSlice<'a, T>,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (commands, access) = Commands::of::<DrawIndirectCommand, T>(buffer);
         Self::with(
             bindings.erase(),
-            kind::RasterVertex::STAGES,
             DrawCommand::Indirect(commands),
             [access],
             state,
-            accesses,
         )
     }
 
@@ -871,16 +842,13 @@ impl<'a, const N: usize> Draw<'a, N, 1> {
         bindings: &'a BindingOutput<'a, kind::RasterMesh>,
         buffer: BufferSlice<'a, T>,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (commands, access) = Commands::of::<DispatchIndirectCommand, T>(buffer);
         Self::with(
             bindings.erase(),
-            kind::RasterMesh::STAGES,
             DrawCommand::LaunchIndirect(commands),
             [access],
             state,
-            accesses,
         )
     }
 }
@@ -893,17 +861,14 @@ impl<'a, const N: usize> Draw<'a, N, 2> {
         buffer: BufferSlice<'a, T>,
         count_buffer: BufferSlice<'a, u32>,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (commands, access) = Commands::of::<DrawIndirectCommand, T>(buffer);
         let (count, count_access) = Count::of(count_buffer);
         Self::with(
             bindings.erase(),
-            kind::RasterVertex::STAGES,
             DrawCommand::IndirectCount(commands, count),
             [access, count_access],
             state,
-            accesses,
         )
     }
 
@@ -914,17 +879,14 @@ impl<'a, const N: usize> Draw<'a, N, 2> {
         index_buffer: BufferSlice<'a, I>,
         buffer: BufferSlice<'a, T>,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (indices, index_access) = Indices::of(index_buffer);
         let (commands, access) = Commands::of::<DrawIndexedIndirectCommand, T>(buffer);
         Self::with(
             bindings.erase(),
-            kind::RasterVertex::STAGES,
             DrawCommand::IndexedIndirect(indices, commands),
             [index_access, access],
             state,
-            accesses,
         )
     }
 
@@ -936,17 +898,14 @@ impl<'a, const N: usize> Draw<'a, N, 2> {
         buffer: BufferSlice<'a, T>,
         count_buffer: BufferSlice<'a, u32>,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (commands, access) = Commands::of::<DispatchIndirectCommand, T>(buffer);
         let (count, count_access) = Count::of(count_buffer);
         Self::with(
             bindings.erase(),
-            kind::RasterMesh::STAGES,
             DrawCommand::LaunchIndirectCount(commands, count),
             [access, count_access],
             state,
-            accesses,
         )
     }
 }
@@ -960,18 +919,15 @@ impl<'a, const N: usize> Draw<'a, N, 3> {
         buffer: BufferSlice<'a, T>,
         count_buffer: BufferSlice<'a, u32>,
         state: RasterState<N>,
-        accesses: Option<Accesses<'a>>,
     ) -> Self {
         let (indices, index_access) = Indices::of(index_buffer);
         let (commands, access) = Commands::of::<DrawIndexedIndirectCommand, T>(buffer);
         let (count, count_access) = Count::of(count_buffer);
         Self::with(
             bindings.erase(),
-            kind::RasterVertex::STAGES,
             DrawCommand::IndexedIndirectCount(indices, commands, count),
             [index_access, access, count_access],
             state,
-            accesses,
         )
     }
 }
@@ -1633,6 +1589,14 @@ fn check_groups(groups: [u32; 3], max: [u32; 3], total: u64, what: &str) {
     );
 }
 
+/// How a compute dispatch gets its workgroups.
+enum Dispatch {
+    Groups([u32; 3]),
+    /// The first workgroup's ID, and the counts.
+    Base([u32; 3], [u32; 3]),
+    Indirect(vk::DeviceAddressRangeKHR, BufferAccess),
+}
+
 /// The address range of the first command of `buffer` an indirect dispatch or trace reads, and
 /// its access.
 #[track_caller]
@@ -1708,21 +1672,17 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     fn compute_private(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
-        dispatch: [u32; 3],
-        indirect_buffer: Option<(vk::DeviceAddressRangeKHR, BufferAccess)>,
-        accesses: Option<Accesses<'_>>,
+        dispatch: Dispatch,
     ) {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("compute", pass = pass.name).entered();
-        let (images, buffers) = declared(accesses, pass.kind.stages());
+        let indirect = match &dispatch {
+            Dispatch::Indirect(_, access) => Some(access.clone()),
+            _ => None,
+        };
         let rec = &mut self.rec;
-        rec.flush_pending(
-            sections.images().chain(images),
-            (sections.buffers())
-                .chain(indirect_buffer.as_ref().map(|(_, access)| access.clone()))
-                .chain(buffers),
-        );
+        rec.flush_pending(sections.images(), sections.buffers().chain(indirect));
         rec.push_constants(sections.push_constants);
 
         rec.enter(pass.name, true);
@@ -1738,15 +1698,19 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             },
         );
         unsafe {
-            if let Some((range, _)) = indirect_buffer {
-                Functions::device_address_commands().cmd_dispatch_indirect2(
-                    rec.handle,
-                    &vk::DispatchIndirect2InfoKHR::default()
-                        .address_range(range)
-                        .address_flags(address_flags()),
-                );
-            } else {
-                Ctx::device().cmd_dispatch(rec.handle, dispatch[0], dispatch[1], dispatch[2]);
+            match dispatch {
+                Dispatch::Indirect(range, _) => {
+                    Functions::device_address_commands().cmd_dispatch_indirect2(
+                        rec.handle,
+                        &vk::DispatchIndirect2InfoKHR::default()
+                            .address_range(range)
+                            .address_flags(address_flags()),
+                    )
+                }
+                Dispatch::Groups([x, y, z]) => Ctx::device().cmd_dispatch(rec.handle, x, y, z),
+                Dispatch::Base([bx, by, bz], [x, y, z]) => {
+                    Ctx::device().cmd_dispatch_base(rec.handle, bx, by, bz, x, y, z)
+                }
             }
         }
         rec.exit(pass.name, true);
@@ -1760,23 +1724,37 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
         buffer: BufferSlice<'_, T>,
-        accesses: Option<Accesses<'_>>,
     ) {
-        let first = first_command::<DispatchIndirectCommand, T>(buffer);
-        self.compute_private(bindings, [0, 0, 0], Some(first), accesses);
+        let (range, access) = first_command::<DispatchIndirectCommand, T>(buffer);
+        self.compute_private(bindings, Dispatch::Indirect(range, access));
     }
 
-    /// Dispatches `dispatch` workgroups of a compute pass that also reaches `accesses`.
+    /// Dispatches `groups` workgroups of a compute pass (the generated `Pass::groups(threads)`
+    /// rounds a thread count up to them).
     #[validation_trace]
-    pub fn compute(
+    pub fn compute(&mut self, bindings: &BindingOutput<'_, kind::Compute>, groups: [u32; 3]) {
+        let max = Ctx::device_properties().limits.max_compute_work_group_count;
+        check_groups(groups, max, u64::MAX, "compute workgroups");
+        self.compute_private(bindings, Dispatch::Groups(groups));
+    }
+
+    /// Dispatches `groups` workgroups whose workgroup IDs start at `base` (`vkCmdDispatchBase`:
+    /// `SV_GroupID` and `SV_DispatchThreadID` include it), e.g. to split a large dispatch.
+    /// Panics if `base + groups` exceeds the device's `maxComputeWorkGroupCount`.
+    #[validation_trace]
+    pub fn compute_base(
         &mut self,
         bindings: &BindingOutput<'_, kind::Compute>,
-        dispatch: [u32; 3],
-        accesses: Option<Accesses<'_>>,
+        base: [u32; 3],
+        groups: [u32; 3],
     ) {
         let max = Ctx::device_properties().limits.max_compute_work_group_count;
-        check_groups(dispatch, max, u64::MAX, "compute workgroups");
-        self.compute_private(bindings, dispatch, None, accesses);
+        let end: [u32; 3] = std::array::from_fn(|i| base[i].saturating_add(groups[i]));
+        assert!(
+            end.iter().zip(max).all(|(&e, m)| e <= m),
+            "workgroups {base:?} to {end:?} exceed the device's {max:?}"
+        );
+        self.compute_private(bindings, Dispatch::Base(base, groups));
     }
 
     #[cfg(feature = "ray-tracing-pipeline")]
@@ -1785,18 +1763,14 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         bindings: &BindingOutput<'_, kind::RayTracing>,
         rays: [u32; 3],
         indirect_buffer: Option<(vk::DeviceAddressRangeKHR, BufferAccess)>,
-        accesses: Option<Accesses<'_>>,
     ) {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
         let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
-        let (images, buffers) = declared(accesses, pass.kind.stages());
         let rec = &mut self.rec;
         rec.flush_pending(
-            sections.images().chain(images),
-            (sections.buffers())
-                .chain(indirect_buffer.as_ref().map(|(_, access)| access.clone()))
-                .chain(buffers),
+            sections.images(),
+            (sections.buffers()).chain(indirect_buffer.as_ref().map(|(_, access)| access.clone())),
         );
         rec.push_constants(sections.push_constants);
 
@@ -1837,15 +1811,13 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         rec.exit(pass.name, true);
     }
 
-    /// Traces `rays` (width, height, depth) raygen invocations of a pass that also reaches
-    /// `accesses`.
+    /// Traces `rays` (width, height, depth) raygen invocations of a pass.
     #[cfg(feature = "ray-tracing-pipeline")]
     #[validation_trace]
     pub fn raytrace(
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
         rays: [u32; 3],
-        accesses: Option<Accesses<'_>>,
     ) {
         let limits = &Ctx::device_properties().limits;
         let max = std::array::from_fn(|i| {
@@ -1856,7 +1828,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         let total = (Ctx::physical_device().ray_tracing_pipeline_properties)
             .map_or(0, |p| p.max_ray_dispatch_invocation_count as u64);
         check_groups(rays, max, total, "rays");
-        self.raytrace_private(bindings, rays, None, accesses);
+        self.raytrace_private(bindings, rays, None);
     }
 
     /// Like [`Self::raytrace`], with the ray counts read from the first command of `buffer`
@@ -1867,10 +1839,9 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
         buffer: BufferSlice<'_, T>,
-        accesses: Option<Accesses<'_>>,
     ) {
         let first = first_command::<TraceRaysIndirectCommand, T>(buffer);
-        self.raytrace_private(bindings, [0, 0, 0], Some(first), accesses);
+        self.raytrace_private(bindings, [0, 0, 0], Some(first));
     }
 }
 
@@ -2308,8 +2279,9 @@ pub(crate) struct Barriers {
     pub(crate) images: SmallVec<[vk::ImageMemoryBarrier2<'static>; INLINE_BARRIERS]>,
 }
 
-/// The resources a pass reaches without naming them in its bindings (through a bindless handle
-/// or a pointer in a buffer), tracked at the command's shader stages.
+/// The resources a pass reaches without naming them in its push constants or specialization
+/// constants (through a bindless handle or a pointer in a buffer), given to its generated
+/// `push_bindings` and tracked at the pass's shader stages like the bindings' own accesses.
 #[derive(Clone, Copy, Default)]
 pub struct Accesses<'a> {
     pub images: &'a [ImageUse<'a>],
@@ -2336,26 +2308,7 @@ impl<'a> Accesses<'a> {
     }
 }
 
-fn declared<'a>(
-    accesses: Option<Accesses<'a>>,
-    stage: vk::PipelineStageFlags2,
-) -> (
-    impl Iterator<Item = ImageUse<'a>> + Clone,
-    impl Iterator<Item = BufferAccess> + Clone,
-) {
-    let Accesses { images, buffers } = accesses.unwrap_or_default();
-    let images = images.iter().cloned().map(move |mut image| {
-        image.access.stage = stage;
-        image
-    });
-    let buffers = buffers.iter().cloned().map(move |mut buffer| {
-        buffer.stage = stage;
-        buffer
-    });
-    (images, buffers)
-}
-
-/// The image accesses of [`Accesses`]; the command sets the stage.
+/// The image accesses of [`Accesses`]; the bindings set the stage.
 impl<'a> ImageUse<'a> {
     /// The pass samples `image` (`Tex2D`, or a `DynImg` with a sampled index).
     pub fn sampled_read(image: impl SampledView + 'a) -> Self {
@@ -2381,7 +2334,7 @@ impl<'a> ImageUse<'a> {
     }
 }
 
-/// The buffer accesses of [`Accesses`]; the command sets the stage.
+/// The buffer accesses of [`Accesses`]; the bindings set the stage.
 impl BufferAccess {
     /// The pass reads `buffer` through a pointer (`Buf`).
     pub fn read<V: Copy + 'static>(buffer: BufferSlice<'_, V>) -> Self {

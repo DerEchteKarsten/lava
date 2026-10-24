@@ -19,14 +19,30 @@ pub(crate) const CAPABILITY_FEATURES: &[(u32, &str, &str)] = &[
     (4449, "storage-8bit", "Storage8Bit"),
     (4450, "storage-8bit", "Storage8Bit"),
     (4472, "ray-query", "RayQuery"),
-    (4478, "ray-traversal-primitive-culling", "RayTraversalPrimitiveCulling"),
+    (
+        4478,
+        "ray-traversal-primitive-culling",
+        "RayTraversalPrimitiveCulling",
+    ),
     (4479, "ray-tracing-pipeline", "RayTracingPipeline"),
     (5254, "shader-output-layer", "ShaderOutputLayer"),
     (5055, "shader-clock", "ShaderClock"),
     (5283, "mesh-shader", "MeshShader"),
-    (5336, "ray-tracing-position-fetch", "RayTracingPositionFetch"),
-    (5388, "ray-tracing-invocation-reorder", "RayTracingInvocationReorder"),
-    (5391, "ray-tracing-position-fetch", "RayTracingPositionFetch"),
+    (
+        5336,
+        "ray-tracing-position-fetch",
+        "RayTracingPositionFetch",
+    ),
+    (
+        5388,
+        "ray-tracing-invocation-reorder",
+        "RayTracingInvocationReorder",
+    ),
+    (
+        5391,
+        "ray-tracing-position-fetch",
+        "RayTracingPositionFetch",
+    ),
 ];
 
 /// The operands of a SPIR-V module's `OpCapability`s, like lava's scan: they and the
