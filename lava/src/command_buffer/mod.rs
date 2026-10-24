@@ -1,7 +1,12 @@
 //! Command recording for generated passes: the typed `CommandBuffer<K>` over the untyped `Recording`, barriers and queue family ownership releases, renderings (render areas, depth or stencil attachments, layered and multiview) and their draws (direct, indexed, indirect from any `StartsWith` command records, counted, multi-draws, mesh launches), dispatches (direct, from a workgroup base, indirect; the last bound compute and ray tracing pipeline kept), scopes and queries (transfers live with the slices and views they take, `drain_uploads` with the staging rings in `buffer/staging.rs`, acceleration structure commands with the structures, `present` with `PresentSurface` in `present.rs`)
 use std::{
-    fmt::Debug, marker::PhantomData, ops::Deref, panic::AssertUnwindSafe, ptr::NonNull,
-    range::Range, sync::atomic::AtomicU64,
+    fmt::Debug,
+    marker::PhantomData,
+    ops::Deref,
+    panic::AssertUnwindSafe,
+    ptr::NonNull,
+    range::Range,
+    sync::{Arc, atomic::AtomicU64},
 };
 
 #[cfg(feature = "multi-draw")]
@@ -10,8 +15,9 @@ use crate::vk::{self, PipelineStageFlags2 as S2};
 #[cfg(feature = "acceleration-structure")]
 use crate::vkobjects::acceleration_structure::Tlas;
 use crate::{
-    buffer::slice::BufferSlice,
+    buffer::{BufferInternal, slice::BufferSlice},
     image::{
+        ImageInternal,
         dim::Dim2D,
         format::Format,
         kind::{ColorTarget, DepthTarget, ImageRef, SampledView, StencilTarget, StorageView},
@@ -46,13 +52,27 @@ use pending::{PendingAccesses, READ_ACCESS, WRITE_ACCESS};
 pub use raster_state::*;
 
 /// A pass's access of a buffer range, made by `BufferSlice::access`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BufferAccess {
+#[derive(Clone, Copy)]
+pub struct BufferAccess<'a> {
     pub stage: vk::PipelineStageFlags2,
     pub access: vk::AccessFlags2,
     pub range: Range<u64>,
     /// Draws of one rendering may make it alongside each other's (`unordered`).
     pub(crate) unordered: bool,
+    /// The buffer the range lies in; none for `EVERY_ACCELERATION_STRUCTURE`.
+    pub(crate) buffer: Option<&'a Arc<BufferInternal>>,
+}
+
+impl Debug for BufferAccess<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferAccess")
+            .field("stage", &self.stage)
+            .field("access", &self.access)
+            .field("range", &self.range)
+            .field("unordered", &self.unordered)
+            .field("buffer", &self.buffer.map(|b| b.handle))
+            .finish()
+    }
 }
 
 /// A read of every acceleration structure (the BLASes a TLAS build or trace reaches): empty, so
@@ -69,7 +89,7 @@ pub(crate) const EVERY_BUFFER: Range<u64> = Range {
     end: u64::MAX,
 };
 
-impl BufferAccess {
+impl BufferAccess<'_> {
     /// The same access, made by draws of one rendering in any order: a rendering doesn't
     /// refuse two draws whose accesses of a range are both unordered, though one writes it
     /// (`RasterBuilder::record` refuses other pairs). Nothing orders such draws' accesses, so
@@ -87,8 +107,8 @@ impl BufferAccess {
         self.unordered
     }
 
-    fn overlaps(&self, other: &BufferAccess) -> bool {
-        let writes_structure = |a: &BufferAccess| {
+    fn overlaps(&self, other: &BufferAccess<'_>) -> bool {
+        let writes_structure = |a: &BufferAccess<'_>| {
             a.access
                 .contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
         };
@@ -116,14 +136,26 @@ pub(crate) struct ImageAccess {
 /// An image access with the tracked states of its mips, which only move when the command is
 /// recorded. Made by `ImageView::access` (shaders' accesses, always in `GENERAL`) and the
 /// constructors of `Accesses`; lava alone picks other layouts, so the tracking stays true.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ImageUse<'a> {
     pub(crate) access: ImageAccess,
-    /// The image's tracked states: one for all its mips, or one per mip of the image.
-    pub(crate) states: &'a [AtomicU64],
+    pub(crate) internal: &'a Arc<ImageInternal>,
 }
 
-impl ImageUse<'_> {
+impl Debug for ImageUse<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageUse")
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
+impl<'a> ImageUse<'a> {
+    /// The image's tracked states: one for all its mips, or one per mip of the image.
+    pub(crate) fn states(&self) -> &'a [AtomicU64] {
+        &self.internal.states
+    }
+
     pub fn image(&self) -> vk::Image {
         self.access.image
     }
@@ -449,7 +481,7 @@ unsized_struct! {
         state: RasterCore,
         samples: Option<(&'a QueryPool<Occlusion>, u32)>,
     } sections {
-        extra: [BufferAccess; E],
+        extra: [BufferAccess<'a>; E],
         blends: [Blend; N],
         write_masks: [ColorComponentFlags; N],
     }
@@ -460,7 +492,7 @@ impl<'a> DrawOutput<'a> {
         self.bindings.sections().images()
     }
 
-    fn buffer_accesses(&self) -> impl Iterator<Item = BufferAccess> + Clone + '_ {
+    fn buffer_accesses(&self) -> impl Iterator<Item = BufferAccess<'a>> + Clone + '_ {
         (self.bindings.sections().buffers()).chain(self.extra().iter().cloned())
     }
 
@@ -520,7 +552,7 @@ impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
     fn with(
         bindings: &'a BindingOutput<'a, ()>,
         command: DrawCommand<'a>,
-        extra: [BufferAccess; E],
+        extra: [BufferAccess<'a>; E],
         state: RasterState<N>,
     ) -> Self {
         let (state, blends, write_masks) = state.split();
@@ -584,7 +616,7 @@ pub(crate) struct Indices {
 }
 
 impl Indices {
-    fn of<I: IndexFormat>(buffer: BufferSlice<'_, I>) -> (Self, BufferAccess) {
+    fn of<I: IndexFormat>(buffer: BufferSlice<'_, I>) -> (Self, BufferAccess<'_>) {
         let access = buffer.access(
             vk::PipelineStageFlags2::INDEX_INPUT,
             vk::AccessFlags2::INDEX_READ,
@@ -619,7 +651,7 @@ pub(crate) struct Commands {
 }
 
 impl Commands {
-    fn of<C: Pod, T: StartsWith<C>>(buffer: BufferSlice<'_, T>) -> (Self, BufferAccess) {
+    fn of<C: Pod, T: StartsWith<C>>(buffer: BufferSlice<'_, T>) -> (Self, BufferAccess<'_>) {
         const {
             assert!(
                 size_of::<T>() >= size_of::<C>() && size_of::<T>().is_multiple_of(4),
@@ -659,7 +691,7 @@ pub(crate) struct Count {
 }
 
 impl Count {
-    fn of(buffer: BufferSlice<'_, u32>) -> (Self, BufferAccess) {
+    fn of(buffer: BufferSlice<'_, u32>) -> (Self, BufferAccess<'_>) {
         let count = Self {
             range: buffer.address_range(),
             flags: buffer.address_flags(),
@@ -1590,11 +1622,11 @@ fn check_groups(groups: [u32; 3], max: [u32; 3], total: u64, what: &str) {
 }
 
 /// How a compute dispatch gets its workgroups.
-enum Dispatch {
+enum Dispatch<'a> {
     Groups([u32; 3]),
     /// The first workgroup's ID, and the counts.
     Base([u32; 3], [u32; 3]),
-    Indirect(vk::DeviceAddressRangeKHR, BufferAccess),
+    Indirect(vk::DeviceAddressRangeKHR, BufferAccess<'a>),
 }
 
 /// The address range of the first command of `buffer` an indirect dispatch or trace reads, and
@@ -1602,7 +1634,7 @@ enum Dispatch {
 #[track_caller]
 fn first_command<C: Pod, T: StartsWith<C>>(
     buffer: BufferSlice<'_, T>,
-) -> (vk::DeviceAddressRangeKHR, BufferAccess) {
+) -> (vk::DeviceAddressRangeKHR, BufferAccess<'_>) {
     assert!(
         !buffer.is_empty(),
         "an indirect dispatch or trace reads its command from an empty slice"
@@ -1625,7 +1657,7 @@ fn address_flags() -> vk::AddressCommandFlagsKHR {
     vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE | vk::AddressCommandFlagsKHR::FULLY_BOUND
 }
 
-fn indirect_access<T: Copy + 'static>(buffer: BufferSlice<'_, T>) -> BufferAccess {
+fn indirect_access<T: Copy + 'static>(buffer: BufferSlice<'_, T>) -> BufferAccess<'_> {
     buffer.access(
         vk::PipelineStageFlags2::DRAW_INDIRECT,
         vk::AccessFlags2::INDIRECT_COMMAND_READ,
@@ -1757,7 +1789,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         &mut self,
         bindings: &BindingOutput<'_, kind::RayTracing>,
         rays: [u32; 3],
-        indirect_buffer: Option<(vk::DeviceAddressRangeKHR, BufferAccess)>,
+        indirect_buffer: Option<(vk::DeviceAddressRangeKHR, BufferAccess<'_>)>,
     ) {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
@@ -1923,7 +1955,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         }
         let view = image.view();
         let aspect = view.format().aspects();
-        (self.rec).release(view.image, view.states, view.mip_range, aspect, D::KIND);
+        (self.rec).release(view.image(), view.states(), view.mip_range, aspect, D::KIND);
     }
 }
 
@@ -2074,7 +2106,7 @@ impl<'p> Recording<'p> {
     pub(crate) fn flush_pending<'a>(
         &mut self,
         image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
-        buffer_accesses: impl Iterator<Item = BufferAccess> + Clone,
+        buffer_accesses: impl Iterator<Item = BufferAccess<'a>> + Clone,
     ) {
         if !self.presents.is_empty() {
             for access in image_accesses.clone() {
@@ -2286,11 +2318,11 @@ pub(crate) struct Barriers {
 #[derive(Clone, Copy, Default)]
 pub struct Accesses<'a> {
     pub images: &'a [ImageUse<'a>],
-    pub buffers: &'a [BufferAccess],
+    pub buffers: &'a [BufferAccess<'a>],
 }
 
 impl<'a> Accesses<'a> {
-    pub fn new(images: &'a [ImageUse<'a>], buffers: &'a [BufferAccess]) -> Self {
+    pub fn new(images: &'a [ImageUse<'a>], buffers: &'a [BufferAccess<'a>]) -> Self {
         Self { images, buffers }
     }
 
@@ -2301,7 +2333,7 @@ impl<'a> Accesses<'a> {
         }
     }
 
-    pub fn buffers(buffers: &'a [BufferAccess]) -> Self {
+    pub fn buffers(buffers: &'a [BufferAccess<'a>]) -> Self {
         Self {
             images: &[],
             buffers,
@@ -2336,14 +2368,14 @@ impl<'a> ImageUse<'a> {
 }
 
 /// The buffer accesses of [`Accesses`]; the bindings set the stage.
-impl BufferAccess {
+impl<'a> BufferAccess<'a> {
     /// The pass reads `buffer` through a pointer (`Buf`).
-    pub fn read<V: Copy + 'static>(buffer: BufferSlice<'_, V>) -> Self {
+    pub fn read<V: Copy + 'static>(buffer: BufferSlice<'a, V>) -> Self {
         buffer.access(S2::NONE, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
     /// The pass reads and writes `buffer` through a pointer (`MutBuf`).
-    pub fn write<V: Copy + 'static>(buffer: BufferSlice<'_, V>) -> Self {
+    pub fn write<V: Copy + 'static>(buffer: BufferSlice<'a, V>) -> Self {
         let access = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
         buffer.access(S2::NONE, access)
     }
@@ -2351,7 +2383,7 @@ impl BufferAccess {
     /// The pass traces `tlas` through an address it reads from a buffer (an `Accel` inside a
     /// struct): its memory and the BLASes it names.
     #[cfg(feature = "acceleration-structure")]
-    pub fn trace(tlas: &Tlas) -> [Self; 2] {
+    pub fn trace(tlas: &'a Tlas) -> [Self; 2] {
         tlas.trace_accesses(S2::NONE)
     }
 }
@@ -2362,7 +2394,7 @@ pub(crate) fn compute_barriers<'a>(
     pending: &PendingAccesses,
     family: &FamilyInfo,
     image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
-    buffer_accesses: impl Iterator<Item = BufferAccess>,
+    buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
 ) -> Option<Barriers> {
     let mut src_stage = vk::PipelineStageFlags2::NONE;
     let mut dst_stage = vk::PipelineStageFlags2::NONE;
@@ -2401,7 +2433,7 @@ pub(crate) fn compute_barriers<'a>(
     for image in image_accesses.clone() {
         // The first access of an acquired swapchain image (which has one state) waits for the
         // acquire's semaphore, which comes after every earlier access of it.
-        if let [state] = image.states
+        if let [state] = image.states()
             && ImageState::load(state).acquired
         {
             continue;
@@ -2439,7 +2471,7 @@ pub(crate) fn compute_barriers<'a>(
     // Every image is checked before any state moves: a panic then leaves the tracking as the
     // barriers logged so far describe it.
     for image in image_accesses.clone() {
-        check_states(image.states, image.access.mip_range, kind);
+        check_states(image.states(), image.access.mip_range, kind);
     }
     let all = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
     let mut image_barriers: SmallVec<[vk::ImageMemoryBarrier2; INLINE_BARRIERS]> = SmallVec::new();
@@ -2458,7 +2490,7 @@ pub(crate) fn compute_barriers<'a>(
             access.access
         };
         take_checked_states(
-            image.states,
+            image.states(),
             access.mip_range,
             access.layout,
             kind,
@@ -2473,7 +2505,7 @@ pub(crate) fn compute_barriers<'a>(
                 let acquire = old.released_to == Some(kind) && old.owner.is_some();
                 if acquire && let Some(owner) = old.owner {
                     // Per tracked state, matching the release's barriers.
-                    for mips in ownership_ranges(image.states, mips) {
+                    for mips in ownership_ranges(image.states(), mips) {
                         acquires.push(
                             vk::ImageMemoryBarrier2::default()
                                 .src_stage_mask(S2::NONE)

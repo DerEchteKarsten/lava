@@ -17,12 +17,13 @@ use smallvec::SmallVec;
 
 use crate::{
     bindless::Ranges,
-    buffer::{Buffer, Gpu, slice::BufferSlice},
+    buffer::{Buffer, BufferInternal, Gpu, slice::BufferSlice},
     command_buffer::{BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE, Recording},
     error::{Error, Result},
     features::{Feature, gate},
     global::Live,
     lifetime,
+    object::Header,
     query::{CompactedSize, QueryKind, QueryPool, SerializedSize},
     queue::{HasCompute, lock},
     state::{Ctx, Functions},
@@ -80,15 +81,16 @@ pub fn scratch_alignment() -> u64 {
 
 /// The read a trace or TLAS build makes of the BLASes it reaches, which lava can't list:
 /// `access` at `stage` of [`EVERY_ACCELERATION_STRUCTURE`].
-pub(crate) fn every_structure_read(
+pub(crate) fn every_structure_read<'a>(
     stage: vk::PipelineStageFlags2,
     access: vk::AccessFlags2,
-) -> BufferAccess {
+) -> BufferAccess<'a> {
     BufferAccess {
         unordered: false,
         stage,
         access,
         range: EVERY_ACCELERATION_STRUCTURE,
+        buffer: None,
     }
 }
 
@@ -97,15 +99,15 @@ mod describe {
     use super::*;
 
     /// One geometry of a build: what Vulkan reads, its shape, and the buffer ranges it reads.
-    pub struct Described {
+    pub struct Described<'a> {
         pub(crate) geometry: vk::AccelerationStructureGeometryKHR<'static>,
         pub(crate) shape: Shape,
-        pub(crate) inputs: [Range<u64>; 3],
+        pub(crate) inputs: [Option<BufferSlice<'a, u8>>; 3],
     }
 
     /// The geometries of a build ([`Level::Geometry`]).
-    pub trait Describe {
-        fn describe(&self, out: &mut SmallVec<[Described; 1]>);
+    pub trait Describe<'a> {
+        fn describe(&self, out: &mut SmallVec<[Described<'a>; 1]>);
     }
 }
 use describe::{Describe, Described};
@@ -222,7 +224,7 @@ impl Recording<'_> {
 pub trait Level: crate::sealed::Sealed + 'static {
     const TY: vk::AccelerationStructureTypeKHR;
     /// What a build of this level reads.
-    type Geometry<'a>: Describe;
+    type Geometry<'a>: Describe<'a>;
 }
 
 /// A bottom-level structure: triangles or AABBs.
@@ -338,7 +340,14 @@ enum Placement<'a> {
 /// which builds write through a shared reference. A TLAS that still names a dropped BLAS must
 /// not be traced ([`Instances::new`]).
 pub struct AccelerationStructure<L: Level> {
-    handle: vk::AccelerationStructureKHR,
+    pub(crate) internal: Arc<StructureInternal>,
+    _level: PhantomData<L>,
+}
+
+/// An acceleration structure as lava owns it, shared by its [`AccelerationStructure`] and
+/// whatever else keeps it, destroyed with the last owner.
+pub(crate) struct StructureInternal {
+    pub(crate) handle: vk::AccelerationStructureKHR,
     address: u64,
     flags: BuildFlags,
     /// Per geometry, the shape it was created for, its counts the most a build may have; empty
@@ -351,9 +360,32 @@ pub struct AccelerationStructure<L: Level> {
     /// The device addresses of its memory, which barriers track.
     range: Range<u64>,
     memory: Memory,
-    _level: PhantomData<L>,
-    /// Last, so it counts the structure until its drop finished.
-    _live: Live,
+    #[allow(dead_code, reason = "held for its count")]
+    header: Header,
+}
+
+impl StructureInternal {
+    /// The buffer its memory lies in.
+    fn buffer(&self) -> &Arc<BufferInternal> {
+        match &self.memory {
+            Memory::Own(buffer) => &buffer.internal,
+            Memory::Arena { arena, .. } => &arena.buffer.internal,
+        }
+    }
+
+    pub(crate) fn access(
+        &self,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> BufferAccess<'_> {
+        BufferAccess {
+            unordered: false,
+            stage,
+            access,
+            range: self.range,
+            buffer: Some(self.buffer()),
+        }
+    }
 }
 
 fn round_up(value: u64, alignment: u64) -> u64 {
@@ -375,7 +407,7 @@ fn limit(limit: &'static str, requested: u64, max: u64) -> Result<()> {
 impl<L: Level> AccelerationStructure<L> {
     /// A structure for builds of `described` (its shapes the maxima), sized by Vulkan.
     fn with_geometries(
-        described: &[Described],
+        described: &[Described<'_>],
         flags: BuildFlags,
         placement: Placement,
     ) -> Result<Self> {
@@ -500,71 +532,75 @@ impl<L: Level> AccelerationStructure<L> {
             )
         };
         Ok(Self {
-            handle,
-            address,
-            flags,
-            shapes,
-            build_scratch,
-            update_scratch,
-            origin,
-            state: BuildState::new(),
-            range,
-            memory,
+            internal: Arc::new(StructureInternal {
+                handle,
+                address,
+                flags,
+                shapes,
+                build_scratch,
+                update_scratch,
+                origin,
+                state: BuildState::new(),
+                range,
+                memory,
+                header: Header::new(live),
+            }),
             _level: PhantomData,
-            _live: live,
         })
     }
 
     /// The same structure named `name` (its own memory too), for debuggers, the validation
     /// layer (with debug utils, `Config::validation`) and allocator reports.
     pub fn named(mut self, name: &str) -> Self {
-        if let Memory::Own(buffer) = &mut self.memory {
+        if let Some(internal) = Arc::get_mut(&mut self.internal)
+            && let Memory::Own(buffer) = &mut internal.memory
+        {
             buffer.set_name(name);
         }
-        Functions::set_debug_name(name, self.handle);
+        Functions::set_debug_name(name, self.internal.handle);
         self
     }
 
     /// Its device address, which shaders and instances use. Not its buffer's address.
     pub fn address(&self) -> u64 {
-        self.address
+        self.internal.address
     }
 
     /// The bytes its memory takes.
     pub fn size(&self) -> u64 {
-        self.range.end - self.range.start
+        self.internal.range.end - self.internal.range.start
     }
 
     pub fn flags(&self) -> BuildFlags {
-        self.flags
+        self.internal.flags
     }
 
     /// The scratch bytes a build needs, a multiple of [`scratch_alignment`]; 0 for structures
     /// that can't be built (compacted, deserialized).
     pub fn build_scratch_size(&self) -> u64 {
-        self.build_scratch
+        self.internal.build_scratch
     }
 
     /// The scratch bytes an update needs, a multiple of [`scratch_alignment`]; 0 without
     /// `allow_update`.
     pub fn update_scratch_size(&self) -> u64 {
-        self.update_scratch
+        self.internal.update_scratch
     }
 
     /// Whether a build (or copy into it) was recorded by a recording that didn't fail, or
     /// reached the GPU: what traces, compaction and copies need.
     pub fn is_built(&self) -> bool {
-        self.state.recorded.load(Ordering::Acquire)
+        self.internal.state.recorded.load(Ordering::Acquire)
     }
 
     /// Whether it was made by `compacted`, so only `compact` and `update` write it.
     pub fn is_compacted(&self) -> bool {
-        matches!(self.origin, Origin::Compacted(_))
+        matches!(self.internal.origin, Origin::Compacted(_))
     }
 
     /// Whether `build` may write it: it was sized for builds.
     pub fn is_buildable(&self) -> bool {
-        match self.origin {
+        match self.internal.origin {
             Origin::Created => true,
             Origin::Copied { buildable } => buildable,
             Origin::Compacted(_) | Origin::Deserialized => false,
@@ -574,7 +610,7 @@ impl<L: Level> AccelerationStructure<L> {
     #[track_caller]
     fn compaction_check(&self) {
         assert!(
-            self.flags.allow_compaction,
+            self.internal.flags.allow_compaction,
             "only a structure built with `allow_compaction` can be compacted"
         );
         assert!(
@@ -597,11 +633,11 @@ impl<L: Level> AccelerationStructure<L> {
         self.compaction_check();
         Self::create(
             size,
-            self.flags,
-            self.shapes.clone(),
+            self.internal.flags,
+            self.internal.shapes.clone(),
             0,
-            self.update_scratch,
-            Origin::Compacted(self.handle),
+            self.internal.update_scratch,
+            Origin::Compacted(self.internal.handle),
             placement,
             Live::new(),
         )
@@ -616,10 +652,10 @@ impl<L: Level> AccelerationStructure<L> {
     fn clone_target_in(&self, placement: Placement) -> Result<Self> {
         Self::create(
             self.size(),
-            self.flags,
-            self.shapes.clone(),
-            self.build_scratch,
-            self.update_scratch,
+            self.internal.flags,
+            self.internal.shapes.clone(),
+            self.internal.build_scratch,
+            self.internal.update_scratch,
             Origin::Copied {
                 buildable: self.is_buildable(),
             },
@@ -675,13 +711,8 @@ impl<L: Level> AccelerationStructure<L> {
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
-    ) -> BufferAccess {
-        BufferAccess {
-            unordered: false,
-            stage,
-            access,
-            range: self.range,
-        }
+    ) -> BufferAccess<'_> {
+        self.internal.access(stage, access)
     }
 }
 
@@ -719,7 +750,7 @@ impl Tlas {
     /// unless a build of it was recorded ([`AccelerationStructure::is_built`]): a trace of an
     /// unbuilt TLAS reads uninitialised memory.
     #[track_caller]
-    pub fn trace_accesses(&self, stage: vk::PipelineStageFlags2) -> [BufferAccess; 2] {
+    pub fn trace_accesses(&self, stage: vk::PipelineStageFlags2) -> [BufferAccess<'_>; 2] {
         assert!(
             self.is_built(),
             "a trace of a TLAS that was never built: record its build first"
@@ -729,7 +760,7 @@ impl Tlas {
     }
 }
 
-impl<L: Level> Drop for AccelerationStructure<L> {
+impl Drop for StructureInternal {
     fn drop(&mut self) {
         let handle = self.handle;
         let arena = match &self.memory {
@@ -871,7 +902,7 @@ impl Scratch {
     pub fn for_any<L: Level>(structures: &[&AccelerationStructure<L>]) -> Result<Self> {
         let sizes = structures
             .iter()
-            .map(|s| s.build_scratch.max(s.update_scratch));
+            .map(|s| s.internal.build_scratch.max(s.internal.update_scratch));
         Self::new(sizes.max().unwrap_or(0))
     }
 
@@ -1072,8 +1103,7 @@ pub struct Triangles<'a> {
     data: vk::AccelerationStructureGeometryTrianglesDataKHR<'static>,
     primitives: u32,
     opaque: bool,
-    inputs: [Range<u64>; 3],
-    _marker: PhantomData<&'a ()>,
+    inputs: [Option<BufferSlice<'a, u8>>; 3],
 }
 
 impl<'a> Triangles<'a> {
@@ -1089,7 +1119,7 @@ impl<'a> Triangles<'a> {
             vk::IndexType::NONE_KHR,
             0,
             (vertices.len() / 3) as u32,
-            (0..0).into(),
+            None,
         )
     }
 
@@ -1108,7 +1138,7 @@ impl<'a> Triangles<'a> {
             I::TYPE,
             indices.address(),
             (indices.len() / 3) as u32,
-            indices.get_range(),
+            Some(indices.bytes()),
         )
     }
 
@@ -1118,7 +1148,7 @@ impl<'a> Triangles<'a> {
         index_type: vk::IndexType,
         index_address: u64,
         primitives: u32,
-        index_range: Range<u64>,
+        indices: Option<BufferSlice<'a, u8>>,
     ) -> Self {
         assert!(!vertices.is_empty(), "a triangle geometry needs vertices");
         let component = V::FORMAT.component_bytes();
@@ -1139,8 +1169,7 @@ impl<'a> Triangles<'a> {
                 .index_data(const_address(index_address)),
             primitives,
             opaque: true,
-            inputs: [vertices.get_range(), index_range, (0..0).into()],
-            _marker: PhantomData,
+            inputs: [Some(vertices.bytes()), indices, None],
         }
     }
 
@@ -1154,7 +1183,7 @@ impl<'a> Triangles<'a> {
             "a transform's address has to be a multiple of 16"
         );
         self.data = self.data.transform_data(const_address(transform.address()));
-        self.inputs[2] = transform.range(..1).get_range();
+        self.inputs[2] = Some(transform.range(..1).bytes());
         self
     }
 
@@ -1181,11 +1210,9 @@ impl<'a> Triangles<'a> {
 /// query's candidates). Opaque unless [`Self::opaque`] says otherwise.
 #[derive(Clone, Copy)]
 pub struct Aabbs<'a> {
-    address: u64,
+    boxes: BufferSlice<'a, u8>,
     primitives: u32,
     opaque: bool,
-    range: Range<u64>,
-    _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> Aabbs<'a> {
@@ -1196,11 +1223,9 @@ impl<'a> Aabbs<'a> {
             "an AABB buffer's address has to be a multiple of 8"
         );
         Self {
-            address: boxes.address(),
             primitives: boxes.len() as u32,
+            boxes: boxes.bytes(),
             opaque: true,
-            range: boxes.get_range(),
-            _marker: PhantomData,
         }
     }
 
@@ -1238,8 +1263,8 @@ fn aabbs_geometry(address: u64, opaque: bool) -> vk::AccelerationStructureGeomet
         .flags(geometry_flags(opaque))
 }
 
-impl Describe for BlasGeometry<'_> {
-    fn describe(&self, out: &mut SmallVec<[Described; 1]>) {
+impl<'a> Describe<'a> for BlasGeometry<'a> {
+    fn describe(&self, out: &mut SmallVec<[Described<'a>; 1]>) {
         match *self {
             BlasGeometry::Triangles(triangles) => out.extend(triangles.iter().map(|t| Described {
                 geometry: triangles_geometry(t.data, t.opaque),
@@ -1247,9 +1272,9 @@ impl Describe for BlasGeometry<'_> {
                 inputs: t.inputs,
             })),
             BlasGeometry::Aabbs(boxes) => out.extend(boxes.iter().map(|b| Described {
-                geometry: aabbs_geometry(b.address, b.opaque),
+                geometry: aabbs_geometry(b.boxes.address(), b.opaque),
                 shape: Shape::aabbs(b.primitives, b.opaque),
-                inputs: [b.range, (0..0).into(), (0..0).into()],
+                inputs: [Some(b.boxes), None, None],
             })),
         }
     }
@@ -1342,8 +1367,8 @@ pub enum BlasDesc<'a> {
 }
 
 impl BlasDesc<'_> {
-    fn described(&self) -> SmallVec<[Described; 1]> {
-        let none = || [(0..0).into(); 3];
+    fn described(&self) -> SmallVec<[Described<'static>; 1]> {
+        let none = || [None; 3];
         match *self {
             BlasDesc::Triangles(triangles) => triangles
                 .iter()
@@ -1513,7 +1538,7 @@ impl Instance {
     }
 }
 
-fn instances_described(address: u64, count: u32) -> Described {
+fn instances_described(address: u64, count: u32) -> Described<'static> {
     Described {
         geometry: vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(vk::GeometryTypeKHR::INSTANCES)
@@ -1522,17 +1547,15 @@ fn instances_described(address: u64, count: u32) -> Described {
                     .data(const_address(address)),
             }),
         shape: Shape::instances(count),
-        inputs: [(0..0).into(); 3],
+        inputs: [None; 3],
     }
 }
 
 /// What a TLAS is built from: a slice of [`Instance`]s, which the host or a pass may write.
 #[derive(Clone, Copy)]
 pub struct Instances<'a> {
-    address: u64,
+    instances: BufferSlice<'a, u8>,
     count: u32,
-    range: Range<u64>,
-    _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> Instances<'a> {
@@ -1551,18 +1574,16 @@ impl<'a> Instances<'a> {
             "an instance buffer's address has to be a multiple of 16"
         );
         Self {
-            address: instances.address(),
             count: instances.len() as u32,
-            range: instances.get_range(),
-            _marker: PhantomData,
+            instances: instances.bytes(),
         }
     }
 }
 
-impl Describe for Instances<'_> {
-    fn describe(&self, out: &mut SmallVec<[Described; 1]>) {
-        let mut described = instances_described(self.address, self.count);
-        described.inputs[0] = self.range;
+impl<'a> Describe<'a> for Instances<'a> {
+    fn describe(&self, out: &mut SmallVec<[Described<'a>; 1]>) {
+        let mut described = instances_described(self.instances.address(), self.count);
+        described.inputs[0] = Some(self.instances);
         out.push(described);
     }
 }
@@ -1637,12 +1658,12 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         scratch: &Scratch,
         update: bool,
     ) {
-        check_distinct(builds.iter().map(|(s, _)| s.handle), "builds");
+        check_distinct(builds.iter().map(|(s, _)| s.internal.handle), "builds");
         let (mut start, mut used) = (0, 0);
         for (i, (structure, _)) in builds.iter().enumerate() {
             let size = match update {
-                true => structure.update_scratch,
-                false => structure.build_scratch,
+                true => structure.internal.update_scratch,
+                false => structure.internal.build_scratch,
             };
             assert!(
                 size <= scratch.size(),
@@ -1673,10 +1694,10 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             scratch.address().is_multiple_of(alignment),
             "a scratch buffer's address has to be a multiple of {alignment}"
         );
-        check_distinct(builds.iter().map(|(s, _)| s.handle), "builds");
+        check_distinct(builds.iter().map(|(s, _)| s.internal.handle), "builds");
 
         let mut described: SmallVec<[SmallVec<[Described; 1]>; 1]> = SmallVec::new();
-        let mut accesses: SmallVec<[BufferAccess; 8]> = SmallVec::new();
+        let mut accesses: SmallVec<[BufferAccess<'_>; 8]> = SmallVec::new();
         // Each build's scratch address.
         let mut scratches: SmallVec<[u64; 1]> = SmallVec::new();
         let mut offset = 0;
@@ -1685,10 +1706,11 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             geometry.describe(&mut geometries);
             if update {
                 assert!(
-                    structure.flags.allow_update && structure.origin != Origin::Deserialized,
+                    structure.internal.flags.allow_update
+                        && structure.internal.origin != Origin::Deserialized,
                     "build {i}: only a structure with `allow_update` can be updated"
                 );
-                let Some(last) = self.rec.last_shapes(&structure.state) else {
+                let Some(last) = self.rec.last_shapes(&structure.internal.state) else {
                     panic!("build {i}: an update refits a structure that was built before");
                 };
                 assert_eq!(
@@ -1715,10 +1737,14 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
                 );
                 assert_eq!(
                     geometries.len(),
-                    structure.shapes.len(),
+                    structure.internal.shapes.len(),
                     "build {i}: a structure is built from as many geometries as it was created for"
                 );
-                for (g, (new, creation)) in geometries.iter().zip(&structure.shapes).enumerate() {
+                for (g, (new, creation)) in geometries
+                    .iter()
+                    .zip(&structure.internal.shapes)
+                    .enumerate()
+                {
                     assert!(
                         new.shape.fits(creation),
                         "build {i}: geometry {g} is {:?}, which doesn't fit the {creation:?} the \
@@ -1729,33 +1755,23 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
                 }
             }
             let size = match update {
-                true => structure.update_scratch,
-                false => structure.build_scratch,
+                true => structure.internal.update_scratch,
+                false => structure.internal.build_scratch,
             };
-            let chunk: Range<u64> =
-                (scratch.address() + offset..scratch.address() + offset + size).into();
-            scratches.push(chunk.start);
+            let chunk = BufferSlice::<u8>::new(scratch.buffer, scratch.address() + offset, size);
+            scratches.push(chunk.address());
             offset += size;
 
             let dst = if update { READ | WRITE } else { WRITE };
             accesses.push(structure.access(BUILD, dst));
-            accesses.push(BufferAccess {
-                unordered: false,
-                stage: BUILD,
-                access: READ | WRITE,
-                range: chunk,
-            });
+            accesses.push(chunk.access(BUILD, READ | WRITE));
             for input in geometries
                 .iter()
                 .flat_map(|g| g.inputs)
+                .flatten()
                 .filter(|r| !r.is_empty())
             {
-                accesses.push(BufferAccess {
-                    unordered: false,
-                    stage: BUILD,
-                    access: vk::AccessFlags2::SHADER_READ,
-                    range: input,
-                });
+                accesses.push(input.access(BUILD, vk::AccessFlags2::SHADER_READ));
             }
             described.push(geometries);
         }
@@ -1776,7 +1792,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             .flush_pending(std::iter::empty(), accesses.iter().cloned());
         for ((structure, _), geometries) in builds.iter().zip(&described) {
             let shapes = geometries.iter().map(|g| g.shape).collect();
-            self.rec.structure_built(&structure.state, shapes);
+            self.rec.structure_built(&structure.internal.state, shapes);
         }
 
         let geometries: SmallVec<[SmallVec<[vk::AccelerationStructureGeometryKHR; 1]>; 1]> =
@@ -1798,15 +1814,15 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             .map(|(((structure, _), geometries), &scratch)| {
                 let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                     .ty(L::TY)
-                    .flags(structure.flags.vk())
+                    .flags(structure.internal.flags.vk())
                     .geometries(geometries)
-                    .dst_acceleration_structure(structure.handle)
+                    .dst_acceleration_structure(structure.internal.handle)
                     .scratch_data(vk::DeviceOrHostAddressKHR {
                         device_address: scratch,
                     });
                 if update {
                     info.mode(vk::BuildAccelerationStructureModeKHR::UPDATE)
-                        .src_acceleration_structure(structure.handle)
+                        .src_acceleration_structure(structure.internal.handle)
                 } else {
                     info.mode(vk::BuildAccelerationStructureModeKHR::BUILD)
                 }
@@ -1838,7 +1854,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     ) {
         for structure in structures {
             assert!(
-                structure.flags.allow_compaction,
+                structure.internal.flags.allow_compaction,
                 "only structures with `allow_compaction` have a compacted size"
             );
         }
@@ -1877,7 +1893,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         self.rec
             .flush_pending(std::iter::empty(), accesses.iter().cloned());
         sizes.take(&self.rec, first, count);
-        let handles: SmallVec<[_; 8]> = structures.iter().map(|s| s.handle).collect();
+        let handles: SmallVec<[_; 8]> = structures.iter().map(|s| s.internal.handle).collect();
         unsafe {
             command_functions().cmd_write_acceleration_structures_properties(
                 self.rec.handle,
@@ -1893,7 +1909,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     #[track_caller]
     fn check_built<L: Level>(&self, structure: &AccelerationStructure<L>, what: &str) {
         assert!(
-            self.rec.last_shapes(&structure.state).is_some() || structure.is_built(),
+            self.rec.last_shapes(&structure.internal.state).is_some() || structure.is_built(),
             "{what} a structure that was built before"
         );
     }
@@ -1907,11 +1923,11 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         dst: &AccelerationStructure<L>,
     ) {
         assert!(
-            src.flags.allow_compaction,
+            src.internal.flags.allow_compaction,
             "only a structure with `allow_compaction` can be compacted"
         );
         assert!(
-            dst.origin == Origin::Compacted(src.handle),
+            dst.internal.origin == Origin::Compacted(src.internal.handle),
             "`compact` copies into a structure made by `compacted` of its source"
         );
         let mode = vk::CopyAccelerationStructureModeKHR::COMPACT;
@@ -1928,10 +1944,10 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         dst: &AccelerationStructure<L>,
     ) {
         assert!(
-            matches!(dst.origin, Origin::Copied { .. })
+            matches!(dst.internal.origin, Origin::Copied { .. })
                 && dst.size() >= src.size()
-                && dst.flags == src.flags
-                && dst.shapes == src.shapes,
+                && dst.internal.flags == src.internal.flags
+                && dst.internal.shapes == src.internal.shapes,
             "`copy_structure` copies into a structure made by `clone_target` of its source"
         );
         let mode = vk::CopyAccelerationStructureModeKHR::CLONE;
@@ -1946,7 +1962,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         mode: vk::CopyAccelerationStructureModeKHR,
         name: &'static str,
     ) {
-        let Some(shapes) = self.rec.last_shapes(&src.state).or_else(|| {
+        let Some(shapes) = self.rec.last_shapes(&src.internal.state).or_else(|| {
             // Built by another timeline's recording in flight, which the caller waits for.
             src.is_built().then(SmallVec::new)
         }) else {
@@ -1956,13 +1972,13 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         self.rec.enter(name, false);
         self.rec
             .flush_pending(std::iter::empty(), accesses.iter().cloned());
-        self.rec.structure_built(&dst.state, shapes);
+        self.rec.structure_built(&dst.internal.state, shapes);
         unsafe {
             command_functions().cmd_copy_acceleration_structure(
                 self.rec.handle,
                 &vk::CopyAccelerationStructureInfoKHR::default()
-                    .src(src.handle)
-                    .dst(dst.handle)
+                    .src(src.internal.handle)
+                    .dst(dst.internal.handle)
                     .mode(mode),
             )
         };
@@ -1997,7 +2013,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             command_functions().cmd_copy_acceleration_structure_to_memory(
                 self.rec.handle,
                 &vk::CopyAccelerationStructureToMemoryInfoKHR::default()
-                    .src(src.handle)
+                    .src(src.internal.handle)
                     .dst(vk::DeviceOrHostAddressKHR {
                         device_address: dst.address(),
                     })
@@ -2017,7 +2033,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         dst: &AccelerationStructure<L>,
     ) {
         assert!(
-            dst.origin == Origin::Deserialized,
+            dst.internal.origin == Origin::Deserialized,
             "`deserialize` writes a structure made by `AccelerationStructure::deserialized`"
         );
         assert!(
@@ -2034,13 +2050,14 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         self.rec.enter(name, false);
         self.rec
             .flush_pending(std::iter::empty(), accesses.iter().cloned());
-        self.rec.structure_built(&dst.state, SmallVec::new());
+        self.rec
+            .structure_built(&dst.internal.state, SmallVec::new());
         unsafe {
             command_functions().cmd_copy_memory_to_acceleration_structure(
                 self.rec.handle,
                 &vk::CopyMemoryToAccelerationStructureInfoKHR::default()
                     .src(const_address(src.address()))
-                    .dst(dst.handle)
+                    .dst(dst.internal.handle)
                     .mode(vk::CopyAccelerationStructureModeKHR::DESERIALIZE),
             )
         };

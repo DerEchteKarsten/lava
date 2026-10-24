@@ -46,8 +46,6 @@ pub(crate) struct Index {
     /// submitted, with their values: what host access checks (`Buffer::host`). A copy of
     /// `state`'s, so the check never waits for a recording.
     pub(crate) writes: Mutex<Vec<(Range<u64>, u64)>>,
-    /// The live timeline's staging ring, which dropped buffers and images forget their copies in.
-    pub(crate) staging: Mutex<Option<Arc<Staging>>>,
 }
 
 #[derive(Default)]
@@ -63,7 +61,6 @@ pub(crate) static INDICES: LazyLock<[Index; MAX_TIMELINES]> = LazyLock::new(|| {
         completed: AtomicU64::new(0),
         state: Mutex::default(),
         writes: Mutex::default(),
-        staging: Mutex::default(),
     })
 });
 
@@ -194,7 +191,6 @@ pub(crate) unsafe fn destroy() {
         state.pending = PendingAccesses::default();
         state.submitted = state.submitted.max(stamp);
         lock(&index.writes).clear();
-        *lock(&index.staging) = None;
     }
     *lock(&LIVE) = [false; MAX_TIMELINES];
 }

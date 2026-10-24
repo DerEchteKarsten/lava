@@ -1,8 +1,12 @@
-//! Format-, usage- and dimension-typed GPU images, with array layers for `D2Array`, with one view over all mips or one per mip (`VkImageView`s only for attachments, made on first use for layer and reinterpreting views; bindless descriptors need none), created only where the device supports their description, recreated at a new extent in their bindless slots (`fit`), host uploads (`host-image-copy`; staged ones are `Uploader::image` in `buffer/staging.rs`), type erasure, and their destruction once no frame can reach them
+//! Format-, usage- and dimension-typed GPU images, with array layers for `D2Array`, with one view over all mips or one per mip (`VkImageView`s only for attachments, made on first use for layer and reinterpreting views; bindless descriptors need none), created only where the device supports their description, recreated at a new extent in their bindless slots (`fit`), host uploads (`host-image-copy`; staged ones are `Uploader::image` in `buffer/staging.rs`), type erasure, and the internal their owners share (`ImageInternal`: the image, its memory, views, handles and tracked states, also of sparse, external and swapchain images), destroyed once the last owner dropped it and no frame can reach it
 use std::{
-    mem::{self, ManuallyDrop},
+    marker::PhantomData,
+    mem,
     range::Range,
-    sync::{Mutex, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
 };
 
 use crate::error::{Error, Result};
@@ -10,6 +14,7 @@ use crate::vk;
 use glam::UVec2;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
+use smallvec::SmallVec;
 
 #[cfg(feature = "host-image-copy")]
 use crate::{
@@ -20,7 +25,7 @@ use crate::{
 };
 
 use crate::{
-    bindless::{self, Allocatable, Combined, ImageHandle, Sampled, Storage},
+    bindless::{self, Allocatable, Combined, Dynamic, ImageHandle, Sampled, Storage},
     command_buffer::image_state::ImageState,
     global::Live,
     image::{
@@ -28,6 +33,7 @@ use crate::{
         usage::{ImageUsage, StaticUsage},
     },
     lifetime,
+    object::Header,
     queue::timeline::forget_image,
     state::{Ctx, Functions, ImageFormatKey},
 };
@@ -44,35 +50,6 @@ pub use kind::{
     StorageView, TransferDstView, TransferSrcView,
 };
 pub use slice::{Filter, ImageSlice, ImageView, TexelBuffer};
-
-pub(crate) use raw::RawImage;
-
-/// A public type in a private module: `Views::create` names it, while nothing outside lava can.
-mod raw {
-    use super::{Allocation, Dim, Format, ImageUsage, Live, ViewCache, vk};
-
-    /// The `vk::Image` and its memory. Only lava makes one, so only lava implements
-    /// [`Views`](super::Views).
-    #[derive(Debug)]
-    pub struct RawImage<F: Format, U: ImageUsage, D: Dim> {
-        pub(super) image: vk::Image,
-        pub(super) allocation: Allocation,
-        pub(super) extent: D::Extent,
-        pub(super) mip_levels: u32,
-        /// 1 unless `D` is `D2Array`.
-        pub(super) layers: u32,
-        pub(super) format: F,
-        pub(super) usage: U,
-        /// What it was created with besides its usage (`MUTABLE_FORMAT` and `EXTENDED_USAGE` of a
-        /// `MutableFormat` usage, the sparse flags of a `SparseImage`).
-        pub(crate) create_flags: vk::ImageCreateFlags,
-        /// The `VkImageView`s of views other than the image's own, made when a rendering first
-        /// needs one (`ImageView::vk_view`).
-        pub(super) cache: ViewCache,
-        /// Last, so it counts the image until its drop finished.
-        pub(super) live: Live,
-    }
-}
 
 fn has_attachment_usage(usage: vk::ImageUsageFlags) -> bool {
     usage.intersects(
@@ -165,6 +142,220 @@ impl ViewCache {
     }
 }
 
+/// A view an image keeps, with the handle of its bindless descriptors (null until it is bound).
+#[derive(Debug)]
+pub(crate) struct ViewSlot {
+    /// Null without attachment usage.
+    pub(crate) view: vk::ImageView,
+    handle: AtomicU32,
+}
+
+impl ViewSlot {
+    pub(crate) fn new(view: vk::ImageView, handle: ImageHandle) -> Self {
+        Self {
+            view,
+            handle: AtomicU32::new(handle.bits()),
+        }
+    }
+
+    pub(crate) fn handle(&self) -> ImageHandle {
+        ImageHandle::from_bits(self.handle.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_handle(&self, handle: ImageHandle) {
+        self.handle.store(handle.bits(), Ordering::Relaxed);
+    }
+
+    /// Its handle, which it no longer frees.
+    fn take_handle(&self) -> ImageHandle {
+        ImageHandle::from_bits(
+            self.handle
+                .swap(ImageHandle::<Dynamic>::NULL.bits(), Ordering::Relaxed),
+        )
+    }
+}
+
+/// Where an image's memory comes from.
+#[derive(Debug)]
+pub(crate) enum ImageMemory {
+    /// None bound yet (sparse images until their pages are, external ones until they are
+    /// allocated), or a null allocation.
+    Allocation(Allocation),
+    /// A dedicated allocation exported or imported (`ExternalImage`).
+    #[cfg(all(feature = "external-memory", unix))]
+    External(#[allow(dead_code, reason = "freed by its drop")] crate::external::Memory),
+    /// Pages bound one by one (`SparseImage`).
+    #[cfg(any(
+        feature = "sparse-residency-image-2d",
+        feature = "sparse-residency-image-3d"
+    ))]
+    Sparse(crate::sparse::Pages),
+    /// A swapchain's image, which the swapchain owns.
+    Swapchain,
+}
+
+impl ImageMemory {
+    fn free(self) {
+        match self {
+            ImageMemory::Allocation(allocation) => {
+                if let Err(err) = Ctx::allocator().free(allocation) {
+                    tracing::error!(%err, "failed to free image allocation");
+                }
+            }
+            // Their own drops free them.
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+}
+
+/// An image as lava owns it, shared by its [`Image`] (and the types made from it) and whatever
+/// else keeps it: the `vk::Image`, its memory, its views and their bindless handles, and its
+/// tracked states, destroyed with the last owner.
+#[derive(Debug)]
+pub(crate) struct ImageInternal {
+    pub(crate) image: vk::Image,
+    pub(crate) memory: ImageMemory,
+    pub(crate) format: vk::Format,
+    pub(crate) aspects: vk::ImageAspectFlags,
+    pub(crate) usage: vk::ImageUsageFlags,
+    pub(crate) mip_levels: u32,
+    /// 1 unless the image is a `D2Array` one.
+    pub(crate) layers: u32,
+    /// What it was created with besides its usage (`MUTABLE_FORMAT` and `EXTENDED_USAGE` of a
+    /// `MutableFormat` usage, the sparse flags of a `SparseImage`).
+    pub(crate) create_flags: vk::ImageCreateFlags,
+    /// The `VkImageView`s of views other than the image's own, made when a rendering first
+    /// needs one (`ImageView::vk_view`).
+    pub(crate) cache: ViewCache,
+    /// The view over every mip and layer.
+    pub(crate) whole: ViewSlot,
+    /// One view per mip of a `MipChain`, none otherwise.
+    pub(crate) mips: Vec<ViewSlot>,
+    /// Its tracked states: one for all mips, or one per mip of a `MipChain` (mip `i` at `i`).
+    pub(crate) states: Box<[AtomicU64]>,
+    /// Counts it as a lava user until its drop finished.
+    #[allow(dead_code, reason = "held for its count")]
+    pub(crate) header: Header,
+}
+
+impl ImageInternal {
+    /// Whether it has an attachment usage, so renderings need `VkImageView`s of its views.
+    pub(crate) fn attachment(&self) -> bool {
+        has_attachment_usage(self.usage)
+    }
+
+    /// A view of `mips` and every layer over every aspect where renderings need one
+    /// (attachment usages), else null: descriptors are written from a view's description,
+    /// without a view object.
+    fn create_view(&self, mips: Range<u32>, view_type: vk::ImageViewType) -> Result<vk::ImageView> {
+        if !self.attachment() {
+            return Ok(vk::ImageView::null());
+        }
+        let layers = (0..self.layers).into();
+        create_view(
+            self.image,
+            self.format,
+            self.aspects,
+            view_type,
+            mips,
+            layers,
+            self.usage,
+        )
+    }
+
+    /// The pages of a sparse image.
+    #[cfg(any(
+        feature = "sparse-residency-image-2d",
+        feature = "sparse-residency-image-3d"
+    ))]
+    pub(crate) fn sparse_pages(&self) -> &crate::sparse::Pages {
+        match &self.memory {
+            ImageMemory::Sparse(pages) => pages,
+            _ => unreachable!("only sparse images have pages"),
+        }
+    }
+
+    /// A swapchain's `image` with its one view (bound as `handle`), which the swapchain
+    /// destroys after this.
+    pub(crate) fn swapchain(
+        image: vk::Image,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        view: vk::ImageView,
+        handle: ImageHandle,
+    ) -> Self {
+        ImageInternal {
+            image,
+            memory: ImageMemory::Swapchain,
+            format,
+            aspects: vk::ImageAspectFlags::COLOR,
+            usage,
+            mip_levels: 1,
+            layers: 1,
+            create_flags: vk::ImageCreateFlags::empty(),
+            cache: ViewCache::default(),
+            whole: ViewSlot::new(view, handle),
+            mips: Vec::new(),
+            states: Box::new([ImageState::UNDEFINED.atomic()]),
+            header: Header::new(Live::internal()),
+        }
+    }
+}
+
+impl Drop for ImageInternal {
+    /// Destroys its views, frees their slots, forgets its pending accesses and destroys the
+    /// image and its memory, once no submission reaches it; a swapchain image's right away,
+    /// since its swapchain is only destroyed once none does.
+    fn drop(&mut self) {
+        let image = self.image;
+        let memory = mem::replace(
+            &mut self.memory,
+            ImageMemory::Allocation(Allocation::default()),
+        );
+        let mut views = self.cache.take();
+        let whole = self.whole.view;
+        views.push(whole);
+        // One mip's view is the whole view, destroyed once.
+        views.extend((self.mips.iter()).map(|m| m.view).filter(|&v| v != whole));
+        views.retain(|&view| view != vk::ImageView::null());
+        let handles: SmallVec<[ImageHandle; 1]> = std::iter::once(&self.whole)
+            .chain(&self.mips)
+            .map(|slot| slot.take_handle())
+            .collect();
+        for &handle in &handles {
+            bindless::forget_handle(handle);
+        }
+        let swapchain = matches!(memory, ImageMemory::Swapchain);
+        let destroy = move || {
+            for view in views {
+                unsafe { Ctx::device().destroy_image_view(view, None) };
+            }
+            for handle in handles {
+                bindless::free_handle(handle);
+            }
+            forget_image(image);
+            if !swapchain {
+                unsafe { Ctx::device().destroy_image(image, None) };
+            }
+            memory.free();
+        };
+        match swapchain {
+            true => destroy(),
+            false => lifetime::retire(destroy),
+        }
+    }
+}
+
+/// An image being made: the `vk::Image` with its description and maybe its memory, but no
+/// views yet ([`Image::from_raw`] makes those).
+pub(crate) struct RawImage<F: Format, U: ImageUsage, D: Dim> {
+    pub(crate) internal: ImageInternal,
+    extent: D::Extent,
+    format: F,
+    usage: U,
+}
+
 impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
     /// The `vk::Image` of the description, checked against the device, without memory
     /// (`allocate` binds lava's, a sparse image binds pages later, an external image its
@@ -232,24 +423,33 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
             create_info = create_info.push_next(&mut external_info);
         }
         let image = unsafe { Ctx::device().create_image(&create_info, None) }?;
-        // From here on `Drop` destroys the image (and frees its memory once it has some).
+        // From here on the internal's `Drop` destroys the image (and frees its memory once it
+        // has some).
         Ok(RawImage {
-            image,
-            allocation: Allocation::default(),
+            internal: ImageInternal {
+                image,
+                memory: ImageMemory::Allocation(Allocation::default()),
+                format: vk_format,
+                aspects: format.aspects(),
+                usage: usage_flags,
+                mip_levels,
+                layers,
+                create_flags: flags,
+                cache: ViewCache::default(),
+                whole: ViewSlot::new(vk::ImageView::null(), ImageHandle::NULL),
+                mips: Vec::new(),
+                states: Box::new([]),
+                header: Header::new(live),
+            },
             extent,
-            mip_levels,
-            layers,
             format,
             usage,
-            create_flags: flags,
-            cache: ViewCache::default(),
-            live,
         })
     }
 
     /// Allocates device-local memory from lava's allocator and binds it.
     fn allocate(&mut self) -> Result<()> {
-        let image = self.image;
+        let image = self.internal.image;
         let mut dedicated = vk::MemoryDedicatedRequirements::default();
         let requirements = {
             let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
@@ -275,238 +475,69 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
             name: "ImageMemory",
             requirements,
         };
-        self.allocation = Ctx::allocator().allocate(&desc)?;
-        unsafe {
-            Ctx::device().bind_image_memory(
-                image,
-                self.allocation.memory(),
-                self.allocation.offset(),
-            )?
+        let allocation = Ctx::allocator().allocate(&desc)?;
+        let bound = unsafe {
+            Ctx::device().bind_image_memory(image, allocation.memory(), allocation.offset())
         };
-        Ok(())
+        self.internal.memory = ImageMemory::Allocation(allocation);
+        Ok(bound?)
     }
 
     #[allow(dead_code)] // Sparse and external images'.
     pub(crate) fn handle(&self) -> vk::Image {
-        self.image
-    }
-
-    /// A view of `mips` and every layer over every aspect where renderings need one
-    /// (attachment usages), else null: descriptors are written from a view's description,
-    /// without a view object.
-    fn create_view(&self, mips: Range<u32>) -> Result<vk::ImageView> {
-        if !has_attachment_usage(self.usage.flags()) {
-            return Ok(vk::ImageView::null());
-        }
-        let format = self.format.vk_format();
-        let layers = (0..self.layers).into();
-        let usage = self.usage.flags();
-        create_view(
-            self.image,
-            format,
-            self.format.aspects(),
-            D::VIEW_TYPE,
-            mips,
-            layers,
-            usage,
-        )
-    }
-}
-
-impl<F: Format, U: ImageUsage, D: Dim> Drop for RawImage<F, U, D> {
-    fn drop(&mut self) {
-        let (image, allocation) = (self.image, mem::take(&mut self.allocation));
-        let views = self.cache.take();
-        lifetime::retire(move || {
-            for view in views {
-                unsafe { Ctx::device().destroy_image_view(view, None) };
-            }
-            forget_image(image);
-            unsafe { Ctx::device().destroy_image(image, None) };
-            if let Err(err) = Ctx::allocator().free(allocation) {
-                tracing::error!(%err, "failed to free image allocation");
-            }
-        });
+        self.internal.image
     }
 }
 
 /// What an image keeps per view: [`Single`] or [`PerMip`].
 pub trait Views: crate::sealed::Sealed + std::fmt::Debug + Send + Sync + 'static + Sized {
+    /// Whether it keeps a view, handle and state per mip.
     #[doc(hidden)]
-    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self>;
-    /// The view over every mip and aspect (null without attachment usage), its handle and the
-    /// states it covers.
-    #[doc(hidden)]
-    fn whole(&self) -> (vk::ImageView, ImageHandle, &[AtomicU64]);
-    #[doc(hidden)]
-    fn whole_handle(&mut self) -> &mut ImageHandle;
-    /// Every handle it keeps, with its mip for a mip's (`None` for the whole view's).
-    #[doc(hidden)]
-    fn handles_mut(&mut self, f: &mut dyn FnMut(Option<u32>, &mut ImageHandle));
+    const PER_MIP: bool;
 }
 
 /// Views with one view per mip besides the whole one: [`PerMip`].
-pub trait MipViews: Views {
-    /// Mip `level`'s view over every aspect (null without attachment usage) and its handle.
-    #[doc(hidden)]
-    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle);
-    #[doc(hidden)]
-    fn mip_handle_mut(&mut self, level: u32) -> &mut ImageHandle;
-}
+pub trait MipViews: Views {}
 
 /// One view, handle and layout for all mips: render targets and textures.
 #[derive(Debug)]
-pub struct Single {
-    view: vk::ImageView,
-    handle: ImageHandle,
-    /// Boxed, so a staged upload reaches it while the image moves (`Uploader::image`).
-    state: Box<AtomicU64>,
-}
+pub enum Single {}
 
 /// The whole view plus a view, handle and layout per mip, for images whose mips the GPU
 /// accesses one at a time.
 #[derive(Debug)]
-pub struct PerMip {
-    view: vk::ImageView,
-    handle: ImageHandle,
-    mips: Box<[MipView]>,
-    layouts: Box<[AtomicU64]>,
-}
-
-#[derive(Debug)]
-struct MipView {
-    view: vk::ImageView,
-    handle: ImageHandle,
-}
-
-fn undefined() -> AtomicU64 {
-    ImageState::UNDEFINED.atomic()
-}
+pub enum PerMip {}
 
 impl crate::sealed::Sealed for Single {}
 impl Views for Single {
-    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
-        Ok(Single {
-            view: raw.create_view((0..raw.mip_levels).into())?,
-            handle: ImageHandle::NULL,
-            state: Box::new(undefined()),
-        })
-    }
-    fn whole(&self) -> (vk::ImageView, ImageHandle, &[AtomicU64]) {
-        (self.view, self.handle, std::slice::from_ref(&*self.state))
-    }
-    fn whole_handle(&mut self) -> &mut ImageHandle {
-        &mut self.handle
-    }
-    fn handles_mut(&mut self, f: &mut dyn FnMut(Option<u32>, &mut ImageHandle)) {
-        f(None, &mut self.handle);
-    }
+    const PER_MIP: bool = false;
 }
 
 impl crate::sealed::Sealed for PerMip {}
 impl Views for PerMip {
-    fn create<F: Format, U: ImageUsage, D: Dim>(raw: &RawImage<F, U, D>) -> Result<Self> {
-        // Built up front, so `Drop` destroys whatever was created before an error.
-        let mut views = PerMip {
-            view: vk::ImageView::null(),
-            handle: ImageHandle::NULL,
-            mips: Box::new([]),
-            layouts: (0..raw.mip_levels).map(|_| undefined()).collect(),
-        };
-        views.view = raw.create_view((0..raw.mip_levels).into())?;
-        let mut mips = Vec::with_capacity(raw.mip_levels as usize);
-        for mip in 0..raw.mip_levels {
-            // One mip's view is the whole view (destroyed once, see `Drop`).
-            let view = match raw.mip_levels {
-                1 => Ok(views.view),
-                _ => raw.create_view((mip..mip + 1).into()),
-            };
-            match view {
-                Ok(view) => mips.push(MipView {
-                    view,
-                    handle: ImageHandle::NULL,
-                }),
-                Err(err) => {
-                    views.mips = mips.into();
-                    return Err(err);
-                }
-            }
-        }
-        views.mips = mips.into();
-        Ok(views)
-    }
-    fn whole(&self) -> (vk::ImageView, ImageHandle, &[AtomicU64]) {
-        (self.view, self.handle, &self.layouts)
-    }
-    fn whole_handle(&mut self) -> &mut ImageHandle {
-        &mut self.handle
-    }
-    fn handles_mut(&mut self, f: &mut dyn FnMut(Option<u32>, &mut ImageHandle)) {
-        f(None, &mut self.handle);
-        for (mip, view) in self.mips.iter_mut().enumerate() {
-            f(Some(mip as u32), &mut view.handle);
-        }
-    }
+    const PER_MIP: bool = true;
 }
-
-impl MipViews for PerMip {
-    fn mip(&self, level: u32) -> (vk::ImageView, ImageHandle) {
-        let mip = &self.mips[level as usize];
-        (mip.view, mip.handle)
-    }
-    fn mip_handle_mut(&mut self, level: u32) -> &mut ImageHandle {
-        &mut self.mips[level as usize].handle
-    }
-}
-
-fn release(view: vk::ImageView, handle: ImageHandle) {
-    bindless::free_handle(handle);
-    if view != vk::ImageView::null() {
-        unsafe { Ctx::device().destroy_image_view(view, None) };
-    }
-}
-
-impl Drop for Single {
-    fn drop(&mut self) {
-        let (view, handle) = (self.view, self.handle);
-        bindless::forget_handle(handle);
-        lifetime::retire(move || release(view, handle));
-    }
-}
-
-impl Drop for PerMip {
-    fn drop(&mut self) {
-        let (view, handle, mips) = (self.view, self.handle, mem::take(&mut self.mips));
-        bindless::forget_handle(handle);
-        for mip in &mips {
-            bindless::forget_handle(mip.handle);
-        }
-        lifetime::retire(move || {
-            release(view, handle);
-            for mip in &mips {
-                let own = mip.view != view;
-                release(
-                    if own { mip.view } else { vk::ImageView::null() },
-                    mip.handle,
-                );
-            }
-        });
-    }
-}
+impl MipViews for PerMip {}
 
 /// An image of format `F`, usage `U` and dimension `D`. Static format and usage types are
 /// checked at compile time, `format::Dynamic`/`usage::Dynamic` values at runtime.
-#[derive(Debug)]
 pub struct Image<F: Format, U: ImageUsage, D: Dim = D2, V: Views = Single> {
-    // Dropped in this order: the views and their handles first, then the image.
-    views: V,
-    raw: RawImage<F, U, D>,
+    pub(crate) internal: Arc<ImageInternal>,
+    extent: D::Extent,
+    format: F,
+    usage: U,
+    _views: PhantomData<fn() -> V>,
 }
 
-impl<F: Format, U: ImageUsage, D: Dim, V: Views> Drop for Image<F, U, D, V> {
-    fn drop(&mut self) {
-        // Before its states go with its views.
-        crate::buffer::staging::forget_image(self.raw.image);
+impl<F: Format, U: ImageUsage, D: Dim, V: Views> std::fmt::Debug for Image<F, U, D, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Image")
+            .field("image", &self.internal.image)
+            .field("format", &self.internal.format)
+            .field("extent", &self.extent)
+            .field("mip_levels", &self.internal.mip_levels)
+            .field("layers", &self.internal.layers)
+            .finish()
     }
 }
 
@@ -591,13 +622,39 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         Self::from_raw(raw)
     }
 
-    /// The image of `raw`, whose memory is bound (or sparse), with its views.
+    /// The image of `raw`, whose memory is bound (or sparse), with its views and states.
     pub(crate) fn from_raw(raw: RawImage<F, U, D>) -> Result<Self> {
+        let RawImage {
+            mut internal,
+            extent,
+            format,
+            usage,
+        } = raw;
+        let levels = internal.mip_levels;
+        let states = if V::PER_MIP { levels } else { 1 };
+        internal.states = (0..states)
+            .map(|_| ImageState::UNDEFINED.atomic())
+            .collect();
+        // Set one by one, so the internal's `Drop` destroys whatever was made before an error.
+        internal.whole.view = internal.create_view((0..levels).into(), D::VIEW_TYPE)?;
+        if V::PER_MIP {
+            for mip in 0..levels {
+                let view = match levels {
+                    1 => internal.whole.view,
+                    _ => internal.create_view((mip..mip + 1).into(), D::VIEW_TYPE)?,
+                };
+                internal.mips.push(ViewSlot::new(view, ImageHandle::NULL));
+            }
+        }
         Ok(Image {
-            views: V::create(&raw)?,
-            raw,
+            internal: Arc::new(internal),
+            extent,
+            format,
+            usage,
+            _views: PhantomData,
         })
     }
+
     /// Recreates the image at `extent` unless it has that extent already, with the same
     /// format, usage, mips and layers, and returns whether it did. The new image keeps the
     /// bindless slots of the old one's `bind_*` bindings: their descriptors are rewritten in
@@ -610,7 +667,7 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     /// (too few texels for its mips); panics on a thread that is recording.
     #[validation_trace]
     pub fn fit(&mut self, extent: D::Extent) -> Result<bool> {
-        if self.raw.extent == extent {
+        if self.extent == extent {
             return Ok(false);
         }
         assert!(
@@ -618,28 +675,25 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
             "`Image::fit` is called inside a recording, whose commands would read the old \
              descriptors: fit images before `submit`"
         );
-        let raw = &self.raw;
+        let old = &self.internal;
         let mut new = RawImage::<F, U, D>::create(
-            raw.format,
-            raw.usage,
+            self.format,
+            self.usage,
             extent,
-            raw.mip_levels,
-            raw.layers,
-            raw.create_flags,
+            old.mip_levels,
+            old.layers,
+            old.create_flags,
             vk::ExternalMemoryHandleTypeFlags::empty(),
         )?;
         new.allocate()?;
-        let mut new = Image::<F, U, D, V>::from_raw(new)?;
+        let new = Image::<F, U, D, V>::from_raw(new)?;
         // The new views take the old ones' slots, which the old views then don't free.
-        let mut handles = Vec::new();
-        self.views.handles_mut(&mut |mip, handle| {
-            handles.push((mip, std::mem::replace(handle, ImageHandle::NULL)));
-        });
-        let mut moved = handles.iter();
-        new.views.handles_mut(&mut |_, handle| {
-            *handle = moved.next().expect("the same views").1;
-        });
-        for &(mip, handle) in &handles {
+        let whole = std::iter::once((&old.whole, &new.internal.whole, None));
+        let mips = (old.mips.iter().zip(&new.internal.mips).enumerate())
+            .map(|(mip, (old, new))| (old, new, Some(mip as u32)));
+        for (old_slot, new_slot, mip) in whole.chain(mips) {
+            let handle = old_slot.take_handle();
+            new_slot.set_handle(handle);
             if handle.is_null() {
                 continue;
             }
@@ -661,37 +715,41 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     /// The same image named `name`, for debuggers, the validation layer (with debug utils,
     /// `Config::validation`) and allocator reports.
     pub fn named(mut self, name: &str) -> Self {
-        if let Err(err) = Ctx::allocator().rename_allocation(&mut self.raw.allocation, name) {
+        // Only an allocation nothing else holds yet can be renamed.
+        if let Some(internal) = Arc::get_mut(&mut self.internal)
+            && let ImageMemory::Allocation(allocation) = &mut internal.memory
+            && let Err(err) = Ctx::allocator().rename_allocation(allocation, name)
+        {
             tracing::warn!(%err, "failed to name an image's allocation");
         }
-        Functions::set_debug_name(name, self.raw.image);
+        Functions::set_debug_name(name, self.internal.image);
         self
     }
 
     /// The extent of mip 0.
     pub fn extent(&self) -> D::Extent {
-        self.raw.extent
+        self.extent
     }
 
     pub fn mip_levels(&self) -> u32 {
-        self.raw.mip_levels
+        self.internal.mip_levels
     }
 
     /// Its array layers: 1 unless it is a `D2Array` image made `with_layers`.
     pub fn layers(&self) -> u32 {
-        self.raw.layers
+        self.internal.layers
     }
 
     pub fn mip_extent(&self, level: u32) -> D::Extent {
-        D::mip_extent(self.raw.extent, level)
+        D::mip_extent(self.extent, level)
     }
 
     pub fn format(&self) -> F {
-        self.raw.format
+        self.format
     }
 
     pub fn usage(&self) -> U {
-        self.raw.usage
+        self.usage
     }
 
     /// The whole view's handle as `K`; panics unless it is bound with `K`'s descriptors (see
@@ -703,38 +761,34 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 
     /// Panics unless the usage has every flag of `required`; does nothing for a static usage.
     pub fn usage_check(&self, required: vk::ImageUsageFlags) {
-        self.raw.usage.check(required);
+        self.usage.check(required);
     }
 
     /// The view over every mip and layer.
     pub fn whole_view(&self) -> ImageView<'_, F, U, D> {
-        let (view, handle, states) = self.views.whole();
-        self.view(view, (0..self.raw.mip_levels).into(), handle, states)
+        let whole = &self.internal.whole;
+        self.view(
+            whole.view,
+            (0..self.internal.mip_levels).into(),
+            whole.handle(),
+        )
     }
 
-    fn view<'a>(
-        &'a self,
+    fn view(
+        &self,
         view: vk::ImageView,
         mip_range: Range<u32>,
         handle: ImageHandle,
-        states: &'a [AtomicU64],
-    ) -> ImageView<'a, F, U, D> {
-        let attachment = has_attachment_usage(self.raw.usage.flags());
+    ) -> ImageView<'_, F, U, D> {
         ImageView {
-            image: self.raw.image,
+            internal: &self.internal,
             view,
             mip_range,
-            layers: (0..self.raw.layers).into(),
+            layers: (0..self.internal.layers).into(),
             extent: self.mip_extent(mip_range.start),
             handle,
-            states,
-            cache: attachment.then_some(&self.raw.cache),
-            mutable: self
-                .raw
-                .create_flags
-                .contains(vk::ImageCreateFlags::MUTABLE_FORMAT),
-            format: self.raw.format,
-            usage: self.raw.usage,
+            format: self.format,
+            usage: self.usage,
             dim: D::default(),
         }
     }
@@ -743,34 +797,22 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     /// the usage no more than its own.
     pub fn cast<NF: Format, NU: ImageUsage>(self, format: NF, usage: NU) -> Image<NF, NU, D, V> {
         slice::cast_check(
-            (self.raw.format.vk_format(), self.raw.usage.flags()),
+            (self.format.vk_format(), self.usage.flags()),
             (format.vk_format(), usage.flags()),
         );
-        let this = ManuallyDrop::new(self);
-        // SAFETY: `this` is never dropped, so its views and image move out once.
-        let (views, raw) = unsafe { (std::ptr::read(&this.views), std::ptr::read(&this.raw)) };
-        let mut raw = ManuallyDrop::new(raw);
         Image {
-            views,
-            raw: RawImage {
-                image: raw.image,
-                allocation: mem::take(&mut raw.allocation),
-                extent: raw.extent,
-                mip_levels: raw.mip_levels,
-                layers: raw.layers,
-                format,
-                usage,
-                create_flags: raw.create_flags,
-                cache: mem::take(&mut raw.cache),
-                live: mem::replace(&mut raw.live, Live::internal()),
-            },
+            internal: self.internal,
+            extent: self.extent,
+            format,
+            usage,
+            _views: PhantomData,
         }
     }
 
     /// The same image with its format and usage as runtime values.
     pub fn erase(self) -> DynamicImage<D, V> {
-        let format = format::Dynamic(self.raw.format.vk_format());
-        let usage = usage::Dynamic(self.raw.usage.flags());
+        let format = format::Dynamic(self.format.vk_format());
+        let usage = usage::Dynamic(self.usage.flags());
         self.cast(format, usage)
     }
 }
@@ -806,14 +848,15 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         self.bind_whole::<Combined>()
     }
 
-    fn bind_whole<K: Allocatable>(mut self) -> Result<Self> {
-        let handle = self.views.whole_handle();
+    fn bind_whole<K: Allocatable>(self) -> Result<Self> {
+        let whole = &self.internal.whole;
+        let handle = whole.handle();
         assert!(
             handle.is_null(),
             "the image is bound already ({handle:?}): bind it once, with `bind_combined` for both descriptors"
         );
-        *handle = ImageHandle::<K>::new(bindless::allocate(K::WIDTH)?).erase();
-        let bound = *handle;
+        let bound = ImageHandle::<K>::new(bindless::allocate(K::WIDTH)?).erase();
+        whole.set_handle(bound);
         bindless::bind_raw([self.whole_view().shader_image()], [bound], false)?;
         Ok(self)
     }
@@ -822,29 +865,26 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
 impl<F: Format, U: ImageUsage, D: Dim, V: MipViews> Image<F, U, D, V> {
     /// The view of mip `level` alone, sized `mip_extent(level)`.
     pub fn mip_view(&self, level: u32) -> ImageView<'_, F, U, D> {
-        let (view, handle) = self.views.mip(level);
-        let (_, _, states) = self.views.whole();
-        self.view(view, (level..level + 1).into(), handle, states)
+        let mip = &self.internal.mips[level as usize];
+        self.view(mip.view, (level..level + 1).into(), mip.handle())
     }
 
-    fn bind_mips<K: Allocatable>(mut self) -> Result<Self> {
-        let levels = 0..self.mip_levels();
+    fn bind_mips<K: Allocatable>(self) -> Result<Self> {
+        let mips = &self.internal.mips;
         assert!(
-            levels
-                .clone()
-                .all(|level| self.views.mip(level).1.is_null()),
+            mips.iter().all(|mip| mip.handle().is_null()),
             "the mips are bound already: bind them once, with `bind_mips_combined` for both descriptors"
         );
-        let first = bindless::allocate(levels.len() as u32 * K::WIDTH)?;
-        for level in levels.clone() {
-            *self.views.mip_handle_mut(level) =
-                ImageHandle::<K>::new(first + level * K::WIDTH).erase();
+        let first = bindless::allocate(mips.len() as u32 * K::WIDTH)?;
+        for (level, mip) in mips.iter().enumerate() {
+            mip.set_handle(ImageHandle::<K>::new(first + level as u32 * K::WIDTH).erase());
         }
+        let levels = 0..self.mip_levels();
         bindless::bind_raw(
             levels
                 .clone()
                 .map(|level| self.mip_view(level).shader_image()),
-            levels.map(|level| self.views.mip(level).1),
+            mips.iter().map(|mip| mip.handle()),
             false,
         )?;
         Ok(self)
@@ -934,7 +974,7 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
             dim::box_inside(o, e, m) && !dim::box_is_empty(e),
             "region {extent:?} at {offset:?} does not fit mip level {mip_level} of size {mip_extent:?}"
         );
-        let format = self.raw.format;
+        let format = self.format;
         let block = slice::copy_block_of(&format, format.aspects());
         slice::check_whole_blocks(block, format.vk_format(), o, e, m);
         self.check_data_len(data, extent, (row_length, image_height), || {
@@ -948,12 +988,12 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
         // The image exists, so the device has host copies.
         self.usage_check(vk::ImageUsageFlags::HOST_TRANSFER_EXT);
         assert!(
-            mip_level < self.raw.mip_levels,
+            mip_level < self.internal.mip_levels,
             "mip level {mip_level} is out of range for an image with {} levels",
-            self.raw.mip_levels
+            self.internal.mip_levels
         );
         assert!(!data.is_empty(), "no texel data to copy");
-        let aspects = self.raw.format.aspects();
+        let aspects = self.format.aspects();
         assert!(
             slice::single_aspect(aspects) == aspects,
             "host copies of combined depth-stencil formats aren't supported: their texel data has no single layout"
@@ -968,9 +1008,9 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
         rows: (u32, u32),
         what: impl FnOnce() -> String,
     ) {
-        let format = self.raw.format;
+        let format = self.format;
         let block = slice::copy_block_of(&format, format.aspects());
-        let expected = slice::rows_len(block, D::extent_3d(extent), self.raw.layers, rows);
+        let expected = slice::rows_len(block, D::extent_3d(extent), self.internal.layers, rows);
         if rows == (0, 0) {
             assert!(
                 data.len() == expected,
@@ -998,14 +1038,17 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
         extent: D::Extent,
         (row_length, image_height): (u32, u32),
     ) -> Result<()> {
-        let image = self.raw.image;
-        let aspect = self.raw.format.aspects();
-        let (_, _, states) = self.views.whole();
+        let image = self.internal.image;
+        let aspect = self.format.aspects();
+        let states = &self.internal.states;
         // A host copy is no queue's access, so the image keeps its owner. The states move only
         // once the transition succeeded.
         let mut transitions: smallvec::SmallVec<[vk::HostImageLayoutTransitionInfoEXT; 1]> =
             smallvec::SmallVec::new();
-        let (mips, general) = ((0..self.raw.mip_levels).into(), vk::ImageLayout::GENERAL);
+        let (mips, general) = (
+            (0..self.internal.mip_levels).into(),
+            vk::ImageLayout::GENERAL,
+        );
         host_layouts(states, mips, general, |mips, old_layout| {
             transitions.push(
                 vk::HostImageLayoutTransitionInfoEXT::default()
@@ -1033,7 +1076,7 @@ impl<F: Format, U: IsHostCopy, D: Dim, V: Views> Image<F, U, D, V> {
                 aspect_mask: aspect,
                 mip_level,
                 base_array_layer: 0,
-                layer_count: self.raw.layers,
+                layer_count: self.internal.layers,
             })
             // 0: rows as long as the region is wide, also right for a mip narrower than its
             // block.

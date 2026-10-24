@@ -778,7 +778,7 @@ pub(crate) struct ShaderImage {
 impl<F: Format, U: ImageUsage, D: Dim> ImageView<'_, F, U, D> {
     pub(crate) fn shader_image(&self) -> ShaderImage {
         ShaderImage {
-            image: self.image,
+            image: self.image(),
             format: self.format.vk_format(),
             aspects: self.format.aspects(),
             view_type: D::VIEW_TYPE,

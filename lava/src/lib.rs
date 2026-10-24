@@ -119,6 +119,7 @@ pub mod half;
 pub mod image;
 mod lifetime;
 pub mod memory;
+mod object;
 pub mod pipeline;
 pub mod present;
 pub mod query;

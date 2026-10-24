@@ -69,7 +69,7 @@ unsized_struct! {
     } sections {
         push_constants: [u8; P],
         images: [ImageUse<'a>; I],
-        buffers: [BufferAccess; B],
+        buffers: [BufferAccess<'a>; B],
         constants: [u8; C],
     }
 }
@@ -81,7 +81,7 @@ pub struct Sections<'s, 'a> {
     pub pass: usize,
     pub push_constants: &'s [u8],
     images: &'s [ImageUse<'a>],
-    buffers: &'s [BufferAccess],
+    buffers: &'s [BufferAccess<'a>],
     stages: vk::PipelineStageFlags2,
     extra: Accesses<'a>,
     pub constants: &'s [u8],
@@ -99,7 +99,7 @@ impl<'s, 'a> Sections<'s, 'a> {
     }
 
     /// The buffer accesses of its fields, then its extra `Accesses` at the pass's stages.
-    pub fn buffers(self) -> impl Iterator<Item = BufferAccess> + Clone {
+    pub fn buffers(self) -> impl Iterator<Item = BufferAccess<'a>> + Clone {
         let stages = self.stages;
         let extra = self.extra.buffers.iter().cloned().map(move |mut buffer| {
             buffer.stage = stages;
@@ -159,7 +159,7 @@ impl<'a, K: kind::Kind, const P: usize, const I: usize, const B: usize>
         pass: usize,
         bindings: &G,
         images: [ImageUse<'a>; I],
-        buffers: [BufferAccess; B],
+        buffers: [BufferAccess<'a>; B],
         accesses: Option<Accesses<'a>>,
     ) -> Self {
         const { assert!(P <= MAX_PUSH_CONSTANTS_SIZE) };
@@ -200,7 +200,7 @@ impl<'a, K: kind::Kind, const P: usize, const I: usize, const B: usize>
         self,
         constants: &G,
         images: [ImageUse<'a>; I2],
-        buffers: [BufferAccess; B2],
+        buffers: [BufferAccess<'a>; B2],
     ) -> Bindings<'a, K, P, IO, BO, C> {
         const { assert!(IO == I + I2 && BO == B + B2) };
         debug_assert!(

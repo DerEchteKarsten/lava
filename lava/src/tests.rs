@@ -1,5 +1,8 @@
 //! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, texel blocks, format components, the format table's texel sizes, copy sizes with row pitches, 64-bit clear values and format compatibility classes, runtime formats' and usages' checks, buffer and image cast checks, mip extents and boxes, the slot allocator (double frees included) and image handle bits, the staging ring's positions, the descriptor heap layout, feature detection (every feature's extensions detect it), feature prerequisites (`consistent`), `without`/`missing_from`, the capability scan and the manifest's cargo names, pipeline cache headers, raster pipeline keys (borrowed keys hash like owned ones) and baked draw state, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads (instances byte for byte, binding table regions), topology classes and render areas, half floats, copy region overlaps, and `unsized_struct!`'s read-back
-use std::{iter, sync::atomic::AtomicU64};
+use std::{
+    iter,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
 
@@ -12,11 +15,14 @@ use crate::{
         pending::{MAX_PENDING_BUFFER_WRITES, PendingAccesses},
     },
     features::{DeviceFacts, FeatureChain, Features, Needs},
+    global::Live,
     image::{
+        ImageInternal, ImageMemory, ViewCache, ViewSlot,
         format::{self, Block, ClearValue, Format},
         slice::rows_len,
         usage::{ImageUsage, StaticUsage, Usage, usage},
     },
+    object::Header,
     queue::{FamilyInfo, Kind},
     vkobjects::physical_device::{QueueFamily, pick_queue_families},
 };
@@ -43,20 +49,21 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
         .unwrap_or_default()
 }
 
-fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess {
+fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess<'static> {
     BufferAccess {
         unordered: false,
         stage,
         access,
         range: range.into(),
+        buffer: None,
     }
 }
 
-fn read(range: std::ops::Range<u64>) -> BufferAccess {
+fn read(range: std::ops::Range<u64>) -> BufferAccess<'static> {
     buffer(S::VERTEX_SHADER, A::SHADER_STORAGE_READ, range)
 }
 
-fn write(range: std::ops::Range<u64>) -> BufferAccess {
+fn write(range: std::ops::Range<u64>) -> BufferAccess<'static> {
     buffer(S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE, range)
 }
 
@@ -69,14 +76,39 @@ fn state(layout: L, owner: Option<Kind>) -> ImageState {
     }
 }
 
-/// An access of image `id` with its own tracked state, which starts as `old`.
-fn image(id: u64, stage: S, access: A, old: ImageState, layout: L) -> ImageUse<'static> {
-    let states = std::slice::from_ref(Box::leak(Box::new(old.atomic())));
-    image_use(id, states, stage, access, layout)
+/// An image `id` with tracked states starting as `states`, never dropped (its `Drop` needs a
+/// context).
+fn tracked(id: u64, states: impl IntoIterator<Item = ImageState>) -> &'static Arc<ImageInternal> {
+    Box::leak(Box::new(Arc::new(ImageInternal {
+        image: vk::Image::from_raw(id),
+        memory: ImageMemory::Allocation(Default::default()),
+        format: vk::Format::R8G8B8A8_UNORM,
+        aspects: vk::ImageAspectFlags::COLOR,
+        usage: vk::ImageUsageFlags::SAMPLED,
+        mip_levels: 1,
+        layers: 1,
+        create_flags: vk::ImageCreateFlags::empty(),
+        cache: ViewCache::default(),
+        whole: ViewSlot::new(vk::ImageView::null(), ImageHandle::NULL),
+        mips: Vec::new(),
+        states: states.into_iter().map(ImageState::atomic).collect(),
+        header: Header::new(Live::internal()),
+    })))
 }
 
-/// An access of mip 0 of image `id`, whose tracked states are `states`.
-fn image_use<'a>(id: u64, states: &'a [AtomicU64], stage: S, access: A, layout: L) -> ImageUse<'a> {
+/// An access of image `id` with its own tracked state, which starts as `old`.
+fn image(id: u64, stage: S, access: A, old: ImageState, layout: L) -> ImageUse<'static> {
+    image_use(id, tracked(id, [old]), stage, access, layout)
+}
+
+/// An access of mip 0 of image `id`, whose tracked states are `internal`'s.
+fn image_use<'a>(
+    id: u64,
+    internal: &'a Arc<ImageInternal>,
+    stage: S,
+    access: A,
+    layout: L,
+) -> ImageUse<'a> {
     ImageUse {
         access: ImageAccess {
             stage,
@@ -86,7 +118,7 @@ fn image_use<'a>(id: u64, states: &'a [AtomicU64], stage: S, access: A, layout: 
             aspect: vk::ImageAspectFlags::COLOR,
             mip_range: (0..1).into(),
         },
-        states,
+        internal,
     }
 }
 
@@ -303,7 +335,7 @@ fn ownership_moves_through_release_and_acquire() {
     );
     assert!(barriers.images.is_empty(), "same layout");
     assert_eq!(
-        ImageState::load(&access.states[0]).owner,
+        ImageState::load(&access.states()[0]).owner,
         Some(Kind::Graphics)
     );
 }
@@ -351,8 +383,8 @@ fn releasing_one_mip_keeps_the_others() {
 /// attachment write before it.
 #[test]
 fn transitions_are_writes_at_their_destination() {
-    let states = [ImageState::UNDEFINED.atomic()];
-    let at = |stage, access, layout| image_use(1, &states, stage, access, layout);
+    let image = tracked(1, [ImageState::UNDEFINED]);
+    let at = |stage, access, layout| image_use(1, image, stage, access, layout);
     let mut pending = PendingAccesses::default();
     let target = at(
         S::COLOR_ATTACHMENT_OUTPUT,
@@ -405,13 +437,13 @@ fn acquires_are_writes_and_transitions_follow_them() {
         released_to: Some(Kind::Graphics),
         ..state(L::GENERAL, Some(Kind::Compute))
     };
-    let states = [released.atomic()];
+    let image = tracked(2, [released]);
     let mut pending = PendingAccesses::default();
     let sampled = flush_barriers(
         &mut pending,
         &[image_use(
             2,
-            &states,
+            image,
             S::FRAGMENT_SHADER,
             A::SHADER_SAMPLED_READ,
             L::GENERAL,
@@ -424,7 +456,7 @@ fn acquires_are_writes_and_transitions_follow_them() {
         &mut pending,
         &[image_use(
             2,
-            &states,
+            image,
             S::TRANSFER,
             A::TRANSFER_READ,
             L::GENERAL,
@@ -438,14 +470,14 @@ fn acquires_are_writes_and_transitions_follow_them() {
     );
 
     // A stale access of the image on this timeline doesn't stand in for the acquire.
-    let states = [released.atomic()];
+    let image = tracked(3, [released]);
     let mut pending = PendingAccesses::default();
     pending.record(
         1,
         iter::once(
             image_use(
                 3,
-                &states,
+                image,
                 S::COMPUTE_SHADER,
                 A::SHADER_STORAGE_WRITE,
                 L::GENERAL,
@@ -456,7 +488,7 @@ fn acquires_are_writes_and_transitions_follow_them() {
     );
     let target = image_use(
         3,
-        &states,
+        image,
         S::COLOR_ATTACHMENT_OUTPUT,
         A::COLOR_ATTACHMENT_WRITE,
         L::ATTACHMENT_OPTIMAL,
@@ -526,11 +558,12 @@ fn transitions_wait_only_for_what_can_still_run() {
     .unwrap();
     assert_eq!(old.images[0].src_stage_mask, S::ALL_COMMANDS);
 
-    let states = [state(L::GENERAL, Some(Kind::Graphics)).atomic()];
+    let image = tracked(6, [state(L::GENERAL, Some(Kind::Graphics))]);
+    let states: &[AtomicU64] = &image.states;
     let target = |access| {
         image_use(
             6,
-            &states,
+            image,
             S::COLOR_ATTACHMENT_OUTPUT,
             access,
             L::ATTACHMENT_OPTIMAL,

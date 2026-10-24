@@ -13,11 +13,10 @@ use crate::{
     features::{Feature, gate},
     global::Live,
     image::{
-        D2, Dim, Image, RawImage, Single,
+        D2, Dim, Image, ImageMemory, RawImage, Single,
         format::{Format, StaticFormat},
         usage::{ImageUsage, StaticUsage},
     },
-    lifetime,
     state::{Ctx, Functions},
     vk,
 };
@@ -56,31 +55,27 @@ impl HandleType {
     }
 }
 
-/// A dedicated `VkDeviceMemory` an external resource owns, freed once no submission reaches
-/// it (after the resource it is bound to, which is dropped first).
+/// A dedicated `VkDeviceMemory` an external resource owns, which its internal frees after the
+/// resource.
 #[derive(Debug)]
-struct Memory {
+pub(crate) struct Memory {
     memory: vk::DeviceMemory,
-    handle_type: HandleType,
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        let memory = self.memory;
-        lifetime::retire(move || unsafe { Ctx::device().free_memory(memory, None) });
+        unsafe { Ctx::device().free_memory(self.memory, None) };
     }
 }
 
-impl Memory {
-    /// Exports the memory as a new file descriptor of its handle type.
-    fn export(&self) -> Result<OwnedFd> {
-        let info = vk::MemoryGetFdInfoKHR::default()
-            .memory(self.memory)
-            .handle_type(self.handle_type.flags());
-        let fd = unsafe { Functions::external_memory_fd().get_memory_fd(&info)? };
-        // SAFETY: Vulkan made the descriptor for the caller, who owns it now.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
+/// Exports `memory` as a new file descriptor of `handle_type`.
+fn export(memory: vk::DeviceMemory, handle_type: HandleType) -> Result<OwnedFd> {
+    let info = vk::MemoryGetFdInfoKHR::default()
+        .memory(memory)
+        .handle_type(handle_type.flags());
+    let fd = unsafe { Functions::external_memory_fd().get_memory_fd(&info)? };
+    // SAFETY: Vulkan made the descriptor for the caller, who owns it now.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Where a dedicated allocation's memory comes from.
@@ -158,19 +153,17 @@ fn allocate(
         // Vulkan owns an imported descriptor once the import succeeded.
         let _ = fd.into_raw_fd();
     }
-    Ok(Memory {
-        memory,
-        handle_type,
-    })
+    Ok(Memory { memory })
 }
 
 /// A device-local buffer of `T`s whose memory is exported to or imported from a file
 /// descriptor. It derefs to its [`Buffer`], whose slices commands take as any buffer's.
 #[derive(Debug)]
 pub struct ExternalBuffer<T: Copy + 'static> {
+    /// Owns the memory, which it frees after the buffer.
     buffer: Buffer<T, Gpu>,
-    /// After the buffer, so it is freed once the buffer is destroyed.
-    memory: Memory,
+    memory: vk::DeviceMemory,
+    handle_type: HandleType,
 }
 
 impl<T: Copy + 'static> Deref for ExternalBuffer<T> {
@@ -198,11 +191,11 @@ impl<T: Copy + 'static> ExternalBuffer<T> {
 
     /// A new file descriptor of its memory, for another device or API to import.
     pub fn export(&self) -> Result<OwnedFd> {
-        self.memory.export()
+        export(self.memory, self.handle_type)
     }
 
     pub fn handle_type(&self) -> HandleType {
-        self.memory.handle_type
+        self.handle_type
     }
 
     fn create(len: usize, handle_type: HandleType, source: Source) -> Result<Self> {
@@ -270,9 +263,11 @@ impl<T: Copy + 'static> ExternalBuffer<T> {
         let address = unsafe {
             device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(handle))
         };
+        let device_memory = memory.memory;
         Ok(ExternalBuffer {
-            buffer: Buffer::from_external(handle, address, num_bytes, live),
-            memory,
+            buffer: Buffer::from_external(handle, address, num_bytes, memory, live),
+            memory: device_memory,
+            handle_type,
         })
     }
 }
@@ -282,9 +277,9 @@ impl<T: Copy + 'static> ExternalBuffer<T> {
 /// derefs to its [`Image`].
 #[derive(Debug)]
 pub struct ExternalImage<F: Format, U: ImageUsage, D: Dim = D2> {
+    /// Owns the memory, which it frees after the image.
     image: Image<F, U, D, Single>,
-    /// After the image, so it is freed once the image is destroyed.
-    memory: Memory,
+    memory: vk::DeviceMemory,
 }
 
 impl<F: Format, U: ImageUsage, D: Dim> Deref for ExternalImage<F, U, D> {
@@ -324,7 +319,7 @@ impl<F: StaticFormat, U: StaticUsage, D: Dim> ExternalImage<F, U, D> {
 impl<F: Format, U: ImageUsage, D: Dim> ExternalImage<F, U, D> {
     /// A new opaque file descriptor of its memory.
     pub fn export(&self) -> Result<OwnedFd> {
-        self.memory.export()
+        export(self.memory, HandleType::OpaqueFd)
     }
 
     fn create(
@@ -336,7 +331,7 @@ impl<F: Format, U: ImageUsage, D: Dim> ExternalImage<F, U, D> {
     ) -> Result<Self> {
         let handle_type = HandleType::OpaqueFd;
         handle_type.check()?;
-        let raw = RawImage::<F, U, D>::create(
+        let mut raw = RawImage::<F, U, D>::create(
             format,
             usage,
             extent,
@@ -351,10 +346,13 @@ impl<F: Format, U: ImageUsage, D: Dim> ExternalImage<F, U, D> {
         let dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         // `raw` destroys the image when this fails.
         let memory = allocate(requirements, handle_type, source, dedicated, false)?;
-        unsafe { device.bind_image_memory(image, memory.memory, 0)? };
+        let device_memory = memory.memory;
+        // The image's internal frees the memory after it, bound or not.
+        raw.internal.memory = ImageMemory::External(memory);
+        unsafe { device.bind_image_memory(image, device_memory, 0)? };
         Ok(ExternalImage {
             image: Image::from_raw(raw)?,
-            memory,
+            memory: device_memory,
         })
     }
 }

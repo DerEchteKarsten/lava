@@ -1,11 +1,11 @@
-//! Uploads into memory the host can't map through a staging ring per timeline (`Staging`, sized at `Timeline::new`, none on `rebar` devices, where every `Gpu` buffer is mapped): `Uploader` handles cloned from the timeline fill it from any thread (`init`, `from_slice`, `write`, `image`, in place where the target is mapped), `cmd.drain_uploads` records every published copy at the point of the recording the application chooses and releases the images to their destination family, and the timeline's values free the drained ring space
+//! Uploads into memory the host can't map through a staging ring per timeline (`Staging`, sized at `Timeline::new`, none on `rebar` devices, where every `Gpu` buffer is mapped): `Uploader` handles cloned from the timeline fill it from any thread (`init`, `from_slice`, `write`, `image`, in place where the target is mapped), `cmd.drain_uploads` records every published copy at the point of the recording the application chooses and releases the images to their destination family (each copy holds its target, and one whose target only the ring still holds is skipped), and the timeline's values free the drained ring space
 use std::{
     collections::VecDeque,
     fmt,
     ops::Range,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
     },
     time::{Duration, Instant},
 };
@@ -16,11 +16,11 @@ use smallvec::SmallVec;
 use std::mem::MaybeUninit;
 
 use crate::{
-    buffer::{Buffer, Gpu, Memory, Upload, slice::BufferSlice},
+    buffer::{Buffer, BufferInternal, Gpu, Memory, Upload, slice::BufferSlice},
     command_buffer::{CommandBuffer, ImageAccess, ImageUse, image_state::ImageState},
     error::{Error, Result},
     image::{
-        Image, Views,
+        Image, ImageInternal, Views,
         dim::Dim,
         format::{ColorAspect, Format},
         slice::{copy_block_of, rows_len},
@@ -140,11 +140,7 @@ impl Ring {
 
 /// A copy of the staged texels into one whole mip.
 pub(crate) struct ImageCopy {
-    image: vk::Image,
-    /// The image's tracked states, one for every mip or one per mip, whose address stays put
-    /// while the image moves; valid until the image is dropped, which forgets the copy first.
-    states: *const AtomicU64,
-    states_len: usize,
+    image: Arc<ImageInternal>,
     aspect: vk::ImageAspectFlags,
     /// The mips whose tracked state the copy moves: all of them where one state covers every
     /// mip, else `level` alone.
@@ -155,19 +151,11 @@ pub(crate) struct ImageCopy {
     layers: u32,
 }
 
-// SAFETY: `states` points at atomics, which every thread may access.
-unsafe impl Send for ImageCopy {}
-
 impl ImageCopy {
-    fn states(&self) -> &[AtomicU64] {
-        // SAFETY: see `states`; the ring's `pending` lock is held while it is used.
-        unsafe { std::slice::from_raw_parts(self.states, self.states_len) }
-    }
-
     /// The family other than `kind` that owns a mip the copy accesses and hasn't released it
     /// to `kind`, if one does.
     fn foreign_owner(&self, kind: Kind) -> Option<Kind> {
-        let states = self.states();
+        let states = &*self.image.states;
         let accessed = match states {
             [_] => states,
             _ => &states[self.mips.start as usize..self.mips.end as usize],
@@ -180,12 +168,21 @@ impl ImageCopy {
     }
 }
 
+/// What a staged write goes to, kept alive by it until its copy completed.
 enum Target {
-    /// The address the staged bytes go to.
-    Buffer(u64),
+    /// The buffer and the address in it the staged bytes go to.
+    Buffer(Arc<BufferInternal>, u64),
     Image(ImageCopy),
-    /// Its target was dropped while the copy was in flight; it is never recorded again.
-    Dropped,
+}
+
+impl Target {
+    /// Whether only the ring holds it: nothing reads it any more, so its copy is skipped.
+    fn orphaned(&self) -> bool {
+        match self {
+            Target::Buffer(buffer, _) => Arc::strong_count(buffer) == 1,
+            Target::Image(copy) => Arc::strong_count(&copy.image) == 1,
+        }
+    }
 }
 
 /// A published write: its reservation, where its data lies in the ring, and where it goes.
@@ -213,38 +210,26 @@ pub(crate) struct Staging {
     /// Drained copies with the value of the submission that recorded them, in that order; their
     /// regions are free once it completed.
     in_flight: Mutex<VecDeque<(Staged, u64)>>,
-    /// The entries of both lists, so drops skip the locks while there are none.
-    entries: AtomicUsize,
 }
 
-/// The number of live rings, so drops skip every lock while there are none.
-static RINGS: AtomicUsize = AtomicUsize::new(0);
-
 impl Staging {
-    /// A ring of `size` bytes (rounded up to whole `STAGING_ALIGN`s) for timeline `timeline`,
-    /// registered in its index.
+    /// A ring of `size` bytes (rounded up to whole `STAGING_ALIGN`s) for timeline `timeline`.
     pub(crate) fn new(timeline: usize, size: u64) -> Result<Arc<Self>> {
         let size = size.next_multiple_of(STAGING_ALIGN);
         let buffer = Buffer::raw(Upload, size, Some(STAGING_ALIGN))?;
-        let staging = Arc::new(Self {
+        Ok(Arc::new(Self {
             buffer,
             ring: Ring::new(size),
             timeline,
             closed: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
             in_flight: Mutex::new(VecDeque::new()),
-            entries: AtomicUsize::new(0),
-        });
-        *lock(&timeline::INDICES[timeline].staging) = Some(staging.clone());
-        RINGS.fetch_add(1, SeqCst);
-        Ok(staging)
+        }))
     }
 
-    /// Unregisters the ring when its timeline drops: no write reaches it from then on.
+    /// Closes the ring when its timeline drops: no write reaches it from then on.
     pub(crate) fn close(&self) {
         self.closed.store(true, SeqCst);
-        *lock(&timeline::INDICES[self.timeline].staging) = None;
-        RINGS.fetch_sub(1, SeqCst);
     }
 
     /// Frees the regions of the submissions that completed (`done`, the timeline's completed
@@ -252,9 +237,7 @@ impl Staging {
     fn reclaim(&self, done: u64) {
         let pending = lock(&self.pending);
         let mut in_flight = lock(&self.in_flight);
-        let before = in_flight.len();
         in_flight.retain(|(_, value)| *value > done);
-        self.entries.fetch_sub(before - in_flight.len(), SeqCst);
         let starts = (pending.iter().map(|s| s.reserved.start))
             .chain(in_flight.iter().map(|(s, _)| s.reserved.start));
         self.ring.reclaim(starts);
@@ -304,20 +287,6 @@ impl Staging {
 
     fn publish(&self, staged: Staged) {
         lock(&self.pending).push(staged);
-        self.entries.fetch_add(1, SeqCst);
-    }
-
-    /// Forgets the pending copies whose target `matches` and neutralises the in-flight ones.
-    fn forget(&self, mut matches: impl FnMut(&Target) -> bool) {
-        let mut pending = lock(&self.pending);
-        let before = pending.len();
-        pending.retain(|s| !matches(&s.target));
-        self.entries.fetch_sub(before - pending.len(), SeqCst);
-        for (staged, _) in lock(&self.in_flight).iter_mut() {
-            if matches(&staged.target) {
-                staged.target = Target::Dropped;
-            }
-        }
     }
 
     /// After the submission of `value` didn't reach the GPU: its copies go back to the front of
@@ -330,43 +299,10 @@ impl Staging {
         }
         let (back, keep): (Vec<_>, Vec<_>) = in_flight.drain(..).partition(|(_, v)| *v == value);
         in_flight.extend(keep);
-        let before = back.len();
-        let mut back: Vec<Staged> = (back.into_iter())
-            .map(|(staged, _)| staged)
-            .filter(|staged| !matches!(staged.target, Target::Dropped))
-            .collect();
-        self.entries.fetch_sub(before - back.len(), SeqCst);
+        let mut back: Vec<Staged> = back.into_iter().map(|(staged, _)| staged).collect();
         back.append(&mut pending);
         *pending = back;
     }
-}
-
-/// The live rings, at most one per timeline.
-fn rings() -> SmallVec<[Arc<Staging>; 2]> {
-    (timeline::INDICES.iter())
-        .filter_map(|index| lock(&index.staging).clone())
-        .collect()
-}
-
-fn forget(mut matches: impl FnMut(&Target) -> bool) {
-    if RINGS.load(SeqCst) == 0 {
-        return;
-    }
-    for ring in rings() {
-        if ring.entries.load(SeqCst) > 0 {
-            ring.forget(&mut matches);
-        }
-    }
-}
-
-/// Forgets the copies into a dropped buffer's `range`.
-pub(crate) fn forget_buffer(range: Range<u64>) {
-    forget(|t| matches!(t, Target::Buffer(address) if range.contains(address)));
-}
-
-/// Forgets the copies into a dropped image, before its tracked states go.
-pub(crate) fn forget_image(image: vk::Image) {
-    forget(|t| matches!(t, Target::Image(copy) if copy.image == image));
 }
 
 /// Counts a writer out when dropped, also when its fill panicked.
@@ -547,9 +483,10 @@ impl Uploader {
             Some(ptr) => fill(buffer.address(), unsafe {
                 std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<T>>(), len)
             }),
-            None => self.stage(len, Target::Buffer(buffer.address()), |data| {
-                fill(buffer.address(), data)
-            })?,
+            None => {
+                let target = Target::Buffer(buffer.internal.clone(), buffer.address());
+                self.stage(len, target, |data| fill(buffer.address(), data))?
+            }
         }
         Ok(buffer)
     }
@@ -587,9 +524,8 @@ impl Uploader {
         }
         if self.staging.is_some() {
             let address = buffer.address() + (offset * size_of::<T>()) as u64;
-            return self.stage(data.len(), Target::Buffer(address), |out| {
-                write_slice(out, data)
-            });
+            let target = Target::Buffer(buffer.internal.clone(), address);
+            return self.stage(data.len(), target, |out| write_slice(out, data));
         }
         let Some(ptr) = buffer.coherent_mapping() else {
             return Err(Error::other(
@@ -664,15 +600,12 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
         expected == len,
         "mip level {level} of {layers} layers holds {expected} bytes but {len} were given"
     );
-    let states = image.whole_view().states;
-    let mips = match states.len() {
+    let mips = match image.internal.states.len() {
         1 => 0..image.mip_levels(),
         _ => level..level + 1,
     };
     Ok(ImageCopy {
-        image: image.whole_view().image,
-        states: states.as_ptr(),
-        states_len: states.len(),
+        image: image.internal.clone(),
         aspect: vk::ImageAspectFlags::COLOR,
         mips,
         level,
@@ -683,10 +616,8 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
 
 /// An image a drain copied into, the mips it copied (bit `i` for mip `i`) and the family it
 /// releases them to.
-struct Copied {
-    image: vk::Image,
-    states: *const AtomicU64,
-    states_len: usize,
+struct Copied<'a> {
+    image: &'a ImageInternal,
     aspect: vk::ImageAspectFlags,
     mips: u64,
     to: Kind,
@@ -725,24 +656,27 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             capacity: staging.ring.size(),
             ..Default::default()
         };
+        let ring = &staging.buffer.internal;
         for staged in pending.iter() {
-            let src = BufferSlice::<u8>::new(staging.buffer.address() + staged.offset, staged.size);
+            if staged.target.orphaned() {
+                continue;
+            }
+            let src = BufferSlice::<u8>::new(ring, ring.address + staged.offset, staged.size);
             match &staged.target {
-                &Target::Buffer(address) => {
-                    self.copy_buffer(src, BufferSlice::<u8>::new(address, staged.size))
+                Target::Buffer(buffer, address) => {
+                    self.copy_buffer(src, BufferSlice::<u8>::new(buffer, *address, staged.size))
                 }
                 Target::Image(copy) => {
                     record_image_copy(self, src, copy);
                     if staged.destination != K::KIND {
                         let mips = (copy.mips.start..copy.mips.end).fold(0, |m, i| m | 1 << i);
-                        let same =
-                            |c: &&mut Copied| c.image == copy.image && c.to == staged.destination;
+                        let same = |c: &&mut Copied| {
+                            std::ptr::eq(c.image, &*copy.image) && c.to == staged.destination
+                        };
                         match copied.iter_mut().find(same) {
                             Some(c) => c.mips |= mips,
                             None => copied.push(Copied {
-                                image: copy.image,
-                                states: copy.states,
-                                states_len: copy.states_len,
+                                image: &copy.image,
                                 aspect: copy.aspect,
                                 mips,
                                 to: staged.destination,
@@ -750,14 +684,12 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                         }
                     }
                 }
-                Target::Dropped => continue,
             }
             stats.copies += 1;
             stats.bytes += staged.size;
         }
         for c in &copied {
-            // SAFETY: as `ImageCopy::states`; the lock is still held.
-            let states = unsafe { std::slice::from_raw_parts(c.states, c.states_len) };
+            let states = &c.image.states;
             // One release per run of copied mips.
             let mut mip = 0;
             while mip < 64 {
@@ -766,16 +698,15 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                     continue;
                 }
                 let end = mip + (c.mips >> mip).trailing_ones();
-                (self.rec).release(c.image, states, (mip..end).into(), c.aspect, c.to);
+                (self.rec).release(c.image.image, states, (mip..end).into(), c.aspect, c.to);
                 mip = end;
             }
         }
+        drop(copied);
         let value = self.rec.value;
         let mut in_flight = lock(&staging.in_flight);
         let done = timeline::completed(staging.timeline);
-        let before = in_flight.len();
         in_flight.retain(|(_, v)| *v > done);
-        staging.entries.fetch_sub(before - in_flight.len(), SeqCst);
         in_flight.extend(pending.drain(..).map(|s| (s, value)));
         staging
             .ring
@@ -794,12 +725,12 @@ fn record_image_copy<K: QueueKind>(
         access: ImageAccess {
             stage: vk::PipelineStageFlags2::TRANSFER,
             access: vk::AccessFlags2::TRANSFER_WRITE,
-            image: copy.image,
+            image: copy.image.image,
             layout: vk::ImageLayout::GENERAL,
             aspect: copy.aspect,
             mip_range: copy.mips.clone().into(),
         },
-        states: copy.states(),
+        internal: &copy.image,
     };
     cmd.rec.flush_pending(
         std::iter::once(image),
@@ -824,7 +755,7 @@ fn record_image_copy<K: QueueKind>(
         Functions::device_address_commands().cmd_copy_memory_to_image(
             cmd.rec.handle,
             &vk::CopyDeviceMemoryImageInfoKHR::default()
-                .image(copy.image)
+                .image(copy.image.image)
                 .regions(&regions),
         )
     };

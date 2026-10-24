@@ -4,6 +4,7 @@ use bytemuck::NoUninit;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::range::Range;
+use std::sync::Arc;
 
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
@@ -11,7 +12,7 @@ use std::iter;
 
 use crate::{
     Error, Result,
-    buffer::{Buffer, Memory},
+    buffer::{Buffer, BufferInternal, Memory},
     command_buffer::{BufferAccess, CommandBuffer},
     queue::QueueKind,
     state::Functions,
@@ -19,28 +20,44 @@ use crate::{
 
 /// A range of a buffer as the GPU sees it: an address and a size. It borrows the buffer but
 /// gives no host access, so copies of it alias nothing.
-#[derive(Copy, Clone, Debug)]
 pub struct BufferSlice<'a, T: Copy + 'static> {
+    pub(crate) buffer: &'a Arc<BufferInternal>,
     pub(crate) address: u64,
     pub(crate) size: u64,
-    /// Of a sparse buffer, whose pages may be unbound: commands don't claim it fully bound.
-    pub(crate) sparse: bool,
     pub(crate) _marker: PhantomData<&'a [T]>,
+}
+
+impl<T: Copy + 'static> Clone for BufferSlice<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: Copy + 'static> Copy for BufferSlice<'_, T> {}
+
+impl<T: Copy + 'static> std::fmt::Debug for BufferSlice<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferSlice")
+            .field("address", &self.address)
+            .field("size", &self.size)
+            .finish()
+    }
 }
 
 #[track_caller]
 pub(crate) fn new_slice<'a, T: Copy + 'static, R: RangeBounds<usize>>(
     index: R,
+    buffer: &'a Arc<BufferInternal>,
     address: u64,
     size: u64,
 ) -> BufferSlice<'a, T> {
-    try_new_slice(index, address, size).unwrap_or_else(|error| panic!("{error}"))
+    try_new_slice(index, buffer, address, size).unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// The `index` range of `T`s within the `size` bytes at `address`, or
+/// The `index` range of `T`s within the `size` bytes at `address` of `buffer`, or
 /// [`Error::SliceOutOfRange`] when it starts after it ends or ends past `size`.
 pub(crate) fn try_new_slice<'a, T: Copy + 'static, R: RangeBounds<usize>>(
     index: R,
+    buffer: &'a Arc<BufferInternal>,
     address: u64,
     size: u64,
 ) -> Result<BufferSlice<'a, T>> {
@@ -65,9 +82,9 @@ pub(crate) fn try_new_slice<'a, T: Copy + 'static, R: RangeBounds<usize>>(
         return Err(Error::SliceOutOfRange { start, end, size });
     }
     Ok(BufferSlice {
+        buffer,
         address: address + start,
         size: end - start,
-        sparse: false,
         _marker: PhantomData,
     })
 }
@@ -76,17 +93,17 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     /// The `index` range of the buffer's elements; panics where [`Self::try_range`] fails.
     #[track_caller]
     pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
-        new_slice(index, self.address, self.size())
+        new_slice(index, &self.internal, self.address(), self.size())
     }
     /// The `index` range of the buffer's bytes; panics where [`Self::try_byte_range`] fails.
     #[track_caller]
     pub fn byte_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, u8> {
-        new_slice::<u8, R>(index, self.address, self.size())
+        new_slice::<u8, R>(index, &self.internal, self.address(), self.size())
     }
     /// The `index` range of the buffer's elements, or [`Error::SliceOutOfRange`] when it starts
     /// after it ends or ends past the buffer.
     pub fn try_range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> Result<BufferSlice<'a, T>> {
-        try_new_slice(index, self.address, self.size())
+        try_new_slice(index, &self.internal, self.address(), self.size())
     }
     /// The `index` range of the buffer's bytes, or [`Error::SliceOutOfRange`] when it starts
     /// after it ends or ends past the buffer.
@@ -94,36 +111,39 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
         &'a self,
         index: R,
     ) -> Result<BufferSlice<'a, u8>> {
-        try_new_slice::<u8, R>(index, self.address, self.size())
+        try_new_slice::<u8, R>(index, &self.internal, self.address(), self.size())
     }
 }
 
 impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
-    /// The `size` bytes at `address`, which the caller keeps alive for `'a`.
-    pub(crate) fn new(address: u64, size: u64) -> Self {
+    /// The `size` bytes at `address`, which lie inside `buffer`.
+    pub(crate) fn new(buffer: &'a Arc<BufferInternal>, address: u64, size: u64) -> Self {
+        debug_assert!(
+            buffer.address <= address && address + size <= buffer.address + buffer.num_bytes
+        );
         BufferSlice {
+            buffer,
             address,
             size,
-            sparse: false,
             _marker: PhantomData,
         }
     }
     /// The same range of bytes.
     pub fn bytes(self) -> BufferSlice<'a, u8> {
-        BufferSlice {
-            address: self.address,
-            size: self.size,
-            sparse: self.sparse,
-            _marker: PhantomData,
-        }
+        BufferSlice::new(self.buffer, self.address, self.size)
     }
     /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`].
-    pub fn access(&self, stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> BufferAccess {
+    pub fn access(
+        &self,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> BufferAccess<'a> {
         BufferAccess {
             unordered: false,
             stage,
             access,
             range: self.get_range(),
+            buffer: Some(self.buffer),
         }
     }
     /// The addresses the slice covers.
@@ -133,36 +153,22 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
     /// The `index` range of the slice's elements; panics where [`Self::try_range`] fails.
     #[track_caller]
     pub fn range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, T> {
-        BufferSlice {
-            sparse: self.sparse,
-            ..new_slice(index, self.address, self.size)
-        }
+        new_slice(index, self.buffer, self.address, self.size)
     }
     /// The `index` range of the slice's bytes; panics where [`Self::try_byte_range`] fails.
     #[track_caller]
     pub fn byte_range<R: RangeBounds<usize>>(self, index: R) -> BufferSlice<'a, u8> {
-        BufferSlice {
-            sparse: self.sparse,
-            ..new_slice::<u8, R>(index, self.address, self.size)
-        }
+        new_slice::<u8, R>(index, self.buffer, self.address, self.size)
     }
     /// The `index` range of the slice's elements, or [`Error::SliceOutOfRange`] when it starts
     /// after it ends or ends past the slice.
     pub fn try_range<R: RangeBounds<usize>>(self, index: R) -> Result<BufferSlice<'a, T>> {
-        let slice = try_new_slice(index, self.address, self.size)?;
-        Ok(BufferSlice {
-            sparse: self.sparse,
-            ..slice
-        })
+        try_new_slice(index, self.buffer, self.address, self.size)
     }
     /// The `index` range of the slice's bytes, or [`Error::SliceOutOfRange`] when it starts
     /// after it ends or ends past the slice.
     pub fn try_byte_range<R: RangeBounds<usize>>(self, index: R) -> Result<BufferSlice<'a, u8>> {
-        let slice = try_new_slice::<u8, R>(index, self.address, self.size)?;
-        Ok(BufferSlice {
-            sparse: self.sparse,
-            ..slice
-        })
+        try_new_slice::<u8, R>(index, self.buffer, self.address, self.size)
     }
     pub fn len(&self) -> usize {
         self.size as usize / size_of::<T>()
@@ -180,12 +186,7 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
     /// aligned to `B`.
     pub fn cast<B: Copy + 'static>(self) -> BufferSlice<'a, B> {
         cast_check::<B>(self.address, self.size);
-        BufferSlice {
-            address: self.address,
-            size: self.size,
-            sparse: self.sparse,
-            _marker: PhantomData,
-        }
+        BufferSlice::new(self.buffer, self.address, self.size)
     }
     pub(crate) fn address_range(&self) -> vk::DeviceAddressRangeKHR {
         vk::DeviceAddressRangeKHR {
@@ -203,7 +204,7 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
     /// The range's memory has storage usage, as every application buffer has (`USAGE`), and
     /// is fully bound unless it is a sparse buffer's.
     pub(crate) fn address_flags(&self) -> vk::AddressCommandFlagsKHR {
-        match self.sparse {
+        match self.buffer.is_sparse() {
             true => vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE,
             false => {
                 vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE

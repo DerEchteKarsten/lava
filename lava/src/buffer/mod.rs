@@ -1,9 +1,5 @@
-//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones (writes of `NoUninit` elements, reads of `AnyBitPattern` ones), checked against GPU writes still in flight; growth that keeps the contents (`reserve`); the staging rings and uploaders (`staging`); casts, and their destruction once no frame can reach them (`retire_buffer`, which sparse and external buffers share)
-use std::{
-    fmt::Debug,
-    marker::PhantomData,
-    mem::{self, ManuallyDrop},
-};
+//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones (writes of `NoUninit` elements, reads of `AnyBitPattern` ones), checked against GPU writes still in flight; growth that keeps the contents (`reserve`); the staging rings and uploaders (`staging`); casts; the internal its owners share (`BufferInternal`, also of sparse and external buffers, whose memory it frees), destroyed once the last owner dropped it and no frame can reach it
+use std::{fmt::Debug, marker::PhantomData, mem, range::Range, sync::Arc};
 
 use crate::error::{Error, Result};
 use crate::vk;
@@ -16,6 +12,7 @@ use crate::{
     command_buffer::{BufferAccess, pending::incomplete_write},
     global::Live,
     lifetime,
+    object::Header,
     queue::{
         lock,
         timeline::{INDICES, completed, poll},
@@ -74,50 +71,109 @@ pub const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// buffer.host_mut()[0] = 1;
 /// # Ok(()) }
 /// ```
-#[derive(Debug)]
 pub struct Buffer<T: Copy + 'static, M: Memory = Gpu> {
-    pub(crate) handle: vk::Buffer,
-    address: u64,
-    num_bytes: u64,
-    allocation: Allocation,
+    pub(crate) internal: Arc<BufferInternal>,
     memory: M,
     _type_marker: PhantomData<T>,
-    /// Last, so it counts the buffer until its drop finished.
-    live: Live,
 }
 
-impl<T: Copy + 'static, M: Memory> Drop for Buffer<T, M> {
-    fn drop(&mut self) {
-        let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
-        retire_buffer(
-            handle,
-            self.address..self.address + self.num_bytes,
-            allocation,
-        );
+impl<T: Copy + 'static, M: Memory> Debug for Buffer<T, M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Buffer")
+            .field("address", &self.internal.address)
+            .field("size", &self.internal.num_bytes)
+            .field("memory", &self.memory.location())
+            .finish()
     }
 }
 
-/// Forgets the uploads into a dropped buffer's addresses `range` and, once no submission
-/// reaches it, its pending accesses, the buffer and its allocation (null for sparse and
-/// external buffers, whose memory their owners free after).
-pub(crate) fn retire_buffer(
-    handle: vk::Buffer,
-    range: std::ops::Range<u64>,
-    allocation: Allocation,
-) {
-    staging::forget_buffer(range.clone());
-    lifetime::retire(move || {
-        for index in INDICES.iter() {
-            let pending = &mut lock(&index.state).pending;
-            let outside = |access: &BufferAccess| !range.contains(&access.range.start);
-            pending.buffer_reads.retain(|read| outside(&read.read));
-            pending.buffer_writes.retain(|write| outside(&write.write));
+/// A buffer as lava owns it, shared by its [`Buffer`] and whatever else keeps it: the handle,
+/// its addresses and its memory, destroyed with the last owner.
+#[derive(Debug)]
+pub(crate) struct BufferInternal {
+    pub(crate) handle: vk::Buffer,
+    pub(crate) address: u64,
+    pub(crate) num_bytes: u64,
+    pub(crate) memory: BufferMemory,
+    /// Counts it as a lava user until its drop finished.
+    #[allow(dead_code, reason = "held for its count")]
+    pub(crate) header: Header,
+}
+
+/// Where a buffer's memory comes from.
+#[derive(Debug)]
+pub(crate) enum BufferMemory {
+    /// lava's allocator; a null allocation for none.
+    Allocation(Allocation),
+    /// A dedicated allocation exported or imported (`ExternalBuffer`).
+    #[cfg(all(feature = "external-memory", unix))]
+    External(#[allow(dead_code, reason = "freed by its drop")] crate::external::Memory),
+    /// Pages bound one by one (`SparseBuffer`).
+    #[cfg(feature = "sparse-residency-buffer")]
+    Sparse(crate::sparse::Pages),
+}
+
+impl BufferMemory {
+    pub(crate) fn allocation(&self) -> Option<&Allocation> {
+        match self {
+            BufferMemory::Allocation(allocation) => Some(allocation),
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
-        unsafe { Ctx::device().destroy_buffer(handle, None) };
-        if let Err(err) = Ctx::allocator().free(allocation) {
-            tracing::error!(%err, "failed to free buffer allocation");
+    }
+
+    /// Frees the memory, once nothing uses it.
+    pub(crate) fn free(self) {
+        match self {
+            BufferMemory::Allocation(allocation) => {
+                if let Err(err) = Ctx::allocator().free(allocation) {
+                    tracing::error!(%err, "failed to free buffer allocation");
+                }
+            }
+            // Their own drops free them.
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
-    });
+    }
+}
+
+impl BufferInternal {
+    /// The addresses it covers.
+    pub(crate) fn range(&self) -> Range<u64> {
+        (self.address..self.address + self.num_bytes).into()
+    }
+
+    /// Whether its pages may be unbound, so commands don't claim it fully bound.
+    pub(crate) fn is_sparse(&self) -> bool {
+        #[cfg(feature = "sparse-residency-buffer")]
+        if let BufferMemory::Sparse(_) = self.memory {
+            return true;
+        }
+        false
+    }
+}
+
+impl Drop for BufferInternal {
+    /// Forgets its pending accesses and destroys the buffer and its memory, once no submission
+    /// reaches it.
+    fn drop(&mut self) {
+        let handle = self.handle;
+        let range = self.address..self.address + self.num_bytes;
+        let memory = mem::replace(
+            &mut self.memory,
+            BufferMemory::Allocation(Allocation::default()),
+        );
+        lifetime::retire(move || {
+            for index in INDICES.iter() {
+                let pending = &mut lock(&index.state).pending;
+                let outside = |access: &BufferAccess| !range.contains(&access.range.start);
+                pending.buffer_reads.retain(|read| outside(&read.read));
+                pending.buffer_writes.retain(|write| outside(&write.write));
+            }
+            unsafe { Ctx::device().destroy_buffer(handle, None) };
+            memory.free();
+        });
+    }
 }
 
 impl<'a, T: Copy + 'static, M: Memory> From<&'a Buffer<T, M>> for BufferSlice<'a, T> {
@@ -138,24 +194,25 @@ impl<T: Copy + 'static> Buffer<T, Gpu> {
 }
 
 impl<T: Copy + 'static> Buffer<T, Gpu> {
-    /// A buffer whose memory its owner bound and frees after it (external memory), with a null
-    /// allocation.
+    /// A buffer whose memory its owner bound and that it frees after it (external memory).
     #[cfg(all(feature = "external-memory", unix))]
     pub(crate) fn from_external(
         handle: vk::Buffer,
         address: u64,
         num_bytes: u64,
+        memory: crate::external::Memory,
         live: Live,
     ) -> Self {
-        Buffer {
-            handle,
-            address,
-            num_bytes,
-            allocation: Allocation::default(),
-            memory: Gpu,
-            _type_marker: PhantomData,
-            live,
-        }
+        Buffer::from_internal(
+            BufferInternal {
+                handle,
+                address,
+                num_bytes,
+                memory: BufferMemory::External(memory),
+                header: Header::new(live),
+            },
+            Gpu,
+        )
     }
 }
 
@@ -185,6 +242,14 @@ impl<T: Copy + 'static> Buffer<T, Shared> {
 }
 
 impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
+    pub(crate) fn from_internal(internal: BufferInternal, memory: M) -> Self {
+        Buffer {
+            internal: Arc::new(internal),
+            memory,
+            _type_marker: PhantomData,
+        }
+    }
+
     /// A buffer of `len` elements in `memory`, any location, a [`Dynamic`] one included.
     #[validation_trace]
     pub fn with_memory(memory: M, len: usize) -> Result<Self> {
@@ -354,15 +419,16 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
         }
         let addr_info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         let address = unsafe { Ctx::device().get_buffer_device_address(&addr_info) };
-        Ok(Self {
-            _type_marker: PhantomData,
-            address,
-            num_bytes,
-            allocation,
+        Ok(Self::from_internal(
+            BufferInternal {
+                handle: buffer,
+                address,
+                num_bytes,
+                memory: BufferMemory::Allocation(allocation),
+                header: Header::new(live.clone()),
+            },
             memory,
-            handle: buffer,
-            live: live.clone(),
-        })
+        ))
     }
 
     /// The same buffer named `name`, for debuggers, the validation layer (with debug utils,
@@ -373,19 +439,23 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     }
 
     pub(crate) fn set_name(&mut self, name: &str) {
-        if let Err(err) = Ctx::allocator().rename_allocation(&mut self.allocation, name) {
+        // Only an allocation nothing else holds yet can be renamed.
+        if let Some(internal) = Arc::get_mut(&mut self.internal)
+            && let BufferMemory::Allocation(allocation) = &mut internal.memory
+            && let Err(err) = Ctx::allocator().rename_allocation(allocation, name)
+        {
             tracing::warn!(%err, "failed to name a buffer's allocation");
         }
-        crate::state::Functions::set_debug_name(name, self.handle);
+        crate::state::Functions::set_debug_name(name, self.internal.handle);
     }
 
     /// The device address of its first byte.
     pub fn address(&self) -> u64 {
-        self.address
+        self.internal.address
     }
 
     pub fn size(&self) -> u64 {
-        self.num_bytes
+        self.internal.num_bytes
     }
 
     /// How many `T`s it holds.
@@ -411,7 +481,7 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     /// devices (allocated from `Shared`'s memory types) and `Gpu` memory in a host-visible
     /// memory type otherwise (integrated GPUs).
     pub(crate) fn mapping(&self) -> Option<*mut T> {
-        let ptr = self.allocation.mapped_ptr()?.as_ptr().cast::<T>();
+        let ptr = (self.internal.memory.allocation()?.mapped_ptr()?.as_ptr()).cast::<T>();
         assert!(
             ptr.is_aligned(),
             "the mapping at {ptr:?} isn't aligned to {} bytes for its elements",
@@ -422,25 +492,19 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
 
     /// Its mapping where the memory is coherent too, which lava writes without flushing.
     pub(crate) fn coherent_mapping(&self) -> Option<*mut T> {
-        let coherent =
-            (self.allocation.memory_properties()).contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+        let coherent = (self.internal.memory.allocation()?.memory_properties())
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
         coherent.then(|| self.mapping()).flatten()
     }
 
     /// The same buffer of `B`s; panics unless its size is a multiple of `B`'s and its address
     /// aligned to `B`.
     pub fn cast<B: Copy + 'static>(self) -> Buffer<B, M> {
-        slice::cast_check::<B>(self.address, self.num_bytes);
-        // `self` is left without memory and never dropped.
-        let mut this = ManuallyDrop::new(self);
+        slice::cast_check::<B>(self.address(), self.size());
         Buffer {
-            handle: this.handle,
-            address: this.address,
-            allocation: mem::take(&mut this.allocation),
-            num_bytes: this.num_bytes,
-            memory: this.memory,
+            internal: self.internal,
+            memory: self.memory,
             _type_marker: PhantomData,
-            live: mem::replace(&mut this.live, Live::internal()),
         }
     }
 
@@ -476,15 +540,10 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
 
     /// The same buffer with its location as a runtime value.
     pub fn erase(self) -> Buffer<T, Dynamic> {
-        let mut this = ManuallyDrop::new(self);
         Buffer {
-            handle: this.handle,
-            address: this.address,
-            allocation: mem::take(&mut this.allocation),
-            num_bytes: this.num_bytes,
-            memory: Dynamic(this.memory.location()),
+            memory: Dynamic(self.memory.location()),
+            internal: self.internal,
             _type_marker: PhantomData,
-            live: mem::replace(&mut this.live, Live::internal()),
         }
     }
 }
@@ -500,7 +559,7 @@ impl<T: Copy + 'static, M: HostVisible> Buffer<T, M> {
     /// Polls the timelines it finds one on. Writes not submitted yet aren't seen: the `&mut`
     /// borrow of `host`/`host_mut` keeps new recordings from reaching the buffer.
     fn incomplete_write(&self) -> Option<(usize, u64)> {
-        let range = (self.address..self.address + self.num_bytes).into();
+        let range = self.internal.range();
         (0..INDICES.len()).find_map(|i| {
             let value = incomplete_write(
                 lock(&INDICES[i].writes).iter().copied(),

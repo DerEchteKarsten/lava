@@ -85,12 +85,13 @@ fn writes_land_where_the_ring_is_drained() {
     assert_eq!(stats.used, 16, "in flight until the next reclaim");
     assert_eq!(uploader.pending(), 0);
 
-    // Dropped targets take their copies with them.
+    // A dropped target's copy stays published, but the drain skips it: nothing else holds
+    // the buffer.
     uploader.write(&buffer, 2, &[30, 40]).unwrap();
     let dropped = Buffer::<u32>::new(4).unwrap();
     uploader.write(&dropped, 0, &[5; 4]).unwrap();
     drop(dropped);
-    assert_eq!(uploader.pending(), 1);
+    assert_eq!(uploader.pending(), 2);
     gpu.submit(|cmd| {
         cmd.fill_buffer(buffer.range(..), 9);
         assert_eq!(cmd.drain_uploads().copies, 1);

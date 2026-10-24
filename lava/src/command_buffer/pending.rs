@@ -13,9 +13,9 @@ pub(crate) const MAX_PENDING_BUFFER_WRITES: usize = 64;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PendingAccesses {
-    pub(crate) buffer_reads: SmallVec<[PendingRead<BufferAccess>; 8]>,
+    pub(crate) buffer_reads: SmallVec<[PendingRead<BufferAccess<'static>>; 8]>,
     pub(crate) image_reads: SmallVec<[PendingRead<ImageAccess>; 8]>,
-    pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess>; 8]>,
+    pub(crate) buffer_writes: SmallVec<[PendingWrite<BufferAccess<'static>>; 8]>,
     pub(crate) image_writes: SmallVec<[PendingWrite<ImageAccess>; 8]>,
 }
 
@@ -207,12 +207,17 @@ impl PendingAccesses {
     /// Tracks the accesses of a command of the submission of timeline value `value`. An older
     /// buffer access is only forgotten once a newer write covers its whole range; a newer read
     /// doesn't wait for older reads, so it takes over those it covers.
-    pub(crate) fn record(
+    pub(crate) fn record<'a>(
         &mut self,
         value: u64,
         image_accesses: impl Iterator<Item = ImageAccess>,
-        buffer_accesses: impl Iterator<Item = BufferAccess>,
+        buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
     ) {
+        // Kept past the recording, without the buffer's reference.
+        let buffer_accesses = buffer_accesses.map(|access| BufferAccess {
+            buffer: None,
+            ..access
+        });
         for access in buffer_accesses {
             let covers = |a: &BufferAccess| {
                 access.range.start <= a.range.start && a.range.end <= access.range.end

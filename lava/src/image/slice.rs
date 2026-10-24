@@ -1,5 +1,9 @@
 //! Image views and the boxes of texels transfers take: `ImageView` (a borrowed range of an image's mips and layers, its handle, its `VkImageView` and reinterpreted formats), `ImageSlice` (a box of one of a view's mips), `TexelBuffer` (buffer rows for copies), and the image transfer commands (clears, blits, image and buffer copies) with their format, box and block checks
-use std::{iter, range::Range, sync::atomic::AtomicU64};
+use std::{
+    iter,
+    range::Range,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use crate::vk;
 use lava_macros::validation_trace;
@@ -7,9 +11,9 @@ use lava_macros::validation_trace;
 use crate::{
     bindless::{Allocatable, ImageHandle},
     buffer::slice::BufferSlice,
-    command_buffer::{BufferAccess, CommandBuffer, ImageAccess, ImageUse},
+    command_buffer::{CommandBuffer, ImageAccess, ImageUse},
     image::{
-        Image, ViewCache, Views,
+        Image, ImageInternal, Views,
         dim::{D2, D2Array, Dim, box_inside, box_is_empty},
         format::{
             self, Block, ColorAspect, DepthStencilAspect, Format, Numeric, StaticFormat,
@@ -24,9 +28,9 @@ use crate::{
 
 /// A borrowed view of `mip_range` and `layer_range` of an image, over every aspect: the image
 /// type commands, bindless binds and generated bindings take.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
-    pub(crate) image: vk::Image,
+    pub(crate) internal: &'a Arc<ImageInternal>,
     /// The image's own `VkImageView` of these mips and layers, if it has one.
     pub(crate) view: vk::ImageView,
     pub(crate) mip_range: Range<u32>,
@@ -34,21 +38,33 @@ pub struct ImageView<'a, F: Format, U: ImageUsage, D: Dim = D2> {
     /// The extent of mip `mip_range.start`.
     pub(crate) extent: D::Extent,
     pub(crate) handle: ImageHandle,
-    /// The image's tracked states: one for all its mips, or one per mip of the image; each
-    /// covers every layer.
-    pub(crate) states: &'a [AtomicU64],
-    /// Where an attachment image keeps the `VkImageView`s of views without one of their own.
-    pub(crate) cache: Option<&'a ViewCache>,
-    /// Its image was created with `MUTABLE_FORMAT`, so it has views of compatible formats.
-    pub(crate) mutable: bool,
     pub(crate) format: F,
     pub(crate) usage: U,
     pub(crate) dim: D,
 }
 
+impl<F: Format, U: ImageUsage, D: Dim> std::fmt::Debug for ImageView<'_, F, U, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageView")
+            .field("image", &self.internal.image)
+            .field("format", &self.format.vk_format())
+            .field("mip_range", &self.mip_range)
+            .field("layers", &self.layers)
+            .field("extent", &self.extent)
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
 impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     pub fn image(&self) -> vk::Image {
-        self.image
+        self.internal.image
+    }
+
+    /// The image's tracked states: one for all its mips, or one per mip of the image; each
+    /// covers every layer.
+    pub(crate) fn states(&self) -> &'a [AtomicU64] {
+        &self.internal.states
     }
 
     /// Its `VkImageView`, which only images with an attachment usage have (null otherwise),
@@ -57,9 +73,9 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     /// (`reinterpret`), gets its own the first time it is asked for, kept until the image is
     /// destroyed.
     pub fn vk_view(&self) -> vk::ImageView {
-        match self.cache {
-            Some(cache) if self.view == vk::ImageView::null() => cache.get(
-                self.image,
+        match self.internal.attachment() {
+            true if self.view == vk::ImageView::null() => self.internal.cache.get(
+                self.internal.image,
                 self.format.vk_format(),
                 self.format.aspects(),
                 D::VIEW_TYPE,
@@ -100,7 +116,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             panic!(
                 "a shader reads the view of {:?} as {}, which it isn't bound as ({:?}): call `{}` \
                  (or `bind_combined` for both descriptors, `bind_mips_*` for a mip's view) on its image",
-                self.image,
+                self.internal.image,
                 std::any::type_name::<K>().rsplit("::").next().unwrap(),
                 self.handle,
                 K::BIND,
@@ -201,7 +217,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     {
         let (from, to) = (self.format.vk_format(), format.vk_format());
         assert!(
-            self.mutable,
+            (self.internal.create_flags).contains(vk::ImageCreateFlags::MUTABLE_FORMAT),
             "a view of {from:?} as {to:?} needs an image created with `MutableFormat` in its usage"
         );
         let class = |f: vk::Format, size: usize, aspects| format::class(f, size, aspects);
@@ -213,7 +229,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         );
         let same = from == to;
         ImageView {
-            image: self.image,
+            internal: self.internal,
             view: if same {
                 self.view
             } else {
@@ -223,9 +239,6 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             layers: self.layers,
             extent: self.extent,
             handle: if same { self.handle } else { ImageHandle::NULL },
-            states: self.states,
-            cache: self.cache,
-            mutable: self.mutable,
             format,
             usage: self.usage,
             dim: self.dim,
@@ -250,12 +263,12 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
             access: ImageAccess {
                 stage,
                 access,
-                image: self.image,
+                image: self.internal.image,
                 layout,
                 aspect: self.format.aspects(),
                 mip_range: self.mip_range,
             },
-            states: self.states,
+            internal: self.internal,
         }
     }
 
@@ -268,7 +281,7 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
         access: vk::AccessFlags2,
     ) -> ImageUse<'a> {
         let mut first = self.access(stage, access);
-        if self.states.len() > 1 {
+        if self.internal.states.len() > 1 {
             first.access.mip_range = (level..level + 1).into();
         }
         first
@@ -283,15 +296,12 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U, D2Array> {
     pub fn layer(self, layer: u32) -> ImageView<'a, F, U, D2> {
         let layers = self.layers(layer..layer + 1);
         ImageView {
-            image: layers.image,
+            internal: layers.internal,
             view: vk::ImageView::null(),
             mip_range: layers.mip_range,
             layers: layers.layers,
             extent: layers.extent,
             handle: ImageHandle::NULL,
-            states: layers.states,
-            cache: layers.cache,
-            mutable: layers.mutable,
             format: layers.format,
             usage: layers.usage,
             dim: D2,
@@ -548,7 +558,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         unsafe {
             Ctx::device().cmd_clear_color_image(
                 self.rec.handle,
-                image.image,
+                image.image(),
                 vk::ImageLayout::GENERAL,
                 &value.color,
                 &[image.subresource_range()],
@@ -594,7 +604,7 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         unsafe {
             Ctx::device().cmd_clear_depth_stencil_image(
                 self.rec.handle,
-                image.image,
+                image.image(),
                 vk::ImageLayout::GENERAL,
                 &vk::ClearDepthStencilValue { depth, stencil },
                 &[image.subresource_range()],
@@ -696,9 +706,9 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         unsafe {
             Ctx::device().cmd_blit_image(
                 self.rec.handle,
-                src.view.image,
+                src.view.image(),
                 vk::ImageLayout::GENERAL,
-                dst.view.image,
+                dst.view.image(),
                 vk::ImageLayout::GENERAL,
                 &regions,
                 vk::Filter::from_raw(filter as i32),
@@ -786,9 +796,9 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             .dst_offset(S::Dim::offset_3d(dst.offset))
             .extent(S::Dim::extent_3d(src.extent))];
         let info = vk::CopyImageInfo2::default()
-            .src_image(src.view.image)
+            .src_image(src.view.image())
             .src_image_layout(vk::ImageLayout::GENERAL)
-            .dst_image(dst.view.image)
+            .dst_image(dst.view.image())
             .dst_image_layout(vk::ImageLayout::GENERAL)
             .regions(&regions);
         unsafe { Ctx::device().cmd_copy_image2(self.rec.handle, &info) };
@@ -815,19 +825,17 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
             )),
-            iter::once(BufferAccess {
-                unordered: false,
-                access: vk::AccessFlags2::TRANSFER_READ,
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                range: src.slice.get_range(),
-            }),
+            iter::once(src.slice.access(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            )),
         );
         let regions = [region];
         unsafe {
             Functions::device_address_commands().cmd_copy_memory_to_image(
                 self.rec.handle,
                 &vk::CopyDeviceMemoryImageInfoKHR::default()
-                    .image(dst.view.image)
+                    .image(dst.view.image())
                     .regions(&regions),
             )
         };
@@ -866,19 +874,17 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
             )),
-            iter::once(BufferAccess {
-                unordered: false,
-                access: vk::AccessFlags2::TRANSFER_WRITE,
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                range: dst.slice.get_range(),
-            }),
+            iter::once(dst.slice.access(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            )),
         );
         let regions = [region];
         unsafe {
             Functions::device_address_commands().cmd_copy_image_to_memory(
                 self.rec.handle,
                 &vk::CopyDeviceMemoryImageInfoKHR::default()
-                    .image(src.view.image)
+                    .image(src.view.image())
                     .regions(&regions),
             )
         };
@@ -1083,7 +1089,7 @@ fn check_overlap<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
     dst: &ImageSlice<ImageView<'_, F2, U2, D>>,
     what: &str,
 ) {
-    if src.view.image != dst.view.image || src.level != dst.level {
+    if src.view.image() != dst.view.image() || src.level != dst.level {
         return;
     }
     let (sl, dl) = (src.view.layers, dst.view.layers);

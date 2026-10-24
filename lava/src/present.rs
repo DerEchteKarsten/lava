@@ -3,7 +3,7 @@ use std::{
     collections::VecDeque,
     fmt,
     marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, atomic::Ordering},
 };
 
 use crate::vk;
@@ -30,7 +30,7 @@ use crate::{
     error::{Error, Result},
     global::Live,
     image::{
-        D2,
+        D2, ImageInternal,
         format::{self, StaticFormat},
         slice::ImageView,
         usage::{StaticUsage, usage},
@@ -38,7 +38,7 @@ use crate::{
     lifetime::{self, Stamp, latest_stamp},
     queue::{
         HasGraphics, lock,
-        timeline::{completed, forget_image, poll},
+        timeline::{completed, poll},
     },
     state::{Ctx, Functions},
 };
@@ -76,7 +76,7 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
         );
         let swapchain = surface.swapchain.as_ref().expect("an image is current");
         self.rec.presents.push(Present {
-            image: view.image,
+            image: view.image(),
             acquire: current.acquire,
             present: swapchain.images[current.index as usize].present,
         });
@@ -280,10 +280,8 @@ impl HdrMetadata {
 }
 
 struct SwapchainImage {
-    image: vk::Image,
-    view: vk::ImageView,
-    handle: ImageHandle,
-    state: AtomicU64,
+    /// The image, its view, handle and tracked state.
+    internal: Arc<ImageInternal>,
     present: vk::Semaphore,
 }
 
@@ -300,13 +298,11 @@ struct Swapchain {
 impl Swapchain {
     fn destroy(self) {
         let device = Ctx::device();
-        for image in &self.images {
-            forget_image(image.image);
-            bindless::free_handle(image.handle);
-            unsafe {
-                device.destroy_image_view(image.view, None);
-                device.destroy_semaphore(image.present, None);
-            }
+        for image in self.images {
+            // The internal destroys its view and frees its handle right away; nothing else
+            // holds it once no submission reaches the swapchain.
+            drop(image.internal);
+            unsafe { device.destroy_semaphore(image.present, None) };
         }
         for fence in self.fences {
             unsafe { device.destroy_fence(fence, None) };
@@ -656,8 +652,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                     acquired: true,
                     ..ImageState::UNDEFINED
                 };
-                swapchain.images[current.index as usize]
-                    .state
+                swapchain.images[current.index as usize].internal.states[0]
                     .store(state.pack(), Ordering::Relaxed);
                 return Ok(size.x > 0 && size.y > 0);
             }
@@ -730,8 +725,7 @@ impl<U: StaticUsage> PresentSurface<U> {
                         acquired: true,
                         ..ImageState::UNDEFINED
                     };
-                    swapchain.images[index as usize]
-                        .state
+                    swapchain.images[index as usize].internal.states[0]
                         .store(state.pack(), Ordering::Relaxed);
                     let acquire = semaphore;
                     self.current = Some(Current {
@@ -830,13 +824,15 @@ impl<U: StaticUsage> PresentSurface<U> {
                         return Err(err.into());
                     }
                 };
-                let state = ImageState::UNDEFINED.atomic();
-                let handle = ImageHandle::NULL;
-                swapchain.images.push(SwapchainImage {
+                let internal = ImageInternal::swapchain(
                     image,
+                    self.format.format,
+                    usage,
                     view,
-                    handle,
-                    state,
+                    ImageHandle::NULL,
+                );
+                swapchain.images.push(SwapchainImage {
+                    internal: Arc::new(internal),
                     present,
                 });
             }
@@ -855,12 +851,15 @@ impl<U: StaticUsage> PresentSurface<U> {
                 }),
                 (false, false) => return Ok(()),
             };
-            for image in &mut swapchain.images {
-                image.handle = new(bindless::allocate(width)?);
+            for image in &swapchain.images {
+                image
+                    .internal
+                    .whole
+                    .set_handle(new(bindless::allocate(width)?));
             }
             let format = self.format.format;
             let images = swapchain.images.iter().map(|image| bindless::ShaderImage {
-                image: image.image,
+                image: image.internal.image,
                 format,
                 aspects: vk::ImageAspectFlags::COLOR,
                 view_type: vk::ImageViewType::TYPE_2D,
@@ -870,7 +869,10 @@ impl<U: StaticUsage> PresentSurface<U> {
             });
             bindless::bind_raw(
                 images,
-                swapchain.images.iter().map(|image| image.handle),
+                swapchain
+                    .images
+                    .iter()
+                    .map(|image| image.internal.whole.handle()),
                 false,
             )?;
             Ok(())
@@ -897,15 +899,12 @@ impl<U: StaticUsage> PresentSurface<U> {
         let swapchain = self.swapchain.as_ref().expect("an image is current");
         let i = &swapchain.images[current.index as usize];
         ImageView {
-            image: i.image,
-            view: i.view,
+            internal: &i.internal,
+            view: i.internal.whole.view,
             mip_range: (0..1).into(),
             layers: (0..1).into(),
             extent: swapchain.extent,
-            handle: i.handle,
-            states: std::slice::from_ref(&i.state),
-            cache: None,
-            mutable: false,
+            handle: i.internal.whole.handle(),
             format: self.format(),
             usage: U::default(),
             dim: D2,

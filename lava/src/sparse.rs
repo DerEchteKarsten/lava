@@ -9,7 +9,12 @@
     )),
     allow(dead_code, unused_imports)
 )]
-use std::{collections::HashMap, marker::PhantomData, ops::Deref, sync::Mutex};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
 
 use glam::UVec3;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
@@ -17,17 +22,18 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    buffer::{self, slice::BufferSlice},
+    buffer::{self, BufferInternal, BufferMemory, slice::BufferSlice},
     error::{Error, Result},
     features::{MissingFeature, On, gate},
     global::Live,
     image::{
-        D2, Dim, Image, RawImage, Single,
+        D2, Dim, Image, ImageMemory, RawImage, Single,
         dim::{box_inside, box_is_empty},
         format::{ColorAspect, Format, StaticFormat},
         usage::{ImageUsage, StaticUsage},
     },
     lifetime,
+    object::Header,
     queue::{Graphics, Timeline, Wait, lock},
     state::Ctx,
     vk,
@@ -42,9 +48,10 @@ enum Page {
     MipTail,
 }
 
-/// The pages of a sparse resource and what their memory needs.
+/// The pages of a sparse resource and what their memory needs; the resource's internal frees
+/// them after it.
 #[derive(Debug)]
-struct Pages {
+pub(crate) struct Pages {
     requirements: vk::MemoryRequirements,
     /// Buffers' pages are linear, optimal images' not (gpu-allocator keeps them apart).
     linear: bool,
@@ -80,17 +87,11 @@ impl Pages {
 impl Drop for Pages {
     fn drop(&mut self) {
         let resident = std::mem::take(self.resident.get_mut().unwrap_or_else(|e| e.into_inner()));
-        if resident.is_empty() {
-            return;
-        }
-        // After the resource's own destructor, which was retired first.
-        lifetime::retire(move || {
-            for (_, allocation) in resident {
-                if let Err(err) = Ctx::allocator().free(allocation) {
-                    tracing::error!(%err, "failed to free a sparse page");
-                }
+        for (_, allocation) in resident {
+            if let Err(err) = Ctx::allocator().free(allocation) {
+                tracing::error!(%err, "failed to free a sparse page");
             }
-        });
+        }
     }
 }
 
@@ -110,14 +111,9 @@ fn residency_check<F: On>(feature: &'static str) -> Result<()> {
 /// are dropped. The host can't access it.
 #[derive(Debug)]
 pub struct SparseBuffer<T: Copy + 'static> {
-    handle: vk::Buffer,
-    address: u64,
-    num_bytes: u64,
-    /// After the buffer, so its pages are freed once it is destroyed.
-    pages: Pages,
+    /// Its pages are its memory, freed after the buffer.
+    internal: Arc<BufferInternal>,
     _type: PhantomData<T>,
-    /// Last, so it counts the buffer until its drop finished.
-    _live: Live,
 }
 
 #[cfg(feature = "sparse-residency-buffer")]
@@ -161,32 +157,41 @@ impl<T: Copy + 'static> SparseBuffer<T> {
             device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(handle))
         };
         Ok(SparseBuffer {
-            handle,
-            address,
-            num_bytes,
-            pages: Pages::new(requirements, true),
+            internal: Arc::new(BufferInternal {
+                handle,
+                address,
+                num_bytes,
+                memory: BufferMemory::Sparse(Pages::new(requirements, true)),
+                header: Header::new(live),
+            }),
             _type: PhantomData,
-            _live: live,
         })
+    }
+
+    fn pages(&self) -> &Pages {
+        match &self.internal.memory {
+            BufferMemory::Sparse(pages) => pages,
+            _ => unreachable!("a sparse buffer's memory is its pages"),
+        }
     }
 
     /// The bytes of a page: what one resident page holds, and where pages start.
     pub fn page_size(&self) -> u64 {
-        self.pages.requirements.alignment
+        self.pages().requirements.alignment
     }
 
     /// How many pages it has.
     pub fn page_count(&self) -> u64 {
-        self.pages.requirements.size.div_ceil(self.page_size())
+        self.pages().requirements.size.div_ceil(self.page_size())
     }
 
     /// Whether page `index` is resident, as far as the binds submitted so far made it.
     pub fn is_resident(&self, index: u64) -> bool {
-        lock(&self.pages.resident).contains_key(&Page::Buffer(index))
+        lock(&self.pages().resident).contains_key(&Page::Buffer(index))
     }
 
     pub fn len(&self) -> usize {
-        (self.num_bytes / size_of::<T>() as u64) as usize
+        (self.internal.num_bytes / size_of::<T>() as u64) as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -194,35 +199,22 @@ impl<T: Copy + 'static> SparseBuffer<T> {
     }
 
     pub fn address(&self) -> u64 {
-        self.address
+        self.internal.address
     }
 
     /// The `index` range of its elements; panics past its end. Commands don't take it as fully
     /// bound.
     #[track_caller]
     pub fn range<R: std::ops::RangeBounds<usize>>(&self, index: R) -> BufferSlice<'_, T> {
-        BufferSlice {
-            sparse: true,
-            ..buffer::slice::new_slice(index, self.address, self.num_bytes)
-        }
+        let internal = &self.internal;
+        buffer::slice::new_slice(index, internal, internal.address, internal.num_bytes)
     }
 
     /// The `index` range of its bytes; panics past its end.
     #[track_caller]
     pub fn byte_range<R: std::ops::RangeBounds<usize>>(&self, index: R) -> BufferSlice<'_, u8> {
-        BufferSlice {
-            sparse: true,
-            ..buffer::slice::new_slice(index, self.address, self.num_bytes)
-        }
-    }
-}
-
-#[cfg(feature = "sparse-residency-buffer")]
-impl<T: Copy + 'static> Drop for SparseBuffer<T> {
-    fn drop(&mut self) {
-        let handle = self.handle;
-        let range = self.address..self.address + self.num_bytes;
-        buffer::retire_buffer(handle, range, Allocation::default());
+        let internal = &self.internal;
+        buffer::slice::new_slice(index, internal, internal.address, internal.num_bytes)
     }
 }
 
@@ -247,11 +239,10 @@ pub struct MipTail {
 /// Colour formats only, one layer.
 #[derive(Debug)]
 pub struct SparseImage<F: Format, U: ImageUsage, D: Dim = D2> {
+    /// Its pages are its memory, freed after the image.
     image: Image<F, U, D, Single>,
     granularity: vk::Extent3D,
     mip_tail: Option<MipTail>,
-    /// After the image, so its pages are freed once it is destroyed.
-    pages: Pages,
 }
 
 #[cfg(any(
@@ -332,7 +323,7 @@ impl<F: Format + ColorAspect, U: ImageUsage, D: Dim> SparseImage<F, U, D> {
         let flags = usage.create_flags()
             | vk::ImageCreateFlags::SPARSE_BINDING
             | vk::ImageCreateFlags::SPARSE_RESIDENCY;
-        let raw = RawImage::<F, U, D>::create(
+        let mut raw = RawImage::<F, U, D>::create(
             format,
             usage,
             extent,
@@ -361,12 +352,16 @@ impl<F: Format + ColorAspect, U: ImageUsage, D: Dim> SparseImage<F, U, D> {
                 size: colour_requirements.image_mip_tail_size,
                 offset: colour_requirements.image_mip_tail_offset,
             });
+        raw.internal.memory = ImageMemory::Sparse(Pages::new(requirements, false));
         Ok(SparseImage {
             image: Image::from_raw(raw)?,
             granularity: colour_requirements.format_properties.image_granularity,
             mip_tail,
-            pages: Pages::new(requirements, false),
         })
+    }
+
+    fn pages(&self) -> &Pages {
+        self.image.internal.sparse_pages()
     }
 
     /// The texels of a tile, which offsets and extents of tile binds are multiples of (or
@@ -378,7 +373,7 @@ impl<F: Format + ColorAspect, U: ImageUsage, D: Dim> SparseImage<F, U, D> {
 
     /// The bytes of a tile's memory.
     pub fn page_size(&self) -> u64 {
-        self.pages.requirements.alignment
+        self.pages().requirements.alignment
     }
 
     /// Its mip tail, `None` where every mip has whole tiles.
@@ -395,7 +390,7 @@ impl<F: Format + ColorAspect, U: ImageUsage, D: Dim> SparseImage<F, U, D> {
             y: tile.y,
             z: tile.z,
         };
-        lock(&self.pages.resident).contains_key(&page)
+        lock(&self.pages().resident).contains_key(&page)
     }
 }
 
@@ -448,8 +443,8 @@ impl<'a> SparseBind<'a> {
         );
         SparseBind {
             target: Target::Buffer {
-                buffer: buffer.handle,
-                pages: &buffer.pages,
+                buffer: buffer.internal.handle,
+                pages: buffer.pages(),
                 range: (pages.start, pages.end),
             },
             resident,
@@ -506,7 +501,7 @@ impl<'a> SparseBind<'a> {
         SparseBind {
             target: Target::Tiles {
                 image: image.whole_view().image(),
-                pages: &image.pages,
+                pages: image.internal.sparse_pages(),
                 granularity: g,
                 mip,
                 mip_extent: m,
@@ -533,7 +528,7 @@ impl<'a> SparseBind<'a> {
         SparseBind {
             target: Target::MipTail {
                 image: image.whole_view().image(),
-                pages: &image.pages,
+                pages: image.internal.sparse_pages(),
                 tail,
             },
             resident,
