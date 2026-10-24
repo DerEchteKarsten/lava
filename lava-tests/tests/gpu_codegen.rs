@@ -1,4 +1,4 @@
-//! GPU tests of what lava-build-slang generates and `bindless.slang` offers: struct layouts with gaps, packing, half and 16-bit fields, matrices and handles behind pointers, image operations (gathers, gradient and bias samples, mip loads, combined samples, atomics), workgroup sizes and `groups`, dispatch bases, required subgroup sizes, several compute entry points per file, and exported constants
+//! GPU tests of what lava-build-slang generates and `bindless.slang` offers: struct layouts with gaps, packing, half and 16-bit fields, matrices and handles behind pointers, read-only storage images and image handles read through a pointer, image operations (gathers, gradient and bias samples, mip loads, combined samples, atomics), workgroup sizes and `groups`, dispatch bases, required subgroup sizes, several compute entry points per file, and exported constants
 mod common;
 
 use common::{buffer_with, gpu, nearest, panic_message, zeroed_buffer};
@@ -446,4 +446,56 @@ fn generated_structs_keep_slangs_layout() {
         1.0 + 20.0 + 300.0,
         "`float3`s are 12 bytes apart behind a pointer"
     );
+}
+
+/// `Image2D` reads through the storage descriptor; `Image2D` and `Tex2D` handles inside a
+/// struct behind a `Buf` read through theirs (their accesses passed by hand).
+#[test]
+fn storage_images_and_handles_behind_pointers_are_read() {
+    let mut gpu = gpu();
+    type Texture = Image<R8G8B8A8Unorm, usage![Sampled, Storage, TransferDst]>;
+    let texels = |base: u8| -> Vec<[u8; 4]> {
+        (0..4u8)
+            .map(|i| [base + i, base + 10 * i, 255 - i, 255])
+            .collect()
+    };
+    let make = |gpu: &mut common::Gpu, base: u8| {
+        let image = Texture::new(UVec2::splat(2))
+            .unwrap()
+            .bind_combined()
+            .unwrap();
+        let data = buffer_with(&texels(base));
+        gpu.submit(|cmd| cmd.copy_buffer_to_image(data.range(..), image.whole()));
+        image
+    };
+    let (top, storage, sampled) = (make(&mut gpu, 10), make(&mut gpu, 50), make(&mut gpu, 90));
+    let mut images: Buffer<TestImagePair, Upload> = Buffer::upload(1).unwrap();
+    images.host_write(
+        0,
+        &[TestImagePair {
+            storage: storage.handle::<bindless::Storage>(),
+            sampled: sampled.handle::<bindless::Sampled>(),
+        }],
+    );
+    let mut out = zeroed_buffer::<Vec4>(12);
+    gpu.submit(|cmd| {
+        let reached = [
+            lava::command_buffer::ImageUse::storage_read(storage.whole_view()),
+            lava::command_buffer::ImageUse::sampled_read(sampled.whole_view()),
+        ];
+        let bindings = TestImage2d::push_bindings(
+            TestImage2dArgs {
+                image: top.whole_view(),
+                images: images.range(..),
+                sampler: nearest(),
+                out: out.range(..),
+            },
+            Some(lava::command_buffer::Accesses::images(&reached)),
+        );
+        cmd.compute(&bindings, [1, 1, 1]);
+    });
+    let read: Vec<[u8; 4]> = out.host().iter().map(|v| bytes(*v)).collect();
+    assert_eq!(read[0..4], texels(10), "the push constant's `Image2D`");
+    assert_eq!(read[4..8], texels(50), "an `Image2D` behind a pointer");
+    assert_eq!(read[8..12], texels(90), "a `Tex2D` behind a pointer");
 }

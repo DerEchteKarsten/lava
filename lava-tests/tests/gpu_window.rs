@@ -1,8 +1,9 @@
-//! Windowed GPU tests: init with a display, surfaces, swapchains, presenting and its misuse, present modes, composite alpha, HDR metadata, surface formats and colour spaces, several windows presented at once
+//! Windowed GPU tests: init with a display, surfaces, swapchains (recreated by size where the surface allows it, else by present mode or composite alpha), presenting and its misuse, the acquire waited for at the first access's stage, surfaces dropped with a current image, present modes, composite alpha, HDR metadata, surface formats and colour spaces, several windows presented at once; each step checks for validation errors
 mod common;
 
 use std::process::ExitCode;
 
+use common::panic_message;
 use lava::{
     Ctx,
     bindless::{self, ImageHandle, Storage},
@@ -62,19 +63,6 @@ fn surface_preferring(window: &Window, formats: &[SurfaceFormat]) -> lava::Resul
     }
 }
 
-/// What `f` panics with.
-fn panic_message(f: impl FnOnce()) -> String {
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("it panics");
-    match panic.downcast::<String>() {
-        Ok(message) => *message,
-        Err(panic) => panic
-            .downcast_ref::<&str>()
-            .copied()
-            .unwrap_or_default()
-            .to_owned(),
-    }
-}
-
 /// Acquires, clears to `color` and presents an image; returns its handle.
 fn present_frame(
     timeline: &mut Timeline<Graphics>,
@@ -109,7 +97,16 @@ fn submit_without_presenting(timeline: &mut Timeline<Graphics>, surface: &mut Su
 
 fn run(event_loop: &ActiveEventLoop) {
     let window = create_window(event_loop, "lava test");
-    let step = |name: &str| println!("test {name} ... ok");
+    // Each step fails on the validation errors it raised, before it reports ok.
+    let step = |name: &str| {
+        let errors = common::take_validation_errors();
+        assert!(
+            errors.is_empty(),
+            "{name}: Vulkan validation errors:\n{}",
+            errors.join("\n\n")
+        );
+        println!("test {name} ... ok");
+    };
 
     common::capture_validation_errors();
     let config = lava::Config {
@@ -118,6 +115,7 @@ fn run(event_loop: &ActiveEventLoop) {
         ..lava::Config::new(&PASS_MAP)
     };
     lava::init(&config).expect("lava init with a display failed");
+    common::assert_validation_active();
     assert!(
         lava::init(&lava::Config::new(&PASS_MAP)).is_err(),
         "second init must fail"
@@ -148,7 +146,14 @@ fn run(event_loop: &ActiveEventLoop) {
     ] {
         handles.push(present_frame(&mut timeline, &mut surface, SIZE, color));
     }
-    assert_eq!(surface.size(), SIZE);
+    // The requested extent where the surface lets the application choose it (Wayland), else
+    // the window's (X11, where a window manager may have resized the window).
+    let window_extent = || glam::UVec2::new(window.inner_size().width, window.inner_size().height);
+    assert!(
+        surface.size() == SIZE || surface.size() == window_extent(),
+        "the swapchain is the requested or the window's extent: {}",
+        surface.size()
+    );
     // Bound as storage, the only descriptor its usage allows.
     for handle in &handles {
         assert!(handle.storage_slot().is_some());
@@ -156,27 +161,89 @@ fn run(event_loop: &ActiveEventLoop) {
     }
     step("acquire_clear_present");
 
-    let old_images = surface.num_images();
-    present_frame(&mut timeline, &mut surface, SIZE / 2, [1.0, 1.0, 0.0, 1.0]);
-    assert_eq!(surface.size(), SIZE / 2);
-    let new = present_frame(&mut timeline, &mut surface, SIZE / 2, [1.0, 0.0, 1.0, 1.0]);
-    assert!(
-        !handles.contains(&new),
-        "the old swapchain's slots stay taken until it is destroyed"
-    );
-    // An acquire destroys the old swapchain once nothing uses it, freeing the lowest slots.
-    for _ in 0..2 {
-        lava::wait_idle().unwrap();
-        present_frame(&mut timeline, &mut surface, SIZE / 2, [0.0, 0.0, 0.0, 1.0]);
+    // The current swapchain's slots: frames until the last twice its image count showed only
+    // that many images (a window manager may still be resizing the window, and X11 recreates
+    // suboptimal swapchains at the same extent).
+    let (mut frames, mut current) = (Vec::new(), Vec::new());
+    let mut extent = surface.size();
+    for _ in 0..64 {
+        let handle = present_frame(&mut timeline, &mut surface, SIZE, [1.0, 1.0, 1.0, 1.0]);
+        frames.push((handle, surface.size()));
+        let n = surface.num_images();
+        if frames.len() >= 2 * n {
+            let last = &frames[frames.len() - 2 * n..];
+            extent = surface.size();
+            let mut handles: Vec<_> = last.iter().map(|&(h, _)| h).collect();
+            handles.sort_by_key(|h| h.storage_slot());
+            handles.dedup();
+            if handles.len() == n && last.iter().all(|&(_, size)| size == extent) {
+                current = handles;
+                break;
+            }
+        }
     }
-    let lowest = handles
-        .iter()
-        .map(|h| h.storage_slot().unwrap())
-        .min()
-        .unwrap();
-    let reserved = bindless::reserve::<Storage>(old_images as u32).unwrap();
-    assert_eq!(reserved.slots().start, lowest);
-    drop(reserved);
+    assert!(
+        !current.is_empty(),
+        "the swapchain settles within 64 frames"
+    );
+    let old_images = surface.num_images();
+    // A smaller window's swapchain is smaller where the surface lets the application choose
+    // its extent (Wayland); where the extent is the window's (X11), it stays, and another
+    // present mode or composite alpha recreates the swapchain instead.
+    let mut new = present_frame(&mut timeline, &mut surface, SIZE / 2, [1.0, 1.0, 0.0, 1.0]);
+    let resized = surface.size();
+    assert!(
+        resized == SIZE / 2 || resized == window_extent(),
+        "the swapchain is the requested or the window's extent: {resized}"
+    );
+    let size = SIZE / 2;
+    // Recreated by the new size, or (X11) by a window manager still resizing the window.
+    let by_size = resized == SIZE / 2 || resized != extent;
+    let recreated = if by_size {
+        println!("the swapchain follows the requested size or the window's");
+        true
+    } else if let Some(&mode) = (surface.present_modes().iter()).find(|&&m| m != PresentMode::Fifo)
+    {
+        println!("the swapchain has the window's extent: recreated by {mode:?}");
+        surface.set_present_mode(mode)
+    } else if let Some(alpha) = (CompositeAlpha::ALL.into_iter())
+        .find(|&a| a != surface.composite_alpha() && surface.supports_composite_alpha(a))
+    {
+        println!("the swapchain has the window's extent: recreated by {alpha:?}");
+        surface.set_composite_alpha(alpha)
+    } else {
+        false
+    };
+    if recreated {
+        if !by_size {
+            new = present_frame(&mut timeline, &mut surface, size, [1.0, 0.0, 1.0, 1.0]);
+        }
+        assert!(
+            !current.contains(&new),
+            "the old swapchain's slots stay taken until it is destroyed"
+        );
+        // An acquire destroys the old swapchain once nothing uses it, freeing its slots.
+        for _ in 0..2 {
+            lava::wait_idle().unwrap();
+            present_frame(&mut timeline, &mut surface, size, [0.0, 0.0, 0.0, 1.0]);
+        }
+        let lowest = (current.iter())
+            .map(|h| h.storage_slot().unwrap())
+            .min()
+            .unwrap();
+        let reserved = bindless::reserve::<Storage>(old_images as u32).unwrap();
+        assert!(
+            reserved.slots().start <= lowest,
+            "{:?} lies above the freed slot {lowest}",
+            reserved.slots()
+        );
+        drop(reserved);
+    } else {
+        eprintln!(
+            "SKIPPED a_new_size_recreates_the_swapchain: the extent is fixed and there is no other present mode or composite alpha"
+        );
+    }
+    assert!(surface.set_present_mode(PresentMode::Fifo));
     step("a_new_size_recreates_the_swapchain_and_frees_the_old_slots");
 
     assert!(!surface.acquire(glam::UVec2::ZERO).unwrap());
@@ -198,22 +265,21 @@ fn run(event_loop: &ActiveEventLoop) {
 
     let submission = timeline.begin().unwrap();
     assert!(surface.acquire(SIZE).unwrap());
-    let unpresented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let message = panic_message(|| {
         submission
             .submit(|cmd| cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4])))
-    }));
-    let message = unpresented.expect_err("the submission that uses the current image presents it");
-    let message = message.downcast_ref::<&str>().copied().unwrap_or_default();
+    });
     assert!(
         message.contains("must present it"),
-        "a real panic with a message: {message:?}"
+        "the submission that uses the current image presents it: {message:?}"
     );
     submit_without_presenting(&mut timeline, &mut surface);
     let submission = timeline.begin().unwrap();
-    let twice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        submission.submit(|cmd| cmd.present(&mut surface))
-    }));
-    assert!(twice.is_err(), "an image is presented by one submission");
+    let message = panic_message(|| submission.submit(|cmd| cmd.present(&mut surface)));
+    assert!(
+        message.contains("a submission presented the current image already"),
+        "an image is presented by one submission: {message}"
+    );
     surface.present().unwrap();
     present_frame(&mut timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
     step("misuse_panics");
@@ -280,7 +346,7 @@ fn run(event_loop: &ActiveEventLoop) {
     });
     match latest_ready {
         Some(mode) if surface.supports(*mode) => println!("presented with {mode:?}"),
-        _ => println!("SKIPPED FifoLatestReady: the surface doesn't support it"),
+        _ => eprintln!("SKIPPED FifoLatestReady: the surface doesn't support it"),
     }
     assert!(surface.set_present_mode(PresentMode::Fifo));
     present_frame(&mut timeline, &mut surface, SIZE, [0.0, 1.0, 0.0, 1.0]);
@@ -312,7 +378,7 @@ fn run(event_loop: &ActiveEventLoop) {
         present_frame(&mut timeline, &mut surface, SIZE, [1.0, 1.0, 1.0, 1.0]);
         step("hdr_metadata");
     } else {
-        println!("SKIPPED hdr_metadata: the device has no VK_EXT_hdr_metadata");
+        eprintln!("SKIPPED hdr_metadata: the device has no VK_EXT_hdr_metadata");
     }
 
     let second_window = create_window(event_loop, "lava test 2");
@@ -378,6 +444,60 @@ fn run(event_loop: &ActiveEventLoop) {
     drop(fallback);
     step("surface_formats_and_colour_spaces");
 
+    // The presenting submission's first access of the image waits for its acquire at that
+    // access's stage: a compute shader's storage write, or a rendering's attachment output.
+    for first in ["compute", "rendering"] {
+        let submission = timeline.begin().unwrap();
+        assert!(surface.acquire(SIZE).unwrap());
+        submission
+            .submit(|cmd| {
+                let image = surface.current_image();
+                match first {
+                    "compute" => cmd.compute(
+                        &TestComputeImage::push_bindings(
+                            TestComputeImageArgs {
+                                target: image,
+                                tint: glam::Vec4::ONE,
+                                offset: glam::UVec2::ZERO,
+                                size: SIZE,
+                            },
+                            None,
+                        ),
+                        [SIZE.x / 8, SIZE.y / 8, 1],
+                    ),
+                    _ => cmd
+                        .raster(
+                            SIZE,
+                            [lava::command_buffer::Attachment::color(
+                                image,
+                                Some(ClearValue::Float([0.0, 0.5, 0.0, 1.0])),
+                            )],
+                        )
+                        .record("clear only"),
+                }
+                cmd.present(&mut surface);
+            })
+            .unwrap();
+        surface.present().unwrap();
+    }
+    step("the_first_access_waits_for_the_acquire_at_its_stage");
+
+    // A surface dropped with a current image: acquired only, or presented by a submission but
+    // not by `present()`.
+    for presented in [false, true] {
+        let window = create_window(event_loop, "lava test 4");
+        let mut dropped = surface_for(&window).unwrap();
+        present_frame(&mut timeline, &mut dropped, SIZE, [0.0, 0.0, 1.0, 1.0]);
+        if presented {
+            submit_without_presenting(&mut timeline, &mut dropped);
+        } else {
+            assert!(dropped.acquire(SIZE).unwrap());
+        }
+        drop(dropped);
+        lava::wait_idle().unwrap();
+    }
+    step("dropping_a_surface_with_a_current_image");
+
     // Destroys the surfaces while the windows are still open.
     drop(second);
     drop(surface);
@@ -385,12 +505,6 @@ fn run(event_loop: &ActiveEventLoop) {
     lava::wait_idle().unwrap();
     step("teardown");
 
-    let errors = common::take_validation_errors();
-    assert!(
-        errors.is_empty(),
-        "Vulkan validation errors:\n{}",
-        errors.join("\n\n")
-    );
     step("no_validation_errors");
 }
 
@@ -414,7 +528,7 @@ impl ApplicationHandler for App {
 
 fn main() -> ExitCode {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-        println!("SKIPPED gpu_window: no Wayland or X11 display available");
+        eprintln!("SKIPPED gpu_window: no Wayland or X11 display available");
         return ExitCode::SUCCESS;
     }
 

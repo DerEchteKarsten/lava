@@ -761,8 +761,8 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         );
         transfer_feature_check(to_vk, vk::FormatFeatureFlags2::TRANSFER_DST, "copied into");
         check_overlap(&src, &dst, "copy");
-        check_image_family(&self.rec.family, &src, false);
-        check_image_family(&self.rec.family, &dst, true);
+        check_image_family(&self.rec.family, &src);
+        check_image_family(&self.rec.family, &dst);
         self.rec.flush_pending(
             [
                 src.view.mip_access(
@@ -928,7 +928,7 @@ fn buffer_image_region<'s, F: Format, U: ImageUsage, D: Dim>(
             "a transfer family copies from and to 4-byte aligned buffer addresses, not {address:#x}"
         );
     }
-    check_image_family(family, slice, into_image);
+    check_image_family(family, slice);
     vk::DeviceMemoryImageCopyKHR::default()
         .address_range(buffer.slice.address_range())
         .address_flags(buffer.slice.address_flags())
@@ -1106,21 +1106,20 @@ fn check_overlap<F: Format, U: ImageUsage, F2: Format, U2: ImageUsage, D: Dim>(
     );
 }
 
-/// Panics where the family can't copy the box: into depth or stencil images only on graphics,
-/// and on a transfer family only boxes of its image granularity (in blocks for a
+/// Panics where the family can't copy the box: depth or stencil images (either way) only on
+/// graphics, and on a transfer family only boxes of its image granularity (in blocks for a
 /// block-compressed format).
 #[track_caller]
 fn check_image_family<F: Format, U: ImageUsage, D: Dim>(
     family: &FamilyInfo,
     slice: &ImageSlice<ImageView<'_, F, U, D>>,
-    into_image: bool,
 ) {
     let depth_stencil = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+    // Both ways: without graphics, buffer copies of a depth or stencil aspect are invalid
+    // (`VUID-vkCmdCopyImageToMemoryKHR-commandBuffer-13106` for copies out of one).
     assert!(
-        family.kind == Kind::Graphics
-            || !into_image
-            || !slice.view.format.aspects().intersects(depth_stencil),
-        "copies into depth or stencil images are recorded on the graphics family"
+        family.kind == Kind::Graphics || !slice.view.format.aspects().intersects(depth_stencil),
+        "copies of depth or stencil images are recorded on the graphics family"
     );
     if family.kind != Kind::Transfer {
         return;

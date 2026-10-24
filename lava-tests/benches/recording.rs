@@ -1,4 +1,4 @@
-//! Benchmark of recording lava-tests' passes into real command buffers, headless with the validation layer off: the CPU time of building the bindings and recording them, per scenario
+//! Benchmark of recording lava-tests' passes into real command buffers, headless with the validation layer off: per scenario, interleaved frame by frame, the CPU time of building the bindings and recording them, and of the whole submission from `begin` until `submit` returned (`LAVA_BENCH_FRAMES` sets the frame count)
 
 use std::{hint::black_box, time::Instant};
 
@@ -9,7 +9,7 @@ use lava::{
     buffer::Buffer,
     command_buffer::{Accesses, Attachment, CommandBuffer, Draw, ImageUse, RasterState},
     image::{Image, format::R8G8B8A8Unorm, usage::usage},
-    queue::{Graphics, Timeline},
+    queue::{Graphics, Timeline, Wait},
 };
 use lava_tests::bindings::*;
 
@@ -165,8 +165,19 @@ const FRAMES: usize = 3000;
 /// Records one scenario's commands.
 type Scenario = fn(&mut CommandBuffer<Graphics>, &Resources);
 
+/// The `(median, 10th, 90th percentile)` of `times`.
+fn percentiles(times: &mut [u64]) -> [u64; 3] {
+    times.sort_unstable();
+    let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+    [at(0.5), at(0.1), at(0.9)]
+}
+
 fn main() {
     lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
+    let frames = std::env::var("LAVA_BENCH_FRAMES")
+        .ok()
+        .map(|n| n.parse().expect("LAVA_BENCH_FRAMES is a frame count"))
+        .unwrap_or(FRAMES);
     let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
     let buffer = |len| Buffer::new(len).unwrap();
     let resources = Resources {
@@ -187,6 +198,23 @@ fn main() {
         textured: (0..TEXTURES).map(|_| Buffer::new(4).unwrap()).collect(),
         indices: Buffer::new(6).unwrap(),
     };
+    // Defined contents: zeroed vertices (degenerate triangles) and indices, numbers to copy.
+    let r = &resources;
+    (timeline.begin().unwrap())
+        .submit(|cmd| {
+            cmd.fill_buffer(r.src.range(..), 1);
+            for buffer in r.dst.iter().chain([&r.out]) {
+                cmd.fill_buffer(buffer.range(..), 0);
+            }
+            cmd.fill_buffer(r.vertices.range(..).cast::<u32>(), 0);
+            for buffer in &r.textured {
+                cmd.fill_buffer(buffer.range(..).cast::<u32>(), 0);
+            }
+            cmd.fill_buffer(r.indices.range(..), 0);
+        })
+        .unwrap()
+        .block()
+        .unwrap();
 
     let mut scenarios: Vec<(&str, Scenario)> = vec![
         ("compute", compute),
@@ -197,27 +225,48 @@ fn main() {
         scenarios.push(("mesh", mesh));
     }
 
-    println!(
-        "Recording time per frame in ns (median, 10th and 90th percentile of {FRAMES} frames):"
-    );
-    for (name, scenario) in scenarios {
-        let mut times = Vec::with_capacity(FRAMES);
-        for frame in 0..WARMUP + FRAMES {
+    // Per scenario, the recording's and the submission's times of each measured frame.
+    let mut times = vec![(Vec::with_capacity(frames), Vec::with_capacity(frames)); scenarios.len()];
+    let mut last: Option<Wait> = None;
+    for frame in 0..WARMUP + frames {
+        // One frame of each scenario after another, so clock changes hit them alike.
+        for (&(_, scenario), (recording, submission)) in scenarios.iter().zip(&mut times) {
+            // The GPU finished the last frame, so `begin` doesn't wait for it: the submission
+            // column is CPU time (the pool reset, recording, the final barrier, merging the
+            // pending accesses, ending the command buffer and the submit).
+            if let Some(wait) = last.take() {
+                wait.block().unwrap();
+            }
             let mut elapsed = 0;
-            (timeline.begin().unwrap())
+            let start = Instant::now();
+            let done = (timeline.begin().unwrap())
                 .submit(|cmd| {
                     let start = Instant::now();
                     scenario(cmd, black_box(&resources));
                     elapsed = start.elapsed().as_nanos() as u64;
                 })
                 .unwrap();
+            let submitted = start.elapsed().as_nanos() as u64;
+            last = Some(done);
             if frame >= WARMUP {
-                times.push(elapsed);
+                recording.push(elapsed);
+                submission.push(submitted);
             }
         }
-        times.sort_unstable();
-        let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
-        println!("{name:<14} {:>9} {:>9} {:>9}", at(0.5), at(0.1), at(0.9));
+    }
+
+    println!(
+        "Time per frame in ns (median, 10th and 90th percentile of {frames} frames, scenarios interleaved):"
+    );
+    println!("  recording: building the bindings and recording them (the submit closure);");
+    println!(
+        "  submission: begin() until submit() returned, after the GPU finished the last frame."
+    );
+    println!("{:<14} {:>29}   {:>29}", "", "recording", "submission");
+    for ((name, _), (recording, submission)) in scenarios.iter().zip(&mut times) {
+        let [r50, r10, r90] = percentiles(recording);
+        let [s50, s10, s90] = percentiles(submission);
+        println!("{name:<14} {r50:>9} {r10:>9} {r90:>9}   {s50:>9} {s10:>9} {s90:>9}");
     }
     drop(timeline);
     lava::wait_idle().unwrap();

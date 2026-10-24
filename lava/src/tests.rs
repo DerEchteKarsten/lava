@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, texel blocks, format components, copy sizes with row pitches, 64-bit clear values and format compatibility classes, the slot allocator and image handle bits, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads (instances, binding table regions), topology classes and render areas, half floats, copy region overlaps, and `unsized_struct!`'s read-back
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, texel blocks, format components, the format table's texel sizes, copy sizes with row pitches, 64-bit clear values and format compatibility classes, runtime formats' and usages' checks, buffer and image cast checks, mip extents and boxes, the slot allocator (double frees included) and image handle bits, the staging ring's positions, the descriptor heap layout, feature detection (every feature's extensions detect it), feature prerequisites (`consistent`), `without`/`missing_from`, the capability scan and the manifest's cargo names, pipeline cache headers, raster pipeline keys (borrowed keys hash like owned ones) and baked draw state, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads (instances byte for byte, binding table regions), topology classes and render areas, half floats, copy region overlaps, and `unsized_struct!`'s read-back
 use std::{iter, sync::atomic::AtomicU64};
 
 use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStageFlags2 as S};
@@ -11,7 +11,7 @@ use crate::{
         image_state::{ImageState, check_states, release_states, released_by, take_checked_states},
         pending::{MAX_PENDING_BUFFER_WRITES, PendingAccesses},
     },
-    features::{DeviceFacts, FeatureChain, Features},
+    features::{DeviceFacts, FeatureChain, Features, Needs},
     image::{
         format::{self, Block, ClearValue, Format},
         slice::rows_len,
@@ -31,6 +31,17 @@ const GRAPHICS: FamilyInfo = FamilyInfo {
     },
     indices: [0, 1, 2],
 };
+
+/// The message `f` panics with; fails the test if it doesn't panic.
+#[track_caller]
+fn panic_message<R>(f: impl FnOnce() -> R) -> String {
+    let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) else {
+        panic!("it should panic");
+    };
+    (payload.downcast_ref::<String>().cloned())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
 
 fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess {
     BufferAccess {
@@ -250,8 +261,10 @@ fn image_states_move_in_runs_of_mips() {
 #[test]
 fn ownership_moves_through_release_and_acquire() {
     let states = [state(L::GENERAL, Some(Kind::Compute)).atomic()];
+    let message = panic_message(|| check_states(&states, (0..1).into(), Kind::Graphics));
     assert!(
-        std::panic::catch_unwind(|| check_states(&states, (0..1).into(), Kind::Graphics)).is_err()
+        message.contains("the Compute family owns is accessed on the Graphics family"),
+        "{message}"
     );
     let mut released = Vec::new();
     release_states(
@@ -811,13 +824,30 @@ fn passes_need_the_features_of_their_capabilities() {
         [1, 39, 5283],
         "the scan stops after the capabilities"
     );
-    let needs = Features::of_spirv(&spirv);
+    // `Shader` (1) needs nothing, `Int8` (39) `shader-int8`, `MeshShadingEXT` (5283)
+    // `mesh-shader`; `RayTracingKHR` (4479) comes after the scan stopped.
+    let mut expected = Needs {
+        features: Features::NONE,
+        compiled_out: Vec::new(),
+    };
     #[cfg(feature = "shader-int8")]
-    assert!(needs.features.shader_int8);
+    {
+        expected.features.shader_int8 = true;
+    }
+    #[cfg(not(feature = "shader-int8"))]
+    expected.compiled_out.push("shader-int8");
     #[cfg(feature = "mesh-shader")]
-    assert!(needs.features.mesh_shader);
+    {
+        expected.features.mesh_shader = true;
+    }
     #[cfg(not(feature = "mesh-shader"))]
-    assert!(needs.compiled_out.contains(&"mesh-shader"));
+    expected.compiled_out.push("mesh-shader");
+    assert_eq!(Features::of_spirv(&spirv), expected);
+    assert_eq!(
+        Features::of_spirv(&spirv).features,
+        named(&["shader-int8", "mesh-shader"]),
+        "every other feature stays off"
+    );
 }
 
 /// What lava enables is what it requires, and enabling every optional feature reads back as
@@ -839,7 +869,7 @@ fn enabled_features_read_back_as_supported() {
         dedicated_transfer: true,
         sparse_queue: true,
     };
-    assert_eq!(enabling(&all).optional(&|_| true, facts), all);
+    assert_eq!(enabling(&all).optional(&|_| true, facts), all.consistent());
 }
 
 #[test]
@@ -941,6 +971,32 @@ fn instances_have_the_layout_of_the_vulkan_struct() {
         flags.contains(InstanceFlags::FORCE_OPAQUE)
             && !flags.contains(InstanceFlags::FORCE_NO_OPAQUE)
     );
+
+    // Byte for byte what ash's struct holds for the same values: the transform's rows, the
+    // 24-bit fields in the low bits of their words, the 8-bit ones in the high, the address.
+    let vulkan = vk::AccelerationStructureInstanceKHR {
+        transform: vk::TransformMatrixKHR {
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0],
+        },
+        instance_custom_index_and_mask: vk::Packed24_8::new(5, 0x0F),
+        instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+            7,
+            (vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE
+                | vk::GeometryInstanceFlagsKHR::TRIANGLE_FLIP_FACING)
+                .as_raw() as u8,
+        ),
+        acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+            device_handle: 0xABC,
+        },
+    };
+    // SAFETY: a `repr(C)` struct of 64 bytes without padding, read as bytes.
+    let vulkan_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const vulkan).cast::<u8>(),
+            size_of::<vk::AccelerationStructureInstanceKHR>(),
+        )
+    };
+    assert_eq!(bytemuck::bytes_of(&instance), vulkan_bytes);
 }
 
 #[test]
@@ -1079,7 +1135,11 @@ fn locations_allocate_from_their_memory_types() {
     );
     assert!(!Location::Gpu.host_visible() && Location::Readback.host_visible());
     Dynamic(Location::Upload).host_check();
-    assert!(std::panic::catch_unwind(|| Dynamic(Location::Gpu).host_check()).is_err());
+    let message = panic_message(|| Dynamic(Location::Gpu).host_check());
+    assert!(
+        message.contains("the host can't access a buffer of Gpu memory"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -1405,8 +1465,11 @@ fn clear_values_pack_64_bit_components_into_two_words() {
         R64G64B64A64Uint.clear_value([1, 2, 0, 0]),
         ClearValue::Uint([1, 0, 2, 0])
     );
-    let third = std::panic::catch_unwind(|| R64G64B64A64Uint.clear_value([1, 2, 3, 0]));
-    assert!(third.is_err(), "a clear value holds two 64-bit components");
+    let message = panic_message(|| R64G64B64A64Uint.clear_value([1, 2, 3, 0]));
+    assert!(
+        message.contains("a clear value holds two 64-bit components"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -1456,4 +1519,590 @@ fn formats_count_their_components() {
     ] {
         assert!(format::info(format).is_some(), "{format:?} has a type");
     }
+}
+
+/// `features` by their cargo names (`"rebar"` too); names lava was compiled without are left
+/// out.
+fn named(names: &[&str]) -> Features {
+    let all = Features::from_bits(iter::repeat(true)).missing_from(&Features::NONE);
+    Features::from_bits(all.iter().map(|name| names.contains(name)))
+}
+
+/// Every feature this build has, by cargo name, `"rebar"` first.
+fn feature_names() -> Vec<&'static str> {
+    Features::from_bits(iter::repeat(true)).missing_from(&Features::NONE)
+}
+
+/// Whether `features` has `name`, which this build compiles.
+fn has_feature(features: Features, name: &str) -> bool {
+    feature_names().contains(&name) && named(&[name]).without(features) == Features::NONE
+}
+
+#[test]
+fn features_subtract_and_name_what_is_missing() {
+    let both = named(&["mesh-shader", "logic-op"]);
+    assert_eq!(both.without(named(&["logic-op"])), named(&["mesh-shader"]));
+    assert_eq!(both.without(both), Features::NONE);
+    assert_eq!(both.without(Features::NONE), both);
+    #[cfg(all(feature = "mesh-shader", feature = "logic-op"))]
+    {
+        assert_eq!(both.missing_from(&named(&["logic-op"])), ["mesh-shader"]);
+        // In declaration order, whatever order they were asked in.
+        assert_eq!(
+            named(&["logic-op", "mesh-shader"]).missing_from(&Features::NONE),
+            ["mesh-shader", "logic-op"]
+        );
+    }
+    assert!(Features::NONE.missing_from(&Features::NONE).is_empty());
+    assert!(both.missing_from(&both).is_empty());
+    let all = Features::from_bits(iter::repeat(true));
+    assert_eq!(all.missing_from(&Features::NONE), feature_names());
+    assert_eq!(feature_names()[0], "rebar");
+}
+
+/// Each feature that builds on others is dropped without any of them, kept with all of them;
+/// every other feature stands alone.
+#[test]
+fn consistent_features_drop_those_without_their_prerequisites() {
+    let needs: &[(&str, &[&str])] = &[
+        ("ray-query", &["acceleration-structure"]),
+        ("ray-tracing-pipeline", &["acceleration-structure"]),
+        (
+            "ray-traversal-primitive-culling",
+            &["ray-query", "acceleration-structure"],
+        ),
+        (
+            "mesh-shader-queries",
+            &["mesh-shader", "pipeline-statistics"],
+        ),
+        ("ray-tracing-position-fetch", &["acceleration-structure"]),
+        (
+            "ray-tracing-invocation-reorder",
+            &["ray-tracing-pipeline", "acceleration-structure"],
+        ),
+        ("depth-clamp-control", &["depth-clamp"]),
+        ("dynamic-depth-clip", &["depth-clip-enable"]),
+        (
+            "dynamic-depth-clip-negative-one-to-one",
+            &["depth-clip-control"],
+        ),
+        (
+            "dynamic-conservative-rasterization",
+            &["conservative-rasterization"],
+        ),
+        ("dynamic-provoking-vertex", &["provoking-vertex"]),
+        ("sparse-residency-buffer", &["sparse-binding"]),
+        ("sparse-residency-image-2d", &["sparse-binding"]),
+        ("sparse-residency-image-3d", &["sparse-binding"]),
+    ];
+    let compiled = feature_names();
+    for &(feature, prerequisites) in needs {
+        if !iter::once(&feature)
+            .chain(prerequisites)
+            .all(|f| compiled.contains(f))
+        {
+            continue;
+        }
+        let with: Vec<&str> = iter::once(feature)
+            .chain(prerequisites.iter().copied())
+            .collect();
+        assert_eq!(named(&with).consistent(), named(&with), "{feature}");
+        for missing in prerequisites {
+            let without: Vec<&str> = with.iter().copied().filter(|f| f != missing).collect();
+            assert!(
+                !has_feature(named(&without).consistent(), feature),
+                "{feature} without {missing}"
+            );
+        }
+    }
+    // Ray traversal culling also comes with ray tracing pipelines instead of ray queries.
+    #[cfg(feature = "ray-tracing-pipeline")]
+    let pipelines = named(&[
+        "ray-traversal-primitive-culling",
+        "ray-tracing-pipeline",
+        "acceleration-structure",
+    ]);
+    #[cfg(feature = "ray-tracing-pipeline")]
+    assert_eq!(pipelines.consistent(), pipelines);
+    for name in feature_names() {
+        let alone = named(&[name]).consistent();
+        match needs.iter().any(|(feature, _)| *feature == name) {
+            true => assert_eq!(alone, Features::NONE, "{name} alone"),
+            false => assert_eq!(alone, named(&[name]), "{name} alone"),
+        }
+    }
+    // Every feature is possible, but ray traversal culling compiled without what brings it.
+    #[cfg(any(
+        not(feature = "ray-traversal-primitive-culling"),
+        feature = "ray-query",
+        feature = "ray-tracing-pipeline"
+    ))]
+    {
+        let all = Features::from_bits(iter::repeat(true));
+        assert_eq!(all.consistent(), all);
+    }
+}
+
+/// The extensions `extensions()` enables for a set of features are all `optional()` needs to
+/// detect it on a device that has its bits, and its bits detect nothing else (but what the
+/// device facts decide).
+#[test]
+fn extensions_name_what_detecting_the_features_needs() {
+    let facts = DeviceFacts {
+        rebar: true,
+        strict_lines: true,
+        dedicated_compute: true,
+        dedicated_transfer: true,
+        sparse_queue: true,
+    };
+    let by_facts = named(&["rebar", "async-compute", "async-transfer"]);
+    let queried = FeatureChain::default();
+    let names = feature_names();
+    // Every feature but those this build can't turn on (ray traversal culling compiled
+    // without ray queries and pipelines).
+    let possible = Features::from_bits(iter::repeat(true)).consistent();
+    for &name in names.iter().filter(|&&name| has_feature(possible, name)) {
+        // The smallest consistent set with it: everything, less what it does without. Removed
+        // from the back, so ray traversal culling keeps ray queries (a ray tracing pipeline
+        // would need the device's `rayTraversalPrimitiveCulling`, which `queried` lacks).
+        let mut set = possible;
+        for &other in names.iter().rev().filter(|&&other| other != name) {
+            let fewer = set.without(named(&[other]));
+            if has_feature(fewer.consistent(), name) {
+                set = fewer.consistent();
+            }
+        }
+        let extensions = set.extensions();
+        let has = |extension: &std::ffi::CStr| extensions.contains(&extension);
+        let detected = FeatureChain::enabling(&set, &queried).optional(&has, facts);
+        assert_eq!(
+            set.without(detected),
+            Features::NONE,
+            "{name}: {:?} undetected with {extensions:?}",
+            set.missing_from(&detected)
+        );
+        // Ray queries imply the culling capability (`RayTraversalPrimitiveCullingKHR`).
+        let implied = match has_feature(set, "ray-query") {
+            true => named(&["ray-traversal-primitive-culling"]),
+            false => Features::NONE,
+        };
+        let extra = detected.without(set).without(by_facts).without(implied);
+        assert_eq!(
+            extra,
+            Features::NONE,
+            "{name}: {:?} detected too",
+            extra.missing_from(&Features::NONE)
+        );
+    }
+}
+
+/// Every cargo name lava's tables use is a feature of `lava/Cargo.toml`, with its `assert-`.
+#[test]
+fn cargo_names_are_features_of_the_manifest() {
+    let manifest = include_str!("../Cargo.toml");
+    let section = manifest
+        .split_once("\n[features]\n")
+        .expect("lava has features")
+        .1;
+    let section = section.split("\n[").next().unwrap();
+    let declared: Vec<&str> = (section.lines())
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, _)| key.trim())
+        .filter(|key| !key.is_empty() && !key.starts_with('#') && !key.starts_with('"'))
+        .collect();
+    assert!(declared.contains(&"default"), "{declared:?}");
+    let declares = |name: &str| declared.contains(&name);
+    for (capability, cargo) in crate::features::SPIRV_CAPABILITIES {
+        assert!(declares(cargo), "capability {capability}: `{cargo}`");
+        assert!(declares(&format!("assert-{cargo}")), "assert-{cargo}");
+    }
+    for name in feature_names().into_iter().skip(1) {
+        assert!(declares(name), "`{name}`");
+        assert!(declares(&format!("assert-{name}")), "assert-{name}");
+    }
+    assert!(
+        !declares("rebar"),
+        "rebar is a device fact, no cargo feature"
+    );
+}
+
+#[test]
+fn freeing_slots_twice_panics() {
+    // Slots 4..10 free.
+    let partly_taken = || {
+        let mut ranges = Ranges::all(10);
+        assert_eq!(ranges.take(4), Some(0));
+        ranges
+    };
+    partly_taken().give(0..4);
+    let message = panic_message(|| partly_taken().give(5..6));
+    assert!(
+        message.contains("bindless slots 5..6 are freed twice"),
+        "{message}"
+    );
+    // Overlapping a free range at either end, or spanning one, is a double free too.
+    for range in [3..5, 9..12, 2..11] {
+        let message = panic_message(|| partly_taken().give(range.clone()));
+        assert!(message.contains("freed twice"), "{range:?}: {message}");
+    }
+    // Free 2..4 and 6..8.
+    let holes = || {
+        let mut ranges = Ranges::all(10);
+        assert_eq!(ranges.take(10), Some(0));
+        ranges.give(2..4);
+        ranges.give(6..8);
+        ranges
+    };
+    let message = panic_message(|| holes().give(1..9));
+    assert!(message.contains("1..9 are freed twice"), "{message}");
+    // Next to free ranges is fine, and an empty range is nothing.
+    let mut ranges = holes();
+    ranges.give(4..6);
+    ranges.give(5..5);
+    assert_eq!(ranges.take(6), Some(2), "2..8 merged");
+}
+
+/// A borrowed key hashes and compares like the key it stands for, so lookups find it without
+/// copying.
+#[test]
+fn borrowed_raster_keys_find_their_owned_keys() {
+    use crate::command_buffer::{Baked, PrimitiveTopology};
+    #[cfg(bake_blend)]
+    use crate::command_buffer::{Blend, ColorComponentFlags};
+    use crate::pipeline::{RasterKey, RasterKeyRef};
+    use hashbrown::{Equivalent, HashMap};
+    use std::hash::BuildHasher;
+    let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::R16G16B16A16_SFLOAT];
+    let key = |colors: &'static [vk::Format], constants: &'static [u8], topology| RasterKeyRef {
+        color_formats: colors,
+        depth_format: vk::Format::D32_SFLOAT,
+        stencil_format: vk::Format::UNDEFINED,
+        view_mask: 0,
+        constants,
+        baked: Baked {
+            topology,
+            ..Baked::default()
+        },
+        #[cfg(bake_blend)]
+        blends: &[Blend::Replace, Blend::Alpha][..colors.len()],
+        #[cfg(bake_blend)]
+        write_masks: &[ColorComponentFlags::RGBA; 2][..colors.len()],
+    };
+    let formats: &'static [vk::Format] = Box::leak(Box::new(formats));
+    let keys = [
+        key(&formats[..1], &[], PrimitiveTopology::TRIANGLE_LIST),
+        key(formats, &[], PrimitiveTopology::TRIANGLE_LIST),
+        key(
+            &formats[..1],
+            &[1, 0, 0, 0],
+            PrimitiveTopology::TRIANGLE_LIST,
+        ),
+        key(&formats[..1], &[], PrimitiveTopology::LINE_LIST),
+    ];
+    let hasher = hashbrown::DefaultHashBuilder::default();
+    let mut map: HashMap<RasterKey, usize> = HashMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        let owned = key.owned();
+        assert_eq!(hasher.hash_one(key), hasher.hash_one(&owned), "{key:?}");
+        assert!(key.equivalent(&owned));
+        map.insert(owned, i);
+    }
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(map.get(key), Some(&i), "{key:?}");
+        for (j, other) in keys.iter().enumerate() {
+            assert_eq!(key.equivalent(&other.owned()), i == j, "{key:?} {other:?}");
+        }
+    }
+}
+
+/// A pipeline bakes the draw state the device can't set dynamically, and only that.
+#[test]
+fn pipelines_bake_only_the_state_without_dynamic_state() {
+    use crate::command_buffer::{Baked, Dynamic, PrimitiveTopology as T, RasterState};
+    let dynamic = |on: bool| Dynamic {
+        blend: on,
+        polygon_mode: on,
+        depth_clamp: on,
+        depth_clamp_range: on,
+        depth_clip: on,
+        depth_clip_negative_one_to_one: on,
+        logic_op: on,
+        conservative: on,
+        line_mode: on,
+        line_stipple_enable: on,
+        line_stipple: on,
+        provoking_vertex: on,
+        topology_unrestricted: on,
+    };
+    let (mut lines, _, _) = RasterState::<1>::default().topology(T::LINE_STRIP).split();
+    let (triangles, _, _) = RasterState::<1>::default().split();
+    // Vertex pipelines bake the topology's class unless any topology is dynamic; mesh
+    // pipelines have none.
+    assert_eq!(
+        Baked::of(&lines, &dynamic(false), true).topology,
+        T::LINE_LIST
+    );
+    assert_eq!(
+        Baked::of(&triangles, &dynamic(false), true).topology,
+        T::TRIANGLE_LIST
+    );
+    assert_eq!(Baked::of(&lines, &dynamic(true), true), Baked::default());
+    assert_eq!(
+        Baked::of(&lines, &dynamic(false), false).topology,
+        Baked::default().topology
+    );
+    // With every state dynamic, draws that differ in it share a pipeline.
+    lines.polygon_mode = crate::command_buffer::PolygonMode::LINE;
+    lines.depth_clip = Some(false);
+    lines.logic_op = Some(crate::command_buffer::LogicOp::XOR);
+    lines.provoking_vertex = vk::ProvokingVertexModeEXT::LAST_VERTEX;
+    lines.conservative = vk::ConservativeRasterizationModeEXT::OVERESTIMATE;
+    lines.line_mode = vk::LineRasterizationModeKHR::BRESENHAM;
+    assert_eq!(
+        Baked::of(&lines, &dynamic(true), false),
+        Baked::of(&triangles, &dynamic(true), false)
+    );
+    let baked = Baked::of(&lines, &dynamic(false), false);
+    #[cfg(bake_polygon_mode)]
+    assert_eq!(baked.polygon_mode, crate::command_buffer::PolygonMode::LINE);
+    #[cfg(bake_depth_clip)]
+    assert!(!baked.depth_clip);
+    #[cfg(bake_logic_op)]
+    assert_eq!(baked.logic_op, Some(crate::command_buffer::LogicOp::XOR));
+    #[cfg(bake_provoking_vertex)]
+    assert_eq!(
+        baked.provoking_vertex,
+        vk::ProvokingVertexModeEXT::LAST_VERTEX
+    );
+    #[cfg(bake_conservative_rasterization)]
+    assert_eq!(
+        baked.conservative,
+        vk::ConservativeRasterizationModeEXT::OVERESTIMATE
+    );
+    #[cfg(bake_line_mode)]
+    assert_eq!(baked.line_mode, vk::LineRasterizationModeKHR::BRESENHAM);
+    let _ = baked;
+    // Depth clipping bakes its effective value: clipped unless clamped.
+    #[cfg(bake_depth_clip)]
+    assert!(Baked::of(&triangles, &dynamic(false), false).depth_clip);
+}
+
+/// The dynamic state follows the features: none without them, all with all of them.
+#[test]
+fn dynamic_state_follows_the_features() {
+    use crate::command_buffer::Dynamic;
+    let none = Dynamic::of(&Features::NONE, true);
+    let all = Dynamic::of(&Features::from_bits(iter::repeat(true)), true);
+    let fields = |d: Dynamic| {
+        [
+            d.blend,
+            d.polygon_mode,
+            d.depth_clamp,
+            d.depth_clamp_range,
+            d.depth_clip,
+            d.depth_clip_negative_one_to_one,
+            d.logic_op,
+            d.conservative,
+            d.line_mode,
+            d.line_stipple_enable,
+            d.line_stipple,
+            d.provoking_vertex,
+            d.topology_unrestricted,
+        ]
+    };
+    assert_eq!(fields(none), [false; 13]);
+    // A dynamic topology leaves its class only with extended dynamic state 3 enabled.
+    assert!(!Dynamic::of(&named(&["logic-op"]), true).topology_unrestricted);
+    #[cfg(all(
+        feature = "dynamic-blend",
+        feature = "dynamic-polygon-mode",
+        feature = "dynamic-depth-clamp",
+        feature = "depth-clamp-control",
+        feature = "dynamic-depth-clip",
+        feature = "dynamic-depth-clip-negative-one-to-one",
+        feature = "dynamic-logic-op",
+        feature = "dynamic-conservative-rasterization",
+        feature = "dynamic-line-mode",
+        feature = "dynamic-line-stipple",
+        feature = "line-stipple",
+        feature = "dynamic-provoking-vertex"
+    ))]
+    {
+        assert_eq!(fields(all), [true; 13]);
+        let all = Features::from_bits(iter::repeat(true));
+        assert!(!Dynamic::of(&all, false).topology_unrestricted);
+        assert!(Dynamic::of(&named(&["dynamic-blend"]), true).topology_unrestricted);
+    }
+    let _ = all;
+}
+
+/// Mips halve every dimension to at least 1; boxes lie inside a mip from a non-negative offset.
+#[test]
+fn mips_halve_and_boxes_lie_inside_them() {
+    use crate::image::dim::{D2, D2Array, D3, Dim, box_inside, box_is_empty};
+    use glam::{UVec2, UVec3};
+    assert_eq!(D2::mip_extent(UVec2::new(64, 16), 0), UVec2::new(64, 16));
+    assert_eq!(D2::mip_extent(UVec2::new(64, 16), 3), UVec2::new(8, 2));
+    assert_eq!(D2::mip_extent(UVec2::new(64, 16), 5), UVec2::new(2, 1));
+    assert_eq!(D2::mip_extent(UVec2::new(5, 3), 1), UVec2::new(2, 1));
+    assert_eq!(
+        D2::mip_extent(UVec2::new(64, 16), 40),
+        UVec2::ONE,
+        "no shift overflow"
+    );
+    assert_eq!(D2Array::mip_extent(UVec2::new(8, 8), 2), UVec2::new(2, 2));
+    assert_eq!(D3::mip_extent(UVec3::new(16, 8, 4), 2), UVec3::new(4, 2, 1));
+    assert_eq!(D3::mip_extent(UVec3::new(16, 8, 4), 3), UVec3::new(2, 1, 1));
+
+    let offset = |x, y, z| vk::Offset3D { x, y, z };
+    let extent = |width, height, depth| vk::Extent3D {
+        width,
+        height,
+        depth,
+    };
+    let mip = extent(8, 4, 1);
+    assert!(box_inside(offset(0, 0, 0), mip, mip));
+    assert!(box_inside(offset(4, 2, 0), extent(4, 2, 1), mip));
+    assert!(!box_inside(offset(5, 2, 0), extent(4, 2, 1), mip));
+    assert!(!box_inside(offset(0, 0, 1), extent(1, 1, 1), mip));
+    assert!(!box_inside(offset(-1, 0, 0), extent(1, 1, 1), mip));
+    assert!(
+        box_inside(offset(8, 4, 1), extent(0, 0, 0), mip),
+        "an empty box at the end"
+    );
+    assert!(
+        !box_inside(
+            offset(i32::MAX, 0, 0),
+            extent(u32::MAX, 1, 1),
+            extent(u32::MAX, 1, 1)
+        ),
+        "no overflow"
+    );
+    assert!(box_is_empty(extent(0, 4, 1)) && !box_is_empty(mip));
+}
+
+/// Buffer casts keep whole, aligned elements; image casts keep the format and a usage subset.
+#[test]
+fn casts_check_sizes_alignments_formats_and_usages() {
+    use crate::buffer::slice::cast_check as buffer_cast;
+    use crate::image::slice::cast_check as image_cast;
+    use vk::{Format as F, ImageUsageFlags as U};
+    buffer_cast::<[u32; 3]>(16, 24);
+    buffer_cast::<u64>(0, 0);
+    let message = panic_message(|| buffer_cast::<[u32; 3]>(16, 20));
+    assert!(
+        message.contains("20 bytes aren't a whole number of 12-byte elements"),
+        "{message}"
+    );
+    let message = panic_message(|| buffer_cast::<u64>(4, 8));
+    assert!(
+        message.contains("address 0x4 isn't aligned to the 8 bytes"),
+        "{message}"
+    );
+    image_cast(
+        (F::R8G8B8A8_UNORM, U::SAMPLED | U::STORAGE),
+        (F::R8G8B8A8_UNORM, U::SAMPLED),
+    );
+    let message = panic_message(|| {
+        image_cast(
+            (F::R8G8B8A8_UNORM, U::SAMPLED),
+            (F::R8G8B8A8_UNORM, U::STORAGE),
+        )
+    });
+    assert!(message.contains("can't cast an image"), "{message}");
+    let message = panic_message(|| {
+        image_cast(
+            (F::R8G8B8A8_UNORM, U::SAMPLED),
+            (F::R8G8B8A8_SRGB, U::SAMPLED),
+        )
+    });
+    assert!(message.contains("to format R8G8B8A8_SRGB"), "{message}");
+}
+
+/// Runtime formats and usages check at runtime what the static types check at compile time.
+#[test]
+fn dynamic_formats_and_usages_check_what_static_ones_guarantee() {
+    use crate::image::{format::*, usage};
+    use vk::{ImageAspectFlags as Aspect, ImageUsageFlags as U};
+    let color = Dynamic(vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(color.texel_size(), R8G8B8A8Unorm.texel_size());
+    assert_eq!(color.aspects(), Aspect::COLOR);
+    color.aspect_check(Aspect::COLOR);
+    color.texel_check::<[f32; 4]>();
+    assert_eq!(
+        color.clear_value(ClearValue::Float([1.0; 4])),
+        ClearValue::Float([1.0; 4])
+    );
+    let message = panic_message(|| color.aspect_check(Aspect::DEPTH));
+    assert!(message.contains("lacks the aspects DEPTH"), "{message}");
+    let message = panic_message(|| color.texel_check::<[u32; 4]>());
+    assert!(
+        message.contains("doesn't have texels of type [u32; 4]"),
+        "{message}"
+    );
+    let message = panic_message(|| color.clear_value(ClearValue::Uint([1; 4])));
+    assert!(message.contains("can't be cleared to Uint"), "{message}");
+
+    let depth = Dynamic(vk::Format::D32_SFLOAT_S8_UINT);
+    assert_eq!(depth.aspects(), Aspect::DEPTH | Aspect::STENCIL);
+    depth.aspect_check(Aspect::STENCIL);
+    depth.clear_value(ClearValue::DepthStencil {
+        depth: 1.0,
+        stencil: 0,
+    });
+    let message = panic_message(|| depth.clear_value(ClearValue::Float([0.0; 4])));
+    assert!(message.contains("can't be cleared"), "{message}");
+    let message = panic_message(|| Dynamic(vk::Format::UNDEFINED).aspects());
+    assert!(
+        message.contains("no format type for UNDEFINED"),
+        "{message}"
+    );
+    assert!(!Dynamic(vk::Format::UNDEFINED).known() && color.known());
+
+    let dynamic = usage::Dynamic(U::SAMPLED | U::TRANSFER_DST);
+    assert_eq!(dynamic.flags(), U::SAMPLED | U::TRANSFER_DST);
+    assert!(dynamic.create_flags().is_empty(), "never a mutable format");
+    dynamic.check(U::SAMPLED);
+    let message = panic_message(|| dynamic.check(U::STORAGE | U::SAMPLED));
+    assert!(message.contains("lacks"), "{message}");
+}
+
+/// Texel sizes of the format table, against the sizes the Vulkan spec gives them.
+#[test]
+fn the_format_table_has_the_spec_texel_sizes() {
+    use vk::Format as F;
+    let sizes = [
+        (F::R8_UNORM, 1),
+        (F::R8G8_SNORM, 2),
+        (F::R8G8B8_UNORM, 3),
+        (F::R8G8B8A8_SRGB, 4),
+        (F::B8G8R8A8_UNORM, 4),
+        (F::A2B10G10R10_UNORM_PACK32, 4),
+        (F::R16_SFLOAT, 2),
+        (F::R16G16B16A16_UINT, 8),
+        (F::R32_SFLOAT, 4),
+        (F::R32G32B32_SFLOAT, 12),
+        (F::R32G32B32A32_SINT, 16),
+        (F::R64_UINT, 8),
+        (F::R64G64B64A64_SFLOAT, 32),
+        (F::B10G11R11_UFLOAT_PACK32, 4),
+        (F::E5B9G9R9_UFLOAT_PACK32, 4),
+        (F::A4R4G4B4_UNORM_PACK16, 2),
+        (F::D16_UNORM, 2),
+        (F::D32_SFLOAT, 4),
+        (F::S8_UINT, 1),
+    ];
+    for (format, size) in sizes {
+        let info = format::info(format).unwrap_or_else(|| panic!("{format:?} has a type"));
+        assert_eq!(info.texel_size, size, "{format:?}");
+        let aspect = crate::image::slice::single_aspect(info.aspects);
+        assert_eq!(
+            format::copy_block(format, info.texel_size, aspect).map(|b| b.bytes),
+            Some(size as u32),
+            "{format:?} copies its texels"
+        );
+    }
+    // Compressed formats have no texel size: their blocks have the bytes.
+    #[cfg(feature = "bc-compression")]
+    assert_eq!(format::info(F::BC7_UNORM_BLOCK).unwrap().texel_size, 0);
 }

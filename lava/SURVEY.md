@@ -19,17 +19,13 @@ compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
 5. **Raster and draws:** dynamic rendering local read (skipped 2026-10-21, see section 5:
    input attachments don't fit lava's descriptor heaps and Slang yet).
-10. **Tests:** all of section 8, plus tests for every change above, one GPU-assisted validation
-    run, and Miri for `unsized_struct!`; the tools generator fix of section 7.
+10. **Tests:** done on 2026-10-24 but for the Miri run of section 8 (Miri isn't installed).
 
-The engine follows in its own repository, only after the other agent's uncommitted engine work
-is committed: 84, the push constants of 3, 4.11's viewport usage, 4.15, 4.17's `fits`, the
-generated API of 2026-10-24 (argument structs, extra accesses in `push_bindings`, no imports
-into `bindings.rs`, generated padding and `Default`s instead of the shaders' hand padding,
-`WORKGROUP_SIZE`/`groups`, `[RustConst]` instead of copied constants), the surface pass of
-2026-10-24 (root re-exports and the prelude, private `state`/`lifetime`/`error`, `lava::vk` for
-`raw_vulkan`, and its renames), release builds without
-validation, and all of section 9 (drop `dynamic-blend` once checked).
+The engine followed on 2026-10-24 (GameEngine branch `survey-follow`), with three deliberate
+differences: its shaders keep their hand padding (Slang's scalar layout doesn't round struct sizes
+up, see STATE), `PerFrame` and `Buffer::reserve` aren't used (no `Submission` in its systems; the
+cull buffers are scratch), and `present-fences` stays checked so headless runs anywhere. The tools
+generator fix of section 7 is in that branch too.
 
 ## 2. Bugs
 
@@ -164,97 +160,12 @@ Done on 2026-10-24 but for these, which turned out to be meant as they are:
 - **lava-build-slang:** its capability table copies `features::SPIRV_CAPABILITIES` on purpose:
   the build script's copy never compiles lava, and a test compares the two.
 
-## 7. Documentation (2026-10-18)
-
-Fixed on 2026-10-24 but for:
-- **Generated context:** the tools generator lists `pub fn` lines inside codegen's raw-string
-  templates as lava-build-slang API, and the test copy of `CallsiteGuard` as lava-macros API. Fix
-  in `../GameEngine/tools/src/main.rs`: skip string literals and `tests/`.
-
 ## 8. Tests (2026-10-18)
 
-### Tests that can't fail
-- `skipped_attachment_keeps_its_content` (`gpu_headless.rs:1907-1940`): `test_raster.slang`
-  writes only location 0, so `Blend::Skip` on the second attachment is never exercised.
-- `extra_accesses_get_barriers_like_the_bindings` (`:2766-2788`): the shader never touches the
-  buffer and nothing is asserted. Sync validation doesn't track buffer device addresses, so the
-  "validation reports the missing barrier" premises at `:999-1001` and `:1523-1525` hold only as
-  data checks *(plausible)*.
-- The slot test's "taken until no frame reaches it" (`:1147`) passes because `bind()` doesn't poll.
-- The "submit in parallel" test (`:200-221`) checks results, not concurrency.
-- Bare `catch_unwind(..).is_err()` without the message passes on any panic (`:441-453, 1094-1103,
-  2095-2098`, `gpu_ray_tracing.rs:428-433`, `gpu_window.rs:159-168`); `panic_message` exists.
-- The capability unit test checks only the bits it sets (`tests.rs:181-195`).
-
-### Tests that fail or skip wrongly
-- The `!host_image_copy` branches at `gpu_headless.rs:1305-1316, 1340-1350` can't run: the image
-  creation before them unwraps the `MissingFeature`. 
-- `volumes_are_uploaded_sampled_and_copied` (`:2489-2494`) fails without host image copy, though
-  only its last part needs it; `:2555-2568` creates a BC7 image without checking `bc_compression`
-  and returns silently.
-- The clock test checks `shader_clock` but not `shader_int64_atomics`, and prints `skipping`,
-  not `SKIPPED` (`:1495-1504`); `:692-694` and `:447-453` skip silently.
-- `gpu_missing_features.rs:215, 229` use `polygon_mode(LINE)` without checking
-  `fill_mode_non_solid`.
-- `gpu_ray_tracing.rs:505-515` multiplies `maxComputeWorkGroupCount` by the size, which exceeds
-  `u32` on most drivers, so it nearly always skips.
-- `gpu_window.rs:124-128` assumes the swapchain can be smaller than the window, which fails on
-  X11 *(plausible)*; each step prints `ok` before validation errors are checked.
-- The timestamp order `times[3].0 >= times[2].1` (`gpu_headless.rs:599`) isn't guaranteed by the
-  spec *(plausible flaky)*.
-
-### Harness
-- `cargo test --release` runs every GPU test with validation off (validation needs
-  `debug_assertions`), and nothing asserts the layer is active.
-- The subscriber has only the capture layer, so lava's own warnings and errors are dropped and
-  failing tests show no logs. Only ERROR and the `message` field are kept, dropping the recorded
-  Rust callsite.
-- `gpu()` discards errors gathered before its lock, including those of `lava::init`, and an init
-  panic poisons the `LazyLock`, so every later test fails with "poisoned".
-- `LAVA_BLESS=0` blesses too (`golden.rs`); goldens shared by two tests or binaries are rewritten
-  by whichever runs last and race between binaries.
-- The recording bench times only the closure (`benches/recording.rs:185-191`): the end barrier,
-  pending merge, `vkEndCommandBuffer` and the submit are outside, where STATE's unexplained 7%
-  may live. Its buffers are uninitialised, `begin()` throttles on GPU time, and scenarios
-  run one after another, not interleaved.
-
-### Coverage gaps
-Each was checked by grep over lava-tests and `lava/src/tests.rs`.
-- **Barriers:** two timelines of one family sharing an image; `forget` on destruction; the
-  `ATTACHMENT_OPTIMAL` vs `GENERAL` choice (only through the validation layer); `make_visible` merging; the swapchain's acquire wait stage; `host_layouts`.
-- **Runtime-typed resources:** `format::Dynamic`, `usage::Dynamic`, `with_params`, the
-  `aspect_check`/`texel_check`/`usage_check` panics,
-  the clear-value assert and `cast_check`. Pure parts (`mip_extent`, `region_fits`,
-  `cast_check`, the format table's sizes) could be unit tests (`format::block`, `rows_len`,
-  `pack_64` and `format::class` are).
-- **Images:** `DepthSplitMips`, unusual clears, linear blits on float formats without linear
-  filtering.
-- **Draws:** `Draw::indirect` with several commands (bug 38); attachments reached through accesses;
-  a draw reading an attachment of its own rendering.
-- **Raster state:** depth bias, clamp and clip, conservative raster, provoking vertex, line
-  width/mode/stipple, depth bounds, blend constants, any topology but `LINE_LIST`. `RasterKeyRef`
-  hashing like `RasterKey` and `Baked::of` are pure and could be unit tests.
-- **Pipelines:** raster or ray tracing passes with specialization constants, mesh passes with a
-  task shader, a `[MaxRecursion(n)]` above the device's limit (no device here has less than 31,
-  and lava-build-slang refuses more), `reload_pass` of a ray tracing pass.
-- **Slang shapes:** `Image2D`, and `Accel` inside structs behind a `Buf`, on the GPU
-  (lava-build-slang's unit tests map them); the hand-copied constants
-  (`MAX_PUSH_CONSTANTS_SIZE`, the clock constants) against lava and `profile.slang`.
-- **Bindless:** `Ranges::give`'s double-free panic.
-- **Features:** `Features::consistent`, `without`/`missing_from`, `extensions()` agreeing with
-  `optional()`, the cargo names in `SPIRV_CAPABILITIES`; the disabled ray tracing and
-  performance paths in `gpu_missing_features`.
-- **Lifetimes and timelines:** slot reuse, two `wait_for`s on one timeline, stages other than
-  `Transfer` on a GPU.
-- **Queries:** the pool-reuse panic, `QueryRecorder` misuse, `instant()` on a device that has
-  it, `memory_report` with the budget.
-- **Commands and families:** `flush_all`; transfer-family alignment and granularity;
-  acceleration structure transforms.
-- **Presenting:** dropping a surface with a current image, the format fallback.
-- **Host access:** `host_ptr`; `Shared` memory where the device lacks `rebar` (only its error).
-- **Validation:** GPU-assisted validation is never on, so bindless indices, layouts and buffer
-  address bounds go unchecked. `unsized_struct!`'s test needs no GPU and could run under Miri
-  once.
+Done on 2026-10-24 but for this one; what the tests can't reach on the Arc B390 is in `STATE.md`
+("lava: tests").
+- **Validation:** `unsized_struct!`'s test hasn't run under Miri: cargo-miri isn't installed
+  here (the command is in CLAUDE.md's Tests section).
 
 ## 9. Seen from the engine (2026-10-18)
 
@@ -285,5 +196,5 @@ Engine-side findings that don't belong to lava's code but came up in this survey
 3. **Fix the timeline and presenting hangs and leaks (64-84).**
 4. **Redesign the APIs users touch first:** init config, memory locations,
    frame and ring helpers and errors before 0.1.
-5. **Make the tests able to fail** (section 8), then add features by real-world demand: arrays,
+5. **Add features by real-world demand** (the tests can fail since 2026-10-24): arrays,
    cubes and MSAA, samplers, staging.

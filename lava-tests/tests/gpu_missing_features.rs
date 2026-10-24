@@ -1,11 +1,14 @@
-//! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`, `rebar` too), the functions that need them return `MissingFeature` (or panic, for draw state), uploads go through staging buffers, and draw state the device can't set dynamically is baked into pipelines and renders the same, the topology class too (without extended dynamic state 3 the device can't leave it)
+//! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`, `rebar` too), the functions that need them return `MissingFeature` (or panic, for draw state; ray tracing structures, arenas and passes and performance queries among them), uploads go through staging buffers, and draw state the device can't set dynamically is baked into pipelines and renders the same, the topology class too (without extended dynamic state 3 the device can't leave it)
 mod common;
 
 use common::render::*;
-use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::{buffer_with, golden::assert_matches_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
     Ctx, Error, Features,
+    acceleration_structure::{
+        Aabb, Aabbs, AabbsDesc, Blas, BlasDesc, BlasGeometry, BuildFlags, StructureArena, Tlas,
+    },
     buffer::{Buffer, Location, Shared},
     command_buffer::{
         Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp, CullModeFlags, Draw,
@@ -84,6 +87,19 @@ fn bindings(
 
 fn unculled() -> RasterState<1> {
     RasterState::default().cull_mode(CullModeFlags::NONE)
+}
+
+/// Unculled lines, or `None` (reported) where the device can't draw them.
+fn wireframe(test: &str) -> Option<RasterState<1>> {
+    let lines = unculled().polygon_mode(PolygonMode::LINE).ok();
+    if lines.is_none() {
+        eprintln!("SKIPPED {test}: the device lacks `fill-mode-non-solid`");
+    }
+    lines
+}
+
+fn is_missing<T>(result: lava::Result<T>, feature: &'static str) -> bool {
+    matches!(result, Err(Error::MissingFeature(m)) if m == missing(feature))
 }
 
 #[test]
@@ -199,6 +215,65 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
     assert!(message.contains("`dual-src-blend`"), "{message}");
 }
 
+/// Without `acceleration-structure` (and the ray tracing features on top of it), every
+/// structure, arena and structure query is `MissingFeature`, and the ray tracing passes have
+/// no pipelines to reload.
+#[test]
+fn ray_tracing_without_its_features_is_missing() {
+    let _gpu = gpu_without();
+    let features = Ctx::features();
+    assert!(!features.acceleration_structure && !features.ray_query);
+    assert!(!features.ray_tracing_pipeline);
+    let feature = "acceleration-structure";
+    let aabbs = [AabbsDesc::new(1)];
+    let sized = Blas::with_capacity(&BlasDesc::Aabbs(&aabbs), BuildFlags::default());
+    assert!(is_missing(sized, feature));
+    let boxes = buffer_with::<Aabb>(&[Aabb {
+        min: glam::Vec3::splat(-1.0),
+        max: glam::Vec3::splat(1.0),
+    }]);
+    let geometry = BlasGeometry::Aabbs(&[Aabbs::new(boxes.range(..))]);
+    assert!(is_missing(
+        Blas::new(&geometry, BuildFlags::default()),
+        feature
+    ));
+    assert!(is_missing(Tlas::new(1, BuildFlags::default()), feature));
+    assert!(is_missing(StructureArena::new(1 << 16), feature));
+    assert!(is_missing(Blas::deserialized(&[0; 64]), feature));
+    assert!(is_missing(QueryPool::serialized_sizes(1), feature));
+    assert!(is_missing(QueryPool::compacted_sizes(1), feature));
+    // Their passes' bindings need a `Tlas`, which can't exist; their pipelines don't either.
+    for name in [
+        "TestRayQuery",
+        "TestRayTracing",
+        "TestPositionFetch",
+        "TestReorder",
+    ] {
+        let pass = (PASS_MAP.passes.iter())
+            .position(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} is a test pass"));
+        let reloaded = lava::pipeline::reload_pass(pass, PASS_MAP.passes[pass].spirv);
+        assert_eq!(reloaded.unwrap(), lava::pipeline::Reload::Skipped, "{name}");
+    }
+}
+
+/// Without `performance-query` there are no counters, no counter pools and no profiled
+/// submissions.
+#[test]
+fn performance_queries_without_their_feature_are_missing() {
+    let _gpu = gpu_without();
+    assert!(!Ctx::features().performance_query);
+    assert_eq!(
+        counters::counters().err(),
+        Some(missing("performance-query"))
+    );
+    // Checked before the selection, which can't name a counter here.
+    assert!(is_missing(
+        QueryPool::performance(1, &[]),
+        "performance-query"
+    ));
+}
+
 #[test]
 fn baked_topology_classes_draw_like_dynamic_ones() {
     let mut gpu = gpu_without();
@@ -212,7 +287,7 @@ fn baked_topology_classes_draw_like_dynamic_ones() {
             .record("lines")
     });
     // The same image as `gpu_headless`'s line list on a device without the restriction.
-    assert_golden("raster_lines", &pixels, [SIZE, SIZE]);
+    assert_matches_golden("raster_lines", &pixels, [SIZE, SIZE]);
     let mixed = render(&mut gpu, |cmd, target| {
         let lines = unculled().topology(PrimitiveTopology::LINE_STRIP);
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
@@ -268,22 +343,26 @@ fn uploads_need_neither_rebar_nor_host_image_copies() {
 fn baked_polygon_modes_draw_like_dynamic_ones() {
     let mut gpu = gpu_without();
     let vertices = two_triangles(&mut gpu);
+    let Some(lines) = wireframe("baked_polygon_modes_draw_like_dynamic_ones") else {
+        return;
+    };
     let pixels = render(&mut gpu, |cmd, target| {
-        let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines))
             .record("wireframe")
     });
     // The same image as `gpu_headless`'s dynamic polygon mode.
-    assert_golden("raster_wireframe", &pixels, [SIZE, SIZE]);
+    assert_matches_golden("raster_wireframe", &pixels, [SIZE, SIZE]);
 }
 
 #[test]
 fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
     let mut gpu = gpu_without();
     let vertices = two_triangles(&mut gpu);
+    let Some(lines) = wireframe("draws_that_differ_in_baked_state_bind_their_own_pipelines") else {
+        return;
+    };
     let pixels = render(&mut gpu, |cmd, target| {
-        let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&left, 3, 1, lines))

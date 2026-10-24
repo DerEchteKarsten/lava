@@ -418,7 +418,7 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
         self
     }
 
-    pub(super) fn split(
+    pub(crate) fn split(
         self,
     ) -> (
         RasterCore,

@@ -1,9 +1,11 @@
-//! Headless GPU tests: buffers (memory locations, host access, uploads), images, sync, command recording, queries, and golden images per pass type
+//! Headless GPU tests: buffers (memory locations, host access and pointers, uploads), images, sync (threads recording at once, waits per stage and per timeline, stamps), command recording, extra accesses of what passes reach through pointers, queries (pool reuse, recorder misuse, host instants, memory reports), full bindless heaps, and golden images per pass type
 mod common;
 
 use common::render::*;
 use common::{
-    Cmd, buffer_in, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer,
+    Cmd, buffer_in, buffer_with,
+    golden::{assert_golden, assert_matches_golden},
+    gpu, nearest, panic_message, zeroed_buffer,
 };
 use glam::{IVec2, IVec3, UVec2, UVec3, UVec4, Vec2, Vec4};
 use lava::{
@@ -26,7 +28,7 @@ use lava::{
         QueryPipelineStatisticFlags as Statistics, QueryPool, QueryRecorder, ScopeInfo,
         ScopeObserver, Timestamp, counters,
     },
-    queue::{Compute, Graphics, GraphicsStage, Kind, MAX_TIMELINES, Timeline, Transfer},
+    queue::{Compute, Graphics, GraphicsStage, Kind, MAX_TIMELINES, QueueKind, Timeline, Transfer},
 };
 use lava_tests::bindings::*;
 
@@ -200,6 +202,9 @@ fn image_uploads_land_where_the_ring_is_drained() {
             .unwrap_err()
             .to_string();
         assert!(message.contains("Image::copy_from"), "{message}");
+        eprintln!(
+            "SKIPPED image_uploads_land_where_the_ring_is_drained (the staged draw): a rebar device has no ring"
+        );
         return;
     }
     let message = panic_message(|| uploader.image(&texture, 0, &texels[..12]));
@@ -247,7 +252,7 @@ fn image_uploads_land_where_the_ring_is_drained() {
             ))
             .record("textured")
     });
-    assert_golden("raster_textured", &pixels, [SIZE, SIZE]);
+    assert_matches_golden("raster_textured", &pixels, [SIZE, SIZE]);
 }
 
 #[test]
@@ -312,27 +317,69 @@ fn shared_memory_is_device_local_and_mapped() {
     assert_eq!(shared.host(), [1, 2, 9, 9]);
 }
 
+/// `host_ptr` is the mapping: writes through it are what `host` reads and the GPU copies.
+#[test]
+fn host_pointers_reach_the_mapping() {
+    let mut gpu = gpu();
+    let mut buffer = Buffer::<u32, Upload>::upload(4).unwrap();
+    let ptr = buffer.host_ptr();
+    // SAFETY: no borrow of the mapping is live and no GPU work reaches the buffer.
+    unsafe { (0..4).for_each(|i| ptr.add(i).write(10 + i as u32)) };
+    assert_eq!(buffer.host(), [10, 11, 12, 13]);
+    let readback = zeroed_buffer::<u32>(4);
+    gpu.submit(|cmd| cmd.copy_buffer(buffer.range(..), readback.range(..)));
+    // SAFETY: the copy completed and wrote every element as a `u32`.
+    assert_eq!(unsafe { readback.host_ptr().add(2).read() }, 12);
+}
+
 // ---- timelines and lifetimes -----------------------------------------------------------------
 
+/// Separate timelines record and submit at the same time, also on a shared queue: while one
+/// thread holds its recording open, every other one completes a whole frame. If submissions
+/// were serialised, the others would block and the open recording would time out.
 #[test]
 fn more_threads_than_queues_submit_in_parallel() {
     let _gpu = gpu();
     // One timeline per thread, more than there are queues where the timelines allow it.
     let threads = (Ctx::queue_count(Kind::Graphics) as usize + 1).min(MAX_TIMELINES - 1);
-    let barrier = std::sync::Barrier::new(threads);
+    assert!(threads >= 2, "the harness leaves room for two timelines");
+    let (created, opened) = (
+        std::sync::Barrier::new(threads),
+        std::sync::Barrier::new(threads),
+    );
+    let (done_sender, done) = std::sync::mpsc::channel::<()>();
+    let mut done = Some(done);
+    let timeout = std::time::Duration::from_secs(30);
     std::thread::scope(|scope| {
         for value in 0..threads as u32 {
-            let barrier = &barrier;
+            let (created, opened) = (&created, &opened);
+            let done = if value == 0 { done.take() } else { None };
+            let done_sender = done_sender.clone();
             scope.spawn(move || {
                 let mut buffer = zeroed_buffer::<u32>(4);
                 let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
-                barrier.wait();
+                created.wait();
+                let fill = |cmd: &mut Cmd| cmd.fill_buffer(buffer.range(..), value);
                 let submission = timeline.begin().unwrap();
-                let done = submission
-                    .submit(|cmd| cmd.fill_buffer(buffer.range(..), value))
-                    .unwrap();
-                done.block().unwrap();
+                let finished = if let Some(done) = done {
+                    // Holds this recording open until every other thread finished a frame.
+                    submission.submit(|cmd| {
+                        fill(cmd);
+                        opened.wait();
+                        for _ in 1..threads {
+                            done.recv_timeout(timeout).expect(
+                                "another thread's submission waited for this open recording",
+                            );
+                        }
+                    })
+                } else {
+                    opened.wait();
+                    submission.submit(fill)
+                };
+                finished.unwrap().block().unwrap();
                 assert_eq!(buffer.host(), [value; 4]);
+                // The receiver is gone if the open recording timed out.
+                let _ = done_sender.send(());
             });
         }
     });
@@ -382,13 +429,16 @@ fn a_panicking_recording_still_makes_its_layout_transitions() {
         Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
             .unwrap();
     let readback = zeroed_buffer::<u8>(8 * 8 * 4);
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let message = panic_message(|| {
         gpu.submit(|cmd| {
             cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.5, 1.0]);
             panic!("recording failed on purpose");
         })
-    }));
-    assert!(panicked.is_err());
+    });
+    assert_eq!(
+        message, "recording failed on purpose",
+        "the panic continues"
+    );
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
     // Destroying it locks every timeline's pending accesses.
     drop(image);
@@ -493,6 +543,224 @@ fn timelines_are_limited_and_reused() {
         .unwrap();
 }
 
+/// An application's own slot reuse (core's materials): an index freed with `latest_stamp()` is
+/// reused once that stamp is done, which takes every timeline.
+#[test]
+fn stamps_are_done_once_every_timeline_completed_them() {
+    let mut gpu = gpu();
+    let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
+    assert!(lava::Stamp::default().is_done());
+    // Whatever an earlier test left reserved is signalled now.
+    gpu.submit(|_| {});
+    let idle = lava::latest_stamp();
+    assert!(idle.is_done(), "nothing is in flight");
+    let reusable = |free: &[(u32, lava::Stamp)]| -> Vec<u32> {
+        (free.iter())
+            .filter(|(_, stamp)| stamp.is_done())
+            .map(|&(index, _)| index)
+            .collect()
+    };
+    let frame = gpu.timeline.begin().unwrap();
+    let free = [(0, lava::latest_stamp())];
+    assert_ne!(free[0].1, idle, "`begin` raised the stamp");
+    assert!(
+        reusable(&free).is_empty(),
+        "the frame being recorded may still read index 0"
+    );
+    frame.submit(|_| {}).unwrap().block().unwrap();
+    assert_eq!(reusable(&free), [0]);
+
+    // Another timeline's reserved stamp holds a stamp back too.
+    other.reserve();
+    let stamp = lava::latest_stamp();
+    assert!(!stamp.is_done());
+    gpu.submit(|_| {});
+    assert!(!stamp.is_done(), "the other timeline hasn't submitted");
+    (other.begin().unwrap())
+        .submit(|_| {})
+        .unwrap()
+        .block()
+        .unwrap();
+    assert!(stamp.is_done());
+}
+
+/// Records eight fills of 64 MiB on `timeline`, then copies `data` into `target`: a submission
+/// that is likely still running when the next one is made.
+fn slow_write<K: QueueKind, T: Copy + 'static>(
+    timeline: &mut Timeline<K>,
+    large: &Buffer<u32>,
+    data: &Buffer<T, Upload>,
+    target: lava::BufferSlice<'_, T>,
+) -> lava::queue::Wait {
+    (timeline.begin().unwrap())
+        .submit(|cmd| {
+            for value in 0..8 {
+                cmd.fill_buffer(large.range(..), value);
+            }
+            cmd.copy_buffer(data.range(..), target);
+        })
+        .unwrap()
+}
+
+/// A timeline on a queue of its own where the device has one (a dedicated compute family's) for
+/// `run`, else another graphics timeline: its submissions share the harness's one queue, run in
+/// submission order anyway, and only a wait that is missing entirely shows.
+macro_rules! with_other_queue {
+    ($test:literal, $run:ident($gpu:expr)) => {
+        match Timeline::<Compute>::new(2, 0) {
+            Ok(mut other) => $run($gpu, &mut other),
+            Err(_) => {
+                eprintln!(
+                    "SKIPPED {} on a queue of its own: no dedicated compute family",
+                    $test
+                );
+                $run($gpu, &mut Timeline::<Graphics>::new(2, 0).unwrap())
+            }
+        }
+    };
+}
+
+/// Two waits on one timeline keep the later value, at both their stages, in either order.
+#[test]
+fn two_waits_on_one_timeline_keep_the_later_value() {
+    let mut gpu = gpu();
+    with_other_queue!(
+        "two_waits_on_one_timeline_keep_the_later_value",
+        two_waits(&mut gpu)
+    );
+}
+
+fn two_waits<K: QueueKind>(gpu: &mut common::Gpu, other: &mut Timeline<K>) {
+    let large = Buffer::<u32>::new(16 << 20).unwrap();
+    let shared = Buffer::<u32>::new(4).unwrap();
+    let (ones, sevens) = (buffer_with(&[1u32; 4]), buffer_with(&[7u32; 4]));
+    for later_first in [true, false] {
+        let mut out = zeroed_buffer::<u32>(4);
+        let first = (other.begin().unwrap())
+            .submit(|cmd| cmd.copy_buffer(ones.range(..), shared.range(..)))
+            .unwrap();
+        first.block().unwrap();
+        let second = slow_write(other, &large, &sevens, shared.range(..));
+        let mut copy = gpu.timeline.begin().unwrap();
+        let (later, earlier) = (
+            second.at(GraphicsStage::Transfer),
+            first.at(GraphicsStage::Compute),
+        );
+        if later_first {
+            copy.wait_for(later).wait_for(earlier);
+        } else {
+            copy.wait_for(earlier).wait_for(later);
+        }
+        (copy.submit(|cmd| cmd.copy_buffer(shared.range(..), out.range(..))))
+            .unwrap()
+            .block()
+            .unwrap();
+        assert!(second.is_done(), "the copy waited for the later submission");
+        assert_eq!(out.host(), [7; 4], "later first: {later_first}");
+    }
+}
+
+/// A graphics submission waits at the stage it names: its compute dispatches, its draws, its
+/// indirect reads (the ray tracing stage's) or all of it, each reading what another timeline
+/// wrote last. Drivers may wait for a semaphore before the whole batch (Mesa's ANV does), so a
+/// stage that holds back too little shows only on drivers that wait per stage; a missing wait
+/// shows wherever the writer has a queue of its own.
+#[test]
+fn waits_hold_back_the_stage_they_name() {
+    let mut gpu = gpu();
+    with_other_queue!("waits_hold_back_the_stage_they_name", stage_waits(&mut gpu));
+}
+
+fn stage_waits<K: QueueKind>(gpu: &mut common::Gpu, other: &mut Timeline<K>) {
+    let large = Buffer::<u32>::new(16 << 20).unwrap();
+    let threes = buffer_with(&[3u32; 64]);
+    let expected: Vec<u32> = (0..64).map(|i| 6 + i).collect();
+    let dispatch = |cmd: &mut Cmd, src: &Buffer<u32>, dst: &Buffer<u32, Readback>| {
+        cmd.compute(
+            &TestComputeBuffer::push_bindings(
+                TestComputeBufferArgs {
+                    src: src.range(..),
+                    dst: dst.range(..),
+                    count: 64,
+                    multiplier: 2,
+                },
+                None,
+            ),
+            [1, 1, 1],
+        )
+    };
+
+    // Compute, and every stage.
+    for stage in [GraphicsStage::Compute, GraphicsStage::All] {
+        let src = Buffer::<u32>::new(64).unwrap();
+        let mut dst = zeroed_buffer::<u32>(64);
+        let written = slow_write(other, &large, &threes, src.range(..));
+        let mut submission = gpu.timeline.begin().unwrap();
+        submission.wait_for(written.at(stage));
+        (submission.submit(|cmd| dispatch(cmd, &src, &dst)))
+            .unwrap()
+            .block()
+            .unwrap();
+        assert_eq!(dst.host(), expected, "{stage:?}");
+    }
+
+    // Indirect reads: a dispatch whose command another timeline wrote.
+    let src = buffer_with(&[3u32; 64]);
+    let command = Buffer::<DispatchIndirectCommand>::new(1).unwrap();
+    let one = buffer_with(&[DispatchIndirectCommand { x: 1, y: 1, z: 1 }]);
+    let mut dst = zeroed_buffer::<u32>(64);
+    let written = slow_write(other, &large, &one, command.range(..));
+    let mut submission = gpu.timeline.begin().unwrap();
+    submission.wait_for(written.at(GraphicsStage::RayTracing));
+    (submission.submit(|cmd| {
+        let bindings = TestComputeBuffer::push_bindings(
+            TestComputeBufferArgs {
+                src: src.range(..),
+                dst: dst.range(..),
+                count: 64,
+                multiplier: 2,
+            },
+            None,
+        );
+        cmd.compute_indirect(&bindings, command.range(..));
+    }))
+    .unwrap()
+    .block()
+    .unwrap();
+    assert_eq!(dst.host(), expected);
+
+    // Draws: a triangle whose vertices another timeline wrote.
+    let data = buffer_with(&[
+        vertex(-0.5, -0.8, 0.5, RED),
+        vertex(-0.1, 0.8, 0.5, RED),
+        vertex(-0.9, 0.8, 0.5, RED),
+    ]);
+    let vertices = Buffer::<TestVertex>::new(3).unwrap();
+    let target = Target::new(EXTENT).unwrap();
+    let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
+    let written = slow_write(other, &large, &data, vertices.range(..));
+    let mut submission = gpu.timeline.begin().unwrap();
+    submission.wait_for(written.at(GraphicsStage::Raster));
+    (submission.submit(|cmd| {
+        cmd.raster(
+            EXTENT,
+            [Attachment::color(target.whole_view(), Some([0.0; 4]))],
+        )
+        .draw(&Draw::new(
+            &bindings(&vertices),
+            3,
+            1,
+            RasterState::default(),
+        ))
+        .record("waited for");
+        cmd.copy_image_to_buffer(target.whole(), readback.range(..));
+    }))
+    .unwrap()
+    .block()
+    .unwrap();
+    assert_pixel(readback.host(), IN_LEFT.0, IN_LEFT.1, [255, 0, 0, 255]);
+}
+
 // ---- queue family ownership ------------------------------------------------------------------
 
 fn has_family(test: &str, kind: Kind) -> bool {
@@ -591,10 +859,9 @@ fn an_unreleased_image_panics() {
         .unwrap();
     cleared.block().unwrap();
     let readback = zeroed_buffer::<u8>(8 * 8 * 4);
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let message = panic_message(|| {
         gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)))
-    }));
-    let message = *panicked.unwrap_err().downcast::<String>().unwrap();
+    });
     assert!(
         message.contains("`cmd.release::<Graphics>(view)`"),
         "{message}"
@@ -809,7 +1076,12 @@ fn observers_see_every_scope_and_pass_once_in_nesting_order() {
         times[parent].0 <= times[child].0 && times[child].1 <= times[parent].1
     };
     assert!(inside(1, 0) && inside(2, 1) && inside(3, 1));
-    assert!(times[3].0 >= times[2].1, "passes run in order");
+    // A timestamp latches once every earlier command of the queue completed its stage, so
+    // timestamps of one stage follow submission order. The second pass's start (written at
+    // `NONE`, after the barrier between the passes but outside its second scope) may latch
+    // before the first pass's end (`ALL_COMMANDS`): only the ends are ordered.
+    assert!(times[3].1 >= times[2].1, "{times:?}");
+    assert!(times[3].0 >= times[2].0, "{times:?}");
 
     // Without an observer, a scope is only a label.
     gpu.submit(|cmd| cmd.measure(None, "frame", |cmd| record_profiled(cmd, &target)));
@@ -892,12 +1164,12 @@ fn a_panic_inside_measure_detaches_the_observer() {
         .unwrap();
     let mut observer = TestObserver::new(Statistics::empty(), &[]);
     gpu.submit(|cmd| {
-        let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let message = panic_message(|| {
             cmd.measure(Some(&mut observer), "frame", |_| {
                 panic!("the recording failed")
             })
-        }));
-        assert!(measured.is_err());
+        });
+        assert_eq!(message, "the recording failed");
         cmd.compute(
             &TestComputeImage::push_bindings(
                 TestComputeImageArgs {
@@ -918,6 +1190,9 @@ fn a_panic_inside_measure_detaches_the_observer() {
 fn statistics_queries_count_their_commands_and_keep_observers_from_nesting_one() {
     let mut gpu = gpu();
     if !Ctx::features().pipeline_statistics {
+        eprintln!(
+            "SKIPPED statistics_queries_count_their_commands_and_keep_observers_from_nesting_one: no pipeline statistics"
+        );
         return;
     }
     let target = Target::new(UVec2::new(SIZE, SIZE))
@@ -1125,6 +1400,166 @@ fn reads_stay_inside_their_pool() {
         pool.read(4, &mut []).unwrap(),
         "no queries are always ready"
     );
+}
+
+/// Ends a query of `pool` on exit without beginning one.
+struct EndOnly<'a> {
+    pool: &'a QueryPool<Occlusion>,
+}
+
+impl ScopeObserver for EndOnly<'_> {
+    fn on_enter(&mut self, _: &mut QueryRecorder, _: &ScopeInfo) {}
+
+    fn on_exit(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo) {
+        if scope.depth == 0 {
+            queries.end_query(self.pool, 0);
+        }
+    }
+}
+
+#[test]
+fn a_recorder_ends_only_a_query_that_is_active() {
+    let mut gpu = gpu();
+    let pool = QueryPool::occlusion(1).unwrap();
+    let mut observer = EndOnly { pool: &pool };
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.measure(Some(&mut observer), "frame", |_| {})));
+    assert!(
+        message.contains("no query of its kind is active"),
+        "{message}"
+    );
+    lava::wait_idle().unwrap();
+    // Inside a `cmd.query` of its kind it ends that one, where it began.
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.query(&pool, 0, |cmd| {
+                cmd.measure(Some(&mut observer), "frame", |_| {})
+            })
+        })
+    });
+    assert!(message.contains("is ended"), "{message}");
+    lava::wait_idle().unwrap();
+}
+
+/// A pool holds one recording: recording into it while an earlier submission that recorded
+/// into it hasn't completed panics. That submission is held open on another thread, so it
+/// can't have completed.
+#[test]
+fn a_pool_in_flight_is_not_recorded_into() {
+    let mut gpu = gpu();
+    let pool = QueryPool::timestamps(2).unwrap();
+    let timeout = std::time::Duration::from_secs(30);
+    let (opened, open) = std::sync::mpsc::channel::<()>();
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    let message = std::thread::scope(|scope| {
+        let pool = &pool;
+        let recorder = scope.spawn(move || {
+            let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
+            (other.begin().unwrap())
+                .submit(|cmd| {
+                    cmd.write_timestamp(pool, 0, lava::PipelineStageFlags2::NONE);
+                    opened.send(()).unwrap();
+                    finished.recv_timeout(timeout).unwrap();
+                })
+                .unwrap()
+                .block()
+                .unwrap();
+        });
+        open.recv_timeout(timeout).unwrap();
+        let message = panic_message(|| {
+            gpu.submit(|cmd| cmd.write_timestamp(pool, 1, lava::PipelineStageFlags2::NONE))
+        });
+        finish.send(()).unwrap();
+        recorder.join().unwrap();
+        message
+    });
+    assert!(
+        message.contains("keep one pool per frame slot"),
+        "{message}"
+    );
+    // Once it completed, the next recording takes the pool again.
+    gpu.submit(|cmd| cmd.write_timestamp(&pool, 1, lava::PipelineStageFlags2::NONE));
+    let mut tick = [0];
+    assert!(pool.read(1, &mut tick).unwrap());
+}
+
+/// Timestamps on the host's clock: between the instants around the submission, as far apart
+/// as `elapsed_ns` says.
+#[test]
+fn timestamps_convert_to_host_instants() {
+    let mut gpu = gpu();
+    let pool = QueryPool::timestamps(2).unwrap();
+    let mut buffer = zeroed_buffer::<u32>(1 << 20);
+    let before = std::time::Instant::now();
+    gpu.submit(|cmd| {
+        cmd.write_timestamp(&pool, 0, lava::PipelineStageFlags2::NONE);
+        cmd.fill_buffer(buffer.range(..), 1);
+        cmd.write_timestamp(&pool, 1, lava::PipelineStageFlags2::ALL_COMMANDS);
+    });
+    let after = std::time::Instant::now();
+    assert_eq!(buffer.host()[0], 1);
+    let mut ticks = [0; 2];
+    assert!(pool.read(0, &mut ticks).unwrap());
+    let (start, end) = match (pool.instant(ticks[0]), pool.instant(ticks[1])) {
+        (Ok(start), Ok(end)) => (
+            start.expect("the device calibrates"),
+            end.expect("the device calibrates"),
+        ),
+        (Err(missing), _) | (_, Err(missing)) => {
+            assert_eq!(missing.feature, "calibrated-timestamps");
+            eprintln!("SKIPPED timestamps_convert_to_host_instants: {missing}");
+            return;
+        }
+    };
+    // The calibration's deviation, and the clocks' rounding, with room to spare.
+    let slack = std::time::Duration::from_millis(5);
+    assert!(start + slack >= before, "{start:?} before {before:?}");
+    assert!(end <= after + slack, "{end:?} after {after:?}");
+    let elapsed = end.saturating_duration_since(start).as_nanos() as i128;
+    let measured = pool.elapsed_ns(ticks[0], ticks[1]) as i128;
+    assert!(
+        (elapsed - measured).abs() < 1_000_000,
+        "{elapsed} vs {measured}"
+    );
+}
+
+/// Allocations are counted at once; with `memory-budget` every heap has a usage and a budget.
+#[test]
+fn memory_reports_count_allocations_and_the_budget() {
+    let _gpu = gpu();
+    lava::wait_idle().unwrap();
+    let before = lava::memory::memory_report();
+    let buffer = Buffer::<u8>::new(8 << 20).unwrap();
+    let report = lava::memory::memory_report();
+    assert!(
+        report.allocated >= before.allocated + (8 << 20),
+        "{report:?}"
+    );
+    assert!(report.reserved >= report.allocated, "{report:?}");
+    assert!(report.heaps.iter().any(|heap| heap.device_local));
+    let mut used = 0;
+    for heap in &report.heaps {
+        match (heap.usage, heap.budget) {
+            (Ok(usage), Ok(budget)) => {
+                assert!(
+                    usage <= heap.size && 0 < budget && budget <= heap.size,
+                    "{heap:?}"
+                );
+                used += usage;
+            }
+            (usage, budget) => {
+                assert!(usage.is_err() && budget.is_err());
+                assert!(!Ctx::features().memory_budget);
+            }
+        }
+    }
+    match Ctx::features().memory_budget {
+        true => assert!(used >= report.allocated, "{used} used of {report:?}"),
+        false => eprintln!(
+            "SKIPPED memory_reports_count_allocations_and_the_budget (the budget): no `memory-budget`"
+        ),
+    }
+    drop(buffer);
 }
 
 /// Counters of one scope, at most `MAX_COUNTERS`.
@@ -1772,20 +2207,15 @@ fn binds_take_free_slots() {
         [unbound.whole_view(); 4],
         (0..4).map(|i| reserved.handle(i)),
     );
-    let unreserved = std::panic::catch_unwind(|| bindless::bind([unbound.whole_view()], [s]));
-    assert!(
-        unreserved.is_err(),
-        "the sampled image's slot isn't reserved"
-    );
+    // The sampled image's slot isn't reserved.
+    let unreserved = panic_message(|| bindless::bind([unbound.whole_view()], [s]));
+    assert!(unreserved.contains("lie in no `SlotRange`"), "{unreserved}");
     let storage_slots = bindless::reserve::<bindless::Storage>(1).unwrap();
-    let refused = std::panic::catch_unwind(|| {
-        bindless::bind([unbound.whole_view()], [storage_slots.handle(0)])
-    });
-    assert!(
-        refused.is_err(),
-        "a sampled image can't be bound as storage"
-    );
-    assert!(std::panic::catch_unwind(|| reserved.handle(4)).is_err());
+    let refused =
+        panic_message(|| bindless::bind([unbound.whole_view()], [storage_slots.handle(0)]));
+    assert!(refused.contains("can't be bound as"), "{refused}");
+    let past = panic_message(|| reserved.handle(4));
+    assert!(past.contains("handle 4 of a range of 4"), "{past}");
     let pairs = bindless::reserve::<Combined>(2).unwrap();
     assert_eq!((pairs.len(), pairs.slots().iter().count()), (2, 4));
     assert_eq!(
@@ -1836,7 +2266,7 @@ fn pairs_skip_single_holes() {
 /// Also a dropped reservation's slots, which `bind` refuses right away.
 #[test]
 fn slots_are_free_again_once_their_image_is_destroyed() {
-    let _gpu = gpu();
+    let mut gpu = gpu();
     // Destroys what earlier tests dropped, so the lowest free slots are the first ones.
     lava::wait_idle().unwrap();
     let bind = || {
@@ -1847,13 +2277,16 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
     };
     let image = bind();
     let slot = image.handle::<bindless::Sampled>();
+    // A frame being recorded may reach it: even a poll leaves its slot taken.
+    let frame = gpu.timeline.begin().unwrap();
     drop(image);
+    lava::reclaim();
     assert_ne!(
         bind().handle::<bindless::Sampled>(),
         slot,
         "taken until no frame reaches it"
     );
-    lava::wait_idle().unwrap();
+    frame.submit(|_| {}).unwrap().block().unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 
     // A mip chain frees its whole view's slot and each mip's, erased or not.
@@ -1883,8 +2316,8 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
     let sampled = bindless::reserve::<bindless::Sampled>(3).unwrap();
     let (handle, slots) = (sampled.handle(0), sampled.slots());
     drop(sampled);
-    let written = std::panic::catch_unwind(|| bindless::bind([texture.whole_view()], [handle]));
-    assert!(written.is_err());
+    let written = panic_message(|| bindless::bind([texture.whole_view()], [handle]));
+    assert!(written.contains("lie in no `SlotRange`"), "{written}");
     lava::wait_idle().unwrap();
     assert_eq!(
         bindless::reserve::<bindless::Sampled>(3).unwrap().slots(),
@@ -2014,11 +2447,15 @@ fn samplers_filter_by_their_description_and_free_their_slots() {
     let desc = SamplerDesc::new();
     let dropped = Sampler::new(&desc).unwrap();
     let index = dropped.handle();
+    // A frame being recorded may reach it: even a poll leaves its slot taken.
+    let frame = gpu.timeline.begin().unwrap();
     drop(dropped);
+    lava::reclaim();
     let next = Sampler::new(&desc).unwrap();
     assert_ne!(next.handle(), index, "taken until no frame reaches it");
-    lava::wait_idle().unwrap();
+    frame.submit(|_| {}).unwrap().block().unwrap();
     assert_eq!(Sampler::new(&desc).unwrap().handle(), index);
+    drop(next);
 }
 
 /// A min or max reduction sampler returns the extreme of the texels it filters.
@@ -2056,6 +2493,59 @@ fn reduction_samplers_return_the_extremes() {
         Accesses::images(&reads),
     );
     assert_eq!((low.x, high.x), (0.1, 0.4));
+}
+
+/// A full heap is an error, of images and of samplers alike, and frees up again.
+#[test]
+fn full_bindless_heaps_are_errors() {
+    let _gpu = gpu();
+    lava::wait_idle().unwrap();
+    // Every free image slot reserved, in halving blocks.
+    let mut taken = Vec::new();
+    let mut n = max_image_slots();
+    while n > 0 {
+        match bindless::reserve::<bindless::Sampled>(n) {
+            Ok(range) => taken.push(range),
+            Err(lava::Error::OutOfBindlessSlots { heap, count }) => {
+                assert_eq!((heap, count), (bindless::Heap::Image, n));
+                n /= 2;
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    let image = || Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::new(4, 4)).unwrap();
+    match image().bind_sampled() {
+        Err(lava::Error::OutOfBindlessSlots { heap, count }) => {
+            assert_eq!((heap, count), (bindless::Heap::Image, 1))
+        }
+        other => panic!("bound into a full heap: {:?}", other.map(|_| ())),
+    }
+    drop(taken);
+    lava::wait_idle().unwrap();
+    image().bind_sampled().unwrap();
+
+    // Samplers until the sampler heap is full.
+    let mut samplers = Vec::new();
+    let error = loop {
+        match Sampler::new(&SamplerDesc::new()) {
+            Ok(sampler) => samplers.push(sampler),
+            Err(error) => break error,
+        }
+        assert!(samplers.len() <= 1 << 12, "at most 4096 samplers");
+    };
+    assert!(
+        matches!(
+            error,
+            lava::Error::OutOfBindlessSlots {
+                heap: bindless::Heap::Sampler,
+                count: 1
+            }
+        ),
+        "{error}"
+    );
+    drop(samplers);
+    lava::wait_idle().unwrap();
+    Sampler::new(&SamplerDesc::new()).unwrap();
 }
 
 type Combinable = Image<R8G8B8A8Unorm, usage![Sampled, Storage, TransferSrc, TransferDst]>;
@@ -2365,22 +2855,34 @@ fn blit_scales_between_differently_sized_regions() {
     }
 }
 
+/// The image `created` is, unless the device lacks host image copies (`MissingFeature`, which
+/// skips `test`).
+fn host_copy_image<T>(test: &str, created: lava::Result<T>) -> Option<T> {
+    match created {
+        Ok(image) => Some(image),
+        Err(lava::Error::MissingFeature(missing)) => {
+            assert_eq!(missing.feature, "host-image-copy");
+            assert!(!Ctx::features().host_image_copy);
+            eprintln!("SKIPPED {test}: the device lacks `host-image-copy`");
+            None
+        }
+        Err(error) => panic!("{test}: {error}"),
+    }
+}
+
 #[test]
 fn host_copy_uploads_a_mip_level() {
     let mut gpu = gpu();
-    let mut image =
+    let Some(mut image) = host_copy_image(
+        "host_copy_uploads_a_mip_level",
         Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc]>::with_mip_levels(
             UVec2::new(8, 8),
             2,
-        )
-        .unwrap();
-    let data = pattern(8, 8);
-
-    if !Ctx::features().host_image_copy {
-        // The device lacks `VK_EXT_host_image_copy`.
-        assert!(image.copy_from(&data, 0).is_err());
+        ),
+    ) else {
         return;
-    }
+    };
+    let data = pattern(8, 8);
 
     image.copy_from(&data, 0).unwrap();
     let mut readback = zeroed_buffer::<u8>(data.len());
@@ -2408,16 +2910,14 @@ fn host_copy_uploads_a_mip_level() {
 #[test]
 fn host_copy_writes_only_the_region() {
     let mut gpu = gpu();
-    let mut image =
-        Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc]>::new(UVec2::new(8, 8))
-            .unwrap();
+    let Some(mut image) = host_copy_image(
+        "host_copy_writes_only_the_region",
+        Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc]>::new(UVec2::new(8, 8)),
+    ) else {
+        return;
+    };
     let (offset, extent) = (IVec2::new(4, 5), UVec2::new(3, 2));
     let patch = vec![200u8; 3 * 2 * 4];
-
-    if !Ctx::features().host_image_copy {
-        assert!(image.copy_region_from(&patch, 0, offset, extent).is_err());
-        return;
-    }
 
     let data = pattern(8, 8);
     image.copy_from(&data, 0).unwrap();
@@ -2591,8 +3091,11 @@ fn compute_pass_reads_and_writes_buffers() {
 #[test]
 fn clock_regions_count_every_subgroup_once() {
     let mut gpu = gpu();
-    if !Ctx::features().shader_clock {
-        eprintln!("skipping clock_regions_count_every_subgroup_once: no subgroup clocks");
+    let features = Ctx::features();
+    if !(features.shader_clock && features.shader_int64_atomics) {
+        eprintln!(
+            "SKIPPED clock_regions_count_every_subgroup_once: the device lacks `shader-clock` or `shader-int64-atomics`"
+        );
         return;
     }
     const INVOCATIONS: usize = 256;
@@ -3135,32 +3638,45 @@ fn skipped_attachment_keeps_its_content() {
         return;
     }
     let vertices = overlapping_triangles(&mut gpu);
-    let second = Target::new(UVec2::new(SIZE, SIZE))
-        .unwrap()
-        .bind_storage()
-        .unwrap();
-    let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
-    let pixels = render(&mut gpu, |cmd, target| {
-        cmd.raster(
-            EXTENT,
-            [
-                Attachment::color(target.whole_view(), None),
-                Attachment::color(second.whole_view(), Some([0.0, 0.0, 1.0, 1.0])),
-            ],
-        )
-        .draw(&Draw::new(
-            &bindings(&vertices),
-            6,
-            1,
-            RasterState::default()
-                .blends([Blend::Replace, Blend::Skip])
-                .expect("the device has `independent-blend`"),
-        ))
-        .record("skip");
-        cmd.copy_image_to_buffer(second.whole(), readback.range(..));
-    });
-    assert_pixel(&pixels, 32, 40, [255, 0, 0, 255]);
-    let second = readback.host();
+    // Both attachments drawn by `TestTwoTargets`: the colour at location 0, its inverse at
+    // location 1, which starts blue.
+    let mut draw = |blends: [Blend; 2]| {
+        let second = Target::new(EXTENT).unwrap();
+        let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
+        let first = render(&mut gpu, |cmd, target| {
+            cmd.raster(
+                EXTENT,
+                [
+                    Attachment::color(target.whole_view(), None),
+                    Attachment::color(second.whole_view(), Some([0.0, 0.0, 1.0, 1.0])),
+                ],
+            )
+            .draw(&Draw::new(
+                &TestTwoTargets::push_bindings(
+                    TestTwoTargetsArgs {
+                        vertices: vertices.range(..),
+                    },
+                    None,
+                ),
+                6,
+                1,
+                RasterState::default()
+                    .blends(blends)
+                    .expect("the device has `independent-blend`"),
+            ))
+            .record("two targets");
+            cmd.copy_image_to_buffer(second.whole(), readback.range(..));
+        });
+        (first, readback.host().to_vec())
+    };
+    // Without `Skip` the shader writes both: red, then cyan.
+    let (first, second) = draw([Blend::Replace, Blend::Replace]);
+    assert_pixel(&first, 32, 40, [255, 0, 0, 255]);
+    assert_pixel(&second, 32, 40, [0, 255, 255, 255]);
+    assert_pixel(&second, 2, 2, [0, 0, 255, 255]);
+    // With it the second attachment keeps its clear while the first is drawn.
+    let (first, second) = draw([Blend::Replace, Blend::Skip]);
+    assert_pixel(&first, 32, 40, [255, 0, 0, 255]);
     assert!(
         second
             .as_chunks::<4>()
@@ -3168,6 +3684,10 @@ fn skipped_attachment_keeps_its_content() {
             .iter()
             .all(|&p| p == [0, 0, 255, 255])
     );
+    // And the other way round.
+    let (first, second) = draw([Blend::Skip, Blend::Replace]);
+    assert!(first.as_chunks::<4>().0.iter().all(|&p| p == BLACK));
+    assert_pixel(&second, 32, 40, [0, 255, 255, 255]);
 }
 
 /// With counter-clockwise front faces the other triangle is culled.
@@ -3793,11 +4313,12 @@ fn volumes_are_uploaded_sampled_and_copied() {
         .collect();
     let upload = buffer_with::<u8>(&texels);
     let volume =
-        MipChain::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc, TransferDst], D3>::with_mip_levels(
+        MipChain::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst], D3>::with_mip_levels(
             size, 2,
         )
         .unwrap()
-        .bind_sampled().unwrap();
+        .bind_sampled()
+        .unwrap();
     assert_eq!(volume.mip_extent(1), UVec3::new(2, 2, 1));
     let target =
         Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(size.truncate())
@@ -3830,20 +4351,25 @@ fn volumes_are_uploaded_sampled_and_copied() {
     assert_eq!(slice.host(), &texels[texels.len() / 2..]);
     assert_eq!(mip.host(), [255, 0, 255, 255].repeat(4));
 
-    // A host copy into the second slice: its offset is three-dimensional.
-    let mut volume = volume;
-    if Ctx::features().host_image_copy {
-        let patch = [7u8; 4 * 4 * 4];
-        let offset = IVec3::new(0, 0, 1);
-        volume
-            .copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 1))
-            .unwrap();
-        panic_message(|| volume.copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 2)));
-        gpu.submit(|cmd| cmd.copy_image_to_buffer(volume.whole(), whole.range(..)));
-        let half = texels.len() / 2;
-        assert_eq!(&whole.host()[..half], &texels[..half]);
-        assert_eq!(&whole.host()[half..], patch);
-    }
+    // A host copy into the second slice of another volume: its offset is three-dimensional.
+    let Some(mut hosted) = host_copy_image(
+        "volumes_are_uploaded_sampled_and_copied (its host copy)",
+        Image::<R8G8B8A8Unorm, usage![HostCopy, TransferSrc], D3>::new(size),
+    ) else {
+        return;
+    };
+    hosted.copy_from(&texels, 0).unwrap();
+    let patch = [7u8; 4 * 4 * 4];
+    let offset = IVec3::new(0, 0, 1);
+    hosted
+        .copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 1))
+        .unwrap();
+    let message = panic_message(|| hosted.copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 2)));
+    assert!(message.contains("does not fit mip level 0"), "{message}");
+    gpu.submit(|cmd| cmd.copy_image_to_buffer(hosted.whole(), whole.range(..)));
+    let half = texels.len() / 2;
+    assert_eq!(&whole.host()[..half], &texels[..half]);
+    assert_eq!(&whole.host()[half..], patch);
 }
 
 /// A BC7 block (mode 6) of one colour: each channel is `(channel << 1) | low_bit`.
@@ -3862,7 +4388,8 @@ fn bc7_block(channels: [u8; 4], low_bit: u8) -> [u8; 16] {
 #[test]
 fn host_copy_uploads_block_compressed_mips() {
     let mut gpu = gpu();
-    if !Ctx::features().host_image_copy {
+    if !Ctx::features().bc_compression {
+        eprintln!("SKIPPED host_copy_uploads_block_compressed_mips: no BC compression");
         return;
     }
     // 8x8 texels are 2x2 blocks: red, green / blue, yellow.
@@ -3873,11 +4400,13 @@ fn host_copy_uploads_block_compressed_mips() {
         bc7_block([127, 127, 0, 127], 1),
     ]
     .concat();
-    let mut texture =
-        Image::<BC7UnormBlock, usage![Sampled, HostCopy]>::with_mip_levels(UVec2::new(8, 8), 4)
-            .unwrap()
-            .bind_sampled()
-            .unwrap();
+    let Some(texture) = host_copy_image(
+        "host_copy_uploads_block_compressed_mips",
+        Image::<BC7UnormBlock, usage![Sampled, HostCopy]>::with_mip_levels(UVec2::new(8, 8), 4),
+    ) else {
+        return;
+    };
+    let mut texture = texture.bind_sampled().unwrap();
     texture.copy_from(&blocks, 0).unwrap();
     // The smaller levels are one block each, even the ones smaller than a block.
     for level in 1..4 {
@@ -4142,41 +4671,82 @@ mod generated {
         assert_eq!(vertices.access, A::SHADER_STORAGE_READ);
     }
 
-    /// The second dispatch's read waits for the first one's write; validation checks it.
+    /// `TestPointerOnly` reaches `data` only through an address without an access: its extra
+    /// accesses alone order the second dispatch's read after the first one's write (the
+    /// validation layer doesn't track device addresses, so only the data can tell).
     #[test]
     fn extra_accesses_get_barriers_like_the_bindings() {
         let mut gpu = gpu();
+        const COUNT: u32 = 1 << 20;
+        let data = Buffer::<u32>::new(COUNT as usize).unwrap();
+        let unused = Buffer::<u32>::new(1).unwrap();
+        let mut out = zeroed_buffer::<u32>(COUNT as usize);
+        let groups = TestPointerOnly::groups([COUNT, 1, 1]);
+        gpu.submit(|cmd| {
+            let written = [BufferAccess::write(data.range(..))];
+            let write = TestPointerOnly::push_bindings(
+                TestPointerOnlyArgs {
+                    data: data.address(),
+                    out: unused.range(..),
+                    count: COUNT,
+                    value: 7,
+                    write: 1,
+                    spin: 4096,
+                },
+                Some(Accesses::buffers(&written)),
+            );
+            // The extra access follows the field's, at the pass's stage.
+            let buffers: Vec<_> = write.sections().buffers().collect();
+            assert_eq!(buffers.len(), 2);
+            assert_eq!(
+                (buffers[1].stage, buffers[1].access, buffers[1].range),
+                (
+                    S::COMPUTE_SHADER,
+                    written[0].access,
+                    data.range(..).get_range()
+                )
+            );
+            cmd.compute(&write, groups);
+            let read = [BufferAccess::read(data.range(..))];
+            let read = TestPointerOnly::push_bindings(
+                TestPointerOnlyArgs {
+                    data: data.address(),
+                    out: out.range(..),
+                    count: COUNT,
+                    value: 0,
+                    write: 0,
+                    spin: 0,
+                },
+                Some(Accesses::buffers(&read)),
+            );
+            cmd.compute(&read, groups);
+        });
+        let wrong = (out.host().iter().enumerate())
+            .filter(|&(i, &value)| value != 7 + i as u32)
+            .count();
+        assert_eq!(wrong, 0, "elements read before they were written");
+
+        // Extra image accesses follow the fields' too.
         let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(UVec2::new(8, 8))
             .unwrap()
             .bind_storage()
             .unwrap();
-        let buffer = zeroed_buffer::<u32>(4);
-        gpu.submit(|cmd| {
-            let args = || TestComputeImageArgs {
+        let images = [ImageUse::storage_read(image.whole_view())];
+        let bindings = TestComputeImage::push_bindings(
+            TestComputeImageArgs {
                 target: image.whole_view(),
                 tint: Vec4::ONE,
                 offset: UVec2::ZERO,
                 size: UVec2::new(8, 8),
-            };
-            let images = [ImageUse::storage_read(image.whole_view())];
-            let written = [BufferAccess::write(buffer.range(..))];
-            let writes =
-                TestComputeImage::push_bindings(args(), Some(Accesses::new(&images, &written)));
-            // The extra accesses follow the fields', at the pass's stages.
-            let buffers: Vec<_> = writes.sections().buffers().collect();
-            assert_eq!(buffers.len(), 1);
-            assert_eq!(
-                (buffers[0].stage, buffers[0].access),
-                (S::COMPUTE_SHADER, written[0].access)
-            );
-            assert_eq!(writes.sections().images().count(), 2);
-            cmd.compute(&writes, [1, 1, 1]);
-            let read = [BufferAccess::read(buffer.range(..))];
-            cmd.compute(
-                &TestComputeImage::push_bindings(args(), Some(Accesses::buffers(&read))),
-                [1, 1, 1],
-            );
-        });
+            },
+            Some(Accesses::images(&images)),
+        );
+        let accesses: Vec<_> = bindings.sections().images().collect();
+        assert_eq!(accesses.len(), 2);
+        assert_eq!(
+            (accesses[1].stage(), accesses[1].access()),
+            (S::COMPUTE_SHADER, A::SHADER_STORAGE_READ)
+        );
     }
 
     #[test]

@@ -1,17 +1,21 @@
-//! GPU ray tracing tests: acceleration structure builds (checked against their creation's shapes, batched to fit a scratch, empty ones skipped), refits, compaction by hand and with a `Compactor`, copies, serialization, arenas, `with_capacity`, half, snorm and `Vec3A` positions, instance flags, the built state traces check (applied only once a recording reaches the GPU), the device limits, ray queries and ray tracing pipelines on a small scene, position fetch and shader execution reordering
+//! GPU ray tracing tests: acceleration structure builds (checked against their creation's shapes, batched to fit a scratch, empty ones skipped), refits, compaction by hand and with a `Compactor`, copies, serialization, arenas, `with_capacity`, half, snorm and `Vec3A` positions, geometry transforms (part of the shape), instance flags, the built state traces check (applied only once a recording reaches the GPU), the device limits (per axis and in total), ray queries (also through a TLAS named in a struct behind a pointer) and ray tracing pipelines (also with specialization constants) on a small scene, position fetch and shader execution reordering
 mod common;
 
-use common::{Cmd, buffer_with, golden::assert_golden, gpu, panic_message, zeroed_buffer};
+use common::{
+    Cmd, buffer_with,
+    golden::{assert_golden, assert_matches_golden},
+    gpu, panic_message, zeroed_buffer,
+};
 use glam::{Affine3A, Quat, UVec2, Vec3, Vec3A};
 use lava::{
     Ctx, Error,
     acceleration_structure::{
         Aabb, Aabbs, AabbsDesc, Blas, BlasDesc, BlasGeometry, Bottom, BuildFlags, BuildPreference,
         Compactor, Half4, Instance, InstanceFlags, Instances, Scratch, Snorm16x4, StructureArena,
-        Tlas, Triangles, TrianglesDesc, VertexPosition, scratch_alignment,
+        Tlas, TransformMatrix, Triangles, TrianglesDesc, VertexPosition, scratch_alignment,
     },
     buffer::{Buffer, Gpu, Readback, Upload},
-    command_buffer::TraceRaysIndirectCommand,
+    command_buffer::{Accesses, BufferAccess, TraceRaysIndirectCommand},
     image::{Image, format::R8G8B8A8Unorm, usage::usage},
     query::{QueryPool, QueryRecorder, ScopeInfo, ScopeObserver},
 };
@@ -511,7 +515,7 @@ fn compacted_structures_trace_the_same_image() {
         trace_query(cmd, target, &tlas);
     });
     assert_query_image(&pixels);
-    assert_golden("ray_query", &pixels, [SIZE, SIZE]);
+    assert_matches_golden("ray_query", &pixels, [SIZE, SIZE]);
 
     // A compacted structure only has its compacted size, which a build could write past.
     assert!(compacted.iter().all(|c| c.is_compacted()));
@@ -520,15 +524,18 @@ fn compacted_structures_trace_the_same_image() {
         max: Vec3::splat(1.0),
     }]);
     let geometry = [Aabbs::new(boxes.range(..))];
-    let rebuild = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let message = panic_message(|| {
         gpu.submit(|cmd| {
             cmd.build(
                 &[(c_sphere, BlasGeometry::Aabbs(&geometry))],
                 scratch.range(..),
             )
         })
-    }));
-    assert!(rebuild.is_err(), "building a compacted structure panics");
+    });
+    assert!(
+        message.contains("a compacted or deserialized structure can't be built again"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -614,30 +621,46 @@ fn traces_stay_within_the_device_limits() {
     ) {
         return;
     }
+    // Per axis a trace may be `maxComputeWorkGroupCount * maxComputeWorkGroupSize` rays wide
+    // (in `u64`: the product exceeds `u32` on many drivers, where no `u32` is too wide), and
+    // all of them together at most `maxRayDispatchInvocationCount` (a `u32`).
     let limits = &Ctx::device_properties().limits;
-    let most = limits.max_compute_work_group_count[0] as u64
-        * limits.max_compute_work_group_size[0] as u64;
-    let Ok(over) = u32::try_from(most + 1) else {
-        eprintln!("SKIPPED traces_stay_within_the_device_limits: no width is too wide");
-        return;
-    };
+    let axis: [u64; 3] = std::array::from_fn(|i| {
+        limits.max_compute_work_group_count[i] as u64 * limits.max_compute_work_group_size[i] as u64
+    });
     let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
     let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
-    let message = panic_message(|| {
-        gpu.submit(|cmd| {
-            let bindings = TestRayTracing::push_bindings(
-                TestRayTracingArgs {
-                    target: target.whole_view(),
-                    tlas: &scene.tlas,
-                    size: EXTENT,
-                },
-                None,
-            )
-            .unwrap();
-            cmd.raytrace(&bindings, [over, 1, 1])
+    let mut trace = |rays: [u32; 3]| {
+        panic_message(|| {
+            gpu.submit(|cmd| {
+                let bindings = TestRayTracing::push_bindings(
+                    TestRayTracingArgs {
+                        target: target.whole_view(),
+                        tlas: &scene.tlas,
+                        size: EXTENT,
+                    },
+                    None,
+                )
+                .unwrap();
+                cmd.raytrace(&bindings, rays)
+            })
         })
-    });
-    assert!(message.contains("rays"), "{message}");
+    };
+    match u32::try_from(axis[0] + 1) {
+        Ok(over) => {
+            let message = trace([over, 1, 1]);
+            assert!(message.contains("rays exceed the device's"), "{message}");
+        }
+        Err(_) => eprintln!(
+            "SKIPPED traces_stay_within_the_device_limits (width): {} rays per axis fit no u32",
+            axis[0]
+        ),
+    }
+    // Two axes at their widest are more rays than any `u32` total allows.
+    let widest = axis.map(|a| a.min(u32::MAX as u64) as u32);
+    assert!(widest[0] as u64 * widest[1] as u64 > u32::MAX as u64);
+    let message = trace([widest[0], widest[1], 1]);
+    assert!(message.contains("more than the device's"), "{message}");
 }
 
 /// One triangle BLAS of `V` positions with an instance of custom index 1 in a TLAS, traced by
@@ -1320,4 +1343,170 @@ fn reordered_traces_hit_like_plain_ones() {
         [122, 122, 122],
     );
     assert_pixel(&pixels, BACKGROUND.0, BACKGROUND.1, [0, 0, 0]);
+}
+
+#[test]
+fn geometry_transforms_move_their_triangles_and_are_part_of_the_shape() {
+    let mut gpu = gpu();
+    if !supported(
+        "geometry_transforms_move_their_triangles",
+        Ctx::features().ray_query,
+    ) {
+        return;
+    }
+    let vertices = buffer_with::<Vec3>(&TRIANGLE_VERTICES);
+    // Half the image to the right: the triangle of `updates_follow_moved_vertices`, moved.
+    let transform = buffer_with(&[TransformMatrix::from(Affine3A::from_translation(
+        Vec3::new(0.5, 0.0, 0.0),
+    ))]);
+    let geometry = [Triangles::new(vertices.range(..)).transform(transform.range(..))];
+    let blas = Blas::new(&BlasGeometry::Triangles(&geometry), BuildFlags::default()).unwrap();
+    let instances =
+        buffer_with::<Instance>(&[Instance::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
+    let tlas = Tlas::new(1, BuildFlags::default()).unwrap();
+    let scratch = Scratch::for_any(&[&blas]).unwrap();
+    let tlas_scratch = Scratch::for_any(&[&tlas]).unwrap();
+    // A build without the transform isn't the shape it was created for.
+    let untransformed = [Triangles::new(vertices.range(..))];
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.build_all(
+                &[(&blas, BlasGeometry::Triangles(&untransformed))],
+                &scratch,
+            )
+        })
+    });
+    assert!(message.contains("doesn't fit"), "{message}");
+    let pixels = render(&mut gpu, |cmd, target| {
+        cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
+        // SAFETY: the BLAS is built before it and outlives the trace.
+        cmd.build_all(
+            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &tlas_scratch,
+        );
+        trace_query(cmd, target, &tlas);
+    });
+    assert_pixel(&pixels, 32, 30, [0, 0, 0]);
+    assert_pixel(&pixels, 48, 30, [255, 51, 26]);
+}
+
+#[test]
+fn instance_flags_disable_culling_and_force_non_opaque() {
+    let mut gpu = gpu();
+    if !supported("instance_flags_disable_culling", Ctx::features().ray_query) {
+        return;
+    }
+    // Every flag lands in the instance's top byte, and the flags combine.
+    let all = [
+        InstanceFlags::TRIANGLE_FACING_CULL_DISABLE,
+        InstanceFlags::TRIANGLE_FLIP_FACING,
+        InstanceFlags::FORCE_OPAQUE,
+        InstanceFlags::FORCE_NO_OPAQUE,
+    ];
+    for (bit, flag) in all.into_iter().enumerate() {
+        assert_eq!(flag.bits(), 1 << bit, "{flag:?}");
+        let instance = Instance::from_address(1, Affine3A::IDENTITY)
+            .with_sbt_offset(7)
+            .with_flags(flag);
+        assert_eq!(instance.sbt_offset_and_flags >> 24, 1 << bit);
+        assert_eq!((instance.flags(), instance.sbt_offset()), (flag, 7));
+    }
+    let both = InstanceFlags::FORCE_OPAQUE | InstanceFlags::TRIANGLE_FLIP_FACING;
+    assert!(
+        both.contains(InstanceFlags::FORCE_OPAQUE)
+            && !both.contains(InstanceFlags::FORCE_NO_OPAQUE)
+    );
+
+    // The ray query commits every non-opaque candidate, so forcing the scene's opaque triangle
+    // non-opaque changes nothing it shows: the same image.
+    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
+    let mut flagged = instances(
+        scene.wall.address(),
+        scene.triangle.address(),
+        scene.sphere.address(),
+    );
+    flagged[1] = flagged[1]
+        .with_flags(InstanceFlags::FORCE_NO_OPAQUE | InstanceFlags::TRIANGLE_FACING_CULL_DISABLE);
+    let flagged = buffer_with::<Instance>(&flagged);
+    let scratch = Scratch::for_any(&[&scene.tlas]).unwrap();
+    let pixels = render(&mut gpu, |cmd, target| {
+        // SAFETY: the scene's BLASes outlive the trace.
+        cmd.build_all(
+            &[(&scene.tlas, unsafe { Instances::new(flagged.range(..)) })],
+            &scratch,
+        );
+        trace_query(cmd, target, &scene.tlas);
+    });
+    assert_query_image(&pixels);
+}
+
+#[test]
+fn structures_named_inside_structs_behind_pointers_are_traced() {
+    let mut gpu = gpu();
+    if !supported("structures_named_inside_structs", Ctx::features().ray_query) {
+        return;
+    }
+    let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
+    let trace = |gpu: &mut common::Gpu, mask: u32| {
+        let mut named: Buffer<TestSceneRef, Upload> = Buffer::upload(1).unwrap();
+        named.host_write(
+            0,
+            &[TestSceneRef {
+                tlas: scene.tlas.address(),
+                mask,
+                ..Default::default()
+            }],
+        );
+        render(gpu, |cmd, target| {
+            // Only named through the struct: its accesses go in by hand.
+            let traced = BufferAccess::trace(&scene.tlas);
+            let bindings = TestAccelStruct::push_bindings(
+                TestAccelStructArgs {
+                    target: target.whole_view(),
+                    scene: named.range(..),
+                    size: EXTENT,
+                },
+                Some(Accesses::buffers(&traced)),
+            )
+            .unwrap();
+            cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1]);
+        })
+    };
+    let pixels = trace(&mut gpu, 0x01);
+    assert_query_image(&pixels);
+    assert_matches_golden("ray_query", &pixels, [SIZE, SIZE]);
+    // The struct's mask also reaches the triangle of mask 0x02 in front of the wall.
+    let pixels = trace(&mut gpu, 0x03);
+    assert_pixel(&pixels, WALL.0, WALL.1, [255, 0, 255]);
+}
+
+#[test]
+fn ray_tracing_passes_take_specialization_constants() {
+    let mut gpu = gpu();
+    if !supported(
+        "ray_tracing_passes_take_specialization_constants",
+        Ctx::features().ray_tracing_pipeline,
+    ) {
+        return;
+    }
+    let (tlas, _blas, _vertices, _indices) = wall_scene(&mut gpu, BuildFlags::default());
+    let trace = |gpu: &mut common::Gpu, sky: u32| {
+        render(gpu, |cmd, target| {
+            let bindings = TestRtConstants::push_bindings(
+                TestRtConstantsArgs {
+                    target: target.whole_view(),
+                    size: EXTENT,
+                },
+                TestRtConstantsConstants { tlas: &tlas, sky },
+                None,
+            )
+            .unwrap();
+            cmd.raytrace(&bindings, [SIZE, SIZE, 1]);
+        })
+    };
+    for sky in [0, 128, 255, 128] {
+        let pixels = trace(&mut gpu, sky);
+        assert_pixel(&pixels, BACKGROUND.0, BACKGROUND.1, [0, sky as u8, 0]);
+        assert_pixel(&pixels, WALL.0, WALL.1, [204, 204, 204]);
+    }
 }

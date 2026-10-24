@@ -1791,4 +1791,43 @@ mod tests {
                 .contains("fn take")
         );
     }
+
+    /// The value of `static const <type> name = <value>;` in Slang source.
+    fn slang_const(source: &str, name: &str) -> u64 {
+        let line = (source.lines())
+            .find(|line| line.contains("static const") && line.contains(&format!(" {name} =")))
+            .unwrap_or_else(|| panic!("no `static const` {name}"));
+        let value = line.split('=').nth(1).unwrap().trim().trim_end_matches(';');
+        match value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            Some(hex) => u64::from_str_radix(hex, 16).unwrap(),
+            None => value.parse().unwrap(),
+        }
+    }
+
+    /// The copies of constants across the crates and the Slang side agree.
+    #[test]
+    fn copied_constants_match_their_sources() {
+        let profile = include_str!("../slang/profile.slang");
+        assert_eq!(slang_const(profile, "CLOCK_STRIPES"), CLOCK_STRIPES as u64);
+        assert_eq!(
+            slang_const(profile, "CLOCK_STRIPE_WORDS"),
+            CLOCK_STRIPE_WORDS as u64
+        );
+        assert_eq!(
+            slang_const(profile, "CLOCK_TICK_BITS"),
+            CLOCK_TICK_BITS as u64
+        );
+        assert_eq!(
+            crate::describe::MAX_PUSH_CONSTANTS_SIZE as usize,
+            lava::pipeline::MAX_PUSH_CONSTANTS_SIZE
+        );
+        let bindless = include_str!("../slang/bindless.slang");
+        let null = lava::bindless::ImageHandle::<lava::bindless::Dynamic>::NULL;
+        let null = u32::from_ne_bytes(lava::bytemuck::bytes_of(&null).try_into().unwrap());
+        assert_eq!(slang_const(bindless, "NULL_HANDLE"), null as u64);
+        assert_eq!(slang_const(bindless, "HANDLE_SLOT"), (1 << 30) - 1);
+    }
 }

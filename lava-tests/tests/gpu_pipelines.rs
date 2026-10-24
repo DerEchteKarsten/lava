@@ -1,4 +1,4 @@
-//! GPU tests of pass pipelines: the pipeline cache file (a foreign one is ignored, the saved one is this device's and loads in a new process), threads that make the same new specialization at once, and `reload_pass` (swap, refusal, races with new specializations)
+//! GPU tests of pass pipelines: the pipeline cache file (a foreign one is ignored, the saved one is this device's and loads in a new process), threads that make the same new specialization at once, and `reload_pass` (swap, refusal, races with new specializations, ray tracing passes with their binding tables and specializations)
 mod common;
 
 use std::{
@@ -84,6 +84,7 @@ fn run_specialized(timeline: &mut Timeline<Graphics>, factor: u32) {
 fn the_pipeline_cache_round_trips() {
     let mut gpu = gpu();
     if std::env::var_os(CHILD).is_some() {
+        eprintln!("SKIPPED the_pipeline_cache_round_trips: this is its child process");
         return;
     }
     // Init ignored the foreign cache; pipelines made since go into the new one.
@@ -131,6 +132,9 @@ fn the_pipeline_cache_round_trips() {
 #[test]
 fn the_saved_cache_loads() {
     if std::env::var_os(CHILD).is_none() {
+        eprintln!(
+            "SKIPPED the_saved_cache_loads: runs only in the child process of the_pipeline_cache_round_trips"
+        );
         return;
     }
     let mut gpu = gpu();
@@ -270,4 +274,108 @@ fn reloads_race_with_new_specializations() {
         });
     });
     lava::wait_idle().unwrap();
+}
+
+type TraceTarget = Image<R8G8B8A8Unorm, usage![Storage, TransferSrc]>;
+
+/// Reloading a ray tracing pass rebuilds its pipeline and binding table, and every
+/// specialization made so far; traces before and after see the same image.
+#[test]
+fn reload_pass_replaces_ray_tracing_pipelines() {
+    use glam::{Affine3A, Vec3};
+    use lava::acceleration_structure::{
+        BlasGeometry, BuildFlags, Instance, Instances, Scratch, Triangles,
+    };
+    let mut gpu = gpu();
+    if !Ctx::features().ray_tracing_pipeline {
+        eprintln!("SKIPPED reload_pass_replaces_ray_tracing_pipelines: no ray tracing pipelines");
+        return;
+    }
+    const SIZE: u32 = 16;
+    let vertices = gpu.buffer(&[
+        Vec3::new(-0.9, -0.9, 0.0),
+        Vec3::new(0.9, -0.9, 0.0),
+        Vec3::new(0.0, 0.9, 0.0),
+    ]);
+    let geometry = [Triangles::new(vertices.range(..))];
+    let blas = lava::Blas::new(&BlasGeometry::Triangles(&geometry), BuildFlags::default()).unwrap();
+    let instances = gpu.buffer(&[Instance::new(&blas, Affine3A::IDENTITY)]);
+    let tlas = lava::Tlas::new(1, BuildFlags::default()).unwrap();
+    let (scratch, tlas_scratch) = (
+        Scratch::for_any(&[&blas]).unwrap(),
+        Scratch::for_any(&[&tlas]).unwrap(),
+    );
+    gpu.submit(|cmd| {
+        cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
+        // SAFETY: the BLAS is built before it and outlives the traces.
+        cmd.build_all(
+            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &tlas_scratch,
+        );
+    });
+    let target = TraceTarget::new(UVec2::splat(SIZE))
+        .unwrap()
+        .bind_storage()
+        .unwrap();
+    let trace = |gpu: &mut common::Gpu, sky: Option<u32>| {
+        let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
+        gpu.submit(|cmd| {
+            let size = UVec2::splat(SIZE);
+            match sky {
+                Some(sky) => cmd.raytrace(
+                    &TestRtConstants::push_bindings(
+                        TestRtConstantsArgs {
+                            target: target.whole_view(),
+                            size,
+                        },
+                        TestRtConstantsConstants { tlas: &tlas, sky },
+                        None,
+                    )
+                    .unwrap(),
+                    [SIZE, SIZE, 1],
+                ),
+                None => cmd.raytrace(
+                    &TestRayTracing::push_bindings(
+                        TestRayTracingArgs {
+                            target: target.whole_view(),
+                            tlas: &tlas,
+                            size,
+                        },
+                        None,
+                    )
+                    .unwrap(),
+                    [SIZE, SIZE, 1],
+                ),
+            }
+            cmd.copy_image_to_buffer(target.whole(), readback.range(..));
+        });
+        readback.host().to_vec()
+    };
+    let traces = |gpu: &mut common::Gpu| {
+        [
+            trace(gpu, None),
+            trace(gpu, Some(100)),
+            trace(gpu, Some(200)),
+        ]
+    };
+    let before = traces(&mut gpu);
+    // A corner misses (the sky), the middle hits the triangle.
+    let texel =
+        |pixels: &[u8], x: u32, y: u32| pixels[((y * SIZE + x) * 4) as usize..][..4].to_vec();
+    assert_eq!(texel(&before[1], 0, 0), [0, 100, 0, 255]);
+    assert_eq!(texel(&before[2], 0, 0), [0, 200, 0, 255]);
+    assert_eq!(texel(&before[1], 8, 8), [204, 204, 204, 255]);
+    for name in ["TestRayTracing", "TestRtConstants"] {
+        let pass = index(name);
+        assert_eq!(
+            reload_pass(pass, PASS_MAP.passes[pass].spirv).unwrap(),
+            Reload::Replaced,
+            "{name}"
+        );
+        assert_eq!(traces(&mut gpu), before, "{name}");
+        assert!(reload_pass(pass, &[3, 2, 1]).is_err(), "not SPIR-V");
+        assert_eq!(traces(&mut gpu), before, "{name}");
+    }
+    lava::wait_idle().unwrap();
+    assert_eq!(traces(&mut gpu), before);
 }

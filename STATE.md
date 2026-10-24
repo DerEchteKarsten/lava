@@ -34,6 +34,9 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - With `assert-present-fences`, `assert-hdr-metadata` or `assert-fifo-latest-ready` but no display, `Ctx::features()` has the feature false while the code assumes it; nothing presents headless, so nothing reads it.
 - The engine-facing `Gated` setters of `RasterState` check the capability whatever the value (`polygon_mode(FILL)` needs `fill-mode-non-solid` too).
 - Baked draw state can make many pipelines per pass on devices without the dynamic state (the 16-pipeline warning then names the pass); `dynamic-*` without `assert-` keeps that possible.
+----fix----
+- `ray-traversal-primitive-culling` compiled without `ray-query` and `ray-tracing-pipeline` can never be on (`Features::consistent` drops it), so `assert-ray-traversal-primitive-culling` alone makes `init` refuse every device; its `Cargo.toml` entry implies only `acceleration-structure` (2026-10-24, found by `lava/src/tests.rs`, whose consistency tests skip that combination).
+- Release builds of lava warn that `CallsiteGuard` and its `enter` are unused (`state.rs`, the `#[validation_trace]` callsite helper; `cargo bench` shows it).
 
 ## lava: renderings and draws (2026-10-21)
 ----find solutions----
@@ -117,6 +120,28 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
 - `compact` recognises the source a compacted structure was made for by its raw handle, so a structure created at a handle value reused after the source's destruction passes (31).
+
+## lava: tests (2026-10-24)
+----intended----
+- What the tests can't reach on the Arc B390 (Mesa 26.2.5), so it passes there untested:
+  - the transfer family's granularity panic (its `minImageTransferGranularity` is 1x1x1; `transfer_family_copies_follow_its_rules` accepts either outcome);
+  - linear blits refused for lack of `SAMPLED_IMAGE_FILTER_LINEAR` (every float format that blits filters linearly; `linear_blits_need_linear_filtering` skips);
+  - smooth and stippled lines (no `smooth-lines`, no `line-stipple`), shader execution reordering, `FifoLatestReady`, counters of command-buffer scope;
+  - a `[MaxRecursion(n)]` above the device's `maxRayRecursionDepth` (31 here, and lava-build-slang refuses more);
+  - stage masks of waits that hold back too little (ANV waits for semaphores per batch), wrong visibility kept by the fold of more than 64 buffer writes (Intel flushes its caches at every submission end), and missing forgets on destruction (they only add waits): those tests check data and validation only.
+- The harness always asks for validation and fails every test of a binary when the layer is missing. The layer prints its settings (`VALIDATION-SETTINGS`, `CURRENT-VALIDATION-ENABLED`) to stdout at `vkCreateInstance`, before lava's messenger exists, past libtest's capture; chaining a `VkDebugUtilsMessengerCreateInfoEXT` into the instance info would route them through `tracing`.
+- GPU-assisted validation (`gpu_assisted`) works with `VK_EXT_descriptor_heap` on this layer and reports out-of-bounds reads through buffer addresses; it warns that it is slow together with the core checks.
+
+## lava: found while the engine followed the survey work (2026-10-24)
+----find solutions----
+- `[RustConst]`'s generated doc names the pass being compiled, not the file that declares the constant (constants of `datatypes.slang` say "of `bvh_cull.slang`"; `lava-build-slang/src/codegen.rs`, the export emission).
+- *(unverified)* Headless sponza reported `memory_report().allocated` = 16.6 MiB against 96 MiB of heap usage; lava's own allocated-bytes counter (`memory.rs`, fed by the allocator guard) may miss some allocations (images, dedicated or sparse ones).
+
+----future work----
+- A struct shared by several shaders can't keep a 16-byte size without hand padding, since Slang's scalar layout doesn't round sizes up (the engine's `BvhNode`, `Material`, `UIVertex` keep their pads). A round-up option or an alignment attribute in lava-build-slang would let shaders drop them.
+- `PerFrame::get` needs a `&Submission`, so systems that only know the frame slot (the engine's bevy systems) can't use it; an accessor by a proven-free slot would.
+- `Buffer::reserve` always copies the old contents; scratch buffers want a grow without contents.
+- Generated code names `::core::` paths, which break in doc tests of a crate itself named `core` (the engine's).
 
 ## Performance
 --- find solutions ---

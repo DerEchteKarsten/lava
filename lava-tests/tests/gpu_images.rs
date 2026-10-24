@@ -1,4 +1,4 @@
-//! GPU tests of images and formats: what the device can't make is refused, texel blocks of compressed formats, 64-bit clears, the checks of blits, clears and copies, depth and stencil clears and copies, image-to-image copies, row pitches, mips of single-view images, reinterpreting views, `Image::fit`, sparse residency and external memory
+//! GPU tests of images and formats: what the device can't make is refused, texel blocks of compressed formats, 64-bit clears, clears of mips, layer ranges and integer formats, the checks of blits (linear filtering among them), clears and copies, runtime-typed images (`format::Dynamic`, `usage::Dynamic`: their checks where commands and bindings use them, `erase` and `cast`), the layouts host copies transition, depth and stencil clears and copies, image-to-image copies, row pitches, mips of single-view images, reinterpreting views, `Image::fit`, sparse residency and external memory
 mod common;
 
 use common::{Cmd, buffer_with, gpu, nearest, panic_message, zeroed_buffer};
@@ -467,6 +467,316 @@ fn mips_of_single_view_images_are_transferred_alone() {
         cmd.copy_image_to_buffer(chain.mip_view(1).whole(), out.range(..));
     });
     assert_eq!(out.host(), [9; 16]);
+}
+
+#[test]
+fn clears_cover_their_views_mips_and_layers() {
+    let mut gpu = gpu();
+    // A mip of a chain: the others keep their colour.
+    let chain = MipChain::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::with_mip_levels(
+        UVec2::splat(4),
+        3,
+    )
+    .unwrap();
+    let mut mips = [4, 2, 1].map(|size| zeroed_buffer::<u8>(size * size * 4));
+    gpu.submit(|cmd| {
+        cmd.clear_image(chain.whole_view(), [1.0, 0.0, 0.0, 1.0]);
+        cmd.clear_image(chain.mip_view(1), [0.0, 1.0, 0.0, 1.0]);
+        for (level, out) in mips.iter().enumerate() {
+            cmd.copy_image_to_buffer(chain.whole().mip(level as u32), out.range(..));
+        }
+    });
+    let all = |out: &mut lava::Buffer<u8, lava::buffer::Readback>, texel: [u8; 4]| {
+        out.host().as_chunks::<4>().0.iter().all(|&t| t == texel)
+    };
+    let [mip0, mip1, mip2] = &mut mips;
+    assert!(all(mip0, [255, 0, 0, 255]) && all(mip2, [255, 0, 0, 255]));
+    assert!(all(mip1, [0, 255, 0, 255]));
+    // Layers of an array: a range of them, then one layer's own view.
+    type Array = Image<R8G8B8A8Unorm, usage![TransferSrc, TransferDst], lava::image::D2Array>;
+    let array = Array::with_layers(UVec2::splat(2), 1, 4).unwrap();
+    let mut layers = zeroed_buffer::<u8>(4 * 2 * 2 * 4);
+    gpu.submit(|cmd| {
+        cmd.clear_image(array.whole_view(), [0.0, 0.0, 0.0, 1.0]);
+        cmd.clear_image(array.whole_view().layers(1..3), [0.0, 0.0, 1.0, 1.0]);
+        cmd.clear_image(array.whole_view().layer(3), [1.0, 1.0, 1.0, 1.0]);
+        cmd.copy_image_to_buffer(array.whole(), layers.range(..));
+    });
+    let expected: [[u8; 4]; 4] = [
+        [0, 0, 0, 255],
+        [0, 0, 255, 255],
+        [0, 0, 255, 255],
+        [255, 255, 255, 255],
+    ];
+    for (layer, texels) in layers.host().as_chunks::<16>().0.iter().enumerate() {
+        assert!(
+            texels.chunks(4).all(|t| t == expected[layer]),
+            "layer {layer}: {texels:?}"
+        );
+    }
+    // Signed integers keep their sign; 16-bit unsigned ones clear exactly.
+    let sint = Image::<R32Sint, usage![TransferSrc, TransferDst]>::new(UVec2::splat(2)).unwrap();
+    let mut out = zeroed_buffer::<i32>(4);
+    gpu.submit(|cmd| {
+        cmd.clear_image(sint.whole_view(), [-5]);
+        cmd.copy_image_to_buffer(sint.whole(), out.range(..));
+    });
+    assert_eq!(out.host(), [-5; 4]);
+    let unorm16 =
+        Image::<R16G16B16A16Unorm, usage![TransferSrc, TransferDst]>::new(UVec2::ONE).unwrap();
+    let mut out = zeroed_buffer::<u16>(4);
+    gpu.submit(|cmd| {
+        cmd.clear_image(unorm16.whole_view(), [0.0, 1.0, 0.5, 1.0]);
+        cmd.copy_image_to_buffer(unorm16.whole(), out.range(..));
+    });
+    assert_eq!(out.host(), [0, 65535, 32768, 65535]);
+}
+
+#[test]
+fn linear_blits_need_linear_filtering() {
+    let mut gpu = gpu();
+    use vk::{Format as F, FormatFeatureFlags2 as Feature};
+    let blits = Feature::BLIT_SRC | Feature::BLIT_DST;
+    let candidates = [
+        F::R32_SFLOAT,
+        F::R32G32_SFLOAT,
+        F::R32G32B32A32_SFLOAT,
+        F::R64_SFLOAT,
+        F::R16G16B16A16_SFLOAT,
+        F::R16G16B16A16_UNORM,
+        F::B10G11R11_UFLOAT_PACK32,
+    ];
+    let Some(&unfiltered) = candidates
+        .iter()
+        .find(|&&f| has(f, blits) && !has(f, Feature::SAMPLED_IMAGE_FILTER_LINEAR))
+    else {
+        return skipped(
+            "linear_blits_need_linear_filtering",
+            "every candidate float format that blits filters linearly here",
+        );
+    };
+    let transfers = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+    let image = |extent| {
+        DynamicImage::with_params(
+            format::Dynamic(unfiltered),
+            usage::Dynamic(transfers),
+            extent,
+            1,
+        )
+        .unwrap()
+    };
+    let (small, large) = (image(UVec2::splat(2)), image(UVec2::splat(4)));
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.blit_image(small.whole(), large.whole(), Filter::Linear))
+    });
+    assert!(
+        message.contains("SAMPLED_IMAGE_FILTER_LINEAR") && message.contains("Filter::Nearest"),
+        "{message}"
+    );
+    // The nearest texel works.
+    gpu.submit(|cmd| {
+        cmd.clear_image(small.whole_view(), format::ClearValue::Float([0.0; 4]));
+        cmd.blit_image(small.whole(), large.whole(), Filter::Nearest)
+    });
+}
+
+// ---- runtime-typed images ------------------------------------------------------------------
+
+type DynamicImage = Image<format::Dynamic, usage::Dynamic>;
+
+fn dynamic(format: vk::Format, usage: vk::ImageUsageFlags) -> DynamicImage {
+    DynamicImage::with_params(
+        format::Dynamic(format),
+        usage::Dynamic(usage),
+        UVec2::splat(4),
+        1,
+    )
+    .unwrap()
+}
+
+/// Runtime formats and usages meet every bound, so each command and generated binding checks
+/// what its bounds would have: the aspects, the texel type, the usage and the clear variant.
+#[test]
+fn runtime_typed_images_are_checked_where_they_are_used() {
+    let mut gpu = gpu();
+    use format::ClearValue;
+    use vk::ImageUsageFlags as Usage;
+    let transfers = Usage::TRANSFER_SRC | Usage::TRANSFER_DST;
+    let words = dynamic(vk::Format::R32_UINT, transfers);
+    assert_eq!(words.format(), format::Dynamic(vk::Format::R32_UINT));
+    assert_eq!(words.usage(), usage::Dynamic(transfers));
+    let mut out = zeroed_buffer::<u32>(16);
+    gpu.submit(|cmd| {
+        cmd.clear_image(words.whole_view(), ClearValue::Uint([7, 0, 0, 0]));
+        cmd.copy_image_to_buffer(words.whole(), out.range(..));
+    });
+    assert_eq!(out.host(), [7; 16]);
+
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.clear_image(words.whole_view(), ClearValue::Float([1.0; 4])))
+    });
+    assert!(message.contains("can't be cleared to Float"), "{message}");
+    let source_only = dynamic(vk::Format::R32_UINT, Usage::TRANSFER_SRC);
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.clear_image(source_only.whole_view(), ClearValue::Uint([0; 4])))
+    });
+    assert!(
+        message.contains("lacks") && message.contains("TRANSFER_DST"),
+        "{message}"
+    );
+    let depth = dynamic(vk::Format::D32_SFLOAT, transfers);
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.clear_image(depth.whole_view(), ClearValue::Float([0.0; 4])))
+    });
+    assert!(
+        message.contains("lacks the aspects") && message.contains("COLOR"),
+        "{message}"
+    );
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            let value = ClearValue::DepthStencil {
+                depth: 0.5,
+                stencil: 0,
+            };
+            cmd.clear_depth_stencil(words.whole_view(), value)
+        })
+    });
+    assert!(message.contains("no depth or stencil aspect"), "{message}");
+    gpu.submit(|cmd| {
+        let value = ClearValue::DepthStencil {
+            depth: 0.5,
+            stencil: 0,
+        };
+        cmd.clear_depth_stencil(depth.whole_view(), value)
+    });
+
+    // `TestComputeImage` writes float texels: a `uint` image's are refused, a float one's taken.
+    let storage = |format| {
+        dynamic(format, Usage::STORAGE | Usage::TRANSFER_SRC)
+            .bind_storage()
+            .unwrap()
+    };
+    fn args(
+        image: &DynamicImage,
+    ) -> TestComputeImageArgs<lava::ImageView<'_, format::Dynamic, usage::Dynamic>> {
+        TestComputeImageArgs {
+            target: image.whole_view(),
+            tint: Vec4::ONE,
+            offset: UVec2::ZERO,
+            size: UVec2::splat(4),
+        }
+    }
+    let uints = storage(vk::Format::R32_UINT);
+    let message = panic_message(|| TestComputeImage::push_bindings(args(&uints), None));
+    assert!(message.contains("doesn't have texels of type"), "{message}");
+    let floats = storage(vk::Format::R8G8B8A8_UNORM);
+    let mut texels = zeroed_buffer::<u8>(64);
+    gpu.submit(|cmd| {
+        cmd.compute(
+            &TestComputeImage::push_bindings(args(&floats), None),
+            [1, 1, 1],
+        );
+        cmd.copy_image_to_buffer(floats.whole(), texels.range(..));
+    });
+    assert!(texels.host().iter().any(|&b| b != 0), "the pass wrote it");
+    // A binding that samples needs the sampled usage.
+    let unsampled = dynamic(vk::Format::R8G8B8A8_UNORM, Usage::STORAGE);
+    let message = panic_message(|| {
+        TestRasterTextured::push_bindings(
+            TestRasterTexturedArgs {
+                vertices: out.range(..).bytes().cast(),
+                tex: unsampled.whole_view(),
+                sampler: nearest(),
+            },
+            None,
+        )
+    });
+    assert!(
+        message.contains("lacks") && message.contains("SAMPLED"),
+        "{message}"
+    );
+}
+
+/// `erase` keeps an image's format and usage as values, `cast` takes them back as types, and
+/// a cast to a format or usage the image doesn't have panics.
+#[test]
+fn erased_images_cast_back_to_what_they_have() {
+    let mut gpu = gpu();
+    type Texture = Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>;
+    let erased = Texture::new(UVec2::splat(4))
+        .unwrap()
+        .bind_sampled()
+        .unwrap()
+        .erase();
+    assert_eq!(erased.format().0, vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(
+        erased.usage().0,
+        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST
+    );
+    // Still bound, and sampled like the static image.
+    let handle = erased.handle::<bindless::Sampled>();
+    gpu.submit(|cmd| {
+        cmd.clear_image(
+            erased.whole_view(),
+            format::ClearValue::Float([0.0, 1.0, 0.0, 1.0]),
+        )
+    });
+    let reads = [ImageUse::sampled_read(erased.whole_view())];
+    assert_eq!(
+        sample(&mut gpu, handle.bits(), &reads),
+        Vec4::new(0.0, 1.0, 0.0, 1.0)
+    );
+    // Fewer usage flags are fine; the handle stays.
+    let sampled = erased.cast(R8G8B8A8Unorm, <usage![Sampled]>::default());
+    assert_eq!(sampled.handle::<bindless::Sampled>(), handle);
+    let message = panic_message(|| {
+        sampled
+            .erase()
+            .cast(R8G8B8A8Srgb, <usage![Sampled]>::default())
+    });
+    assert!(message.contains("can't cast"), "{message}");
+    let other = Texture::new(UVec2::ONE).unwrap().erase();
+    let message =
+        panic_message(|| other.cast(R8G8B8A8Unorm, <usage![Sampled, Storage]>::default()));
+    assert!(message.contains("can't cast"), "{message}");
+}
+
+/// A host copy moves the layouts of the mips it finds in another one (here: never accessed,
+/// so `UNDEFINED`) to `GENERAL`, leaves those already there, and GPU accesses after it find
+/// them there; validation checks each transition's old layout.
+#[test]
+fn host_copies_transition_only_the_mips_not_yet_general() {
+    let mut gpu = gpu();
+    let test = "host_copies_transition_only_the_mips_not_yet_general";
+    if !has(
+        vk::Format::R8G8B8A8_UNORM,
+        vk::FormatFeatureFlags2::HOST_IMAGE_TRANSFER_EXT,
+    ) {
+        return skipped(test, "no host copies of R8G8B8A8Unorm");
+    }
+    type Chain = MipChain<R8G8B8A8Unorm, usage![HostCopy, TransferSrc, TransferDst]>;
+    let mut chain = match Chain::with_mip_levels(UVec2::splat(4), 3) {
+        Ok(chain) => chain,
+        Err(Error::MissingFeature(_)) => return skipped(test, "no host image copies"),
+        Err(error) => panic!("{error}"),
+    };
+    // Mip 1 is cleared on the GPU (GENERAL); mips 0 and 2 were never accessed.
+    gpu.submit(|cmd| cmd.clear_image(chain.mip_view(1), [0.0, 1.0, 0.0, 1.0]));
+    let texels: Vec<u8> = (0..4 * 4 * 4).map(|i| i as u8).collect();
+    chain.copy_from(&texels, 0).unwrap();
+    // The cleared mip kept its contents: it wasn't transitioned from `UNDEFINED`.
+    let (mut mip0, mut mip1) = (zeroed_buffer::<u8>(64), zeroed_buffer::<u8>(16));
+    gpu.submit(|cmd| {
+        cmd.copy_image_to_buffer(chain.mip_view(0).whole(), mip0.range(..));
+        cmd.copy_image_to_buffer(chain.mip_view(1).whole(), mip1.range(..));
+    });
+    assert_eq!(mip0.host(), texels);
+    assert!(mip1.host().chunks(4).all(|t| t == [0, 255, 0, 255]));
+    // Again after GPU use: nothing to transition.
+    chain.copy_from(&[9; 4], 2).unwrap();
+    let mut mip2 = zeroed_buffer::<u8>(4);
+    gpu.submit(|cmd| cmd.copy_image_to_buffer(chain.mip_view(2).whole(), mip2.range(..)));
+    assert_eq!(mip2.host(), [9; 4]);
 }
 
 // ---- reinterpreting views ------------------------------------------------------------------

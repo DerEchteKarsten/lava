@@ -173,7 +173,7 @@ pub(crate) struct RasterKeyRef<'a> {
 
 impl RasterKeyRef<'_> {
     /// The key it borrows, owned: what the pipeline map stores.
-    fn owned(&self) -> RasterKey {
+    pub(crate) fn owned(&self) -> RasterKey {
         RasterKey {
             color_formats: SmallVec::from_slice(self.color_formats),
             depth_format: self.depth_format,

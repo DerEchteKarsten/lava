@@ -1,5 +1,7 @@
-//! Golden-image comparison: rendered RGBA8 pixels against PNGs in `lava-tests/tests/golden`
-use std::{fs::File, io::BufWriter, path::PathBuf};
+//! Golden-image comparison: rendered RGBA8 pixels against PNGs in `lava-tests/tests/golden`, blessed with `LAVA_BLESS=1` only by the one test that owns a golden (`assert_golden`; others compare, `assert_matches_golden`), written atomically
+use std::{
+    collections::BTreeMap, fs::File, io::BufWriter, panic::Location, path::PathBuf, sync::Mutex,
+};
 
 /// A channel may differ by this much (of 255) before a pixel counts as different.
 const CHANNEL_TOLERANCE: u8 = 2;
@@ -10,8 +12,16 @@ fn failure_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("golden-failures")
 }
 
+/// Writes through a temporary file and a rename, so a test binary comparing at the same time
+/// never reads half a PNG.
 fn write_png(path: &PathBuf, pixels: &[u8], [width, height]: [u32; 2]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let temporary = path.with_extension(format!("png.{}.tmp", std::process::id()));
+    write_png_to(&temporary, pixels, [width, height]);
+    std::fs::rename(&temporary, path).unwrap();
+}
+
+fn write_png_to(path: &PathBuf, pixels: &[u8], [width, height]: [u32; 2]) {
     let mut encoder = png::Encoder::new(BufWriter::new(File::create(path).unwrap()), width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
@@ -22,24 +32,58 @@ fn write_png(path: &PathBuf, pixels: &[u8], [width, height]: [u32; 2]) {
         .unwrap();
 }
 
+/// Whether this run rewrites the goldens: `LAVA_BLESS=1`, no other value.
+fn blessing() -> bool {
+    std::env::var_os("LAVA_BLESS").is_some_and(|value| value == "1")
+}
+
 /// Fails the test unless `pixels` (tightly packed RGBA8, `size` = [width, height]) match the
-/// golden image `name`. On a mismatch the actual image and a diff are written next to the
-/// test binaries for inspection.
+/// golden image `name`, which this test owns: with `LAVA_BLESS=1` it writes the golden instead.
+/// Every golden has one owner; other tests that render the same image compare with
+/// [`assert_matches_golden`], so two writers never race. On a mismatch the actual image and a
+/// diff are written next to the test binaries for inspection.
 #[track_caller]
 pub fn assert_golden(name: &str, pixels: &[u8], size: [u32; 2]) {
+    static OWNERS: Mutex<BTreeMap<String, &'static Location<'static>>> =
+        Mutex::new(BTreeMap::new());
+    let caller = Location::caller();
+    let owner = *OWNERS
+        .lock()
+        .unwrap()
+        .entry(name.to_owned())
+        .or_insert(caller);
+    assert_eq!(
+        owner, caller,
+        "golden `{name}` has two owners; compare in one with `assert_matches_golden`"
+    );
+    if blessing() {
+        check_size(name, pixels, size);
+        write_png(&golden_path(name), pixels, size);
+        eprintln!("blessed {}", golden_path(name).display());
+        return;
+    }
+    assert_matches_golden(name, pixels, size);
+}
+
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden")).join(format!("{name}.png"))
+}
+
+#[track_caller]
+fn check_size(name: &str, pixels: &[u8], size: [u32; 2]) {
     assert_eq!(
         pixels.len(),
         (size[0] * size[1] * 4) as usize,
-        "pixel data does not match {size:?}"
+        "pixel data of `{name}` does not match {size:?}"
     );
-    let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden"))
-        .join(format!("{name}.png"));
+}
 
-    if std::env::var_os("LAVA_BLESS").is_some() {
-        write_png(&path, pixels, size);
-        eprintln!("blessed {}", path.display());
-        return;
-    }
+/// Like [`assert_golden`] for a golden another test owns: compares, also while blessing (the
+/// owner may be in another test binary; rerun after blessing if it changed).
+#[track_caller]
+pub fn assert_matches_golden(name: &str, pixels: &[u8], size: [u32; 2]) {
+    check_size(name, pixels, size);
+    let path = golden_path(name);
 
     let Ok(file) = File::open(&path) else {
         panic!(

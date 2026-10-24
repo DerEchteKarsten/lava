@@ -1,4 +1,4 @@
-//! GPU tests of renderings and draws: indirect draws of several commands and records that start with one, indexed indirect and counted draws, `u16` indices, first vertices and instances, multi-draws, depth bias clamps, per-draw scissors and viewports, render area offsets, vertex-only passes, stencil-only attachments, unordered accesses, array layers (sampled, copied, attached one at a time), layered and multiview renderings, dual-source blending, the depth clip default, and the checks of draw state values
+//! GPU tests of renderings and draws: raster state on the GPU (provoking vertices, conservative rasterization, wide, rectangular, Bresenham, smooth and stippled lines, depth bounds, blend constants, strips, fans, points and line strips), attachments a draw also accesses or samples (a read-only depth attachment), raster specialization constants, task shaders, indirect draws of several commands and records that start with one, indexed indirect and counted draws, `u16` indices, first vertices and instances, multi-draws, depth bias clamps, per-draw scissors and viewports, render area offsets, vertex-only passes, stencil-only attachments, unordered accesses, array layers (sampled, copied, attached one at a time), layered and multiview renderings, dual-source blending, the depth clip default, and the checks of draw state values
 mod common;
 
 use common::render::*;
@@ -10,8 +10,8 @@ use lava::{
     command_buffer::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
         BufferAccess, CompareOp, CullModeFlags, DepthBias, Draw, DrawIndexedIndirectCommand,
-        DrawIndirectCommand, LineStipple, PrimitiveTopology, RasterState, Rect, StartsWith,
-        Stencil, StencilFace, StencilOp, kind,
+        DrawIndirectCommand, ImageUse, LineStipple, PrimitiveTopology, RasterState, Rect,
+        StartsWith, Stencil, StencilFace, StencilOp, kind,
     },
     image::{
         D2Array, Image,
@@ -665,9 +665,7 @@ fn draw_state_values_are_checked() {
             let _ = Draw::new(&bindings, 3, 1, state);
         }));
         if let Err(payload) = drawn {
-            let message = (payload.downcast_ref::<String>().cloned())
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default();
+            let message = common::payload_message(&*payload);
             assert!(message.contains("primitiveUnderestimation"), "{message}");
         }
     }
@@ -694,6 +692,491 @@ fn blending_into_a_format_that_cant_blend_panics() {
     assert!(
         message.contains("doesn't blend on this device"),
         "{message}"
+    );
+}
+
+// ---- raster state ----------------------------------------------------------------------------
+
+fn flat(
+    vertices: &Buffer<TestVertex>,
+) -> impl std::ops::Deref<Target = BindingOutput<'_, kind::RasterVertex>> {
+    TestFlat::push_bindings(
+        TestFlatArgs {
+            vertices: vertices.range(..),
+        },
+        None,
+    )
+}
+
+/// Draws `count` vertices of `vertices` with `state` through the flat-shaded pass.
+fn draw_flat(
+    gpu: &mut Gpu,
+    vertices: &Buffer<TestVertex>,
+    count: u32,
+    state: RasterState<1>,
+) -> Vec<u8> {
+    render(gpu, |cmd, target| {
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&flat(vertices), count, 1, state))
+            .record("flat");
+    })
+}
+
+/// The clip-space coordinate of the centre of pixel `p` (of 64).
+fn centre(p: u32) -> f32 {
+    -1.0 + (p as f32 + 0.5) / (SIZE as f32 / 2.0)
+}
+
+const WHITE: [u8; 4] = [255; 4];
+
+/// A horizontal line through the centres of row `row`, from `x0` to `x1` in clip space.
+fn row_line(gpu: &mut Gpu, row: u32, x0: f32, x1: f32) -> Buffer<TestVertex> {
+    let y = centre(row);
+    gpu.buffer(&[vertex(x0, y, 0.5, [1.0; 4]), vertex(x1, y, 0.5, [1.0; 4])])
+}
+
+#[test]
+fn flat_shading_takes_the_provoking_vertex() {
+    let mut gpu = gpu();
+    let vertices = two_triangles(&mut gpu);
+    // The left triangle's vertices are red, green and blue.
+    let first = draw_flat(&mut gpu, &vertices, 3, unculled());
+    assert_pixel(&first, IN_LEFT.0, IN_LEFT.1, [255, 0, 0, 255]);
+    let Ok(last) = unculled().provoking_vertex(vk::ProvokingVertexModeEXT::LAST_VERTEX) else {
+        return skip(
+            "flat_shading_takes_the_provoking_vertex",
+            "the device lacks `provoking-vertex`",
+        );
+    };
+    let last = draw_flat(&mut gpu, &vertices, 3, last);
+    assert_pixel(&last, IN_LEFT.0, IN_LEFT.1, [0, 0, 255, 255]);
+    // Back to the first in the same rendering: the change is per draw.
+    let both = render(&mut gpu, |cmd, target| {
+        let last = unculled()
+            .provoking_vertex(vk::ProvokingVertexModeEXT::LAST_VERTEX)
+            .unwrap();
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&flat(&vertices), 3, 1, last))
+            .draw(&Draw::new(&flat(&vertices), 3, 1, unculled()))
+            .record("last then first");
+    });
+    assert_eq!(both, first);
+}
+
+#[test]
+fn conservative_rasterization_covers_touched_pixels() {
+    let mut gpu = gpu();
+    // A sliver in the corner of pixel (10, 10) that misses its centre.
+    let corner = -1.0 + 10.0 / 32.0;
+    let sliver = gpu.buffer(&[
+        vertex(corner + 0.001, corner + 0.001, 0.5, [1.0; 4]),
+        vertex(corner + 0.006, corner + 0.001, 0.5, [1.0; 4]),
+        vertex(corner + 0.001, corner + 0.006, 0.5, [1.0; 4]),
+    ]);
+    let plain = draw_flat(&mut gpu, &sliver, 3, unculled());
+    assert!(plain.as_chunks::<4>().0.iter().all(|&p| p == BLACK));
+    let mode = vk::ConservativeRasterizationModeEXT::OVERESTIMATE;
+    let Ok(over) = unculled().conservative(mode) else {
+        return skip(
+            "conservative_rasterization_covers_touched_pixels",
+            "the device lacks `conservative-rasterization`",
+        );
+    };
+    let over = draw_flat(&mut gpu, &sliver, 3, over);
+    assert_pixel(&over, 10, 10, WHITE);
+    assert_pixel(&over, 12, 12, BLACK);
+}
+
+#[test]
+fn wide_lines_cover_their_width() {
+    let mut gpu = gpu();
+    let line = row_line(&mut gpu, 20, -0.9, 0.9);
+    let lines = || unculled().topology(PrimitiveTopology::LINE_LIST);
+    let thin = draw_flat(&mut gpu, &line, 2, lines());
+    assert_pixel(&thin, 32, 20, WHITE);
+    assert_pixel(&thin, 32, 18, BLACK);
+    assert_pixel(&thin, 32, 22, BLACK);
+    let [_, max] = Ctx::device_properties().limits.line_width_range;
+    let Ok(wide) = lines().line_width(5.0) else {
+        return skip(
+            "wide_lines_cover_their_width",
+            "the device lacks `wide-lines`",
+        );
+    };
+    if max < 5.0 {
+        return skip("wide_lines_cover_their_width", "lines can't be 5 wide");
+    }
+    let wide = draw_flat(&mut gpu, &line, 2, wide);
+    for row in 18..=22 {
+        assert_pixel(&wide, 32, row, WHITE);
+    }
+    assert_pixel(&wide, 32, 16, BLACK);
+    assert_pixel(&wide, 32, 24, BLACK);
+}
+
+#[test]
+fn line_modes_and_stipples_draw_their_lines() {
+    let mut gpu = gpu();
+    let line = row_line(&mut gpu, 20, -1.0, 1.0);
+    let lines = || unculled().topology(PrimitiveTopology::LINE_LIST);
+    let test = "line_modes_and_stipples_draw_their_lines";
+    let modes = [
+        ("rectangular", lines().rectangular_lines().ok()),
+        ("bresenham", lines().bresenham_lines().ok()),
+        ("smooth", lines().smooth_lines().ok()),
+    ];
+    for (name, state) in modes {
+        let Some(state) = state else {
+            skip(test, &format!("the device lacks `{name}-lines`"));
+            continue;
+        };
+        let pixels = draw_flat(&mut gpu, &line, 2, state);
+        // Smooth lines fade at their edges; their centre row is lit.
+        assert_ne!(pixel(&pixels, 32, 20), BLACK, "{name} lines");
+        assert_pixel(&pixels, 32, 23, BLACK);
+    }
+    // Eight pixels on, eight off, from the line's start.
+    let stipple = Some(LineStipple {
+        factor: 1,
+        pattern: 0x00ff,
+    });
+    let Ok(stippled) = lines().line_stipple(stipple) else {
+        return skip(test, "the device lacks `line-stipple`");
+    };
+    let pixels = draw_flat(&mut gpu, &line, 2, stippled);
+    for x in [2, 5, 18, 21] {
+        assert_pixel(&pixels, x, 20, WHITE);
+    }
+    for x in [10, 13, 26, 29] {
+        assert_pixel(&pixels, x, 20, BLACK);
+    }
+    // Twice as long with a factor of 2.
+    let doubled = lines()
+        .line_stipple(Some(LineStipple {
+            factor: 2,
+            pattern: 0x00ff,
+        }))
+        .unwrap();
+    let pixels = draw_flat(&mut gpu, &line, 2, doubled);
+    assert_pixel(&pixels, 10, 20, WHITE);
+    assert_pixel(&pixels, 21, 20, BLACK);
+}
+
+#[test]
+fn depth_bounds_keep_fragments_over_stored_depths_inside() {
+    let mut gpu = gpu();
+    let vertices = two_triangles(&mut gpu);
+    let Ok(inside) = unculled().depth_bounds(Some([0.0, 0.5])) else {
+        return skip(
+            "depth_bounds_keep_fragments_over_stored_depths_inside",
+            "the device lacks `depth-bounds`",
+        );
+    };
+    let outside = unculled().depth_bounds(Some([0.5, 1.0])).unwrap();
+    let depth = Image::<D32Sfloat, usage![DepthAttachment, TransferDst]>::new(EXTENT).unwrap();
+    let pixels = render(&mut gpu, |cmd, target| {
+        // The bounds test the stored depth (0.25), not the fragment's (0.5).
+        cmd.clear_depth_stencil(depth.whole_view(), [0.25]);
+        let left = TestFlat::push_bindings(
+            TestFlatArgs {
+                vertices: vertices.range(0..3),
+            },
+            None,
+        );
+        let right = TestFlat::push_bindings(
+            TestFlatArgs {
+                vertices: vertices.range(3..6),
+            },
+            None,
+        );
+        let test = |state: RasterState<1>| state.depth_test(None).depth_write(false);
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .depth_attachment(depth.whole_view(), None)
+            .draw(&Draw::new(&left, 3, 1, test(inside)))
+            .draw(&Draw::new(&right, 3, 1, test(outside)))
+            .record("depth bounds");
+    });
+    assert_pixel(&pixels, IN_LEFT.0, IN_LEFT.1, [255, 0, 0, 255]);
+    assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, BLACK);
+}
+
+#[test]
+fn blend_constants_scale_constant_factors() {
+    let mut gpu = gpu();
+    let vertices = two_triangles(&mut gpu);
+    let constant = BlendEquation {
+        src_color: BlendFactor::CONSTANT_COLOR,
+        dst_color: BlendFactor::ZERO,
+        color_op: BlendOp::ADD,
+        src_alpha: BlendFactor::CONSTANT_ALPHA,
+        dst_alpha: BlendFactor::ZERO,
+        alpha_op: BlendOp::ADD,
+    };
+    let state = |constants| {
+        unculled()
+            .blend(Blend::Equation(constant))
+            .blend_constants(constants)
+    };
+    let pixels = render(&mut gpu, |cmd, target| {
+        let left = TestFlat::push_bindings(
+            TestFlatArgs {
+                vertices: vertices.range(0..3),
+            },
+            None,
+        );
+        let right = TestFlat::push_bindings(
+            TestFlatArgs {
+                vertices: vertices.range(3..6),
+            },
+            None,
+        );
+        // Two draws with their own constants in one rendering.
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&left, 3, 1, state([0.5, 1.0, 1.0, 1.0])))
+            .draw(&Draw::new(&right, 3, 1, state([1.0, 0.25, 0.0, 1.0])))
+            .record("blend constants");
+    });
+    // Red (the first vertex's flat colour) halved; yellow with a quarter of its green.
+    assert_pixel(&pixels, IN_LEFT.0, IN_LEFT.1, [128, 0, 0, 255]);
+    assert_pixel(&pixels, IN_RIGHT.0, IN_RIGHT.1, [255, 64, 0, 255]);
+}
+
+#[test]
+fn strips_fans_and_points_assemble_their_primitives() {
+    let mut gpu = gpu();
+    let quad = |order: [(f32, f32); 4]| order.map(|(x, y)| vertex(x, y, 0.5, [1.0; 4]));
+    // The left half as a strip and as a fan.
+    let strip = gpu.buffer(&quad([(-1.0, -1.0), (0.0, -1.0), (-1.0, 1.0), (0.0, 1.0)]));
+    let fan = gpu.buffer(&quad([(-1.0, -1.0), (0.0, -1.0), (0.0, 1.0), (-1.0, 1.0)]));
+    for (name, vertices, topology) in [
+        ("strip", &strip, PrimitiveTopology::TRIANGLE_STRIP),
+        ("fan", &fan, PrimitiveTopology::TRIANGLE_FAN),
+    ] {
+        let pixels = draw_flat(&mut gpu, vertices, 4, unculled().topology(topology));
+        for (x, y) in [(2, 2), (30, 2), (2, 61), (30, 61), (16, 32)] {
+            assert_eq!(pixel(&pixels, x, y), WHITE, "{name} at ({x}, {y})");
+        }
+        assert_pixel(&pixels, 40, 32, BLACK);
+    }
+    // Two single-pixel points.
+    let points = gpu.buffer(&[
+        vertex(centre(10), centre(12), 0.5, [1.0; 4]),
+        vertex(centre(40), centre(50), 0.5, [1.0; 4]),
+    ]);
+    let pixels = draw_flat(
+        &mut gpu,
+        &points,
+        2,
+        unculled().topology(PrimitiveTopology::POINT_LIST),
+    );
+    let lit: Vec<_> = (0..SIZE * SIZE)
+        .filter(|i| pixel(&pixels, i % SIZE, i / SIZE) != BLACK)
+        .map(|i| (i % SIZE, i / SIZE))
+        .collect();
+    assert_eq!(lit, [(10, 12), (40, 50)]);
+    // A strip of two lines: across row 20, then down column 50.
+    let (x0, x1, y0, y1) = (centre(5), centre(50), centre(20), centre(60));
+    let corner = gpu.buffer(&[
+        vertex(x0, y0, 0.5, [1.0; 4]),
+        vertex(x1, y0, 0.5, [1.0; 4]),
+        vertex(x1, y1, 0.5, [1.0; 4]),
+    ]);
+    let pixels = draw_flat(
+        &mut gpu,
+        &corner,
+        3,
+        unculled().topology(PrimitiveTopology::LINE_STRIP),
+    );
+    assert_pixel(&pixels, 30, 20, WHITE);
+    assert_pixel(&pixels, 50, 40, WHITE);
+    assert_pixel(&pixels, 30, 40, BLACK);
+}
+
+// ---- attachments read by their own rendering ---------------------------------------------------
+
+/// An attachment that a draw also names in its accesses is rendered in `GENERAL` (its
+/// descriptor's layout) and draws as usual; validation checks the layouts the rendering and the
+/// copy after it use.
+#[test]
+fn attachments_reached_through_accesses_draw_as_usual() {
+    let mut gpu = gpu();
+    let vertices = two_triangles(&mut gpu);
+    let expected = both(&mut gpu, &vertices);
+    let pixels = render(&mut gpu, |cmd, target| {
+        let reached = [ImageUse::storage_read(target.whole_view())];
+        let bindings = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(..),
+                instance_offset: Vec2::ZERO,
+            },
+            Some(Accesses::images(&reached)),
+        );
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&bindings, 6, 1, unculled()))
+            .record("reached");
+        // And again, from the `GENERAL` layout the rendering left.
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&raster(&vertices), 6, 1, unculled()))
+            .record("plain");
+    });
+    assert_eq!(pixels, expected);
+}
+
+/// A draw samples the read-only depth attachment it is depth-tested against (a `DynImg`, named
+/// in its accesses): both in `GENERAL`, neither writing, so no barrier lies between them.
+#[test]
+fn a_draw_samples_its_own_read_only_depth_attachment() {
+    let mut gpu = gpu();
+    let depth = Image::<D32Sfloat, usage![DepthAttachment, Sampled, TransferDst]>::new(EXTENT)
+        .unwrap()
+        .bind_sampled()
+        .unwrap();
+    let screen =
+        |z| [(-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)].map(|(x, y)| vertex(x, y, z, [1.0; 4]));
+    let (near, far) = (gpu.buffer(&screen(0.5)), gpu.buffer(&screen(0.1)));
+    let draw = |gpu: &mut Gpu, vertices: &Buffer<TestVertex>| {
+        render(gpu, |cmd, target| {
+            cmd.clear_depth_stencil(depth.whole_view(), [0.25]);
+            let reached = [ImageUse::sampled_read(depth.whole_view())];
+            let bindings = TestDepthRead::push_bindings(
+                TestDepthReadArgs {
+                    vertices: vertices.range(..),
+                    depth: depth.handle::<lava::bindless::Sampled>().erase(),
+                    sampler: nearest(),
+                    size: Vec2::splat(SIZE as f32),
+                },
+                Some(Accesses::images(&reached)),
+            );
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+                .depth_attachment(depth.whole_view(), None)
+                .draw(&Draw::new(&bindings, 3, 1, unculled().depth_write(false)))
+                .record("sampling its depth");
+        })
+    };
+    // In front of the stored 0.25: coloured with it.
+    let pixels = draw(&mut gpu, &near);
+    for (x, y) in [(1, 1), (32, 32), (62, 62)] {
+        assert_pixel(&pixels, x, y, [64, 64, 64, 255]);
+    }
+    // Behind it: depth-tested away.
+    let pixels = draw(&mut gpu, &far);
+    assert!(pixels.as_chunks::<4>().0.iter().all(|&p| p == BLACK));
+}
+
+// ---- pipelines -------------------------------------------------------------------------------
+
+#[test]
+fn raster_specialization_constants_pick_the_pipeline() {
+    let mut gpu = gpu();
+    let vertices = two_triangles(&mut gpu);
+    let reference = both(&mut gpu, &vertices);
+    let constants = |brightness, dropped| {
+        TestRasterSpecialized::push_bindings(
+            TestRasterSpecializedArgs {
+                vertices: vertices.range(..),
+            },
+            TestRasterSpecializedConstants {
+                brightness,
+                dropped,
+            },
+            None,
+        )
+    };
+    let (plain, dimmed, no_green) = (constants(1.0, 3), constants(0.5, 3), constants(1.0, 1));
+    let draw = |gpu: &mut Gpu, bindings: &BindingOutput<'_, kind::RasterVertex>| {
+        render(gpu, |cmd, target| {
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+                .draw(&Draw::new(bindings, 6, 1, unculled()))
+                .record("constants");
+        })
+    };
+    assert_eq!(draw(&mut gpu, &plain), reference);
+    let half = draw(&mut gpu, &dimmed);
+    let dropped = draw(&mut gpu, &no_green);
+    for (x, y) in [IN_LEFT, IN_RIGHT] {
+        let [r, g, b, a] = pixel(&reference, x, y);
+        let halve = |c: u8| ((c as f32 / 255.0 * 0.5) * 255.0).round() as u8;
+        assert_pixel(&half, x, y, [halve(r), halve(g), halve(b), a]);
+        assert_pixel(&dropped, x, y, [r, 0, b, a]);
+    }
+    // Draws of one rendering with different constants bind their own pipelines.
+    let mixed = render(&mut gpu, |cmd, target| {
+        let left = TestRasterSpecialized::push_bindings(
+            TestRasterSpecializedArgs {
+                vertices: vertices.range(0..3),
+            },
+            TestRasterSpecializedConstants {
+                brightness: 0.5,
+                dropped: 3,
+            },
+            None,
+        );
+        let right = TestRasterSpecialized::push_bindings(
+            TestRasterSpecializedArgs {
+                vertices: vertices.range(3..6),
+            },
+            TestRasterSpecializedConstants {
+                brightness: 1.0,
+                dropped: 1,
+            },
+            None,
+        );
+        cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+            .draw(&Draw::new(&left, 3, 1, unculled()))
+            .draw(&Draw::new(&right, 3, 1, unculled()))
+            .record("mixed constants");
+    });
+    assert_eq!(
+        pixel(&mixed, IN_LEFT.0, IN_LEFT.1),
+        pixel(&half, IN_LEFT.0, IN_LEFT.1)
+    );
+    assert_pixel(&mixed, IN_RIGHT.0, IN_RIGHT.1, [255, 0, 0, 255]);
+}
+
+#[test]
+fn task_shaders_launch_the_mesh_workgroups_of_their_payload() {
+    let mut gpu = gpu();
+    let launch = |columns| {
+        TestTask::push_bindings(
+            TestTaskArgs {
+                color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+                columns,
+                width: 0.5,
+            },
+            None,
+        )
+        .ok()
+    };
+    let Some(two) = launch(2) else {
+        return skip(
+            "task_shaders_launch_the_mesh_workgroups_of_their_payload",
+            "the device lacks `mesh-shader`",
+        );
+    };
+    let four = launch(4).unwrap();
+    let draw = |gpu: &mut Gpu, bindings: &BindingOutput<'_, kind::RasterMesh>| {
+        render(gpu, |cmd, target| {
+            cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
+                .draw(&Draw::launch(bindings, [1, 1, 1], unculled()))
+                .record("task");
+        })
+    };
+    // Columns 16 pixels wide, from the left.
+    let pixels = draw(&mut gpu, &two);
+    for x in [2, 14, 18, 30] {
+        assert_pixel(&pixels, x, 32, [0, 255, 0, 255]);
+    }
+    for x in [34, 50, 62] {
+        assert_pixel(&pixels, x, 32, BLACK);
+    }
+    let pixels = draw(&mut gpu, &four);
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&p| p == [0, 255, 0, 255]),
+        "four columns cover the target"
     );
 }
 

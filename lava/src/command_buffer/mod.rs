@@ -416,6 +416,16 @@ impl<'a> Attachment<'a> {
     }
 }
 
+/// The mip ranges of the ownership transfer barriers of `mips`: one per tracked state (all of
+/// them for an image with one state, one per mip for a `MipChain`), since a release and its
+/// acquire must name the same subresources whatever mips each side accesses together.
+fn ownership_ranges(states: &[AtomicU64], mips: Range<u32>) -> SmallVec<[Range<u32>; 4]> {
+    match states {
+        [_] => smallvec::smallvec![mips],
+        _ => mips.into_iter().map(|mip| (mip..mip + 1).into()).collect(),
+    }
+}
+
 /// An attachment is one mip of an image (Vulkan's attachment views have one level).
 #[track_caller]
 fn one_mip(mips: Range<u32>) {
@@ -1950,19 +1960,24 @@ impl Recording<'_> {
         }
         let mut images = SmallVec::new();
         release_states(states, mips, self.family.kind, to, |mips, layout| {
-            images.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(stage)
-                    .src_access_mask(access)
-                    .dst_stage_mask(S2::NONE)
-                    .dst_access_mask(vk::AccessFlags2::NONE)
-                    .old_layout(layout)
-                    .new_layout(layout)
-                    .src_queue_family_index(from)
-                    .dst_queue_family_index(to_index)
-                    .image(image)
-                    .subresource_range(subresource_range(aspect, mips)),
-            )
+            // One barrier per tracked state, as the acquire makes them: the two halves of a
+            // transfer must name the same subresources, and the receiver may access the mips
+            // one at a time.
+            for mips in ownership_ranges(states, mips) {
+                images.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(stage)
+                        .src_access_mask(access)
+                        .dst_stage_mask(S2::NONE)
+                        .dst_access_mask(vk::AccessFlags2::NONE)
+                        .old_layout(layout)
+                        .new_layout(layout)
+                        .src_queue_family_index(from)
+                        .dst_queue_family_index(to_index)
+                        .image(image)
+                        .subresource_range(subresource_range(aspect, mips)),
+                )
+            }
         });
         if images.is_empty() {
             return;
@@ -2457,19 +2472,22 @@ pub(crate) fn compute_barriers<'a>(
                 // Released to this family: the acquire half of the transfer.
                 let acquire = old.released_to == Some(kind) && old.owner.is_some();
                 if acquire && let Some(owner) = old.owner {
-                    acquires.push(
-                        vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(S2::NONE)
-                            .src_access_mask(vk::AccessFlags2::NONE)
-                            .dst_stage_mask(to_stage)
-                            .dst_access_mask(to_access)
-                            .old_layout(old.layout)
-                            .new_layout(old.layout)
-                            .src_queue_family_index(family.index(owner))
-                            .dst_queue_family_index(family.index(kind))
-                            .image(access.image)
-                            .subresource_range(subresource_range(access.aspect, mips)),
-                    );
+                    // Per tracked state, matching the release's barriers.
+                    for mips in ownership_ranges(image.states, mips) {
+                        acquires.push(
+                            vk::ImageMemoryBarrier2::default()
+                                .src_stage_mask(S2::NONE)
+                                .src_access_mask(vk::AccessFlags2::NONE)
+                                .dst_stage_mask(to_stage)
+                                .dst_access_mask(to_access)
+                                .old_layout(old.layout)
+                                .new_layout(old.layout)
+                                .src_queue_family_index(family.index(owner))
+                                .dst_queue_family_index(family.index(kind))
+                                .image(access.image)
+                                .subresource_range(subresource_range(access.aspect, mips)),
+                        );
+                    }
                 }
                 if old.layout == access.layout {
                     return;

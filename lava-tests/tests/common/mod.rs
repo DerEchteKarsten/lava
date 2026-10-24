@@ -1,10 +1,13 @@
-//! Shared harness for lava's GPU tests: one headless context per process (with the features a test binary disables, its staging ring size and pipeline cache file) and its graphics timeline, serialised, validation-checked
+//! Shared harness for lava's GPU tests: one headless context per process (with the features a test binary disables, its staging ring size and pipeline cache file) and its graphics timeline, serialised and validation-checked (the layer asserted active, init's errors included), a subscriber that shows lava's warnings in failing tests, and panic messages
 #![allow(dead_code)]
 
 pub mod golden;
 pub mod render;
 
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::{
+    LazyLock, Mutex, MutexGuard, Once, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use bytemuck::Pod;
 use lava::{
@@ -13,19 +16,40 @@ use lava::{
     command_buffer::CommandBuffer,
     queue::{Graphics, Timeline, Wait},
 };
-use tracing::field::{Field, Visit};
-use tracing_subscriber::{Layer, layer::SubscriberExt};
+use tracing::{
+    Level,
+    field::{Field, Visit},
+};
+use tracing_subscriber::{
+    Layer,
+    filter::{Targets, filter_fn},
+    layer::SubscriberExt,
+};
 
-static VALIDATION_ERRORS: LazyLock<Arc<Mutex<Vec<String>>>> = LazyLock::new(Default::default);
+static VALIDATION_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Set when lava warned that `Config::validation` found no validation layer.
+static LAYER_MISSING: AtomicBool = AtomicBool::new(false);
 
+/// Collects validation errors (with the lava call they came from) and notices lava's warning
+/// that the validation layer is missing.
 struct ValidationCapture;
 
-struct Message(String);
+#[derive(Default)]
+struct Fields {
+    message: String,
+    location: Option<String>,
+}
 
-impl Visit for Message {
+impl Visit for Fields {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.record_debug(field, &value as &dyn std::fmt::Debug)
+    }
+
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "validation_location" => self.location = Some(format!("{value:?}")),
+            _ => {}
         }
     }
 }
@@ -33,10 +57,16 @@ impl Visit for Message {
 impl<S: tracing::Subscriber> Layer<S> for ValidationCapture {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let meta = event.metadata();
-        if meta.target() == "vulkan-validation" && *meta.level() == tracing::Level::ERROR {
-            let mut message = Message(String::new());
-            event.record(&mut message);
-            VALIDATION_ERRORS.lock().unwrap().push(message.0);
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if meta.target() == "vulkan-validation" {
+            let message = match fields.location {
+                Some(location) => format!("{}\n  (in the lava call at {location})", fields.message),
+                None => fields.message,
+            };
+            VALIDATION_ERRORS.lock().unwrap().push(message);
+        } else if fields.message.contains("validation layer isn't installed") {
+            LAYER_MISSING.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -47,14 +77,44 @@ pub struct Gpu {
     pub timeline: Timeline<Graphics>,
 }
 
-/// Starts collecting validation errors; call once, before `lava::init`.
+/// Installs the tests' subscriber (once per process; call before `lava::init`): validation
+/// errors are collected for [`take_validation_errors`], and lava's warnings and errors and the
+/// validation errors are printed through the test writer, so a failing test shows them.
 pub fn capture_validation_errors() {
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(ValidationCapture))
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let capture = ValidationCapture.with_filter(filter_fn(|meta| {
+            let target = meta.target();
+            (target == "vulkan-validation" && *meta.level() == Level::ERROR)
+                || (target.starts_with("lava") && *meta.level() <= Level::WARN)
+        }));
+        let log = tracing_subscriber::fmt::layer()
+            .with_test_writer()
+            .with_filter(
+                Targets::new()
+                    .with_target("lava", Level::WARN)
+                    .with_target("lava_build_slang", Level::WARN)
+                    .with_target("vulkan-validation", Level::ERROR),
+            );
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(capture).with(log),
+        )
         .expect("no other tracing subscriber is installed");
+    });
 }
 
+/// The validation errors raised since the last call.
 pub fn take_validation_errors() -> Vec<String> {
     std::mem::take(&mut *VALIDATION_ERRORS.lock().unwrap())
+}
+
+/// Fails unless the validation layer `lava::init` was asked for is active: the GPU tests count
+/// on it, so a missing layer must not pass them silently.
+pub fn assert_validation_active() {
+    assert!(
+        !LAYER_MISSING.load(Ordering::Relaxed),
+        "the GPU tests run with `Config::validation`, but lava found no Khronos validation layer: install it (e.g. the vulkan-validation-layers package)"
+    );
 }
 
 static DISABLED: OnceLock<lava::Features> = OnceLock::new();
@@ -92,17 +152,41 @@ pub fn pipeline_cache(path: &'static std::path::Path) {
     );
 }
 
-static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
+static GPU_ASSISTED: OnceLock<bool> = OnceLock::new();
+
+/// Turns on GPU-assisted validation (`Config::gpu_assisted_validation`) for the process's
+/// context; call before the first `gpu()`.
+pub fn gpu_assisted_validation() {
+    GPU_ASSISTED.get_or_init(|| true);
+}
+
+/// The process's context, or why it couldn't be made: every test then fails with that reason.
+static GPU: LazyLock<Result<Mutex<Gpu>, String>> = LazyLock::new(|| {
     capture_validation_errors();
+    std::panic::catch_unwind(init_gpu)
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "the harness panicked: {}",
+                payload_message(&*payload)
+            ))
+        })
+        .map(Mutex::new)
+});
+
+fn init_gpu() -> Result<Gpu, String> {
     let config = lava::Config {
         validation: true,
+        gpu_assisted_validation: GPU_ASSISTED.get().copied().unwrap_or(false),
         disabled: DISABLED.get().copied().unwrap_or_default(),
         pipeline_cache: PIPELINE_CACHE.get().copied(),
         ..lava::Config::new(&lava_tests::bindings::PASS_MAP)
     };
-    lava::init(&config).expect(
-        "headless lava init failed; the GPU tests need a Vulkan 1.4 GPU with VK_EXT_descriptor_heap and the Khronos validation layer",
-    );
+    lava::init(&config).map_err(|error| {
+        format!(
+            "headless lava init failed: {error}; the GPU tests need a Vulkan 1.4 GPU with VK_EXT_descriptor_heap and the Khronos validation layer"
+        )
+    })?;
+    assert_validation_active();
     let nearest = SamplerDesc::new()
         .filter(lava::vk::Filter::NEAREST)
         .mipmap_mode(lava::vk::SamplerMipmapMode::NEAREST)
@@ -110,10 +194,18 @@ static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {
         .border_color(lava::vk::BorderColor::FLOAT_OPAQUE_WHITE);
     let _ = NEAREST.set(Sampler::new(&nearest).unwrap());
     let staging = STAGING.get().copied().unwrap_or(16 << 20);
-    Mutex::new(Gpu {
+    let gpu = Gpu {
         timeline: Timeline::new(2, staging).unwrap(),
-    })
-});
+    };
+    let errors = take_validation_errors();
+    if !errors.is_empty() {
+        return Err(format!(
+            "Vulkan validation errors in lava::init:\n{}",
+            errors.join("\n\n")
+        ));
+    }
+    Ok(gpu)
+}
 
 static NEAREST: OnceLock<Sampler> = OnceLock::new();
 
@@ -157,10 +249,14 @@ impl Drop for GpuGuard {
 }
 
 /// Tests run one at a time: lava's context is global and some devices have one graphics queue.
+/// Validation errors raised outside any test's guard (by destructors that ran late) fail the
+/// next test that takes it.
 pub fn gpu() -> GpuGuard {
-    let guard = GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    take_validation_errors();
-    GpuGuard(guard)
+    let gpu = match &*GPU {
+        Ok(gpu) => gpu,
+        Err(error) => panic!("{error}"),
+    };
+    GpuGuard(gpu.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
 impl Gpu {
@@ -205,6 +301,11 @@ pub fn panic_message<R>(f: impl FnOnce() -> R) -> String {
     let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) else {
         panic!("it should panic");
     };
+    payload_message(&*payload)
+}
+
+/// The text of a panic's payload.
+pub fn payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     (payload.downcast_ref::<String>().cloned())
         .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_default()
