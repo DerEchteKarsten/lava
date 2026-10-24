@@ -440,12 +440,12 @@ fn a_panicking_recording_still_makes_its_layout_transitions() {
         "the panic continues"
     );
     gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
-    // Destroying it locks every timeline's pending accesses.
+    // Destroyed with the accesses the replayed recording left in it.
     drop(image);
     gpu.submit(|cmd| cmd.fill_buffer(readback.range(..), 0));
 }
 
-/// Destructors lock the pending accesses a recording holds.
+/// A thread that records runs no destructors: `reclaim` inside a submission leaves them for later.
 #[test]
 fn a_recording_thread_runs_no_destructors() {
     let mut gpu = gpu();

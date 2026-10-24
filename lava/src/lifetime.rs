@@ -48,8 +48,8 @@ pub(crate) static RETIRED: Mutex<VecDeque<(Stamp, Destroy)>> = Mutex::new(VecDeq
 static RECLAIMING: Mutex<()> = Mutex::new(());
 
 thread_local! {
-    /// The thread records and holds its timeline's pending accesses, which destroying an image
-    /// or buffer locks.
+    /// The thread records a submission, holding its timeline's index state: destructors, which
+    /// wait anyway, run later on a thread that doesn't.
     pub(crate) static RECORDING: Cell<bool> = const { Cell::new(false) };
     /// The thread holds `RECLAIMING`: a destructor that reclaims returns right away.
     static RECLAIMS: Cell<bool> = const { Cell::new(false) };

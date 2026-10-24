@@ -689,7 +689,6 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             stats.bytes += staged.size;
         }
         for c in &copied {
-            let states = &c.image.states;
             // One release per run of copied mips.
             let mut mip = 0;
             while mip < 64 {
@@ -698,7 +697,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                     continue;
                 }
                 let end = mip + (c.mips >> mip).trailing_ones();
-                (self.rec).release(c.image.image, states, (mip..end).into(), c.aspect, c.to);
+                (self.rec).release(c.image, (mip..end).into(), c.aspect, c.to);
                 mip = end;
             }
         }

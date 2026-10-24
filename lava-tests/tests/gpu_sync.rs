@@ -1,4 +1,4 @@
-//! GPU tests of barrier tracking across submissions and families: two graphics timelines sharing an image through waits, more than 64 pending buffer writes folded into one, resources forgotten on every timeline once destroyed, attachments a draw of their rendering samples rendered in `GENERAL`, transitions and acquires of several mips merged into one write, `flush_all` on every family, and the transfer family's copy rules
+//! GPU tests of barrier tracking across submissions and families: two graphics timelines sharing an image through waits, writes of many buffers tracked in each, new resources at destroyed ones' handles and addresses starting without their accesses, attachments a draw of their rendering samples rendered in `GENERAL`, transitions and acquires of several mips merged into one write, `flush_all` on every family, and the transfer family's copy rules
 mod common;
 
 use common::render::*;
@@ -109,23 +109,23 @@ fn two_graphics_timelines_share_an_image_through_waits() {
 
 // ---- pending buffer writes ---------------------------------------------------------------------
 
-/// More than 64 pending buffer writes fold the completed ones into one write of every
-/// address: later commands still wait for it, a host access of a buffer it holds doesn't (it
-/// only holds completed writes), and a write still in flight keeps blocking host access.
+/// Writes of many buffers, each tracked in its buffer: later commands still wait for completed
+/// ones of an earlier submission, a host access of a buffer whose writes completed doesn't wait,
+/// and a write still in flight keeps blocking host access.
 #[test]
-fn more_than_64_buffer_writes_fold_and_keep_their_order() {
+fn many_buffers_writes_keep_their_order() {
     let mut gpu = gpu();
     const BUFFERS: usize = 80;
     const LEN: usize = 64;
     let sources: Vec<Buffer<u32>> = (0..BUFFERS).map(|_| Buffer::new(LEN).unwrap()).collect();
-    // Completed writes of every source, more than lava keeps one by one.
+    // Writes of every source, completed by the next submission.
     gpu.submit(|cmd| {
         for (i, source) in sources.iter().enumerate() {
             cmd.fill_buffer(source.range(..), i as u32);
         }
     });
-    // Refilled sources (written in this submission, not folded) and folded ones are both read
-    // by a shader, which writes as many readbacks again.
+    // Refilled sources (written in this submission) and the others (written in the last one)
+    // are both read by a shader, which writes as many readbacks again.
     let mut outs: Vec<_> = (0..BUFFERS).map(|_| zeroed_buffer::<u32>(LEN)).collect();
     gpu.submit(|cmd| {
         for (i, source) in sources.iter().enumerate().step_by(2) {
@@ -156,7 +156,7 @@ fn more_than_64_buffer_writes_fold_and_keep_their_order() {
         assert_eq!(out.host(), expected, "buffer {i}");
     }
 
-    // The readbacks' writes fold at the next submission, which has one in flight.
+    // The readbacks' writes completed; the next submission has one in flight.
     let large = Buffer::<u32>::new(16 << 20).unwrap();
     let mut late = zeroed_buffer::<u32>(4);
     let in_flight = (gpu.timeline.begin().unwrap())
@@ -165,7 +165,7 @@ fn more_than_64_buffer_writes_fold_and_keep_their_order() {
                 cmd.fill_buffer(large.range(..), value);
             }
             cmd.copy_buffer(large.range(..4), late.range(..));
-            // And a copy from a folded write, which must wait for it.
+            // And a copy from an earlier submission's write, which must wait for it.
             cmd.copy_buffer(outs[1].range(..4), outs[0].range(..4));
         })
         .unwrap();

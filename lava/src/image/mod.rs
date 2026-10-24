@@ -26,7 +26,7 @@ use crate::{
 
 use crate::{
     bindless::{self, Allocatable, Combined, Dynamic, ImageHandle, Sampled, Storage},
-    command_buffer::image_state::ImageState,
+    command_buffer::{access_state::AccessState, image_state::ImageState},
     global::Live,
     image::{
         format::{Format, StaticFormat},
@@ -34,7 +34,6 @@ use crate::{
     },
     lifetime,
     object::Header,
-    queue::timeline::forget_image,
     state::{Ctx, Functions, ImageFormatKey},
 };
 
@@ -234,6 +233,8 @@ pub(crate) struct ImageInternal {
     pub(crate) mips: Vec<ViewSlot>,
     /// Its tracked states: one for all mips, or one per mip of a `MipChain` (mip `i` at `i`).
     pub(crate) states: Box<[AtomicU64]>,
+    /// What the timelines' submissions read and wrote of it, which later commands wait for.
+    pub(crate) access: Mutex<AccessState>,
     /// Counts it as a lava user until its drop finished.
     #[allow(dead_code, reason = "held for its count")]
     pub(crate) header: Header,
@@ -298,15 +299,16 @@ impl ImageInternal {
             whole: ViewSlot::new(view, handle),
             mips: Vec::new(),
             states: Box::new([ImageState::UNDEFINED.atomic()]),
+            access: Mutex::default(),
             header: Header::new(Live::internal()),
         }
     }
 }
 
 impl Drop for ImageInternal {
-    /// Destroys its views, frees their slots, forgets its pending accesses and destroys the
-    /// image and its memory, once no submission reaches it; a swapchain image's right away,
-    /// since its swapchain is only destroyed once none does.
+    /// Destroys its views, frees their slots and destroys the image and its memory, once no
+    /// submission reaches it; a swapchain image's right away, since its swapchain is only
+    /// destroyed once none does. Its tracked accesses go with it.
     fn drop(&mut self) {
         let image = self.image;
         let memory = mem::replace(
@@ -334,7 +336,6 @@ impl Drop for ImageInternal {
             for handle in handles {
                 bindless::free_handle(handle);
             }
-            forget_image(image);
             if !swapchain {
                 unsafe { Ctx::device().destroy_image(image, None) };
             }
@@ -439,6 +440,7 @@ impl<F: Format, U: ImageUsage, D: Dim> RawImage<F, U, D> {
                 whole: ViewSlot::new(vk::ImageView::null(), ImageHandle::NULL),
                 mips: Vec::new(),
                 states: Box::new([]),
+                access: Mutex::default(),
                 header: Header::new(live),
             },
             extent,

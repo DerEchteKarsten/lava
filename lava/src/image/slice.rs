@@ -1,9 +1,5 @@
 //! Image views and the boxes of texels transfers take: `ImageView` (a borrowed range of an image's mips and layers, its handle, its `VkImageView` and reinterpreted formats), `ImageSlice` (a box of one of a view's mips), `TexelBuffer` (buffer rows for copies), and the image transfer commands (clears, blits, image and buffer copies) with their format, box and block checks
-use std::{
-    iter,
-    range::Range,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{iter, range::Range, sync::Arc};
 
 use crate::vk;
 use lava_macros::validation_trace;
@@ -59,12 +55,6 @@ impl<F: Format, U: ImageUsage, D: Dim> std::fmt::Debug for ImageView<'_, F, U, D
 impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     pub fn image(&self) -> vk::Image {
         self.internal.image
-    }
-
-    /// The image's tracked states: one for all its mips, or one per mip of the image; each
-    /// covers every layer.
-    pub(crate) fn states(&self) -> &'a [AtomicU64] {
-        &self.internal.states
     }
 
     /// Its `VkImageView`, which only images with an attachment usage have (null otherwise),

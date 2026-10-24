@@ -1,5 +1,11 @@
 //! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones (writes of `NoUninit` elements, reads of `AnyBitPattern` ones), checked against GPU writes still in flight; growth that keeps the contents (`reserve`); the staging rings and uploaders (`staging`); casts; the internal its owners share (`BufferInternal`, also of sparse and external buffers, whose memory it frees), destroyed once the last owner dropped it and no frame can reach it
-use std::{fmt::Debug, marker::PhantomData, mem, range::Range, sync::Arc};
+use std::{
+    fmt::Debug,
+    marker::PhantomData,
+    mem,
+    range::Range,
+    sync::{Arc, Mutex},
+};
 
 use crate::error::{Error, Result};
 use crate::vk;
@@ -9,14 +15,11 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    command_buffer::{BufferAccess, pending::incomplete_write},
+    command_buffer::access_state::AccessState,
     global::Live,
     lifetime,
     object::Header,
-    queue::{
-        lock,
-        timeline::{INDICES, completed, poll},
-    },
+    queue::{lock, timeline::poll},
     state::Ctx,
 };
 
@@ -95,6 +98,8 @@ pub(crate) struct BufferInternal {
     pub(crate) address: u64,
     pub(crate) num_bytes: u64,
     pub(crate) memory: BufferMemory,
+    /// What the timelines' submissions read and wrote of it, which later commands wait for.
+    pub(crate) state: Mutex<AccessState>,
     /// Counts it as a lava user until its drop finished.
     #[allow(dead_code, reason = "held for its count")]
     pub(crate) header: Header,
@@ -154,22 +159,15 @@ impl BufferInternal {
 }
 
 impl Drop for BufferInternal {
-    /// Forgets its pending accesses and destroys the buffer and its memory, once no submission
-    /// reaches it.
+    /// Destroys the buffer and its memory, once no submission reaches it; its tracked accesses
+    /// go with it.
     fn drop(&mut self) {
         let handle = self.handle;
-        let range = self.address..self.address + self.num_bytes;
         let memory = mem::replace(
             &mut self.memory,
             BufferMemory::Allocation(Allocation::default()),
         );
         lifetime::retire(move || {
-            for index in INDICES.iter() {
-                let pending = &mut lock(&index.state).pending;
-                let outside = |access: &BufferAccess| !range.contains(&access.range.start);
-                pending.buffer_reads.retain(|read| outside(&read.read));
-                pending.buffer_writes.retain(|write| outside(&write.write));
-            }
             unsafe { Ctx::device().destroy_buffer(handle, None) };
             memory.free();
         });
@@ -209,6 +207,7 @@ impl<T: Copy + 'static> Buffer<T, Gpu> {
                 address,
                 num_bytes,
                 memory: BufferMemory::External(memory),
+                state: Mutex::default(),
                 header: Header::new(live),
             },
             Gpu,
@@ -425,6 +424,7 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
                 address,
                 num_bytes,
                 memory: BufferMemory::Allocation(allocation),
+                state: Mutex::default(),
                 header: Header::new(live.clone()),
             },
             memory,
@@ -555,19 +555,12 @@ impl<T: Copy + 'static, M: HostVisible> Buffer<T, M> {
         self.mapping().expect("host-visible memory is mapped")
     }
 
-    /// The timeline and value of a submitted GPU write of the buffer that hasn't completed.
-    /// Polls the timelines it finds one on. Writes not submitted yet aren't seen: the `&mut`
-    /// borrow of `host`/`host_mut` keeps new recordings from reaching the buffer.
+    /// The timeline and value of a recorded GPU write of the buffer that hasn't completed,
+    /// polling the timeline it finds one on. The `&mut` borrow of `host`/`host_mut` keeps new
+    /// recordings from reaching the buffer.
     fn incomplete_write(&self) -> Option<(usize, u64)> {
-        let range = self.internal.range();
-        (0..INDICES.len()).find_map(|i| {
-            let value = incomplete_write(
-                lock(&INDICES[i].writes).iter().copied(),
-                range,
-                completed(i),
-            )?;
-            (!poll(i).is_ok_and(|done| done >= value)).then_some((i, value))
-        })
+        let (i, value) = lock(&self.internal.state).incomplete_write(self.internal.range())?;
+        (!poll(i).is_ok_and(|done| done >= value)).then_some((i, value))
     }
 
     #[track_caller]

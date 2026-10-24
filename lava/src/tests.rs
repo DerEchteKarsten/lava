@@ -9,10 +9,13 @@ use crate::vk::{self, AccessFlags2 as A, Handle, ImageLayout as L, PipelineStage
 use crate::{
     bindless::{Combined, HeapLayout, ImageHandle, Ranges, Sampled, Storage},
     buffer::staging::{Reservation, Ring, STAGING_ALIGN, Uploader},
+    buffer::{BufferInternal, BufferMemory},
     command_buffer::{
-        Barriers, BufferAccess, EVERY_BUFFER, ImageAccess, ImageUse, compute_barriers,
+        Barriers, BufferAccess, ImageAccess, ImageUse,
+        access_state::{AccessState, MAX_WRITES, StructureAccesses, Tracker},
+        compute_barriers,
         image_state::{ImageState, check_states, release_states, released_by, take_checked_states},
-        pending::{MAX_PENDING_BUFFER_WRITES, PendingAccesses},
+        made_visible, record,
     },
     features::{DeviceFacts, FeatureChain, Features, Needs},
     global::Live,
@@ -49,13 +52,30 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
         .unwrap_or_default()
 }
 
+thread_local! {
+    /// The buffer of a test's accesses: every test runs on a thread of its own, so each gets a
+    /// fresh one. Never dropped (its `Drop` needs a context).
+    static BUFFER: &'static Arc<BufferInternal> = Box::leak(Box::new(Arc::new(BufferInternal {
+        handle: vk::Buffer::null(),
+        address: 0,
+        num_bytes: 1 << 40,
+        memory: BufferMemory::Allocation(Default::default()),
+        state: Default::default(),
+        header: Header::new(Live::internal()),
+    })));
+}
+
+fn test_buffer() -> &'static Arc<BufferInternal> {
+    BUFFER.with(|buffer| *buffer)
+}
+
 fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess<'static> {
     BufferAccess {
         unordered: false,
         stage,
         access,
         range: range.into(),
-        buffer: None,
+        buffer: Some(test_buffer()),
     }
 }
 
@@ -92,6 +112,7 @@ fn tracked(id: u64, states: impl IntoIterator<Item = ImageState>) -> &'static Ar
         whole: ViewSlot::new(vk::ImageView::null(), ImageHandle::NULL),
         mips: Vec::new(),
         states: states.into_iter().map(ImageState::atomic).collect(),
+        access: Default::default(),
         header: Header::new(Live::internal()),
     })))
 }
@@ -122,36 +143,74 @@ fn image_use<'a>(
     }
 }
 
+/// A recording of value `value` on timeline 0, which completed `completed`.
+fn tracker(value: u64, completed: u64) -> Tracker {
+    Tracker {
+        timeline: 0,
+        value,
+        base: 0,
+        completed,
+    }
+}
+
+/// What a recording keeps while it tracks accesses: its tracker, its barrier log and its
+/// timeline's acceleration structure accesses.
+struct Rec {
+    tracker: Tracker,
+    log: Vec<Barriers>,
+    structures: StructureAccesses,
+}
+
+impl Rec {
+    fn new() -> Self {
+        Self::at(tracker(1, 0))
+    }
+
+    fn at(tracker: Tracker) -> Self {
+        Rec {
+            tracker,
+            log: Vec::new(),
+            structures: StructureAccesses::default(),
+        }
+    }
+
+    /// Tracks `images` and `buffers` without their barriers.
+    fn record(&mut self, images: &[ImageUse], buffers: &[BufferAccess]) {
+        record(
+            &self.tracker,
+            &self.log,
+            &mut self.structures,
+            images.iter().cloned(),
+            buffers.iter().cloned(),
+        );
+    }
+}
+
 /// Records `images` and `buffers` after the barriers they need, like `Recording::flush_pending`.
 fn flush_barriers(
-    pending: &mut PendingAccesses,
+    rec: &mut Rec,
     images: &[ImageUse],
     buffers: &[BufferAccess],
 ) -> Option<Barriers> {
     let barriers = compute_barriers(
-        pending,
+        &rec.tracker,
+        &rec.log,
+        &mut rec.structures,
         &GRAPHICS,
         images.iter().cloned(),
         buffers.iter().cloned(),
     );
     if let Some(barriers) = &barriers {
-        pending.made_visible(barriers, 1);
+        rec.log.push(barriers.clone());
+        made_visible(&rec.tracker, &rec.log, images.iter().cloned());
     }
-    pending.record(
-        1,
-        images.iter().map(|i| i.access.clone()),
-        buffers.iter().cloned(),
-    );
+    rec.record(images, buffers);
     barriers
 }
 
 /// `flush_barriers`' memory barrier's source and its number of image barriers.
-fn flush(
-    pending: &mut PendingAccesses,
-    images: &[ImageUse],
-    buffers: &[BufferAccess],
-) -> Option<(S, A, usize)> {
-    flush_barriers(pending, images, buffers).map(|b| {
+fn flush(rec: &mut Rec, images: &[ImageUse], buffers: &[BufferAccess]) -> Option<(S, A, usize)> {
+    flush_barriers(rec, images, buffers).map(|b| {
         let memory = b.memory.map_or((S::NONE, A::NONE), |m| {
             (m.src_stage_mask, m.src_access_mask)
         });
@@ -161,7 +220,7 @@ fn flush(
 
 #[test]
 fn buffer_hazards_wait_for_the_overlapping_accesses() {
-    let mut pending = PendingAccesses::default();
+    let mut pending = Rec::new();
     assert_eq!(
         flush(&mut pending, &[], &[write(0..100)]),
         None,
@@ -190,38 +249,99 @@ fn buffer_hazards_wait_for_the_overlapping_accesses() {
 /// A partly overlapping write keeps the older write pending; reads of completed submissions
 /// are dropped.
 #[test]
-fn pending_accesses_shrink_only_when_covered_or_completed() {
-    let mut pending = PendingAccesses::default();
-    pending.record(
-        1,
-        iter::empty(),
-        [
-            write(0..100),
-            buffer(S::TRANSFER, A::TRANSFER_WRITE, 50..60),
-        ]
-        .into_iter(),
+fn tracked_accesses_shrink_only_when_covered_or_completed() {
+    let mut state = AccessState::default();
+    let t = tracker(1, 0);
+    let (write, transfer) = (
+        (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+        (S::TRANSFER, A::TRANSFER_WRITE),
     );
-    assert_eq!(pending.buffer_writes.len(), 2);
-    pending.record(1, iter::empty(), [write(0..100)].into_iter());
+    state.record(&t, &[], (0..100).into(), write.0, write.1);
+    state.record(&t, &[], (50..60).into(), transfer.0, transfer.1);
+    assert_eq!(state.writes.len(), 2);
+    state.record(&t, &[], (0..100).into(), write.0, write.1);
+    assert_eq!(state.writes.len(), 1, "a covering write replaces both");
+    state.record(
+        &tracker(2, 0),
+        &[],
+        (0..10).into(),
+        S::VERTEX_SHADER,
+        A::SHADER_STORAGE_READ,
+    );
+    state.sources(&tracker(3, 1));
+    assert_eq!(state.reads.len(), 1);
+    state.sources(&tracker(3, 2));
+    assert!(state.reads.is_empty());
+}
+
+/// Each timeline sees only its own accesses, and a timeline that took an index over ignores
+/// what its former owners left (`Tracker::base`).
+#[test]
+fn timelines_track_their_own_accesses() {
+    let mut state = AccessState::default();
+    let write = |t: &Tracker, state: &mut AccessState| {
+        state.record(
+            t,
+            &[],
+            (0..16).into(),
+            S::COMPUTE_SHADER,
+            A::SHADER_STORAGE_WRITE,
+        )
+    };
+    let read_hazards = |t: &Tracker, state: &mut AccessState| {
+        state.hazards(
+            t,
+            &[],
+            (0..16).into(),
+            S::COMPUTE_SHADER,
+            A::SHADER_STORAGE_READ,
+        )
+    };
+    let other = Tracker {
+        timeline: 1,
+        ..tracker(1, 0)
+    };
+    write(&other, &mut state);
     assert_eq!(
-        pending.buffer_writes.len(),
-        1,
-        "a covering write replaces both"
+        read_hazards(&tracker(1, 0), &mut state),
+        None,
+        "another timeline's"
     );
-    pending.record(2, iter::empty(), [read(0..10)].into_iter());
-    pending.retire(1);
-    assert_eq!(pending.buffer_reads.len(), 1);
-    pending.retire(2);
-    assert!(pending.buffer_reads.is_empty());
+    assert!(read_hazards(&other, &mut state).is_some());
+    let next_owner = Tracker {
+        base: 1,
+        ..tracker(2, 1)
+    };
+    let next_owner = Tracker {
+        timeline: 1,
+        ..next_owner
+    };
+    assert_eq!(
+        read_hazards(&next_owner, &mut state),
+        None,
+        "a former owner's"
+    );
+    assert!(state.writes.is_empty());
+}
+
+/// A barrier's visibility outlives its recording's log: a buffer written and read once in one
+/// recording needs no barrier for the same read in the next.
+#[test]
+fn visibility_outlives_its_recording() {
+    let mut first = Rec::new();
+    flush(&mut first, &[], &[write(0..16)]);
+    assert!(flush(&mut first, &[], &[read(0..16)]).is_some());
+    let mut next = Rec::at(tracker(2, 0));
+    assert_eq!(flush(&mut next, &[], &[read(0..16)]), None);
 }
 
 /// Two barriers, to sampled reads in fragment shaders and to storage reads in compute shaders,
 /// don't make a write visible to sampled reads in compute shaders.
 #[test]
 fn write_visibility_is_per_barrier() {
-    let general = state(L::GENERAL, Some(Kind::Graphics));
-    let at = |stage, access| image(1, stage, access, general, L::GENERAL);
-    let mut pending = PendingAccesses::default();
+    let image = tracked(1, [state(L::GENERAL, Some(Kind::Graphics))]);
+    let at = |stage, access| image_use(1, image, stage, access, L::GENERAL);
+    let mut pending = Rec::new();
     flush(
         &mut pending,
         &[at(S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE)],
@@ -317,7 +437,9 @@ fn ownership_moves_through_release_and_acquire() {
         L::GENERAL,
     );
     let barriers = compute_barriers(
-        &PendingAccesses::default(),
+        &tracker(1, 0),
+        &[],
+        &mut StructureAccesses::default(),
         &GRAPHICS,
         iter::once(access.clone()),
         iter::empty(),
@@ -385,7 +507,7 @@ fn releasing_one_mip_keeps_the_others() {
 fn transitions_are_writes_at_their_destination() {
     let image = tracked(1, [ImageState::UNDEFINED]);
     let at = |stage, access, layout| image_use(1, image, stage, access, layout);
-    let mut pending = PendingAccesses::default();
+    let mut pending = Rec::new();
     let target = at(
         S::COLOR_ATTACHMENT_OUTPUT,
         A::COLOR_ATTACHMENT_WRITE,
@@ -405,14 +527,14 @@ fn transitions_are_writes_at_their_destination() {
         (transition.src_stage_mask, transition.dst_stage_mask),
         (S::COLOR_ATTACHMENT_OUTPUT, S::FRAGMENT_SHADER)
     );
-    let [write] = pending.image_writes.as_slice() else {
-        panic!("one write")
-    };
-    assert_eq!(
-        (write.write.stage, write.write.access),
-        (S::FRAGMENT_SHADER, A::NONE)
-    );
-    assert!(write.visible_to(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ));
+    {
+        let access = image.access.lock().unwrap();
+        let [write] = access.writes.as_slice() else {
+            panic!("one write")
+        };
+        assert_eq!((write.stage, write.access), (S::FRAGMENT_SHADER, A::NONE));
+        assert!(write.visible_to(S::FRAGMENT_SHADER, A::SHADER_SAMPLED_READ));
+    }
 
     let compute = flush_barriers(
         &mut pending,
@@ -438,7 +560,7 @@ fn acquires_are_writes_and_transitions_follow_them() {
         ..state(L::GENERAL, Some(Kind::Compute))
     };
     let image = tracked(2, [released]);
-    let mut pending = PendingAccesses::default();
+    let mut pending = Rec::new();
     let sampled = flush_barriers(
         &mut pending,
         &[image_use(
@@ -471,20 +593,16 @@ fn acquires_are_writes_and_transitions_follow_them() {
 
     // A stale access of the image on this timeline doesn't stand in for the acquire.
     let image = tracked(3, [released]);
-    let mut pending = PendingAccesses::default();
+    let mut pending = Rec::new();
     pending.record(
-        1,
-        iter::once(
-            image_use(
-                3,
-                image,
-                S::COMPUTE_SHADER,
-                A::SHADER_STORAGE_WRITE,
-                L::GENERAL,
-            )
-            .access,
-        ),
-        iter::empty(),
+        &[image_use(
+            3,
+            image,
+            S::COMPUTE_SHADER,
+            A::SHADER_STORAGE_WRITE,
+            L::GENERAL,
+        )],
+        &[],
     );
     let target = image_use(
         3,
@@ -527,7 +645,7 @@ fn a_released_image_is_the_receivers() {
 /// semaphore, not for the accesses before its present.
 #[test]
 fn transitions_wait_only_for_what_can_still_run() {
-    let mut pending = PendingAccesses::default();
+    let mut pending = Rec::new();
     let fresh = flush_barriers(
         &mut pending,
         &[image(
@@ -593,11 +711,11 @@ fn transitions_wait_only_for_what_can_still_run() {
     assert_eq!(acquired.images[0].old_layout, L::UNDEFINED);
 }
 
-/// Image reads of completed submissions are dropped like buffer reads, and completed buffer
-/// writes fold into one of every buffer, which keeps the visibility all of them had.
+/// Image reads of completed submissions are dropped like buffer reads, and once a buffer has
+/// more than `MAX_WRITES` writes, its completed ones fold into one over all their ranges, which
+/// keeps the visibility all of them had (barriers logged since they were recorded included).
 #[test]
 fn completed_accesses_retire_and_folds_keep_their_visibility() {
-    let mut pending = PendingAccesses::default();
     let sampled = image(
         7,
         S::FRAGMENT_SHADER,
@@ -605,31 +723,39 @@ fn completed_accesses_retire_and_folds_keep_their_visibility() {
         state(L::GENERAL, Some(Kind::Graphics)),
         L::GENERAL,
     );
-    pending.record(3, iter::once(sampled.access), iter::empty());
-    pending.retire(2);
-    assert_eq!(pending.image_reads.len(), 1);
-    pending.retire(3);
-    assert!(pending.image_reads.is_empty());
+    Rec::at(tracker(3, 0)).record(&[sampled.clone()], &[]);
+    let mut access = sampled.internal.access.lock().unwrap();
+    access.sources(&tracker(4, 2));
+    assert_eq!(access.reads.len(), 1);
+    access.sources(&tracker(4, 3));
+    assert!(access.reads.is_empty());
+    drop(access);
 
-    let mut pending = PendingAccesses::default();
-    for i in 0..=MAX_PENDING_BUFFER_WRITES as u64 {
+    let mut pending = Rec::new();
+    for i in 0..=MAX_WRITES as u64 {
         flush(&mut pending, &[], &[write(i * 16..i * 16 + 16)]);
         flush(&mut pending, &[], &[read(i * 16..i * 16 + 16)]);
     }
-    pending.retire(1);
-    let [every] = pending.buffer_writes.as_slice() else {
-        panic!("one folded write")
-    };
-    assert_eq!(every.write.range, EVERY_BUFFER);
-    assert!(every.visible_to(S::VERTEX_SHADER, A::SHADER_STORAGE_READ));
+    // The next recording, once the first completed: its write folds the completed ones.
+    let end = (MAX_WRITES as u64 + 1) * 16;
+    let mut next = Rec::at(tracker(2, 1));
+    flush(&mut next, &[], &[write(end..end + 16)]);
+    {
+        let state = test_buffer().state.lock().unwrap();
+        let [_, folded] = state.writes.as_slice() else {
+            panic!("the new write and the folded one")
+        };
+        assert_eq!((folded.range.start, folded.range.end), (0, end));
+        assert!(folded.visible_to(S::VERTEX_SHADER, A::SHADER_STORAGE_READ));
+    }
     assert_eq!(
-        flush(&mut pending, &[], &[read(0..16)]),
+        flush(&mut next, &[], &[read(0..16)]),
         None,
         "already visible"
     );
     assert!(
         flush(
-            &mut pending,
+            &mut next,
             &[],
             &[buffer(S::TRANSFER, A::TRANSFER_READ, 0..16)]
         )
@@ -1175,25 +1301,39 @@ fn locations_allocate_from_their_memory_types() {
     );
 }
 
+/// Host access waits for the latest submitted write overlapping its range that its timeline
+/// hasn't completed.
 #[test]
 fn host_access_waits_for_overlapping_incomplete_writes() {
-    use crate::command_buffer::{
-        EVERY_ACCELERATION_STRUCTURE, EVERY_BUFFER, pending::incomplete_write,
-    };
-    let writes = [
-        ((0..16).into(), 3),
-        ((16..32).into(), 5),
-        (EVERY_BUFFER, 0),
-        (EVERY_ACCELERATION_STRUCTURE, 9),
-    ];
+    let mut state = AccessState::default();
+    let write = (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE);
+    state.record(&tracker(3, 0), &[], (0..16).into(), write.0, write.1);
+    state.record(&tracker(5, 0), &[], (16..32).into(), write.0, write.1);
+    state.record(&tracker(9, 0), &[], (32..48).into(), write.0, write.1);
+    state.record(
+        &tracker(9, 0),
+        &[],
+        (64..80).into(),
+        S::COMPUTE_SHADER,
+        A::SHADER_STORAGE_READ,
+    );
+    // Timeline 0 submitted up to 8 (so 9 is still being recorded) and completed `completed`.
     let scan = |range: std::ops::Range<u64>, completed| {
-        incomplete_write(writes.iter().copied(), range.into(), completed)
+        state.incomplete_write_of(range.into(), |_| (completed, 0, 8))
     };
-    assert_eq!(scan(0..64, 0), Some(5), "the latest overlapping value");
-    assert_eq!(scan(8..12, 2), Some(3));
+    assert_eq!(
+        scan(0..64, 0),
+        Some((0, 5)),
+        "the latest submitted overlapping value"
+    );
+    assert_eq!(scan(8..12, 2), Some((0, 3)));
     assert_eq!(scan(8..12, 3), None, "completed");
-    assert_eq!(scan(32..64, 0), None, "touching isn't overlapping");
-    assert_eq!(scan(16..20, 4), Some(5));
+    assert_eq!(
+        scan(32..64, 0),
+        None,
+        "recorded but not submitted, or touching"
+    );
+    assert_eq!(scan(64..80, 0), None, "reads aren't waited for");
 }
 
 #[test]

@@ -162,6 +162,7 @@ impl<T: Copy + 'static> SparseBuffer<T> {
                 address,
                 num_bytes,
                 memory: BufferMemory::Sparse(Pages::new(requirements, true)),
+                state: Default::default(),
                 header: Header::new(live),
             }),
             _type: PhantomData,

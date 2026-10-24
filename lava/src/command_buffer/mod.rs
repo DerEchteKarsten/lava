@@ -29,7 +29,7 @@ use crate::{
         Occlusion, QueryPool, RecordedOn, ScopeInfo, ScopeObserver, Scoped, Timestamp,
         observer::{Observer, Typed},
     },
-    queue::{FamilyInfo, HasCompute, HasGraphics, Kind, QueueKind},
+    queue::{FamilyInfo, HasCompute, HasGraphics, Kind, QueueKind, lock},
     state::{Ctx, Functions, with_debug_name},
 };
 use bytemuck::{NoUninit, Pod, Zeroable};
@@ -41,14 +41,14 @@ use crate::buffer::staging::Staging;
 #[cfg(feature = "ray-tracing-pipeline")]
 use crate::vkobjects::rt_pipeline::BoundRayTracing;
 
+pub(crate) mod access_state;
 mod binding_output;
 pub(crate) mod image_state;
-pub(crate) mod pending;
 mod raster_state;
 use crate::unsized_struct::unsized_struct;
+use access_state::{READ_ACCESS, StructureAccesses, Tracker, WHOLE, WRITE_ACCESS};
 pub use binding_output::{BindingOutput, Bindings, Sections, kind};
 use image_state::{ImageState, check_states, release_states, released_by, take_checked_states};
-use pending::{PendingAccesses, READ_ACCESS, WRITE_ACCESS};
 pub use raster_state::*;
 
 /// A pass's access of a buffer range, made by `BufferSlice::access`.
@@ -79,13 +79,6 @@ impl Debug for BufferAccess<'_> {
 /// it only conflicts with acceleration structure writes (`BufferAccess::overlaps`).
 pub(crate) const EVERY_ACCELERATION_STRUCTURE: Range<u64> = Range {
     start: u64::MAX,
-    end: u64::MAX,
-};
-
-/// The write completed buffer writes fold into (`PendingAccesses::retire`); no buffer starts at
-/// address 0, so none covers it.
-pub(crate) const EVERY_BUFFER: Range<u64> = Range {
-    start: 0,
     end: u64::MAX,
 };
 
@@ -180,7 +173,11 @@ impl<'a> ImageUse<'a> {
 
 pub(crate) struct Recording<'p> {
     pub(crate) handle: vk::CommandBuffer,
-    pub(crate) pending_accesses: &'p mut PendingAccesses,
+    /// Its timeline's reads of every acceleration structure and the structure writes they wait
+    /// for; every other access is tracked in its buffer or image.
+    pub(crate) structures: &'p mut StructureAccesses,
+    /// What its accesses are tagged with.
+    pub(crate) tracker: Tracker,
     pub(crate) timeline: usize,
     pub(crate) value: u64,
     pub(crate) family: FamilyInfo,
@@ -1955,17 +1952,16 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         }
         let view = image.view();
         let aspect = view.format().aspects();
-        (self.rec).release(view.image(), view.states(), view.mip_range, aspect, D::KIND);
+        (self.rec).release(view.internal, view.mip_range, aspect, D::KIND);
     }
 }
 
 impl Recording<'_> {
-    /// Records the release of `mips` of `image`, whose tracked states are `states`, to the
-    /// family of kind `to`; mips nobody owns stay unowned. Panics unless this family owns them.
+    /// Records the release of `mips` of `internal`'s image to the family of kind `to`; mips
+    /// nobody owns stay unowned. Panics unless this family owns them.
     pub(crate) fn release(
         &mut self,
-        image: vk::Image,
-        states: &[AtomicU64],
+        internal: &ImageInternal,
         mips: Range<u32>,
         aspect: vk::ImageAspectFlags,
         to: Kind,
@@ -1973,19 +1969,12 @@ impl Recording<'_> {
         if to == self.family.kind {
             return;
         }
+        let (image, states) = (internal.image, &*internal.states);
         self.check_unpresented(image);
         let (from, to_index) = (self.family.index(self.family.kind), self.family.index(to));
         // It waits for this timeline's accesses of the image; the acquire waits for it through
         // the semaphore its submission signals.
-        let pending = &self.pending_accesses;
-        let tracked = (pending.image_reads.iter().map(|r| &r.read))
-            .chain(pending.image_writes.iter().map(|w| &w.write))
-            .filter(|a| a.image == image);
-        let (mut stage, mut access) = (S2::NONE, vk::AccessFlags2::NONE);
-        for a in tracked {
-            stage |= a.stage;
-            access |= a.access;
-        }
+        let (mut stage, mut access) = lock(&internal.access).sources(&self.tracker);
         if stage.is_empty() {
             stage = S2::ALL_COMMANDS;
             access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
@@ -2024,7 +2013,7 @@ impl Recording<'_> {
         // The family it goes to waits for this submission as a whole. Mips this family still
         // owns keep the image's accesses, which their later accesses wait for.
         if released_by(states, self.family.kind) {
-            self.pending_accesses.forget_image(image);
+            lock(&internal.access).forget(&self.tracker);
         }
     }
 }
@@ -2033,15 +2022,16 @@ impl<'p> Recording<'p> {
     pub(crate) fn new(
         handle: vk::CommandBuffer,
         family: FamilyInfo,
-        pending_accesses: &'p mut PendingAccesses,
-        timeline: usize,
-        value: u64,
+        structures: &'p mut StructureAccesses,
+        tracker: Tracker,
         barrier_log: &'p mut Vec<Barriers>,
         staging: Option<&'p Staging>,
     ) -> Self {
+        let (timeline, value) = (tracker.timeline as usize, tracker.value);
         Self {
             handle,
-            pending_accesses,
+            structures,
+            tracker,
             timeline,
             value,
             family,
@@ -2114,22 +2104,24 @@ impl<'p> Recording<'p> {
             }
         }
         let barriers = compute_barriers(
-            self.pending_accesses,
+            &self.tracker,
+            self.barrier_log,
+            self.structures,
             &self.family,
             image_accesses.clone(),
             buffer_accesses.clone(),
         );
         if let Some(barriers) = barriers {
             self.acquired.extend_from_slice(&barriers.acquired);
-            self.pending_accesses.made_visible(&barriers, self.value);
             self.barrier_log.push(barriers);
-            let barriers = self.barrier_log.last().expect("just pushed");
-            self.pipeline_barrier(barriers);
+            self.pipeline_barrier(self.barrier_log.last().expect("just pushed"));
+            made_visible(&self.tracker, self.barrier_log, image_accesses.clone());
         }
-
-        (self.pending_accesses).record(
-            self.value,
-            image_accesses.map(|image| image.access),
+        record(
+            &self.tracker,
+            self.barrier_log,
+            self.structures,
+            image_accesses,
             buffer_accesses,
         );
     }
@@ -2391,7 +2383,9 @@ impl<'a> BufferAccess<'a> {
 /// The barriers a command with these accesses needs after `pending`. It moves each image's
 /// tracked state, so call it once per command, when the command is recorded.
 pub(crate) fn compute_barriers<'a>(
-    pending: &PendingAccesses,
+    t: &Tracker,
+    log: &[Barriers],
+    structures: &mut StructureAccesses,
     family: &FamilyInfo,
     image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
     buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
@@ -2400,33 +2394,34 @@ pub(crate) fn compute_barriers<'a>(
     let mut dst_stage = vk::PipelineStageFlags2::NONE;
     let mut src_access = vk::AccessFlags2::empty();
     let mut dst_access = vk::AccessFlags2::empty();
+    let mut hazard = |found: Option<(S2, vk::AccessFlags2)>, stage, access| {
+        if let Some((s, a)) = found {
+            src_stage |= s;
+            src_access |= a;
+            dst_stage |= stage;
+            dst_access |= access;
+        }
+    };
 
-    for buffer_access in buffer_accesses {
-        let is_write = buffer_access.access.intersects(WRITE_ACCESS);
-        let is_read = buffer_access.access.intersects(READ_ACCESS);
-        if !is_read && !is_write {
+    for b in buffer_accesses {
+        let (stage, access) = (b.stage, b.access);
+        if !access.intersects(READ_ACCESS | WRITE_ACCESS) {
             continue;
         }
-        if is_write {
-            for pending in pending
-                .buffer_reads
-                .iter()
-                .filter(|r| r.overlaps(&buffer_access))
-            {
-                src_stage |= pending.stage;
-                src_access |= pending.access;
-                dst_stage |= buffer_access.stage;
-                dst_access |= buffer_access.access;
+        match b.buffer {
+            // A read of every acceleration structure.
+            None => hazard(
+                structures.read_hazards(t, log, stage, access),
+                stage,
+                access,
+            ),
+            Some(buffer) => {
+                let found = lock(&buffer.state).hazards(t, log, b.range, stage, access);
+                hazard(found, stage, access);
+                if access.contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
+                    hazard(structures.write_hazards(t), stage, access);
+                }
             }
-        }
-        for w in pending.buffer_writes.iter().filter(|w| {
-            w.write.overlaps(&buffer_access)
-                && !w.visible_to(buffer_access.stage, buffer_access.access)
-        }) {
-            src_stage |= w.write.stage;
-            src_access |= w.write.access;
-            dst_stage |= buffer_access.stage;
-            dst_access |= buffer_access.access;
         }
     }
 
@@ -2438,33 +2433,12 @@ pub(crate) fn compute_barriers<'a>(
         {
             continue;
         }
-        let image_access = image.access;
-        let is_write = image_access.access.intersects(WRITE_ACCESS);
-        let is_read = image_access.access.intersects(READ_ACCESS);
-        if !is_read && !is_write {
+        let (stage, access) = (image.access.stage, image.access.access);
+        if !access.intersects(READ_ACCESS | WRITE_ACCESS) {
             continue;
         }
-        if is_write {
-            for pending in pending
-                .image_reads
-                .iter()
-                .filter(|r| r.image == image_access.image)
-            {
-                src_stage |= pending.stage;
-                src_access |= pending.access;
-                dst_stage |= image_access.stage;
-                dst_access |= image_access.access;
-            }
-        }
-        for w in pending.image_writes.iter().filter(|w| {
-            w.write.image == image_access.image
-                && !w.visible_to(image_access.stage, image_access.access)
-        }) {
-            src_stage |= w.write.stage;
-            src_access |= w.write.access;
-            dst_stage |= image_access.stage;
-            dst_access |= image_access.access;
-        }
+        let found = lock(&image.internal.access).hazards(t, log, WHOLE, stage, access);
+        hazard(found, stage, access);
     }
 
     let kind = family.kind;
@@ -2489,6 +2463,8 @@ pub(crate) fn compute_barriers<'a>(
         } else {
             access.access
         };
+        // What a transition waits for: the image's tracked accesses.
+        let tracked = lock(&image.internal.access).sources(t);
         take_checked_states(
             image.states(),
             access.mip_range,
@@ -2527,14 +2503,7 @@ pub(crate) fn compute_barriers<'a>(
                 // The transition waits for the image's tracked accesses. Without any, a
                 // submission it waited for may still use it, so it waits for everything, unless
                 // no command ever accessed it.
-                let (mut src_stage, mut src_access) = (S2::NONE, vk::AccessFlags2::NONE);
-                for p in (pending.image_reads.iter().map(|r| &r.read))
-                    .chain(pending.image_writes.iter().map(|w| &w.write))
-                    .filter(|p| p.image == access.image)
-                {
-                    src_stage |= p.stage;
-                    src_access |= p.access;
-                }
+                let (mut src_stage, mut src_access) = tracked;
                 let from_present = old.layout == vk::ImageLayout::PRESENT_SRC_KHR;
                 let fresh = old == ImageState::UNDEFINED;
                 if !fresh && (src_stage.is_empty() || from_present) {
@@ -2604,6 +2573,61 @@ pub(crate) fn compute_barriers<'a>(
         }),
         images: image_barriers,
     })
+}
+
+/// After a command's barriers, the last of `log`: a layout transition or queue family acquire
+/// is its image's latest write, at its barriers' destination stages and visible there
+/// (`AccessState::transition`). Memory barriers make writes visible through the log.
+pub(crate) fn made_visible<'a>(
+    t: &Tracker,
+    log: &[Barriers],
+    image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
+) {
+    let Some(barriers) = log.last() else { return };
+    let moved = barriers.acquires.iter().chain(&barriers.images);
+    for (i, barrier) in moved.clone().enumerate() {
+        let image = barrier.image;
+        if moved.clone().take(i).any(|b| b.image == image) {
+            continue;
+        }
+        let scopes: SmallVec<[(S2, vk::AccessFlags2); 2]> = (moved.clone().skip(i))
+            .filter(|b| b.image == image)
+            .map(|b| (b.dst_stage_mask, b.dst_access_mask))
+            .collect();
+        if let Some(access) = image_accesses.clone().find(|a| a.access.image == image) {
+            lock(&access.internal.access).transition(t, log, &scopes);
+        }
+    }
+}
+
+/// Tracks the accesses of a command recorded after the barriers of `log`, in their buffers and
+/// images, and in `structures` for every acceleration structure read and structure write.
+pub(crate) fn record<'a>(
+    t: &Tracker,
+    log: &[Barriers],
+    structures: &mut StructureAccesses,
+    image_accesses: impl Iterator<Item = ImageUse<'a>>,
+    buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
+) {
+    for b in buffer_accesses {
+        match b.buffer {
+            None => {
+                if b.access.intersects(READ_ACCESS) {
+                    structures.record_read(t, b.stage, b.access);
+                }
+            }
+            Some(buffer) => {
+                lock(&buffer.state).record(t, log, b.range, b.stage, b.access);
+                if (b.access).contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
+                    structures.record_write(t, log, b.stage, b.access);
+                }
+            }
+        }
+    }
+    for image in image_accesses {
+        let access = &image.access;
+        lock(&image.internal.access).record(t, log, WHOLE, access.stage, access.access);
+    }
 }
 
 /// Every layer of `mips`: an image's tracked states cover all its layers.
