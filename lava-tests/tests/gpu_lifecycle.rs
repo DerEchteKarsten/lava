@@ -7,7 +7,7 @@ use common::panic_message;
 use glam::UVec2;
 use lava::{
     Config, Ctx, Error,
-    bindless::{self, Heap, Sampled},
+    bindless::Sampled,
     buffer::{Buffer, Readback},
     image::{Image, format::R8G8B8A8Unorm, usage::usage},
     pipeline::{PassEntry, PassKind, PassMap},
@@ -43,20 +43,6 @@ fn sampled_slot(image: &Texture) -> u32 {
 /// What one context does: typed errors, timelines and destruction, waits, and a refused
 /// shutdown.
 fn exercise() {
-    let empty = bindless::reserve::<Sampled>(0).unwrap();
-    assert!(empty.is_empty() && empty.slots().is_empty());
-    let full = bindless::reserve::<Sampled>(1 << 24);
-    assert!(
-        matches!(
-            full,
-            Err(Error::OutOfBindlessSlots {
-                heap: Heap::Image,
-                ..
-            })
-        ),
-        "{full:?}"
-    );
-
     let mut timeline = Timeline::<Graphics>::new(1, 0).unwrap();
     // Named for debuggers and allocator reports.
     let mut readback = Buffer::<u32, Readback>::readback(4)

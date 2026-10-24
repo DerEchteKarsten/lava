@@ -1,4 +1,4 @@
-//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (queued bindless rewrites first, after the last sparse binding; with `submit_profiled` inside a hardware counter query, and `capture` once per counter pass) and sparse bindings (`submit_sparse`, ordered with them by the semaphore), the base value below which a new timeline of an index ignores its former owners' tracked accesses, and the reads of every acceleration structure; values no submission signals (a dropped timeline's stamp, a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
+//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (after the last sparse binding; with `submit_profiled` inside a hardware counter query, and `capture` once per counter pass) and sparse bindings (`submit_sparse`, ordered with them by the semaphore), the base value below which a new timeline of an index ignores its former owners' tracked accesses, and the reads of every acceleration structure; values no submission signals (a dropped timeline's stamp, a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
 use std::{
     fmt,
     marker::PhantomData,
@@ -627,11 +627,6 @@ impl<K: QueueKind> Submission<'_, K> {
             let _ = &profile;
         }));
         Bindless::bind(slot.cmd, K::KIND);
-        // Rewrites of reserved slots, ordered after the queue's earlier commands.
-        let queued = match K::KIND {
-            Kind::Transfer => Default::default(),
-            _ => Bindless::flush_queued(slot.cmd),
-        };
         let recorded =
             begun.and_then(|()| std::panic::catch_unwind(AssertUnwindSafe(|| record(&mut cmd))));
         lifetime::RECORDING.set(was_recording);
@@ -740,7 +735,6 @@ impl<K: QueueKind> Submission<'_, K> {
             if let Some(staging) = staging {
                 staging.requeue(value);
             }
-            Bindless::requeue(queued);
             let replayed = (|| -> Result<()> {
                 unsafe {
                     device.reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())?;

@@ -867,13 +867,12 @@ impl<U: StaticUsage> PresentSurface<U> {
                 layers: (0..1).into(),
                 usage,
             });
-            bindless::bind_raw(
+            bindless::write_descriptors(
                 images,
                 swapchain
                     .images
                     .iter()
                     .map(|image| image.internal.whole.handle()),
-                false,
             )?;
             Ok(())
         })();

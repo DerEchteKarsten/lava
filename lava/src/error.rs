@@ -176,7 +176,7 @@ impl fmt::Display for Error {
             }
             Error::ObjectsAlive { count } => write!(
                 f,
-                "{count} lava objects or calls are still alive, so lava wasn't shut down: drop every buffer, image, timeline, uploader, surface, sampler, slot range, query pool, acceleration structure and structure arena first"
+                "{count} lava objects or calls are still alive, so lava wasn't shut down: drop every buffer, image, timeline, uploader, surface, sampler, query pool, acceleration structure and structure arena first"
             ),
             Error::Vulkan(result) => write!(f, "Vulkan error {result:?} ({result})"),
             Error::Loading(err) => write!(f, "the Vulkan library couldn't be loaded: {err}"),

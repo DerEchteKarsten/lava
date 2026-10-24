@@ -42,6 +42,34 @@ fn sample(gpu: &mut common::Gpu, bits: u32, reads: &[ImageUse<'_>]) -> Vec4 {
     out.host()[0]
 }
 
+/// `sample` in a submission the host doesn't wait for: its `Wait` and what it writes.
+fn sample_later(
+    gpu: &mut common::Gpu,
+    bits: u32,
+    reads: &[ImageUse<'_>],
+) -> (lava::Wait, lava::Buffer<Vec4, lava::buffer::Readback>) {
+    let out = zeroed_buffer::<Vec4>(3);
+    let submission = gpu.timeline.begin().unwrap();
+    let wait = submission
+        .submit(|cmd| {
+            let bindings = TestSample::push_bindings(
+                TestSampleArgs {
+                    out: out.range(..),
+                    first: nearest(),
+                    second: nearest(),
+                    compare: NO_SAMPLER,
+                    slot: bits,
+                    uv: Vec2::splat(0.5),
+                    reference: 0.0,
+                },
+                Some(Accesses::images(reads)),
+            );
+            cmd.compute(&bindings, [1, 1, 1]);
+        })
+        .unwrap();
+    (wait, out)
+}
+
 fn has(format: vk::Format, feature: vk::FormatFeatureFlags2) -> bool {
     Ctx::format_features(format).contains(feature)
 }
@@ -799,8 +827,7 @@ fn mutable_format_images_have_views_of_their_class() {
     let image = Srgb::new(UVec2::splat(4)).unwrap().bind_sampled().unwrap();
     let unorm = image.whole_view().reinterpret::<R8G8B8A8Unorm>();
     assert_eq!(unorm.format().vk_format(), vk::Format::R8G8B8A8_UNORM);
-    let slots = bindless::reserve::<bindless::Combined>(1).unwrap();
-    bindless::bind([unorm], [slots.handle(0)]);
+    let handle = unorm.bind::<bindless::Combined>().unwrap();
     // Rendered through the UNORM view, 0.5 is stored as 128, which sRGB reads as 0.216.
     gpu.submit(|cmd| {
         cmd.raster(
@@ -813,7 +840,7 @@ fn mutable_format_images_have_views_of_their_class() {
     let srgb = sample(&mut gpu, image.handle::<bindless::Sampled>().bits(), &reads);
     let linear = sample(
         &mut gpu,
-        slots.handle(0).as_sampled().bits(),
+        handle.as_sampled().bits(),
         &[ImageUse::sampled_read(unorm)],
     );
     assert!((linear.x - 128.0 / 255.0).abs() < 1e-3, "{linear}");
@@ -833,30 +860,44 @@ fn mutable_format_images_have_views_of_their_class() {
 
 // ---- fit -------------------------------------------------------------------------------------
 
+/// A fitted image is bound again as before, at new slots: frames recorded before it read the
+/// old image, which lives on until they are done, later ones the new one through its new
+/// handle.
 #[test]
-fn fitted_images_keep_their_slots() {
+fn fitted_images_are_bound_again_at_new_slots() {
     let mut gpu = gpu();
     type Texture = Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>;
     let mut image = Texture::new(UVec2::splat(2))
         .unwrap()
         .bind_sampled()
         .unwrap();
-    let handle = image.handle::<bindless::Sampled>();
+    let old = image.handle::<bindless::Sampled>();
     gpu.submit(|cmd| cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.0, 1.0]));
     assert!(
         !image.fit(UVec2::splat(2)).unwrap(),
         "the same extent keeps the image"
     );
+    // A frame in flight that reads the old image through its handle.
+    let reads = [ImageUse::sampled_read(image.whole_view())];
+    let (in_flight, mut before) = sample_later(&mut gpu, old.bits(), &reads);
+    drop(reads);
     assert!(image.fit(UVec2::splat(8)).unwrap());
     assert_eq!(image.extent(), UVec2::splat(8));
-    assert_eq!(image.handle::<bindless::Sampled>(), handle, "the same slot");
+    let new = image.handle::<bindless::Sampled>();
+    assert_ne!(new, old, "new slots");
+    in_flight.block().unwrap();
+    assert_eq!(
+        before.host()[0],
+        Vec4::new(1.0, 0.0, 0.0, 1.0),
+        "the old image"
+    );
     gpu.submit(|cmd| cmd.clear_image(image.whole_view(), [0.0, 1.0, 0.0, 1.0]));
     let reads = [ImageUse::sampled_read(image.whole_view())];
     assert_eq!(
-        sample(&mut gpu, handle.bits(), &reads),
+        sample(&mut gpu, new.bits(), &reads),
         Vec4::new(0.0, 1.0, 0.0, 1.0)
     );
-    // A mip chain's mips keep theirs.
+    // A mip chain's mips are bound again as a block.
     let mut chain = MipChain::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::with_mip_levels(
         UVec2::splat(4),
         2,
@@ -864,9 +905,9 @@ fn fitted_images_keep_their_slots() {
     .unwrap()
     .bind_mips_sampled()
     .unwrap();
-    let mip1 = chain.mip_view(1).handle::<bindless::Sampled>();
     assert!(chain.fit(UVec2::splat(8)).unwrap());
-    assert_eq!(chain.mip_view(1).handle::<bindless::Sampled>(), mip1);
+    let mip1 = chain.mip_view(1).handle::<bindless::Sampled>();
+    assert_eq!(chain.mip_view(0).handle::<bindless::Sampled>().mip(1), mip1);
     gpu.submit(|cmd| cmd.clear_image(chain.mip_view(1), [0.0, 0.0, 1.0, 1.0]));
     let reads = [ImageUse::sampled_read(chain.mip_view(1))];
     assert_eq!(
@@ -876,11 +917,6 @@ fn fitted_images_keep_their_slots() {
     // Too small for its mips: an error, and the image stays.
     assert!(chain.fit(UVec2::ONE).is_err());
     assert_eq!(chain.extent(), UVec2::splat(8));
-    // Fitted, then dropped before a submission: the slot's queued rewrite goes with it.
-    let mut dropped = Texture::new(UVec2::ONE).unwrap().bind_sampled().unwrap();
-    dropped.fit(UVec2::splat(2)).unwrap();
-    drop(dropped);
-    gpu.submit(|_| {});
 }
 
 // ---- sparse residency ------------------------------------------------------------------------

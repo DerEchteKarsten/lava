@@ -1,15 +1,16 @@
-//! Image views and the boxes of texels transfers take: `ImageView` (a borrowed range of an image's mips and layers, its handle, its `VkImageView` and reinterpreted formats), `ImageSlice` (a box of one of a view's mips), `TexelBuffer` (buffer rows for copies), and the image transfer commands (clears, blits, image and buffer copies) with their format, box and block checks
+//! Image views and the boxes of texels transfers take: `ImageView` (a borrowed range of an image's mips and layers, its handle (`bind` for a view bound on its own), its `VkImageView` and reinterpreted formats), `ImageSlice` (a box of one of a view's mips), `TexelBuffer` (buffer rows for copies), and the image transfer commands (clears, blits, image and buffer copies) with their format, box and block checks
 use std::{iter, range::Range, sync::Arc};
 
 use crate::vk;
 use lava_macros::validation_trace;
 
 use crate::{
-    bindless::{Allocatable, ImageHandle},
+    bindless::{self, Allocatable, ImageHandle},
     buffer::slice::BufferSlice,
     command_buffer::{CommandBuffer, ImageAccess, ImageUse},
+    error::Result,
     image::{
-        Image, ImageInternal, Views,
+        Image, ImageInternal, ViewKey, Views,
         dim::{D2, D2Array, Dim, box_inside, box_is_empty},
         format::{
             self, Block, ColorAspect, DepthStencilAspect, Format, Numeric, StaticFormat,
@@ -99,19 +100,51 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
     /// The view's handle as `K`, for a shader that reads it through `K`'s descriptors. Panics
     /// unless it is bound with them: a `Sampled` handle needs `bind_sampled` or `bind_combined`
     /// (`bind_mips_*` for a mip's view), a `Storage` one `bind_storage` or `bind_combined`, a
-    /// `Combined` one `bind_combined`.
+    /// `Combined` one `bind_combined`; a view the image's binds don't cover (a layer, some
+    /// mips or layers, another format) [`Self::bind`].
     #[track_caller]
     pub fn handle<K: Allocatable>(&self) -> ImageHandle<K> {
-        self.handle.narrow().unwrap_or_else(|| {
-            panic!(
-                "a shader reads the view of {:?} as {}, which it isn't bound as ({:?}): call `{}` \
-                 (or `bind_combined` for both descriptors, `bind_mips_*` for a mip's view) on its image",
-                self.internal.image,
-                std::any::type_name::<K>().rsplit("::").next().unwrap(),
-                self.handle,
-                K::BIND,
-            )
+        (self.handle.narrow())
+            .or_else(|| self.internal.cache.handle(self.key()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a shader reads the view of {:?} as {}, which it isn't bound as ({:?}): call \
+                     `{}` (or `bind_combined` for both descriptors, `bind_mips_*` for a mip's view) \
+                     on its image, or `bind::<{}>()` on a view of some of its layers, mips or \
+                     another format",
+                    self.internal.image,
+                    std::any::type_name::<K>().rsplit("::").next().unwrap(),
+                    self.handle,
+                    K::BIND,
+                    std::any::type_name::<K>().rsplit("::").next().unwrap(),
+                )
+            })
+    }
+
+    /// Binds this view (its mips, layers and format) with `K`'s descriptors at free slots,
+    /// written right away and freed with the image, and returns the handle; [`Self::handle`]
+    /// finds it from then on, also on views made again. The view's own handle where it has
+    /// `K`'s descriptors already (the image's `bind_*`), and the same handle every time.
+    /// Panics unless the image's usage has the descriptors' (sampled, storage);
+    /// `Error::OutOfBindlessSlots` when the heap is full.
+    #[validation_trace]
+    pub fn bind<K: Allocatable>(&self) -> Result<ImageHandle<K>> {
+        if let Some(handle) = self.handle.narrow() {
+            return Ok(handle);
+        }
+        let image = self.shader_image();
+        (self.internal.cache).bind(self.key(), |handle| {
+            bindless::write_descriptors([image], [handle])
         })
+    }
+
+    fn key(&self) -> ViewKey {
+        ViewKey::new(
+            self.format.vk_format(),
+            self.mip_range,
+            self.layers,
+            D::VIEW_TYPE,
+        )
     }
 
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
@@ -184,8 +217,8 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
 
     /// The same mips and layers as `F2`, a format of the image's compatibility class (sRGB
     /// texels as UNORM ones for storage, `R32Uint` for atomics on `R32Sfloat`): for an image
-    /// whose usage has `MutableFormat`. It has no handle (bind it into reserved slots with
-    /// `bindless::bind`) and, for an attachment image, its own `VkImageView`, made on first
+    /// whose usage has `MutableFormat`. It has no handle until it is bound on its own
+    /// ([`Self::bind`]) and, for an attachment image, its own `VkImageView`, made on first
     /// use. Panics for a format of another class (see `reinterpret_as`).
     #[track_caller]
     pub fn reinterpret<F2: StaticFormat>(self) -> ImageView<'a, F2, U, D>
@@ -280,8 +313,8 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
 
 impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U, D2Array> {
     /// Layer `layer` of the view, as a 2D view of the same mips: to render into one layer, copy
-    /// it or bind it alone (`bindless::bind`). It has no handle of its own (the array's
-    /// `bind_*` bind the array). Panics for a layer the view doesn't show.
+    /// it or bind it alone ([`ImageView::bind`]; the array's `bind_*` bind the array). Panics
+    /// for a layer the view doesn't show.
     #[track_caller]
     pub fn layer(self, layer: u32) -> ImageView<'a, F, U, D2> {
         let layers = self.layers(layer..layer + 1);
@@ -300,7 +333,8 @@ impl<'a, F: Format, U: ImageUsage> ImageView<'a, F, U, D2Array> {
 
     /// Layers `layers` of the view (counted from the image's first), still an array: for a
     /// layered or multiview rendering into some layers. Panics for layers the view doesn't
-    /// show; fewer than the view's have no handle.
+    /// show; fewer than the view's have no handle until they are bound on their own
+    /// ([`ImageView::bind`]).
     #[track_caller]
     pub fn layers(self, layers: std::ops::Range<u32>) -> Self {
         assert!(

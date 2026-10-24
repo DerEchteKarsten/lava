@@ -91,14 +91,36 @@ fn create_view(
 /// own (one layer of an array, a range of layers), by mips, layers and view type; destroyed
 /// with the image.
 #[derive(Debug, Default)]
-pub(crate) struct ViewCache(Mutex<Vec<(ViewKey, vk::ImageView)>>);
+pub(crate) struct ViewCache {
+    views: Mutex<Vec<(ViewKey, vk::ImageView)>>,
+    /// The handles of views bound on their own (`ImageView::bind`): layers, mip ranges and
+    /// reinterpreting views, freed with the image.
+    handles: Mutex<Vec<(ViewKey, ImageHandle)>>,
+}
 
+/// What a view shows: its format, mips, layers and view type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ViewKey {
+pub(crate) struct ViewKey {
     format: vk::Format,
     mips: (u32, u32),
     layers: (u32, u32),
     view_type: vk::ImageViewType,
+}
+
+impl ViewKey {
+    pub(crate) fn new(
+        format: vk::Format,
+        mips: Range<u32>,
+        layers: Range<u32>,
+        view_type: vk::ImageViewType,
+    ) -> Self {
+        ViewKey {
+            format,
+            mips: (mips.start, mips.end),
+            layers: (layers.start, layers.end),
+            view_type,
+        }
+    }
 }
 
 impl ViewCache {
@@ -116,13 +138,8 @@ impl ViewCache {
         layers: Range<u32>,
         usage: vk::ImageUsageFlags,
     ) -> vk::ImageView {
-        let key = ViewKey {
-            format,
-            mips: (mips.start, mips.end),
-            layers: (layers.start, layers.end),
-            view_type,
-        };
-        let mut views = crate::queue::lock(&self.0);
+        let key = ViewKey::new(format, mips, layers, view_type);
+        let mut views = crate::queue::lock(&self.views);
         if let Some(&(_, view)) = views.iter().find(|(k, _)| *k == key) {
             return view;
         }
@@ -134,10 +151,49 @@ impl ViewCache {
 
     fn take(&mut self) -> Vec<vk::ImageView> {
         let views = self
-            .0
+            .views
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         mem::take(views).into_iter().map(|(_, view)| view).collect()
+    }
+
+    /// The handle the view `key` was bound with on its own that has `K`'s descriptors.
+    pub(crate) fn handle<K: Allocatable>(&self, key: ViewKey) -> Option<ImageHandle<K>> {
+        (crate::queue::lock(&self.handles).iter())
+            .filter(|(k, _)| *k == key)
+            .find_map(|(_, handle)| handle.narrow())
+    }
+
+    /// The handle of `key` with `K`'s descriptors, bound by `bind` (which writes them into the
+    /// slots it is given) the first time it is asked for.
+    pub(crate) fn bind<K: Allocatable>(
+        &self,
+        key: ViewKey,
+        bind: impl FnOnce(ImageHandle) -> Result<()>,
+    ) -> Result<ImageHandle<K>> {
+        let mut handles = crate::queue::lock(&self.handles);
+        let found = (handles.iter()).filter(|(k, _)| *k == key);
+        if let Some(handle) = found.clone().find_map(|(_, handle)| handle.narrow()) {
+            return Ok(handle);
+        }
+        let handle = ImageHandle::<K>::new(bindless::allocate(K::WIDTH)?);
+        if let Err(err) = bind(handle.erase()) {
+            bindless::free_handle(handle.erase());
+            return Err(err);
+        }
+        handles.push((key, handle.erase()));
+        Ok(handle)
+    }
+
+    fn take_handles(&mut self) -> Vec<ImageHandle> {
+        let handles = self
+            .handles
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mem::take(handles)
+            .into_iter()
+            .map(|(_, handle)| handle)
+            .collect()
     }
 }
 
@@ -321,13 +377,11 @@ impl Drop for ImageInternal {
         // One mip's view is the whole view, destroyed once.
         views.extend((self.mips.iter()).map(|m| m.view).filter(|&v| v != whole));
         views.retain(|&view| view != vk::ImageView::null());
-        let handles: SmallVec<[ImageHandle; 1]> = std::iter::once(&self.whole)
+        let mut handles: SmallVec<[ImageHandle; 1]> = std::iter::once(&self.whole)
             .chain(&self.mips)
             .map(|slot| slot.take_handle())
             .collect();
-        for &handle in &handles {
-            bindless::forget_handle(handle);
-        }
+        handles.extend(self.cache.take_handles());
         let swapchain = matches!(memory, ImageMemory::Swapchain);
         let destroy = move || {
             for view in views {
@@ -658,25 +712,18 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     }
 
     /// Recreates the image at `extent` unless it has that extent already, with the same
-    /// format, usage, mips and layers, and returns whether it did. The new image keeps the
-    /// bindless slots of the old one's `bind_*` bindings: their descriptors are rewritten in
-    /// submission order, as [`bindless::bind`] rewrites reserved slots, so frames in flight
-    /// read the old image (which lives until they are done) and submissions after the next
-    /// graphics or compute submission the new one. Slots it was bound into with
-    /// `bindless::bind` keep the old image's descriptors: bind the new one there too. The new
-    /// image's contents are undefined, its name is gone, and the old views' borrows have
-    /// ended (`&mut self`). Errors where the old image's description doesn't fit `extent`
-    /// (too few texels for its mips); panics on a thread that is recording.
+    /// format, usage, mips and layers, and returns whether it did. The new image is bound like
+    /// the old one (`bind_*`, `bind_mips_*`) at new slots, so its handles differ: write them
+    /// wherever the old ones were stored. Views bound on their own (`ImageView::bind`) aren't
+    /// bound again. The old image lives on until nothing reaches it any more (frames in flight
+    /// read it); the new one's contents are undefined, its name is gone, and the old views'
+    /// borrows have ended (`&mut self`). Errors where the old image's description doesn't fit
+    /// `extent` (too few texels for its mips).
     #[validation_trace]
     pub fn fit(&mut self, extent: D::Extent) -> Result<bool> {
         if self.extent == extent {
             return Ok(false);
         }
-        assert!(
-            !lifetime::RECORDING.get(),
-            "`Image::fit` is called inside a recording, whose commands would read the old \
-             descriptors: fit images before `submit`"
-        );
         let old = &self.internal;
         let mut new = RawImage::<F, U, D>::create(
             self.format,
@@ -689,26 +736,15 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
         )?;
         new.allocate()?;
         let new = Image::<F, U, D, V>::from_raw(new)?;
-        // The new views take the old ones' slots, which the old views then don't free.
-        let whole = std::iter::once((&old.whole, &new.internal.whole, None));
-        let mips = (old.mips.iter().zip(&new.internal.mips).enumerate())
-            .map(|(mip, (old, new))| (old, new, Some(mip as u32)));
-        for (old_slot, new_slot, mip) in whole.chain(mips) {
-            let handle = old_slot.take_handle();
-            new_slot.set_handle(handle);
-            if handle.is_null() {
-                continue;
-            }
-            let image = match mip {
-                None => new.whole_view().shader_image(),
-                // A mip's descriptor shows that mip alone.
-                Some(mip) => {
-                    let mut view = new.whole_view();
-                    view.mip_range = (mip..mip + 1).into();
-                    view.shader_image()
-                }
-            };
-            bindless::rebind(image, handle)?;
+        // Bound as the old one was, at new slots.
+        let whole = old.whole.handle();
+        if !whole.is_null() {
+            new.bind_whole_as(whole.kind())?;
+        }
+        if let Some(first) = old.mips.first().map(ViewSlot::handle)
+            && !first.is_null()
+        {
+            new.bind_mips_as(first.kind())?;
         }
         *self = new;
         Ok(true)
@@ -851,16 +887,39 @@ impl<F: Format, U: ImageUsage, D: Dim, V: Views> Image<F, U, D, V> {
     }
 
     fn bind_whole<K: Allocatable>(self) -> Result<Self> {
-        let whole = &self.internal.whole;
-        let handle = whole.handle();
+        let handle = self.internal.whole.handle();
         assert!(
             handle.is_null(),
             "the image is bound already ({handle:?}): bind it once, with `bind_combined` for both descriptors"
         );
-        let bound = ImageHandle::<K>::new(bindless::allocate(K::WIDTH)?).erase();
-        whole.set_handle(bound);
-        bindless::bind_raw([self.whole_view().shader_image()], [bound], false)?;
+        self.bind_whole_as(K::BITS)?;
         Ok(self)
+    }
+
+    /// Binds the whole view with the descriptors of `kind` (a handle's bits 30 and 31), at new
+    /// slots.
+    fn bind_whole_as(&self, kind: u32) -> Result<()> {
+        let width = ImageHandle::<Dynamic>::width_of(kind);
+        let bound = ImageHandle::with_kind(kind, bindless::allocate(width)?);
+        self.internal.whole.set_handle(bound);
+        bindless::write_descriptors([self.whole_view().shader_image()], [bound])
+    }
+
+    /// Binds each mip's view with the descriptors of `kind`, one block of contiguous new slots
+    /// for all.
+    fn bind_mips_as(&self, kind: u32) -> Result<()> {
+        let mips = &self.internal.mips;
+        let width = ImageHandle::<Dynamic>::width_of(kind);
+        let start = bindless::allocate(mips.len() as u32 * width)?;
+        for (level, mip) in mips.iter().enumerate() {
+            mip.set_handle(ImageHandle::with_kind(kind, start + level as u32 * width));
+        }
+        let images = (mips.iter().enumerate()).map(|(level, mip)| {
+            let level = level as u32;
+            self.view(mip.view, (level..level + 1).into(), mip.handle())
+                .shader_image()
+        });
+        bindless::write_descriptors(images, mips.iter().map(ViewSlot::handle))
     }
 }
 
@@ -872,23 +931,11 @@ impl<F: Format, U: ImageUsage, D: Dim, V: MipViews> Image<F, U, D, V> {
     }
 
     fn bind_mips<K: Allocatable>(self) -> Result<Self> {
-        let mips = &self.internal.mips;
         assert!(
-            mips.iter().all(|mip| mip.handle().is_null()),
+            self.internal.mips.iter().all(|mip| mip.handle().is_null()),
             "the mips are bound already: bind them once, with `bind_mips_combined` for both descriptors"
         );
-        let first = bindless::allocate(mips.len() as u32 * K::WIDTH)?;
-        for (level, mip) in mips.iter().enumerate() {
-            mip.set_handle(ImageHandle::<K>::new(first + level as u32 * K::WIDTH).erase());
-        }
-        let levels = 0..self.mip_levels();
-        bindless::bind_raw(
-            levels
-                .clone()
-                .map(|level| self.mip_view(level).shader_image()),
-            mips.iter().map(|mip| mip.handle()),
-            false,
-        )?;
+        self.bind_mips_as(K::BITS)?;
         Ok(self)
     }
 

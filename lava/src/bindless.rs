@@ -1,5 +1,5 @@
-//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, freed with their images) or in ranges the application reserves (`reserve`, rewritten in submission order by `bind`, as a fitted image's slots are by `rebind`), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap
-use std::{collections::BTreeMap, marker::PhantomData, ops::Range, ptr::NonNull, sync::Mutex};
+//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, written right away, freed with their images; slot 0 never, the null handle), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap (slot 0 lava's default sampler)
+use std::{marker::PhantomData, ops::Range, ptr::NonNull, sync::Mutex};
 
 use crate::error::{Error, Result};
 use crate::vk::{self, BorderColor, CompareOp, Filter, SamplerAddressMode, SamplerMipmapMode};
@@ -27,17 +27,9 @@ pub(crate) struct Bindless {
     images: HeapLayout,
     samplers: HeapLayout,
     free: Mutex<Ranges>,
-    /// The live slot ranges of `reserve`, which `bind` writes.
-    reserved: Mutex<Vec<Range<u32>>>,
-    /// The slots of images `Image::fit` recreated, whose rewrites are queued like `bind`'s
-    /// until the image is dropped.
-    rebound: Mutex<Vec<Range<u32>>>,
     free_samplers: Mutex<Ranges>,
     resource_heap: HeapBuffer,
     sampler_heap: HeapBuffer,
-    /// Descriptors `bind` wrote for reserved slots, by byte offset in the resource heap, which
-    /// the next submission of a timeline with shaders copies there before its commands.
-    queued: Mutex<Queued>,
 }
 
 static BINDLESS: Global<Bindless> = Global::new();
@@ -64,12 +56,6 @@ impl std::fmt::Display for Heap {
 const MAX_IMAGE_SLOTS: u32 = 1 << 16;
 /// The most samplers.
 const MAX_SAMPLERS: u32 = 1 << 12;
-
-/// Descriptors waiting for a submission to copy them into the resource heap, by byte offset.
-pub(crate) type Queued = BTreeMap<u64, SmallVec<[u8; 64]>>;
-
-/// The most bytes one `vkCmdUpdateMemoryKHR` writes.
-const MAX_UPDATE: usize = 65536;
 
 /// Where a heap keeps its descriptors: `count` descriptors `stride` bytes apart from offset 0,
 /// then the implementation's reserved range from `reserved_offset` to `size`. The stride is what
@@ -176,7 +162,7 @@ impl Ranges {
 
     /// The first `n` contiguous free slots (first fit), which are taken.
     pub(crate) fn take(&mut self, n: u32) -> Option<u32> {
-        assert!(n > 0, "a slot range holds at least one slot");
+        assert!(n > 0, "a run of slots holds at least one");
         let i = self
             .free
             .iter()
@@ -237,114 +223,6 @@ pub(crate) fn free_handle(handle: ImageHandle) {
     if let Some(slots) = handle.slots() {
         free(slots);
     }
-}
-
-/// Writes `image`'s descriptors into the slots of `handle`, which an image `Image::fit`
-/// replaced had, in submission order like [`bind`]'s: frames in flight read the old image's.
-pub(crate) fn rebind(image: ShaderImage, handle: ImageHandle) -> Result<()> {
-    let Some(slots) = handle.slots() else {
-        return Ok(());
-    };
-    {
-        let mut rebound = lock(&Bindless::get().rebound);
-        if !rebound.contains(&slots) {
-            rebound.push(slots);
-        }
-    }
-    bind_raw([image], [handle], true)
-}
-
-/// Discards the queued rewrites of a dropped image's slots, which nothing reads any more and
-/// which would overwrite the slots' next owner.
-pub(crate) fn forget_handle(handle: ImageHandle) {
-    let Some(slots) = handle.slots() else { return };
-    let bindless = Bindless::get();
-    {
-        let mut rebound = lock(&bindless.rebound);
-        if let Some(i) = rebound.iter().position(|r| *r == slots) {
-            rebound.swap_remove(i);
-        } else {
-            return;
-        }
-    }
-    let layout = &bindless.images;
-    let bytes = layout.offset(slots.start)..layout.offset(slots.end);
-    lock(&bindless.queued).retain(|offset, _| !bytes.contains(offset));
-}
-
-/// Image slots the application writes with [`bind`], made by [`reserve`]: `len` handles of kind
-/// `K`, each `K::WIDTH` slots (none for `reserve(0)`). Dropping it frees them once no
-/// submission reaches them, and [`bind`] refuses them right away.
-#[derive(Debug)]
-#[must_use]
-pub struct SlotRange<K: Allocatable> {
-    start: u32,
-    len: u32,
-    kind: PhantomData<K>,
-    _live: Live,
-}
-
-impl<K: Allocatable> SlotRange<K> {
-    /// How many handles it holds.
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-
-    /// Whether it holds no handle (`reserve(0)`).
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Its slots in the resource heap, `K::WIDTH` per handle.
-    pub fn slots(&self) -> std::range::Range<u32> {
-        (self.start..self.start + self.len * K::WIDTH).into()
-    }
-
-    /// Its `i`-th handle. Panics past its end.
-    pub fn handle(&self, i: u32) -> ImageHandle<K> {
-        assert!(i < self.len, "handle {i} of a range of {}", self.len);
-        ImageHandle::new(self.start + i * K::WIDTH)
-    }
-}
-
-impl<K: Allocatable> Drop for SlotRange<K> {
-    fn drop(&mut self) {
-        if self.is_empty() {
-            return;
-        }
-        let range: Range<u32> = self.slots().into();
-        let bindless = Bindless::get();
-        let mut reserved = lock(&bindless.reserved);
-        if let Some(i) = reserved.iter().position(|r| *r == range) {
-            reserved.swap_remove(i);
-        }
-        drop(reserved);
-        // Nothing reads them any more, and a later copy could overwrite the slots' next owner.
-        let layout = &bindless.images;
-        let bytes = layout.offset(range.start)..layout.offset(range.end);
-        lock(&bindless.queued).retain(|offset, _| !bytes.contains(offset));
-        lifetime::retire(move || free(range));
-    }
-}
-
-/// The first `n` handles' worth of contiguous free image slots (`n * K::WIDTH`), for [`bind`];
-/// an empty range for 0.
-pub fn reserve<K: Allocatable>(n: u32) -> Result<SlotRange<K>> {
-    let live = Live::new();
-    let slots = n.checked_mul(K::WIDTH).expect("too many slots");
-    let start = match n {
-        0 => 0,
-        _ => allocate(slots)?,
-    };
-    if n > 0 {
-        lock(&Bindless::get().reserved).push(start..start + slots);
-    }
-    Ok(SlotRange {
-        start,
-        len: n,
-        kind: PhantomData,
-        _live: live,
-    })
 }
 
 /// How a [`Sampler`] filters and addresses an image. [`SamplerDesc::new`] (and `Default`)
@@ -625,7 +503,7 @@ const PAIR: u32 = 1 << 31;
 /// assert!(handle.is_null());
 /// ```
 ///
-/// `K` is what it is known to name: lava's binds and [`reserve`] make the typed kinds, which
+/// `K` is what it is known to name: lava's binds make the typed kinds, which
 /// [`Self::erase`] turns into [`Dynamic`], and [`Self::as_sampled`]/[`Self::as_storage`] into
 /// the part of a [`Combined`] handle a shader reads; every one of them keeps the bits.
 #[repr(transparent)]
@@ -697,7 +575,17 @@ impl<K: HandleKind> ImageHandle<K> {
 
     /// How many descriptors it names.
     const fn width(self) -> u32 {
-        1 + (self.bits >> 31)
+        Self::width_of(self.bits)
+    }
+
+    /// How many descriptors a handle of `kind` (its bits 30 and 31) names.
+    pub(crate) const fn width_of(kind: u32) -> u32 {
+        1 + (kind >> 31)
+    }
+
+    /// Its kind: bits 30 and 31.
+    pub(crate) const fn kind(self) -> u32 {
+        self.bits & !SLOT
     }
 
     /// Its slots in the resource heap, `None` for `NULL`.
@@ -757,6 +645,21 @@ impl ImageHandle {
     }
 }
 
+impl ImageHandle {
+    /// The handle of the descriptors of `kind` (a handle's bits 30 and 31) from `slot` on.
+    pub(crate) fn with_kind(kind: u32, slot: u32) -> Self {
+        assert!(
+            slot + Self::width_of(kind) - 1 <= SLOT,
+            "image slot {slot} doesn't fit a handle"
+        );
+        assert!(
+            slot > 0,
+            "image slot 0 is reserved: its sampled handle is `NULL`"
+        );
+        Self::from_bits(slot | kind)
+    }
+}
+
 impl<K: Allocatable> ImageHandle<K> {
     /// The handle of `K`'s descriptors from `slot` on.
     pub(crate) fn new(slot: u32) -> Self {
@@ -772,7 +675,8 @@ impl<K: Allocatable> ImageHandle<K> {
     }
 }
 
-/// Valid image slots are `0..max_image_slots()`; a [`Combined`] handle takes two.
+/// Image slots are `1..max_image_slots()` (slot 0 is the null handle's); a [`Combined`] handle
+/// takes two.
 pub fn max_image_slots() -> u32 {
     Bindless::get().images.count
 }
@@ -805,48 +709,11 @@ impl<F: Format, U: ImageUsage, D: Dim> ImageView<'_, F, U, D> {
 }
 
 /// Writes each image's descriptors into the slots of the handle at the same position, skipping
-/// `NULL` handles. Panics unless every slot lies in a live [`SlotRange`] and every image has
-/// the usages of its handle's descriptors.
-///
-/// The descriptors reach the heap in submission order: the next submission of a timeline with
-/// shaders (graphics or compute) copies them in before its commands, after waiting for every
-/// earlier command of its queue, so submissions before it read the old descriptors and those
-/// after it the new ones. Batch rewrites, since each such submission waits once. Another
-/// timeline's submissions see a rewrite only once they [`wait_for`] the one that copied it, and
-/// one of them in flight must not read the slot meanwhile.
-///
-/// [`wait_for`]: crate::queue::Submission::wait_for
-#[validation_trace]
-pub fn bind<'a, F: Format, U: ImageUsage, D: Dim, K: Allocatable>(
-    images: impl IntoIterator<Item = ImageView<'a, F, U, D>>,
-    handles: impl IntoIterator<Item = ImageHandle<K>>,
-) {
-    let _call = crate::state::call();
-    let bindless = Bindless::get();
-    let reserved = lock(&bindless.reserved);
-    let handles = handles.into_iter().inspect(|handle| {
-        if let Some(slots) = handle.slots() {
-            assert!(
-                reserved
-                    .iter()
-                    .any(|r| r.start <= slots.start && slots.end <= r.end),
-                "bindless slots {slots:?} lie in no `SlotRange`: `bind` writes only reserved \
-                 slots (`reserve`)"
-            );
-        }
-    });
-    let images = images.into_iter().map(|image| image.shader_image());
-    bind_raw(images, handles.map(ImageHandle::erase), true)
-        .expect("writing image descriptors failed");
-}
-
-/// [`bind`] for any slots: writes the descriptors into the heap right away, or with `queued`
-/// leaves them for the next submission (see [`bind`]). Right away is for slots no submission
-/// reaches, freshly allocated ones.
-pub(crate) fn bind_raw(
+/// `NULL` handles, right away: the slots are freshly allocated, so no submission reaches them.
+/// Panics unless every image has the usages of its handle's descriptors.
+pub(crate) fn write_descriptors(
     images: impl IntoIterator<Item = ShaderImage>,
     handles: impl IntoIterator<Item = ImageHandle>,
-    queued: bool,
 ) -> Result<()> {
     let bindless = Bindless::get();
     let layout = &bindless.images;
@@ -929,32 +796,14 @@ pub(crate) fn bind_raw(
                 .data((info as *const vk::ImageDescriptorInfoEXT).cast())
         })
         .collect();
-    let functions = Functions::descriptor_heap();
-    if !queued {
-        let ranges: SmallVec<[_; 8]> = (targets.iter())
-            .map(|&(.., slot)| {
-                bindless
-                    .resource_heap
-                    .host_range(layout.offset(slot), layout.stride)
-            })
-            .collect();
-        unsafe { functions.write_resource_descriptors(&resources, &ranges)? };
-        return Ok(());
-    }
-    let stride = layout.stride as usize;
-    let mut staging: SmallVec<[u8; 512]> = smallvec::smallvec![0; targets.len() * stride];
-    let base = staging.as_mut_ptr();
-    let ranges: SmallVec<[_; 8]> = (0..targets.len())
-        .map(|i| vk::HostAddressRangeEXT {
-            address: unsafe { base.add(i * stride) }.cast(),
-            size: stride,
+    let ranges: SmallVec<[_; 8]> = (targets.iter())
+        .map(|&(.., slot)| {
+            bindless
+                .resource_heap
+                .host_range(layout.offset(slot), layout.stride)
         })
         .collect();
-    unsafe { functions.write_resource_descriptors(&resources, &ranges)? };
-    let mut queue = lock(&bindless.queued);
-    for (&(.., slot), descriptor) in targets.iter().zip(staging.chunks(stride)) {
-        queue.insert(layout.offset(slot), SmallVec::from_slice(descriptor));
-    }
+    unsafe { Functions::descriptor_heap().write_resource_descriptors(&resources, &ranges)? };
     Ok(())
 }
 
@@ -993,14 +842,11 @@ impl Bindless {
         debug_assert_eq!(reserved, (Some(0), Some(0)));
         BINDLESS.set(Self {
             free: Mutex::new(free),
-            reserved: Default::default(),
-            rebound: Default::default(),
             free_samplers: Mutex::new(free_samplers),
             images,
             samplers,
             resource_heap,
             sampler_heap,
-            queued: Mutex::new(BTreeMap::new()),
         });
         write_sampler(0, &SamplerDesc::new())
     }
@@ -1018,82 +864,10 @@ impl Bindless {
         }
     }
 
-    /// Records the copies of the descriptors [`bind`] queued into the resource heap, after
-    /// every earlier command of the queue and before every later read of the heap, and returns
-    /// them, so a recording that never reaches the GPU can queue them again ([`Self::requeue`]).
-    pub(crate) fn flush_queued(cmd: vk::CommandBuffer) -> Queued {
-        let s = Self::get();
-        let queued = std::mem::take(&mut *lock(&s.queued));
-        if queued.is_empty() {
-            return queued;
-        }
-        let device = Ctx::device();
-        let barrier = |src_stage, src_access, dst_stage, dst_access| {
-            let barrier = [vk::MemoryBarrier2::default()
-                .src_stage_mask(src_stage)
-                .src_access_mask(src_access)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access)];
-            let info = vk::DependencyInfo::default().memory_barriers(&barrier);
-            unsafe { device.cmd_pipeline_barrier2(cmd, &info) };
-        };
-        use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
-        barrier(S::ALL_COMMANDS, A::NONE, S::TRANSFER, A::TRANSFER_WRITE);
-        // Neighbouring descriptors in one update, up to its limit.
-        let mut runs: SmallVec<[(u64, Vec<u8>); 4]> = SmallVec::new();
-        for (&offset, descriptor) in &queued {
-            match runs.last_mut() {
-                Some((start, bytes))
-                    if *start + bytes.len() as u64 == offset
-                        && bytes.len() + descriptor.len() <= MAX_UPDATE =>
-                {
-                    bytes.extend_from_slice(descriptor)
-                }
-                _ => runs.push((offset, descriptor.to_vec())),
-            }
-        }
-        let heap = s.resource_heap.bind.heap_range.address;
-        let flags = vk::AddressCommandFlagsKHR::UNKNOWN_STORAGE_BUFFER_USAGE
-            | vk::AddressCommandFlagsKHR::FULLY_BOUND;
-        for (offset, bytes) in &runs {
-            let range = vk::DeviceAddressRangeKHR {
-                address: heap + offset,
-                size: bytes.len() as u64,
-            };
-            unsafe {
-                Functions::device_address_commands().cmd_update_memory(cmd, &range, flags, bytes)
-            };
-        }
-        barrier(
-            S::TRANSFER,
-            A::TRANSFER_WRITE,
-            S::ALL_COMMANDS,
-            vk::ACCESS_2_RESOURCE_HEAP_READ_EXT,
-        );
-        queued
-    }
-
-    /// Queues descriptors again whose submission never reached the GPU, unless `bind` queued a
-    /// newer one for their slot meanwhile or their reservation (or fitted image) was dropped.
-    pub(crate) fn requeue(queued: Queued) {
-        let s = Self::get();
-        let reserved = lock(&s.reserved);
-        let rebound = lock(&s.rebound);
-        let live = |offset: u64| {
-            let slot = (offset / s.images.stride) as u32;
-            (reserved.iter().chain(rebound.iter())).any(|range| range.contains(&slot))
-        };
-        let mut queue = lock(&s.queued);
-        for (offset, descriptor) in queued.into_iter().filter(|&(offset, _)| live(offset)) {
-            queue.entry(offset).or_insert(descriptor);
-        }
-    }
-
     /// Unsets the heaps and hands their buffers to [`lifetime`], at `shutdown`.
     ///
     /// # Safety
-    /// Nothing records or binds (lava is closed), and every image, sampler and slot range was
-    /// destroyed.
+    /// Nothing records or binds (lava is closed), and every image and sampler was destroyed.
     pub(crate) unsafe fn destroy() {
         drop(unsafe { BINDLESS.take() });
     }

@@ -341,7 +341,7 @@ fn device_idle() -> Result<()> {
 /// lava isn't initialised.
 ///
 /// Drop every lava object first (buffers, images, acceleration structures, timelines,
-/// uploaders, surfaces, samplers, slot ranges, query pools). While one is alive, or another
+/// uploaders, surfaces, samplers, query pools). While one is alive, or another
 /// thread is inside a lava call, it destroys nothing, lava stays initialised, and it returns
 /// `Error::ObjectsAlive`. A lost device is no error here: what is left is destroyed anyway.
 /// [`Wait`]s and [`Stamp`]s of the old context count as done in the next one; counters of

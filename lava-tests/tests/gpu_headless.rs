@@ -19,7 +19,7 @@ use lava::{
         RasterState, Rect, Stencil, StencilFace, StencilOp, kind,
     },
     image::{
-        D3, Filter, Image, MipChain,
+        D2Array, D3, Filter, Image, MipChain,
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, R32Sfloat},
         usage::usage,
     },
@@ -2199,29 +2199,17 @@ fn binds_take_free_slots() {
         "a view is bound once: {twice}"
     );
 
-    // `bind` writes reserved slots only and checks the usage at runtime, static types included.
-    let reserved = bindless::reserve::<bindless::Sampled>(4).unwrap();
-    assert_eq!((reserved.len(), reserved.slots().iter().count()), (4, 4));
-    assert!(!reserved.slots().contains(&s_slot));
-    bindless::bind(
-        [unbound.whole_view(); 4],
-        (0..4).map(|i| reserved.handle(i)),
-    );
-    // The sampled image's slot isn't reserved.
-    let unreserved = panic_message(|| bindless::bind([unbound.whole_view()], [s]));
-    assert!(unreserved.contains("lie in no `SlotRange`"), "{unreserved}");
-    let storage_slots = bindless::reserve::<bindless::Storage>(1).unwrap();
-    let refused =
-        panic_message(|| bindless::bind([unbound.whole_view()], [storage_slots.handle(0)]));
-    assert!(refused.contains("can't be bound as"), "{refused}");
-    let past = panic_message(|| reserved.handle(4));
-    assert!(past.contains("handle 4 of a range of 4"), "{past}");
-    let pairs = bindless::reserve::<Combined>(2).unwrap();
-    assert_eq!((pairs.len(), pairs.slots().iter().count()), (2, 4));
+    // A view bound on its own: the image's handle where it has the descriptors, else slots of
+    // its own, the same every time, and the usage checked at runtime, static types included.
+    assert_eq!(sampled.whole_view().bind::<bindless::Sampled>().unwrap(), s);
+    let alone = unbound.whole_view().bind::<bindless::Sampled>().unwrap();
     assert_eq!(
-        pairs.handle(1).sampled_slot(),
-        Some(pairs.slots().start + 2)
+        unbound.whole_view().bind::<bindless::Sampled>().unwrap(),
+        alone
     );
+    assert_eq!(unbound.whole_view().handle::<bindless::Sampled>(), alone);
+    let refused = panic_message(|| unbound.whole_view().bind::<bindless::Storage>());
+    assert!(refused.contains("can't be bound as"), "{refused}");
 }
 
 /// A pair takes the first two neighbouring free slots, past the holes single slots leave.
@@ -2229,41 +2217,41 @@ fn binds_take_free_slots() {
 fn pairs_skip_single_holes() {
     let _gpu = gpu();
     lava::wait_idle().unwrap();
+    type Both = Image<R8G8B8A8Unorm, usage![Sampled, Storage]>;
+    let single = || Both::new(UVec2::ONE).unwrap().bind_sampled().unwrap();
+    let slot = |image: &Both| image.handle::<bindless::Sampled>().sampled_slot().unwrap();
     // Single slots until seven in a row: the holes other tests left are filled then.
     let mut taken = Vec::new();
-    let in_a_row = |taken: &[bindless::SlotRange<bindless::Sampled>]| {
+    let in_a_row = |taken: &[Both]| {
         taken.len() >= 7
             && taken[taken.len() - 7..]
                 .windows(2)
-                .all(|w| w[1].slots().start == w[0].slots().end)
+                .all(|w| slot(&w[1]) == slot(&w[0]) + 1)
     };
     while !in_a_row(&taken) {
-        taken.push(bindless::reserve::<bindless::Sampled>(1).unwrap());
+        taken.push(single());
     }
-    let start = taken[taken.len() - 7].slots().start;
+    let start = slot(&taken[taken.len() - 7]);
     // Every other one of the seven freed again: the holes are one slot each.
-    let (kept, dropped): (Vec<_>, Vec<_>) = taken.into_iter().partition(|slot| {
-        let slot = slot.slots().start;
+    let (kept, dropped): (Vec<_>, Vec<_>) = taken.into_iter().partition(|image| {
+        let slot = slot(image);
         slot < start || (slot - start) % 2 == 0
     });
     drop(dropped);
     lava::wait_idle().unwrap();
-    let pair = bindless::reserve::<Combined>(1).unwrap();
-    assert!(
-        pair.slots().start >= start + 7,
-        "no hole fits a pair: {:?}",
-        pair.slots()
-    );
-    let single = bindless::reserve::<bindless::Storage>(1).unwrap();
+    let pair = Both::new(UVec2::ONE).unwrap().bind_combined().unwrap();
+    let pair_slot = pair.handle::<Combined>().sampled_slot().unwrap();
+    assert!(pair_slot >= start + 7, "no hole fits a pair: {pair_slot}");
+    let storage = Both::new(UVec2::ONE).unwrap().bind_storage().unwrap();
     assert_eq!(
-        single.slots().start,
-        start + 1,
+        storage.handle::<bindless::Storage>().storage_slot(),
+        Some(start + 1),
         "a single fills the first hole"
     );
     drop(kept);
 }
 
-/// Also a dropped reservation's slots, which `bind` refuses right away.
+/// A dropped image's slots are free again once no submission reaches it.
 #[test]
 fn slots_are_free_again_once_their_image_is_destroyed() {
     let mut gpu = gpu();
@@ -2289,40 +2277,33 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
     frame.submit(|_| {}).unwrap().block().unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 
-    // A mip chain frees its whole view's slot and each mip's, erased or not.
+    // A mip chain frees its whole view's slot and each mip's, erased or not, and so does a
+    // view bound on its own.
     lava::wait_idle().unwrap();
-    let chain =
-        MipChain::<R8G8B8A8Unorm, usage![Sampled, Storage]>::with_mip_levels(UVec2::new(4, 4), 3)
-            .unwrap()
-            .bind_sampled()
-            .unwrap()
-            .bind_mips_storage()
-            .unwrap()
-            .erase();
-    assert_eq!(chain.format().0, lava::VkFormat::R8G8B8A8_UNORM);
+    type Chain = MipChain<R8G8B8A8Unorm, usage![Sampled, Storage]>;
+    let chain = || Chain::with_mip_levels(UVec2::new(4, 4), 3).unwrap();
+    let bound = chain()
+        .bind_sampled()
+        .unwrap()
+        .bind_mips_storage()
+        .unwrap()
+        .erase();
+    assert_eq!(bound.format().0, lava::VkFormat::R8G8B8A8_UNORM);
+    let alone = bound.mip_view(1).bind::<bindless::Sampled>().unwrap();
     let (whole, mips) = (
-        chain.handle::<bindless::Sampled>(),
-        chain.mip_view(0).handle::<bindless::Storage>(),
+        bound.handle::<bindless::Sampled>(),
+        bound.mip_view(0).handle::<bindless::Storage>(),
     );
-    drop(chain);
+    drop(bound);
     lava::wait_idle().unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), whole);
-    let storage = bindless::reserve::<bindless::Storage>(3).unwrap();
-    assert_eq!(storage.handle(0), mips, "the mips' slots came back whole");
-    drop(storage);
-    lava::wait_idle().unwrap();
-
-    let texture = Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::new(4, 4)).unwrap();
-    let sampled = bindless::reserve::<bindless::Sampled>(3).unwrap();
-    let (handle, slots) = (sampled.handle(0), sampled.slots());
-    drop(sampled);
-    let written = panic_message(|| bindless::bind([texture.whole_view()], [handle]));
-    assert!(written.contains("lie in no `SlotRange`"), "{written}");
-    lava::wait_idle().unwrap();
+    let again = chain().bind_mips_storage().unwrap();
     assert_eq!(
-        bindless::reserve::<bindless::Sampled>(3).unwrap().slots(),
-        slots
+        again.mip_view(0).handle::<bindless::Storage>(),
+        mips,
+        "the mips' slots came back whole"
     );
+    assert_eq!(bind().handle::<bindless::Sampled>(), alone);
 }
 
 const NO_SAMPLER: SamplerHandle = SamplerHandle { index: !0 };
@@ -2356,55 +2337,38 @@ fn sample(
     out.host().try_into().unwrap()
 }
 
-/// A 1x1 sampled image of `color`.
-fn solid(
-    gpu: &mut common::Gpu,
-    color: [f32; 4],
-) -> Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]> {
-    let image = Image::new(UVec2::ONE).unwrap();
-    gpu.submit(|cmd| cmd.clear_image(image.whole_view(), color));
-    image
-}
-
-/// `bind` into a reserved slot reaches the heap in submission order: a frame still in flight
-/// reads the old image, the next one the new image.
+/// A layer of an array bound on its own reads that layer alone.
 #[test]
-fn reserved_slots_are_rewritten_between_frames_in_flight() {
+fn layers_bound_on_their_own_read_their_layer() {
     let mut gpu = gpu();
-    let red = solid(&mut gpu, [1.0, 0.0, 0.0, 1.0]);
-    let green = solid(&mut gpu, [0.0, 1.0, 0.0, 1.0]);
-    let slot = bindless::reserve::<bindless::Sampled>(1).unwrap();
-    let mut outs = [zeroed_buffer::<Vec4>(3), zeroed_buffer::<Vec4>(3)];
-    let frame = |gpu: &mut common::Gpu,
-                 image: &Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>,
-                 out: &Buffer<Vec4, Readback>| {
-        bindless::bind([image.whole_view()], [slot.handle(0)]);
-        let reads = [ImageUse::sampled_read(image.whole_view())];
-        let submission = gpu.timeline.begin().unwrap();
-        submission
-            .submit(|cmd| {
-                let bindings = TestSample::push_bindings(
-                    TestSampleArgs {
-                        out: out.range(..),
-                        first: nearest(),
-                        second: nearest(),
-                        compare: NO_SAMPLER,
-                        slot: slot.handle(0).bits(),
-                        uv: Vec2::splat(0.5),
-                        reference: 0.0,
-                    },
-                    Some(Accesses::images(&reads)),
-                );
-                cmd.compute(&bindings, [1, 1, 1]);
-            })
-            .unwrap()
-    };
-    let first = frame(&mut gpu, &red, &outs[0]);
-    let second = frame(&mut gpu, &green, &outs[1]);
-    second.block().unwrap();
-    assert!(first.is_done());
-    assert_eq!(outs[0].host()[0], Vec4::new(1.0, 0.0, 0.0, 1.0));
-    assert_eq!(outs[1].host()[0], Vec4::new(0.0, 1.0, 0.0, 1.0));
+    let array = Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst], D2Array>::with_layers(
+        UVec2::ONE,
+        1,
+        2,
+    )
+    .unwrap();
+    let colors = [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]];
+    gpu.submit(|cmd| {
+        for (layer, color) in colors.into_iter().enumerate() {
+            cmd.clear_image(array.whole_view().layer(layer as u32), color);
+        }
+    });
+    for layer in 0..2 {
+        let view = array.whole_view().layer(layer);
+        let handle = view.bind::<bindless::Sampled>().unwrap();
+        assert_eq!(view.handle::<bindless::Sampled>(), handle);
+        let reads = [ImageUse::sampled_read(view)];
+        let samplers = [nearest(), nearest(), NO_SAMPLER];
+        let [read, ..] = sample(
+            &mut gpu,
+            handle.bits(),
+            samplers,
+            Vec2::splat(0.5),
+            0.0,
+            Accesses::images(&reads),
+        );
+        assert_eq!(read, Vec4::from(colors[layer as usize]), "layer {layer}");
+    }
 }
 
 /// Samplers are runtime objects: two in one pass, each with its filter, and a dropped one's
@@ -2500,19 +2464,37 @@ fn reduction_samplers_return_the_extremes() {
 fn full_bindless_heaps_are_errors() {
     let _gpu = gpu();
     lava::wait_idle().unwrap();
-    // Every free image slot reserved, in halving blocks.
+    // Every free image slot taken, by the layers of arrays bound one by one.
+    let layers = Ctx::device_properties()
+        .limits
+        .max_image_array_layers
+        .min(2048);
     let mut taken = Vec::new();
-    let mut n = max_image_slots();
-    while n > 0 {
-        match bindless::reserve::<bindless::Sampled>(n) {
-            Ok(range) => taken.push(range),
-            Err(lava::Error::OutOfBindlessSlots { heap, count }) => {
-                assert_eq!((heap, count), (bindless::Heap::Image, n));
-                n /= 2;
+    let full = 'fill: loop {
+        assert!(
+            taken.len() as u32 * layers <= max_image_slots(),
+            "the heap never filled"
+        );
+        let array =
+            Image::<R8G8B8A8Unorm, usage![Sampled], D2Array>::with_layers(UVec2::ONE, 1, layers)
+                .unwrap();
+        for layer in 0..layers {
+            if let Err(error) = array.whole_view().layer(layer).bind::<bindless::Sampled>() {
+                break 'fill error;
             }
-            Err(error) => panic!("{error}"),
         }
-    }
+        taken.push(array);
+    };
+    assert!(
+        matches!(
+            full,
+            lava::Error::OutOfBindlessSlots {
+                heap: bindless::Heap::Image,
+                count: 1
+            }
+        ),
+        "{full}"
+    );
     let image = || Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::new(4, 4)).unwrap();
     match image().bind_sampled() {
         Err(lava::Error::OutOfBindlessSlots { heap, count }) => {
@@ -2657,16 +2639,15 @@ fn combined_images_read_sampled_and_write_storage() {
     assert_eq!(out[2], Vec4::ZERO, "the null handle");
 }
 
-/// `bind` writes both descriptors of a reserved pair.
+/// A view bound on its own as `Combined` holds both descriptors of its pair.
 #[test]
-fn reserved_pairs_hold_both_descriptors() {
+fn views_bound_on_their_own_hold_both_descriptors() {
     let mut gpu = gpu();
     let target = quarter(&mut gpu).bind_combined().unwrap();
     let image = quarter(&mut gpu);
-    let pairs = bindless::reserve::<Combined>(2).unwrap();
-    bindless::bind([image.whole_view()], [pairs.handle(1)]);
+    let pair = image.whole_view().bind::<Combined>().unwrap();
     let chain = combined_chain(&mut gpu, 1);
-    run_combined(&mut gpu, &target, Some((pairs.handle(1), &image)), &chain);
+    run_combined(&mut gpu, &target, Some((pair, &image)), &chain);
     for texel in texels(&mut gpu, &image) {
         assert!(close(texel, [192; 4]), "tripled: {texel:?}");
     }
@@ -3865,8 +3846,7 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
     assert_eq!(depth_at(IN_LEFT), 0.5);
     assert_eq!(depth_at(IN_RIGHT), 0.25);
 
-    let slot = bindless::reserve::<bindless::Sampled>(1).unwrap();
-    bindless::bind([depth.whole_view()], [slot.handle(0)]);
+    let slot = depth.whole_view().bind::<bindless::Sampled>().unwrap();
     let less = Sampler::new(
         &SamplerDesc::new()
             .filter(lava::vk::Filter::NEAREST)
@@ -3879,7 +3859,7 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
     let at = |gpu: &mut common::Gpu, texel, reference| {
         sample(
             gpu,
-            slot.handle(0).bits(),
+            slot.bits(),
             samplers,
             uv(texel),
             reference,

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use common::panic_message;
 use lava::{
     Ctx,
-    bindless::{self, ImageHandle, Storage},
+    bindless::{ImageHandle, Storage},
     image::{
         format::{self, A2B10G10R10UnormPack32, B8G8R8A8Unorm, ClearValue, R8Unorm},
         usage::usage,
@@ -231,13 +231,24 @@ fn run(event_loop: &ActiveEventLoop) {
             .map(|h| h.storage_slot().unwrap())
             .min()
             .unwrap();
-        let reserved = bindless::reserve::<Storage>(old_images as u32).unwrap();
+        type Bound = lava::Image<lava::image::format::R8G8B8A8Unorm, lava::usage![Storage]>;
+        let bound: Vec<_> = (0..old_images)
+            .map(|_| {
+                Bound::new(glam::UVec2::ONE)
+                    .unwrap()
+                    .bind_storage()
+                    .unwrap()
+            })
+            .collect();
+        let first = (bound.iter())
+            .map(|image| image.handle::<Storage>().storage_slot().unwrap())
+            .min()
+            .unwrap();
         assert!(
-            reserved.slots().start <= lowest,
-            "{:?} lies above the freed slot {lowest}",
-            reserved.slots()
+            first <= lowest,
+            "{first} lies above the freed slot {lowest}"
         );
-        drop(reserved);
+        drop(bound);
     } else {
         eprintln!(
             "SKIPPED a_new_size_recreates_the_swapchain: the extent is fixed and there is no other present mode or composite alpha"
