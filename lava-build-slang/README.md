@@ -25,7 +25,7 @@ cmd.compute(
 
 The generated code names everything through lava (`::lava::glam`, `::lava::bytemuck`, which lava re-exports with bytemuck's `derive` and `min_const_generics`), so the application needs no other dependency for it.
 
-Every compilation can include `bindless.slang` (lava's bindless images, buffer pointers and specialization constants), `ray_tracing.slang` and `profile.slang`, which this crate ships.
+Every compilation can include `bindless.slang` (lava's bindless images, buffer pointers and specialization constants), `ray_tracing.slang` and `profile.slang`, which this crate ships in `lava_build_slang::SHADER_DIR`.
 
 With the `hot-reload` feature, `lava_build_slang::watch!()` (called after `lava::init`) recompiles changed passes while the application runs and swaps their pipelines in. It needs lava-build-slang as a normal dependency with the feature, beside the build dependency.
 

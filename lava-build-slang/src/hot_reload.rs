@@ -11,7 +11,7 @@ use lava::pipeline::{self, Reload, pass_map};
 use notify::EventHandler;
 
 use crate::{
-    Optimization, SLANG_DIR,
+    Optimization, SHADER_DIR,
     compile::{self, slang},
 };
 
@@ -159,7 +159,7 @@ fn reload_file(
     }
 }
 
-/// Watches the build's directories and [`SLANG_DIR`] and compiles changed passes on a thread of
+/// Watches the build's directories and [`SHADER_DIR`] and compiles changed passes on a thread of
 /// its own. Later calls do nothing.
 pub fn watch(build: &'static Build) {
     use notify::Watcher;
@@ -169,7 +169,7 @@ pub fn watch(build: &'static Build) {
         let watch = || -> std::result::Result<notify::RecommendedWatcher, String> {
             matches_pass_map(build)?;
             let dirs: Vec<&Path> = (build.watch_dirs.iter().copied())
-                .chain([SLANG_DIR])
+                .chain([SHADER_DIR])
                 .map(Path::new)
                 .collect();
             // A binary moved off the build machine has no shaders to watch.

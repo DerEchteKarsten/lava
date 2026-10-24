@@ -72,7 +72,12 @@ pub fn assert_golden(name: &str, pixels: &[u8], size: [u32; 2]) {
 
     let (mut different_pixels, mut max_delta) = (0, 0);
     let mut diff_image = Vec::with_capacity(pixels.len());
-    for (a, e) in pixels.chunks_exact(4).zip(expected.chunks_exact(4)) {
+    for (a, e) in pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0)
+    {
         let delta = a.iter().zip(e).map(|(a, e)| a.abs_diff(*e)).max().unwrap();
         max_delta = max_delta.max(delta);
         let differs = delta > CHANNEL_TOLERANCE;

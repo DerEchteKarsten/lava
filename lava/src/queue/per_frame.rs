@@ -21,8 +21,13 @@ pub struct PerFrame<T> {
 
 impl<T> PerFrame<T> {
     /// A value per frame slot of `timeline`, `make(slot)` each.
-    pub fn new<K: QueueKind>(timeline: &Timeline<K>, mut make: impl FnMut(usize) -> Result<T>) -> Result<Self> {
-        let slots = (0..timeline.in_flight() as usize).map(&mut make).collect::<Result<_>>()?;
+    pub fn new<K: QueueKind>(
+        timeline: &Timeline<K>,
+        mut make: impl FnMut(usize) -> Result<T>,
+    ) -> Result<Self> {
+        let slots = (0..timeline.in_flight() as usize)
+            .map(&mut make)
+            .collect::<Result<_>>()?;
         Ok(PerFrame {
             slots,
             timeline: timeline.index(),

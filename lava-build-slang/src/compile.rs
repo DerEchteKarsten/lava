@@ -1,14 +1,14 @@
 //! Slang sessions and the compilation of one pass file into its passes (SPIR-V, description and warnings), shared by the build script and the hot reload, so both compile alike: pass names and their checks, entry point stages and attributes, ray tracing groups
 use std::{collections::BTreeMap, ffi::CString, path::Path};
 
-pub use shader_slang as slang;
+pub(crate) use shader_slang as slang;
 
 use crate::describe::{self, PassDesc};
 use crate::reflect::{self, CheckedAttributes, CheckedEntryPoint, CheckedName, CheckedShader};
-use crate::{Optimization, SLANG_DIR};
+use crate::{Optimization, SHADER_DIR};
 
 pub struct Options<'a> {
-    /// Absolute include directories; [`SLANG_DIR`] is always searched too.
+    /// Absolute include directories; [`SHADER_DIR`] is always searched too.
     pub search_paths: &'a [&'a str],
     pub defines: &'a [(&'a str, &'a str)],
     pub optimization: Optimization,
@@ -22,7 +22,7 @@ pub fn session(global: &slang::GlobalSession, options: &Options) -> slang::Sessi
         .search_paths
         .iter()
         .copied()
-        .chain([SLANG_DIR])
+        .chain([SHADER_DIR])
         .map(|path| CString::new(path).unwrap())
         .collect();
     let search_paths: Vec<_> = paths.iter().map(|path| path.as_ptr()).collect();
@@ -191,32 +191,73 @@ fn link(
     reflect::link(&composite)
 }
 
-pub fn stage_name(stage: slang::Stage) -> Result<&'static str, String> {
-    use slang::Stage;
-    Ok(match stage {
-        Stage::Vertex => "vertex",
-        Stage::Fragment => "fragment",
-        Stage::Mesh => "mesh",
-        Stage::Amplification => "amplification",
-        Stage::Compute => "compute",
-        Stage::RayGeneration => "raygen",
-        Stage::AnyHit => "any_hit",
-        Stage::ClosestHit => "closest_hit",
-        Stage::Miss => "miss",
-        Stage::Intersection => "intersection",
-        Stage::Callable => "callable",
-        other => return Err(format!("the stage {other:?} has no lava pass")),
-    })
+/// The stage of an entry point lava has passes for. Declared in the order of their names, so a
+/// sorted list of a pass's stages matches the patterns of `describe`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stage {
+    /// Slang's amplification stage.
+    Task,
+    AnyHit,
+    Callable,
+    ClosestHit,
+    Compute,
+    Fragment,
+    Intersection,
+    Mesh,
+    Miss,
+    RayGen,
+    Vertex,
 }
 
-pub const RAY_TRACING_STAGES: [&str; 6] = [
-    "raygen",
-    "miss",
-    "closest_hit",
-    "any_hit",
-    "intersection",
-    "callable",
-];
+impl Stage {
+    pub fn of(stage: slang::Stage) -> Result<Self, String> {
+        use slang::Stage as S;
+        Ok(match stage {
+            S::Vertex => Self::Vertex,
+            S::Fragment => Self::Fragment,
+            S::Mesh => Self::Mesh,
+            S::Amplification => Self::Task,
+            S::Compute => Self::Compute,
+            S::RayGeneration => Self::RayGen,
+            S::AnyHit => Self::AnyHit,
+            S::ClosestHit => Self::ClosestHit,
+            S::Miss => Self::Miss,
+            S::Intersection => Self::Intersection,
+            S::Callable => Self::Callable,
+            other => return Err(format!("the stage {other:?} has no lava pass")),
+        })
+    }
+
+    /// Its name in messages and layout hashes.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Fragment => "fragment",
+            Self::Mesh => "mesh",
+            Self::Task => "amplification",
+            Self::Compute => "compute",
+            Self::RayGen => "raygen",
+            Self::AnyHit => "any_hit",
+            Self::ClosestHit => "closest_hit",
+            Self::Miss => "miss",
+            Self::Intersection => "intersection",
+            Self::Callable => "callable",
+        }
+    }
+
+    /// A stage of ray tracing pipelines.
+    pub fn is_ray_tracing(self) -> bool {
+        matches!(
+            self,
+            Self::RayGen
+                | Self::Miss
+                | Self::ClosestHit
+                | Self::AnyHit
+                | Self::Intersection
+                | Self::Callable
+        )
+    }
+}
 
 /// The integer argument of the user attribute `name` (`Group`, `MaxRecursion`).
 pub fn entry_attribute(entry: &slang::reflection::EntryPoint, name: &str) -> Option<i32> {
@@ -228,7 +269,7 @@ pub fn entry_attribute(entry: &slang::reflection::EntryPoint, name: &str) -> Opt
 }
 
 pub struct Entry<'a> {
-    pub stage: &'static str,
+    pub stage: Stage,
     pub name: &'a str,
     pub group: Option<i32>,
     pub max_recursion: Option<i32>,
@@ -266,7 +307,7 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
             return Err(format!("`{}` has the negative group {index}", entry.name));
         }
         if let Some(depth) = entry.max_recursion {
-            if entry.stage != "raygen" {
+            if entry.stage != Stage::RayGen {
                 return Err(format!(
                     "`{}` isn't a raygen but has `MaxRecursion`",
                     entry.name
@@ -279,7 +320,7 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
         }
         let taken = |region: &str| format!("two {region} entry points have group {index}");
         match entry.stage {
-            "raygen" => {
+            Stage::RayGen => {
                 if entry.group.is_some() {
                     return Err(format!("the raygen `{}` has a `Group`", entry.name));
                 }
@@ -287,12 +328,12 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
                     return Err("a ray tracing pass has exactly one raygen".into());
                 }
             }
-            "miss" => {
+            Stage::Miss => {
                 if miss.insert(index, name).is_some() {
                     return Err(taken("miss"));
                 }
             }
-            "callable" => {
+            Stage::Callable => {
                 if callable.insert(index, name).is_some() {
                     return Err(taken("callable"));
                 }
@@ -300,12 +341,15 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
             stage => {
                 let group = hit.entry(index).or_default();
                 let slot = match stage {
-                    "closest_hit" => &mut group.closest_hit,
-                    "any_hit" => &mut group.any_hit,
-                    "intersection" => &mut group.intersection,
-                    other => return Err(format!("`{}` has the stage {other}", entry.name)),
+                    Stage::ClosestHit => &mut group.closest_hit,
+                    Stage::AnyHit => &mut group.any_hit,
+                    Stage::Intersection => &mut group.intersection,
+                    other => {
+                        return Err(format!("`{}` has the stage {}", entry.name, other.name()));
+                    }
                 };
                 if slot.replace(name).is_some() {
+                    let stage = stage.name();
                     return Err(format!("hit group {index} has two {stage} entry points"));
                 }
             }
@@ -337,7 +381,7 @@ pub fn ray_tracing_groups(entries: &[Entry]) -> Result<RayTracingGroups, String>
 mod tests {
     use super::*;
 
-    fn entry(stage: &'static str, name: &'static str, group: Option<i32>) -> Entry<'static> {
+    fn entry(stage: Stage, name: &'static str, group: Option<i32>) -> Entry<'static> {
         Entry {
             stage,
             name,
@@ -348,17 +392,17 @@ mod tests {
 
     #[test]
     fn entries_are_grouped_by_index_per_region() {
-        let mut raygen = entry("raygen", "rg", None);
+        let mut raygen = entry(Stage::RayGen, "rg", None);
         raygen.max_recursion = Some(2);
         let groups = ray_tracing_groups(&[
-            entry("miss", "shadow", Some(1)),
-            entry("closest_hit", "sphere_hit", Some(1)),
+            entry(Stage::Miss, "shadow", Some(1)),
+            entry(Stage::ClosestHit, "sphere_hit", Some(1)),
             raygen,
-            entry("miss", "sky", None),
-            entry("any_hit", "holes", None),
-            entry("intersection", "sphere", Some(1)),
-            entry("closest_hit", "triangle_hit", Some(0)),
-            entry("callable", "colour", None),
+            entry(Stage::Miss, "sky", None),
+            entry(Stage::AnyHit, "holes", None),
+            entry(Stage::Intersection, "sphere", Some(1)),
+            entry(Stage::ClosestHit, "triangle_hit", Some(0)),
+            entry(Stage::Callable, "colour", None),
         ])
         .unwrap();
         assert_eq!(groups.miss, ["sky", "shadow"]);
@@ -383,25 +427,29 @@ mod tests {
 
     #[test]
     fn malformed_groups_are_refused() {
-        let rg = || entry("raygen", "rg", None);
+        let rg = || entry(Stage::RayGen, "rg", None);
         let refused = |entries: &[Entry]| ray_tracing_groups(entries).unwrap_err();
-        assert!(refused(&[entry("miss", "m", None)]).contains("needs a raygen"));
-        assert!(refused(&[rg(), entry("raygen", "rg2", None)]).contains("exactly one raygen"));
-        assert!(
-            refused(&[rg(), entry("miss", "a", None), entry("miss", "b", None)])
-                .contains("two miss")
-        );
-        assert!(refused(&[rg(), entry("miss", "a", Some(1))]).contains("skip group 0"));
+        assert!(refused(&[entry(Stage::Miss, "m", None)]).contains("needs a raygen"));
+        assert!(refused(&[rg(), entry(Stage::RayGen, "rg2", None)]).contains("exactly one raygen"));
         assert!(
             refused(&[
                 rg(),
-                entry("closest_hit", "a", None),
-                entry("closest_hit", "b", None)
+                entry(Stage::Miss, "a", None),
+                entry(Stage::Miss, "b", None)
+            ])
+            .contains("two miss")
+        );
+        assert!(refused(&[rg(), entry(Stage::Miss, "a", Some(1))]).contains("skip group 0"));
+        assert!(
+            refused(&[
+                rg(),
+                entry(Stage::ClosestHit, "a", None),
+                entry(Stage::ClosestHit, "b", None)
             ])
             .contains("two closest_hit")
         );
-        assert!(refused(&[rg(), entry("callable", "c", Some(-1))]).contains("negative"));
-        let mut miss = entry("miss", "m", None);
+        assert!(refused(&[rg(), entry(Stage::Callable, "c", Some(-1))]).contains("negative"));
+        let mut miss = entry(Stage::Miss, "m", None);
         miss.max_recursion = Some(2);
         assert!(refused(&[rg(), miss]).contains("isn't a raygen"));
         let mut deep = rg();

@@ -6,13 +6,12 @@ use std::time::Duration;
 use common::panic_message;
 use glam::UVec2;
 use lava::{
-    Config, Error,
+    Config, Ctx, Error,
     bindless::{self, Heap, Sampled},
     buffer::{Buffer, Readback},
     image::{Image, format::R8G8B8A8Unorm, usage::usage},
     pipeline::{PassEntry, PassKind, PassMap},
     queue::{Graphics, Timeline, Wait},
-    state::Ctx,
 };
 use lava_tests::bindings::*;
 
@@ -132,7 +131,10 @@ static BROKEN: PassMap = PassMap {
     passes: &[PassEntry {
         name: "Broken",
         spirv: &[3, 2, 1],
-        kind: PassKind::Compute { entry: c"main", subgroup_size: None },
+        kind: PassKind::Compute {
+            entry: c"main",
+            subgroup_size: None,
+        },
         constants: &[],
         constants_size: 0,
     }],

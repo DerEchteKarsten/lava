@@ -1,14 +1,15 @@
 //! GPU tests of a device without lava's optional features: init disables them (`Config::disabled`, `rebar` too), the functions that need them return `MissingFeature` (or panic, for draw state), uploads go through staging buffers, and draw state the device can't set dynamically is baked into pipelines and renders the same, the topology class too (without extended dynamic state 3 the device can't leave it)
 mod common;
 
-use common::{Cmd, Gpu, buffer_with, golden::assert_golden, gpu, zeroed_buffer};
+use common::render::*;
+use common::{buffer_with, golden::assert_golden, gpu, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
-    Error, Features,
+    Ctx, Error, Features,
     buffer::{Buffer, Location, Shared},
     command_buffer::{
-        Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp, CullModeFlags,
-        Draw, LogicOp, MultiDraw, PolygonMode, PrimitiveTopology, RasterState, kind,
+        Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp, CullModeFlags, Draw,
+        LogicOp, MultiDraw, PolygonMode, PrimitiveTopology, RasterState, kind,
     },
     features::MissingFeature,
     image::{
@@ -19,14 +20,8 @@ use lava::{
     memory::memory_report,
     query::{QueryPipelineStatisticFlags as Statistics, QueryPool, Timestamp, counters},
     queue::{Compute, Kind, Timeline, Transfer},
-    state::Ctx,
 };
 use lava_tests::bindings::*;
-
-const SIZE: u32 = 64;
-const EXTENT: UVec2 = UVec2::splat(SIZE);
-
-type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Storage, TransferSrc, TransferDst]>;
 
 fn disabled() -> Features {
     Features {
@@ -61,7 +56,7 @@ fn disabled() -> Features {
         dynamic_line_mode: true,
         dynamic_line_stipple: true,
         dynamic_provoking_vertex: true,
-        ..Features::DEFAULT
+        ..Features::NONE
     }
 }
 
@@ -74,75 +69,17 @@ fn missing(feature: &'static str) -> MissingFeature {
     MissingFeature { feature }
 }
 
-/// Clears a fresh target to `clear`, lets `record` draw into it, and reads it back.
-fn render(
-    gpu: &mut common::Gpu,
-    clear: [f32; 4],
-    record: impl FnOnce(&mut Cmd, &Target),
-) -> Vec<u8> {
-    let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
-    let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
-    gpu.submit(|cmd| {
-        cmd.clear_image(target.whole_view(), clear);
-        record(cmd, &target);
-        cmd.copy_image_to_buffer(target.whole(), readback.range(..));
-    });
-    readback.host().to_vec()
-}
-
-#[track_caller]
-fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 4]) {
-    let i = ((y * SIZE + x) * 4) as usize;
-    let actual: [u8; 4] = pixels[i..i + 4].try_into().unwrap();
-    let close = actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2);
-    assert!(
-        close,
-        "pixel ({x}, {y}) is {actual:?}, expected {expected:?}"
-    );
-}
-
-fn vertex(x: f32, y: f32, z: f32, color: [f32; 4]) -> TestVertex {
-    TestVertex {
-        position: Vec4::new(x, y, z, 1.0),
-        color: Vec4::from_array(color),
-    }
-}
-
-const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
-const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
-const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
-const YELLOW: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
-
-/// The same two triangles as `gpu_headless`: one front-facing in the left half, one
-/// back-facing yellow one in the right half.
-fn two_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
-    gpu.buffer(&[
-        vertex(-0.5, -0.8, 0.5, RED),
-        vertex(-0.1, 0.8, 0.5, GREEN),
-        vertex(-0.9, 0.8, 0.5, BLUE),
-        vertex(0.5, -0.8, 0.5, YELLOW),
-        vertex(0.1, 0.8, 0.5, YELLOW),
-        vertex(0.9, 0.8, 0.5, YELLOW),
-    ])
-}
-
-/// A far green triangle and a near red one in front of it, drawn in that order.
-fn overlapping_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
-    gpu.buffer(&[
-        vertex(0.0, -0.8, 0.8, GREEN),
-        vertex(0.8, 0.8, 0.8, GREEN),
-        vertex(-0.8, 0.8, 0.8, GREEN),
-        vertex(0.0, -0.8, 0.2, RED),
-        vertex(0.8, 0.8, 0.2, RED),
-        vertex(-0.8, 0.8, 0.2, RED),
-    ])
-}
-
 fn bindings(
     vertices: &Buffer<TestVertex>,
     range: std::ops::Range<usize>,
 ) -> impl std::ops::Deref<Target = BindingOutput<'_, kind::RasterVertex>> {
-    TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(range), instance_offset: Vec2::ZERO }, None)
+    TestRaster::push_bindings(
+        TestRasterArgs {
+            vertices: vertices.range(range),
+            instance_offset: Vec2::ZERO,
+        },
+        None,
+    )
 }
 
 fn unculled() -> RasterState<1> {
@@ -167,10 +104,19 @@ fn disabled_features_are_off() {
 #[test]
 fn functions_that_need_a_disabled_feature_return_missing_feature() {
     let _gpu = gpu_without();
-    let launch = TestMesh::push_bindings(TestMeshArgs { color: Vec4::ONE, group_offset: Vec2::ZERO, scale: 0.1 }, None);
+    let launch = TestMesh::push_bindings(
+        TestMeshArgs {
+            color: Vec4::ONE,
+            group_offset: Vec2::ZERO,
+            scale: 0.1,
+        },
+        None,
+    );
     assert_eq!(launch.err(), Some(missing("mesh-shader")));
     // A pass the device can't run has no pipelines to replace: its reload is skipped.
-    let mesh = (PASS_MAP.passes.iter()).position(|p| p.name == "TestMesh").unwrap();
+    let mesh = (PASS_MAP.passes.iter())
+        .position(|p| p.name == "TestMesh")
+        .unwrap();
     let reloaded = lava::pipeline::reload_pass(mesh, PASS_MAP.passes[mesh].spirv);
     assert_eq!(reloaded.unwrap(), lava::pipeline::Reload::Skipped);
     let statistics = QueryPool::statistics(1, Statistics::COMPUTE_SHADER_INVOCATIONS);
@@ -210,10 +156,7 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
     ));
     assert_eq!(Location::shared_or_upload(), Location::Upload);
     let state = RasterState::<1>::default();
-    assert_eq!(
-        state.clone().line_width(2.0).err(),
-        Some(missing("wide-lines"))
-    );
+    assert_eq!(state.line_width(2.0).err(), Some(missing("wide-lines")));
     assert_eq!(
         state.depth_bounds(Some([0.0, 0.5])).err(),
         Some(missing("depth-bounds"))
@@ -223,10 +166,22 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
         first_vertex: 0,
         vertex_count: 3,
     }];
-    let bindings = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None);
+    let bindings = TestRaster::push_bindings(
+        TestRasterArgs {
+            vertices: vertices.range(..),
+            instance_offset: Vec2::ZERO,
+        },
+        None,
+    );
     let multi = Draw::multi(&bindings, &draws, 1, RasterState::<1>::default());
     assert_eq!(multi.err(), Some(missing("multi-draw")));
-    let layered = TestLayered::push_bindings(TestLayeredArgs { vertices: vertices.range(..), second: Vec4::ONE }, None);
+    let layered = TestLayered::push_bindings(
+        TestLayeredArgs {
+            vertices: vertices.range(..),
+            second: Vec4::ONE,
+        },
+        None,
+    );
     assert_eq!(layered.err(), Some(missing("shader-output-layer")));
     // Draw state that needs a feature without a setter of its own panics.
     let src1 = BlendEquation {
@@ -239,7 +194,7 @@ fn functions_that_need_a_disabled_feature_return_missing_feature() {
     };
     let message = common::panic_message(|| {
         let state = RasterState::<1>::default().blend(Blend::Equation(src1));
-        drop(Draw::new(&bindings, 3, 1, state));
+        let _ = Draw::new(&bindings, 3, 1, state);
     });
     assert!(message.contains("`dual-src-blend`"), "{message}");
 }
@@ -250,7 +205,7 @@ fn baked_topology_classes_draw_like_dynamic_ones() {
     let vertices = two_triangles(&mut gpu);
     // Pipelines bake the line class, which the draw's dynamic topology stays in (validation
     // checks it), and a triangle draw after it binds its own.
-    let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let pixels = render(&mut gpu, |cmd, target| {
         let lines = unculled().topology(PrimitiveTopology::LINE_LIST);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines))
@@ -258,7 +213,7 @@ fn baked_topology_classes_draw_like_dynamic_ones() {
     });
     // The same image as `gpu_headless`'s line list on a device without the restriction.
     assert_golden("raster_lines", &pixels, [SIZE, SIZE]);
-    let mixed = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let mixed = render(&mut gpu, |cmd, target| {
         let lines = unculled().topology(PrimitiveTopology::LINE_STRIP);
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -276,7 +231,10 @@ fn baked_topology_classes_draw_like_dynamic_ones() {
 fn uploads_need_neither_rebar_nor_host_image_copies() {
     let mut gpu = gpu_without();
     let uploader = gpu.uploader();
-    assert!(uploader.stages(), "a timeline without `rebar` has the ring it was given");
+    assert!(
+        uploader.stages(),
+        "a timeline without `rebar` has the ring it was given"
+    );
     let data: Vec<u32> = (0..256).collect();
     let buffer = uploader.from_slice(&data).unwrap();
     // Staged without `rebar`, unless device-local memory is mapped anyway (integrated GPUs).
@@ -285,12 +243,19 @@ fn uploads_need_neither_rebar_nor_host_image_copies() {
     }
     assert!(uploader.pending() <= 1);
     let texels: Vec<u8> = (0..16 * 4).map(|i| i as u8).collect();
-    let image = Image::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::new(UVec2::new(4, 4)).unwrap();
+    let image =
+        Image::<R8G8B8A8Unorm, usage![TransferSrc, TransferDst]>::new(UVec2::new(4, 4)).unwrap();
     uploader.image(&image, 0, &texels).unwrap();
-    let (mut buffer_out, mut image_out) = (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u8>(texels.len()));
+    let (mut buffer_out, mut image_out) = (
+        zeroed_buffer::<u32>(data.len()),
+        zeroed_buffer::<u8>(texels.len()),
+    );
     gpu.submit(|cmd| {
         let stats = cmd.drain_uploads();
-        assert!(stats.copies >= 1 && stats.bytes >= texels.len() as u64, "{stats:?}");
+        assert!(
+            stats.copies >= 1 && stats.bytes >= texels.len() as u64,
+            "{stats:?}"
+        );
         cmd.copy_buffer(buffer.range(..), buffer_out.range(..));
         cmd.copy_image_to_buffer(image.whole_view().whole(), image_out.range(..));
     });
@@ -303,7 +268,7 @@ fn uploads_need_neither_rebar_nor_host_image_copies() {
 fn baked_polygon_modes_draw_like_dynamic_ones() {
     let mut gpu = gpu_without();
     let vertices = two_triangles(&mut gpu);
-    let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let pixels = render(&mut gpu, |cmd, target| {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, lines))
@@ -317,7 +282,7 @@ fn baked_polygon_modes_draw_like_dynamic_ones() {
 fn draws_that_differ_in_baked_state_bind_their_own_pipelines() {
     let mut gpu = gpu_without();
     let vertices = two_triangles(&mut gpu);
-    let pixels = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let pixels = render(&mut gpu, |cmd, target| {
         let lines = unculled().polygon_mode(PolygonMode::LINE).unwrap();
         let (left, right) = (bindings(&vertices, 0..3), bindings(&vertices, 3..6));
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -335,7 +300,7 @@ fn baked_blends_combine_and_skip() {
     let mut gpu = gpu_without();
     let vertices = overlapping_triangles(&mut gpu);
     // Green, then red added on top of it.
-    let added = render(&mut gpu, [0.0, 0.0, 0.0, 1.0], |cmd, target| {
+    let added = render(&mut gpu, |cmd, target| {
         let add = RasterState::default().blend(Blend::Add);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, add))
@@ -343,13 +308,19 @@ fn baked_blends_combine_and_skip() {
     });
     assert_pixel(&added, 32, 40, [255, 255, 0, 255]);
     // A skipped attachment's baked write mask is empty.
-    let skipped = render(&mut gpu, BLUE, |cmd, target| {
+    let skipped = render_cleared(&mut gpu, BLUE, |cmd, target| {
         let skip = RasterState::default().blend(Blend::Skip);
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, skip))
             .record("skipped")
     });
-    assert!(skipped.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
+    assert!(
+        skipped
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&p| p == [0, 0, 255, 255])
+    );
 }
 
 #[test]
@@ -360,7 +331,7 @@ fn baked_logic_ops_replace_blending() {
         return;
     }
     let vertices = overlapping_triangles(&mut gpu);
-    let pixels = render(&mut gpu, [1.0; 4], |cmd, target| {
+    let pixels = render_cleared(&mut gpu, [1.0; 4], |cmd, target| {
         let xor = RasterState::default().logic_op(Some(LogicOp::XOR)).unwrap();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::new(&bindings(&vertices, 0..6), 6, 1, xor))

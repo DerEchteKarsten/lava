@@ -215,14 +215,19 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
 
 #[track_caller]
 pub(crate) fn cast_check<B>(address: u64, size: u64) {
-    const { assert!(size_of::<B>() > 0, "buffers of zero-sized elements have no length") };
+    const {
+        assert!(
+            size_of::<B>() > 0,
+            "buffers of zero-sized elements have no length"
+        )
+    };
     let (element, align) = (size_of::<B>() as u64, align_of::<B>() as u64);
     assert!(
-        element != 0 && size % element == 0,
+        element != 0 && size.is_multiple_of(element),
         "{size} bytes aren't a whole number of {element}-byte elements"
     );
     assert!(
-        address % align == 0,
+        address.is_multiple_of(align),
         "address {address:#x} isn't aligned to the {align} bytes of the elements"
     );
 }
@@ -231,7 +236,7 @@ pub(crate) fn cast_check<B>(address: u64, size: u64) {
 #[track_caller]
 fn check_words(address: u64, size: u64, what: &str) {
     assert!(
-        address % 4 == 0 && size % 4 == 0,
+        address.is_multiple_of(4) && size.is_multiple_of(4),
         "{what} writes whole 4-byte words at 4-byte aligned addresses, not {size} bytes at {address:#x}"
     );
 }
@@ -248,15 +253,11 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         if buffer.is_empty() {
             return;
         }
-        self.rec.flush_pending(
-            std::iter::empty(),
-            std::iter::once(BufferAccess {
-                unordered: false,
-                access: vk::AccessFlags2::TRANSFER_WRITE,
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                range: buffer.get_range(),
-            }),
+        let write = buffer.access(
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
         );
+        self.rec.flush_pending(iter::empty(), iter::once(write));
         unsafe {
             Functions::device_address_commands().cmd_fill_memory(
                 self.rec.handle,
@@ -289,15 +290,11 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         if bytes.is_empty() {
             return;
         }
-        self.rec.flush_pending(
-            iter::empty(),
-            iter::once(BufferAccess {
-                unordered: false,
-                stage: vk::PipelineStageFlags2::TRANSFER,
-                access: vk::AccessFlags2::TRANSFER_WRITE,
-                range: buffer.get_range(),
-            }),
+        let write = buffer.access(
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
         );
+        self.rec.flush_pending(iter::empty(), iter::once(write));
         unsafe {
             Functions::device_address_commands().cmd_update_memory(
                 self.rec.handle,
@@ -309,7 +306,11 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
     }
     /// Copies `src` to the start of `dst`, which must be at least as long and not overlap it.
     #[validation_trace]
-    pub fn copy_buffer<'a, T: Copy + 'static>(&mut self, src: BufferSlice<'a, T>, dst: BufferSlice<'a, T>) {
+    pub fn copy_buffer<'a, T: Copy + 'static>(
+        &mut self,
+        src: BufferSlice<'a, T>,
+        dst: BufferSlice<'a, T>,
+    ) {
         self.copy_buffer_regions(&[(src, dst)]);
     }
     /// One `copy_buffer` per pair, in one command. No region's destination may overlap
@@ -337,11 +338,21 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         if regions.is_empty() {
             return;
         }
-        check_copy_overlaps(regions.iter().map(|(src, dst)| (src.get_range(), dst.get_range())));
+        check_copy_overlaps(
+            regions
+                .iter()
+                .map(|(src, dst)| (src.get_range(), dst.get_range())),
+        );
         let accesses = regions.iter().flat_map(|(src, dst)| {
             [
-                src.access(vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ),
-                dst.access(vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE),
+                src.access(
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                ),
+                dst.access(
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                ),
             ]
         });
         self.rec.flush_pending(iter::empty(), accesses);

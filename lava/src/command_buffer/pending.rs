@@ -59,14 +59,17 @@ impl<A> PendingWrite<A> {
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
     ) -> bool {
-        (self.visible.iter()).any(|&(stages, accesses)| {
-            stages.contains(stage) && accesses.contains(access)
-        })
+        (self.visible.iter())
+            .any(|&(stages, accesses)| stages.contains(stage) && accesses.contains(access))
     }
 
     /// A scope merges only into one of the same stages or accesses, or replaces one it contains:
     /// only then is the merged scope exactly the pairs of both.
-    pub(crate) fn make_visible(&mut self, stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) {
+    pub(crate) fn make_visible(
+        &mut self,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) {
         if self.visible_to(stage, access) {
             return;
         }
@@ -207,19 +210,19 @@ impl PendingAccesses {
     pub(crate) fn record(
         &mut self,
         value: u64,
-        image_acceses: impl Iterator<Item = ImageAccess>,
-        buffer_acceses: impl Iterator<Item = BufferAccess>,
+        image_accesses: impl Iterator<Item = ImageAccess>,
+        buffer_accesses: impl Iterator<Item = BufferAccess>,
     ) {
-        for access in buffer_acceses {
+        for access in buffer_accesses {
             let covers = |a: &BufferAccess| {
                 access.range.start <= a.range.start && a.range.end <= access.range.end
             };
-            let writes = access.access.intersects(all_write_access());
-            let reads = access.access.intersects(all_read_access());
+            let writes = access.access.intersects(WRITE_ACCESS);
+            let reads = access.access.intersects(READ_ACCESS);
 
             if writes {
                 self.buffer_writes.retain(|a| !covers(&a.write));
-                self.buffer_writes.push(PendingWrite::new(access.clone(), value));
+                self.buffer_writes.push(PendingWrite::new(access, value));
                 // Its barrier waited for every structure read, and later reads run at the build
                 // stage after it.
                 let structure_write = access
@@ -230,7 +233,7 @@ impl PendingAccesses {
                 });
             }
             if reads {
-                let mut read = access.clone();
+                let mut read = access;
                 self.buffer_reads.retain(|a| {
                     let covered = covers(a);
                     if covered {
@@ -243,14 +246,15 @@ impl PendingAccesses {
             }
         }
 
-        for access in image_acceses {
+        for access in image_accesses {
             let same_image = |a: &ImageAccess| a.image == access.image;
-            let writes = access.access.intersects(all_write_access());
-            let reads = access.access.intersects(all_read_access());
+            let writes = access.access.intersects(WRITE_ACCESS);
+            let reads = access.access.intersects(READ_ACCESS);
 
             if writes {
                 self.image_writes.retain(|a| !same_image(&a.write));
-                self.image_writes.push(PendingWrite::new(access.clone(), value));
+                self.image_writes
+                    .push(PendingWrite::new(access.clone(), value));
                 self.image_reads.retain(|a| !same_image(a));
             }
             if reads {
@@ -285,50 +289,59 @@ pub(crate) fn incomplete_write(
         .max()
 }
 
-pub(crate) fn all_write_access() -> vk::AccessFlags2 {
-    vk::AccessFlags2::SHADER_WRITE
-        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-        | vk::AccessFlags2::TRANSFER_WRITE
-        | vk::AccessFlags2::HOST_WRITE
-        | vk::AccessFlags2::MEMORY_WRITE
-        | vk::AccessFlags2::SHADER_STORAGE_WRITE
-        | vk::AccessFlags2::TRANSFORM_FEEDBACK_WRITE_EXT
-        | vk::AccessFlags2::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT
-        | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR
-        | vk::AccessFlags2::COMMAND_PREPROCESS_WRITE_NV
-        | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR
-        | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR
-        | vk::AccessFlags2::MICROMAP_WRITE_EXT
-        | vk::AccessFlags2::OPTICAL_FLOW_WRITE_NV
+/// The union of these `AccessFlags2`, as a constant (ash's `|` isn't `const`).
+macro_rules! access_set {
+    ($($flag:ident,)*) => {
+        vk::AccessFlags2::from_raw(0 $(| vk::AccessFlags2::$flag.as_raw())*)
+    };
 }
 
-pub(crate) fn all_read_access() -> vk::AccessFlags2 {
-    vk::AccessFlags2::INDIRECT_COMMAND_READ
-        | vk::AccessFlags2::INDEX_READ
-        | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
-        | vk::AccessFlags2::UNIFORM_READ
-        | vk::AccessFlags2::INPUT_ATTACHMENT_READ
-        | vk::AccessFlags2::SHADER_READ
-        | vk::AccessFlags2::COLOR_ATTACHMENT_READ
-        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-        | vk::AccessFlags2::TRANSFER_READ
-        | vk::AccessFlags2::HOST_READ
-        | vk::AccessFlags2::MEMORY_READ
-        | vk::AccessFlags2::SHADER_SAMPLED_READ
-        | vk::AccessFlags2::SHADER_STORAGE_READ
-        | vk::AccessFlags2::SHADER_BINDING_TABLE_READ_KHR
-        | vk::AccessFlags2::TRANSFORM_FEEDBACK_COUNTER_READ_EXT
-        | vk::AccessFlags2::CONDITIONAL_RENDERING_READ_EXT
-        | vk::AccessFlags2::COLOR_ATTACHMENT_READ_NONCOHERENT_EXT
-        | vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
-        | vk::AccessFlags2::FRAGMENT_DENSITY_MAP_READ_EXT
-        | vk::AccessFlags2::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR
-        | vk::AccessFlags2::COMMAND_PREPROCESS_READ_NV
-        | vk::AccessFlags2::DESCRIPTOR_BUFFER_READ_EXT
-        | vk::AccessFlags2::INVOCATION_MASK_READ_HUAWEI
-        | vk::AccessFlags2::VIDEO_DECODE_READ_KHR
-        | vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
-        | vk::AccessFlags2::MICROMAP_READ_EXT
-        | vk::AccessFlags2::OPTICAL_FLOW_READ_NV
-}
+/// Every access that writes.
+pub(crate) const WRITE_ACCESS: vk::AccessFlags2 = access_set!(
+    SHADER_WRITE,
+    COLOR_ATTACHMENT_WRITE,
+    DEPTH_STENCIL_ATTACHMENT_WRITE,
+    TRANSFER_WRITE,
+    HOST_WRITE,
+    MEMORY_WRITE,
+    SHADER_STORAGE_WRITE,
+    TRANSFORM_FEEDBACK_WRITE_EXT,
+    TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT,
+    ACCELERATION_STRUCTURE_WRITE_KHR,
+    COMMAND_PREPROCESS_WRITE_NV,
+    VIDEO_DECODE_WRITE_KHR,
+    VIDEO_ENCODE_WRITE_KHR,
+    MICROMAP_WRITE_EXT,
+    OPTICAL_FLOW_WRITE_NV,
+);
+
+/// Every access that reads.
+pub(crate) const READ_ACCESS: vk::AccessFlags2 = access_set!(
+    INDIRECT_COMMAND_READ,
+    INDEX_READ,
+    VERTEX_ATTRIBUTE_READ,
+    UNIFORM_READ,
+    INPUT_ATTACHMENT_READ,
+    SHADER_READ,
+    COLOR_ATTACHMENT_READ,
+    DEPTH_STENCIL_ATTACHMENT_READ,
+    TRANSFER_READ,
+    HOST_READ,
+    MEMORY_READ,
+    SHADER_SAMPLED_READ,
+    SHADER_STORAGE_READ,
+    SHADER_BINDING_TABLE_READ_KHR,
+    TRANSFORM_FEEDBACK_COUNTER_READ_EXT,
+    CONDITIONAL_RENDERING_READ_EXT,
+    COLOR_ATTACHMENT_READ_NONCOHERENT_EXT,
+    ACCELERATION_STRUCTURE_READ_KHR,
+    FRAGMENT_DENSITY_MAP_READ_EXT,
+    FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR,
+    COMMAND_PREPROCESS_READ_NV,
+    DESCRIPTOR_BUFFER_READ_EXT,
+    INVOCATION_MASK_READ_HUAWEI,
+    VIDEO_DECODE_READ_KHR,
+    VIDEO_ENCODE_READ_KHR,
+    MICROMAP_READ_EXT,
+    OPTICAL_FLOW_READ_NV,
+);

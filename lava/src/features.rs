@@ -124,7 +124,7 @@ where
 pub type Gated<F, T> = <<F as Feature>::Mode as Mode>::Out<T>;
 
 /// `value()` as a [`Gated`] value: called only if the device has `F`.
-pub fn gate<F: Feature, T>(value: impl FnOnce() -> T) -> Gated<F, T> {
+pub fn gated<F: Feature, T>(value: impl FnOnce() -> T) -> Gated<F, T> {
     <F::Mode as Mode>::wrap(F::check().map(|()| value()))
 }
 
@@ -159,7 +159,8 @@ macro_rules! features {
         }
 
         impl Features {
-            pub const DEFAULT: Features = Features {
+            /// No feature: what `Default` gives too.
+            pub const NONE: Features = Features {
                 rebar: false,
                 $(#[cfg(feature = $cargo)] $name: false,)*
             };
@@ -177,6 +178,7 @@ macro_rules! features {
                 }
             }
 
+            /// The features this build of lava asserts (`assert-X`), which `init` requires.
             pub fn asserted() -> Features {
                 Features {
                     rebar: false,
@@ -356,45 +358,63 @@ features! {
     conservative_rasterization: "conservative-rasterization" / "assert-conservative-rasterization" => ConservativeRasterization,
     /// `VK_EXT_provoking_vertex` with last-vertex provoking: `RasterState::provoking_vertex`.
     provoking_vertex: "provoking-vertex" / "assert-provoking-vertex" => ProvokingVertex,
-    /// `VK_KHR_line_rasterization`'s line modes: `RasterState::rectangular_lines`,
-    /// `bresenham_lines` and `smooth_lines`.
+    /// Rectangular lines (`RasterState::rectangular_lines`, `VK_KHR_line_rasterization`'s
+    /// `rectangularLines`, like the other line modes).
     rectangular_lines: "rectangular-lines" / "assert-rectangular-lines" => RectangularLines,
+    /// Bresenham lines (`RasterState::bresenham_lines`, `bresenhamLines`).
     bresenham_lines: "bresenham-lines" / "assert-bresenham-lines" => BresenhamLines,
+    /// Antialiased rectangular lines (`RasterState::smooth_lines`, `smoothLines`).
     smooth_lines: "smooth-lines" / "assert-smooth-lines" => SmoothLines,
     /// Stippled lines (`RasterState::line_stipple`) in every line mode the device has.
     line_stipple: "line-stipple" / "assert-line-stipple" => LineStipple,
-    /// Shader capabilities: 8-, 16- and 64-bit types and 64-bit atomics (on buffers, and on
-    /// shared memory where the device has `shaderSharedInt64Atomics`).
+    /// 8-bit integers in shaders (`shaderInt8`).
     shader_int8: "shader-int8" / "assert-shader-int8" => ShaderInt8,
+    /// 16-bit integers in shaders (`shaderInt16`).
     shader_int16: "shader-int16" / "assert-shader-int16" => ShaderInt16,
+    /// 16-bit floats in shaders (`shaderFloat16`).
     shader_float16: "shader-float16" / "assert-shader-float16" => ShaderFloat16,
+    /// 64-bit floats in shaders (`shaderFloat64`).
     shader_float64: "shader-float64" / "assert-shader-float64" => ShaderFloat64,
+    /// 64-bit integer atomics on buffers (`shaderBufferInt64Atomics`), and on shared memory
+    /// where the device has `shaderSharedInt64Atomics`.
     shader_int64_atomics: "shader-int64-atomics" / "assert-shader-int64-atomics" => ShaderInt64Atomics,
-    /// 8- and 16-bit values in storage and uniform buffers and push constants.
+    /// 8-bit values in storage and uniform buffers and push constants.
     storage_8bit: "storage-8bit" / "assert-storage-8bit" => Storage8Bit,
+    /// 16-bit values in storage and uniform buffers and push constants.
     storage_16bit: "storage-16bit" / "assert-storage-16bit" => Storage16Bit,
     /// 16-bit values in shader inputs and outputs (`StorageInputOutput16`).
     storage_input_output_16: "storage-input-output-16" / "assert-storage-input-output-16" => StorageInputOutput16,
-    /// Clip and cull distances written by shaders (`SV_ClipDistance`, `SV_CullDistance`).
+    /// Clip distances written by shaders (`SV_ClipDistance`, `shaderClipDistance`).
     clip_distance: "clip-distance" / "assert-clip-distance" => ClipDistance,
+    /// Cull distances written by shaders (`SV_CullDistance`, `shaderCullDistance`).
     cull_distance: "cull-distance" / "assert-cull-distance" => CullDistance,
-    /// Extended dynamic state: draws that differ in it share a pipeline; without it the state
-    /// is part of the pipeline's key.
+    /// Extended dynamic state (this and every `dynamic_*` feature): draws that differ in it
+    /// share a pipeline; without it the state is part of the pipeline's key. This one: blend
+    /// enables, equations and write masks.
     dynamic_blend: "dynamic-blend" / "assert-dynamic-blend" => DynamicBlend,
+    /// The polygon mode as dynamic state.
     dynamic_polygon_mode: "dynamic-polygon-mode" / "assert-dynamic-polygon-mode" => DynamicPolygonMode,
+    /// Depth clamping as dynamic state.
     dynamic_depth_clamp: "dynamic-depth-clamp" / "assert-dynamic-depth-clamp" => DynamicDepthClamp,
+    /// Depth clipping as dynamic state.
     dynamic_depth_clip: "dynamic-depth-clip" / "assert-dynamic-depth-clip" => DynamicDepthClip,
+    /// The clip space depth range (`depth_clip_negative_one_to_one`) as dynamic state.
     dynamic_depth_clip_negative_one_to_one: "dynamic-depth-clip-negative-one-to-one" / "assert-dynamic-depth-clip-negative-one-to-one" => DynamicDepthClipNegativeOneToOne,
+    /// The logic op as dynamic state (with `VK_EXT_extended_dynamic_state2`'s).
     dynamic_logic_op: "dynamic-logic-op" / "assert-dynamic-logic-op" => DynamicLogicOp,
+    /// The conservative rasterization mode as dynamic state.
     dynamic_conservative_rasterization: "dynamic-conservative-rasterization" / "assert-dynamic-conservative-rasterization" => DynamicConservativeRasterization,
+    /// The line rasterization mode as dynamic state.
     dynamic_line_mode: "dynamic-line-mode" / "assert-dynamic-line-mode" => DynamicLineMode,
+    /// Line stippling on or off as dynamic state.
     dynamic_line_stipple: "dynamic-line-stipple" / "assert-dynamic-line-stipple" => DynamicLineStipple,
+    /// The provoking vertex as dynamic state.
     dynamic_provoking_vertex: "dynamic-provoking-vertex" / "assert-dynamic-provoking-vertex" => DynamicProvokingVertex,
 }
 
 impl Default for Features {
     fn default() -> Self {
-        Self::DEFAULT
+        Self::NONE
     }
 }
 
@@ -442,8 +462,8 @@ pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
 pub(crate) fn spirv_capabilities(spirv: &[u8]) -> impl Iterator<Item = u32> + '_ {
     const OP_EXTENSION: u32 = 10;
     const OP_CAPABILITY: u32 = 17;
-    let mut words = (spirv.chunks_exact(4))
-        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+    let mut words = (spirv.as_chunks::<4>().0.iter())
+        .map(|&w| u32::from_le_bytes(w))
         .skip(5);
     fn skip(words: &mut impl Iterator<Item = u32>, n: usize) {
         if n > 0 {
@@ -475,6 +495,7 @@ pub(crate) struct Needs {
 }
 
 impl Features {
+    /// The cargo names of the features `self` has and `available` lacks.
     pub fn missing_from(&self, available: &Features) -> Vec<&'static str> {
         (self.bits().zip(available.bits()).zip(Self::NAMES))
             .filter(|((wanted, has), _)| *wanted && !*has)
@@ -482,10 +503,7 @@ impl Features {
             .collect()
     }
 
-    pub fn union(self, other: Features) -> Features {
-        Self::from_bits(self.bits().zip(other.bits()).map(|(a, b)| a || b))
-    }
-
+    /// `self` without the features `other` has.
     pub fn without(self, other: Features) -> Features {
         Self::from_bits(self.bits().zip(other.bits()).map(|(a, b)| a && !b))
     }
@@ -678,43 +696,16 @@ impl FeatureChain {
         let mut features2 = chain.chain(has);
         unsafe { instance.get_physical_device_features2(device, &mut features2) };
         chain.core = features2.features;
+        // The links point into this frame, which the returned chain leaves.
+        chain.unlink();
         chain
     }
 
-    /// The structs whose extension `has` names, linked behind one `PhysicalDeviceFeatures2`.
-    pub(crate) fn chain<'a>(&'a mut self, has: &dyn Fn(&CStr) -> bool) -> vk::PhysicalDeviceFeatures2<'a> {
-        let Self {
-            core,
-            vk11,
-            vk12,
-            vk13,
-            address_commands,
-            descriptor_heap,
-            untyped_pointers,
-            dynamic_state2,
-            dynamic_state3,
-            lines,
-            provoking_vertex,
-            multi_draw,
-            depth_clip_enable,
-            depth_clip_control,
-            depth_clamp_control,
-            mesh,
-            acceleration_structure,
-            ray_query,
-            ray_tracing_pipeline,
-            position_fetch,
-            invocation_reorder,
-            host_image_copy,
-            clock,
-            performance,
-            swapchain_maintenance1,
-            fifo_latest_ready,
-        } = self;
-        // ash 0.38's `push_next` links the pushed struct's whole chain, so unlink a queried one.
+    /// Clears every struct's `p_next`.
+    fn unlink(&mut self) {
         macro_rules! unlink {
             ($($field:ident),*) => {
-                $($field.p_next = core::ptr::null_mut();)*
+                $(self.$field.p_next = core::ptr::null_mut();)*
             };
         }
         unlink!(
@@ -744,6 +735,44 @@ impl FeatureChain {
             swapchain_maintenance1,
             fifo_latest_ready
         );
+    }
+
+    /// The structs whose extension `has` names, linked behind one `PhysicalDeviceFeatures2`.
+    pub(crate) fn chain<'a>(
+        &'a mut self,
+        has: &dyn Fn(&CStr) -> bool,
+    ) -> vk::PhysicalDeviceFeatures2<'a> {
+        // ash 0.38's `push_next` links the pushed struct's whole chain, so a struct copied from
+        // another chain (`enabling` starts from the queried one) mustn't bring its links.
+        self.unlink();
+        let Self {
+            core,
+            vk11,
+            vk12,
+            vk13,
+            address_commands,
+            descriptor_heap,
+            untyped_pointers,
+            dynamic_state2,
+            dynamic_state3,
+            lines,
+            provoking_vertex,
+            multi_draw,
+            depth_clip_enable,
+            depth_clip_control,
+            depth_clamp_control,
+            mesh,
+            acceleration_structure,
+            ray_query,
+            ray_tracing_pipeline,
+            position_fetch,
+            invocation_reorder,
+            host_image_copy,
+            clock,
+            performance,
+            swapchain_maintenance1,
+            fifo_latest_ready,
+        } = self;
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(*core)
             .push_next(vk11)
@@ -802,7 +831,10 @@ impl FeatureChain {
         let bits = [
             ("shaderInt64", c.shader_int64),
             ("fragmentStoresAndAtomics", c.fragment_stores_and_atomics),
-            ("vertexPipelineStoresAndAtomics", c.vertex_pipeline_stores_and_atomics),
+            (
+                "vertexPipelineStoresAndAtomics",
+                c.vertex_pipeline_stores_and_atomics,
+            ),
             ("multiDrawIndirect", c.multi_draw_indirect),
             ("drawIndirectFirstInstance", c.draw_indirect_first_instance),
             ("depthBiasClamp", c.depth_bias_clamp),
@@ -813,18 +845,32 @@ impl FeatureChain {
             ("drawIndirectCount", v12.draw_indirect_count),
             ("scalarBlockLayout", v12.scalar_block_layout),
             ("vulkanMemoryModel", v12.vulkan_memory_model),
-            ("vulkanMemoryModelDeviceScope", v12.vulkan_memory_model_device_scope),
+            (
+                "vulkanMemoryModelDeviceScope",
+                v12.vulkan_memory_model_device_scope,
+            ),
             ("hostQueryReset", v12.host_query_reset),
             ("dynamicRendering", v13.dynamic_rendering),
             ("synchronization2", v13.synchronization2),
             ("maintenance4", v13.maintenance4),
-            ("shaderDemoteToHelperInvocation", v13.shader_demote_to_helper_invocation),
-            ("deviceAddressCommands", self.address_commands.device_address_commands),
+            (
+                "shaderDemoteToHelperInvocation",
+                v13.shader_demote_to_helper_invocation,
+            ),
+            (
+                "deviceAddressCommands",
+                self.address_commands.device_address_commands,
+            ),
             ("descriptorHeap", self.descriptor_heap.descriptor_heap),
-            ("shaderUntypedPointers", self.untyped_pointers.shader_untyped_pointers),
+            (
+                "shaderUntypedPointers",
+                self.untyped_pointers.shader_untyped_pointers,
+            ),
         ];
         let bits = bits.into_iter().filter(|(_, bit)| *bit != vk::TRUE);
-        extensions.chain(bits.map(|(name, _)| name.to_owned())).collect()
+        extensions
+            .chain(bits.map(|(name, _)| name.to_owned()))
+            .collect()
     }
 
     #[allow(unused_variables)]
@@ -832,15 +878,15 @@ impl FeatureChain {
         let t = |bit: vk::Bool32| bit == vk::TRUE;
         let (c, v11, v12) = (&self.core, &self.vk11, &self.vk12);
         let (d2, d3, lines) = (&self.dynamic_state2, &self.dynamic_state3, &self.lines);
+        // A struct is linked only where the device has its extension (`chain`), so its bits
+        // are false elsewhere: only bits of other extensions need `has`.
         let line_ext = has(ash::khr::line_rasterization::NAME);
-        let acceleration_structure = has(ash::khr::acceleration_structure::NAME)
-            && has(ash::khr::deferred_host_operations::NAME)
+        let acceleration_structure = has(ash::khr::deferred_host_operations::NAME)
             && t(self.acceleration_structure.acceleration_structure);
-        let eds3 = |bit| has(ash::ext::extended_dynamic_state3::NAME) && t(bit);
         #[allow(unused_mut)]
         let mut f = Features {
             rebar: device.rebar,
-            ..Features::DEFAULT
+            ..Features::NONE
         };
         set! { f:
             "host-image-copy" => host_image_copy = t(self.host_image_copy.host_image_copy),
@@ -857,11 +903,9 @@ impl FeatureChain {
                         || t(self.ray_tracing_pipeline.ray_tracing_pipeline)
                             && t(self.ray_tracing_pipeline.ray_traversal_primitive_culling)),
             "ray-tracing-position-fetch" => ray_tracing_position_fetch = acceleration_structure
-                && has(ash::khr::ray_tracing_position_fetch::NAME)
                 && t(self.position_fetch.ray_tracing_position_fetch),
             "ray-tracing-invocation-reorder" => ray_tracing_invocation_reorder =
-                has(crate::vk::ray_tracing_invocation_reorder::NAME)
-                    && t(self.invocation_reorder.ray_tracing_invocation_reorder),
+                t(self.invocation_reorder.ray_tracing_invocation_reorder),
             "pipeline-statistics" => pipeline_statistics = t(c.pipeline_statistics_query),
             "precise-occlusion" => precise_occlusion = t(c.occlusion_query_precise),
             "memory-budget" => memory_budget = has(ash::ext::memory_budget::NAME),
@@ -890,8 +934,7 @@ impl FeatureChain {
                 cfg!(unix) && has(ash::khr::external_memory_fd::NAME),
             "independent-blend" => independent_blend = t(c.independent_blend),
             "dual-src-blend" => dual_src_blend = t(c.dual_src_blend),
-            "multi-draw" => multi_draw =
-                has(ash::ext::multi_draw::NAME) && t(self.multi_draw.multi_draw),
+            "multi-draw" => multi_draw = t(self.multi_draw.multi_draw),
             "shader-output-layer" => shader_output_layer =
                 t(v12.shader_output_layer) && t(v12.shader_output_viewport_index),
             "fill-mode-non-solid" => fill_mode_non_solid = t(c.fill_mode_non_solid),
@@ -909,9 +952,9 @@ impl FeatureChain {
             "conservative-rasterization" => conservative_rasterization =
                 has(ash::ext::conservative_rasterization::NAME),
             "provoking-vertex" => provoking_vertex = t(self.provoking_vertex.provoking_vertex_last),
-            "rectangular-lines" => rectangular_lines = line_ext && t(lines.rectangular_lines),
-            "bresenham-lines" => bresenham_lines = line_ext && t(lines.bresenham_lines),
-            "smooth-lines" => smooth_lines = line_ext && t(lines.smooth_lines),
+            "rectangular-lines" => rectangular_lines = t(lines.rectangular_lines),
+            "bresenham-lines" => bresenham_lines = t(lines.bresenham_lines),
+            "smooth-lines" => smooth_lines = t(lines.smooth_lines),
             "shader-int8" => shader_int8 = t(v12.shader_int8),
             "shader-int16" => shader_int16 = t(c.shader_int16),
             "shader-float16" => shader_float16 = t(v12.shader_float16),
@@ -926,34 +969,32 @@ impl FeatureChain {
             "storage-input-output-16" => storage_input_output_16 = t(v11.storage_input_output16),
             "clip-distance" => clip_distance = t(c.shader_clip_distance),
             "cull-distance" => cull_distance = t(c.shader_cull_distance),
-            "dynamic-blend" => dynamic_blend = eds3(d3.extended_dynamic_state3_color_blend_enable)
+            "dynamic-blend" => dynamic_blend = t(d3.extended_dynamic_state3_color_blend_enable)
                 && t(d3.extended_dynamic_state3_color_blend_equation)
                 && t(d3.extended_dynamic_state3_color_write_mask),
             "dynamic-polygon-mode" => dynamic_polygon_mode =
-                eds3(d3.extended_dynamic_state3_polygon_mode),
+                t(d3.extended_dynamic_state3_polygon_mode),
             "dynamic-depth-clamp" => dynamic_depth_clamp =
-                eds3(d3.extended_dynamic_state3_depth_clamp_enable),
+                t(d3.extended_dynamic_state3_depth_clamp_enable),
             "dynamic-depth-clip" => dynamic_depth_clip =
-                eds3(d3.extended_dynamic_state3_depth_clip_enable),
+                t(d3.extended_dynamic_state3_depth_clip_enable),
             "dynamic-depth-clip-negative-one-to-one" => dynamic_depth_clip_negative_one_to_one =
-                eds3(d3.extended_dynamic_state3_depth_clip_negative_one_to_one),
+                t(d3.extended_dynamic_state3_depth_clip_negative_one_to_one),
             "dynamic-logic-op" => dynamic_logic_op =
-                eds3(d3.extended_dynamic_state3_logic_op_enable)
-                    && has(ash::ext::extended_dynamic_state2::NAME)
+                t(d3.extended_dynamic_state3_logic_op_enable)
                     && t(d2.extended_dynamic_state2_logic_op),
             "dynamic-conservative-rasterization" => dynamic_conservative_rasterization =
-                eds3(d3.extended_dynamic_state3_conservative_rasterization_mode),
+                t(d3.extended_dynamic_state3_conservative_rasterization_mode),
             "dynamic-line-mode" => dynamic_line_mode =
-                line_ext && eds3(d3.extended_dynamic_state3_line_rasterization_mode),
+                line_ext && t(d3.extended_dynamic_state3_line_rasterization_mode),
             "dynamic-line-stipple" => dynamic_line_stipple =
-                line_ext && eds3(d3.extended_dynamic_state3_line_stipple_enable),
+                line_ext && t(d3.extended_dynamic_state3_line_stipple_enable),
             "dynamic-provoking-vertex" => dynamic_provoking_vertex =
-                eds3(d3.extended_dynamic_state3_provoking_vertex_mode),
+                t(d3.extended_dynamic_state3_provoking_vertex_mode),
         }
         let stippled = |mode: vk::Bool32, stippled: vk::Bool32| !t(mode) || t(stippled);
         set! { f:
-            "line-stipple" => line_stipple = line_ext
-                && device.strict_lines
+            "line-stipple" => line_stipple = device.strict_lines
                 && t(lines.stippled_rectangular_lines)
                 && stippled(lines.bresenham_lines, lines.stippled_bresenham_lines)
                 && stippled(lines.smooth_lines, lines.stippled_smooth_lines),
@@ -968,14 +1009,16 @@ impl FeatureChain {
         let on = |b: bool| b as vk::Bool32;
         let has = |bit: vk::Bool32| bit == vk::TRUE;
         let f = features;
-        let mut chain = Self::default();
-        chain.core = vk::PhysicalDeviceFeatures::default()
-            .shader_int64(true)
-            .fragment_stores_and_atomics(true)
-            .vertex_pipeline_stores_and_atomics(true)
-            .multi_draw_indirect(true)
-            .draw_indirect_first_instance(true)
-            .depth_bias_clamp(true);
+        let mut chain = Self {
+            core: vk::PhysicalDeviceFeatures::default()
+                .shader_int64(true)
+                .fragment_stores_and_atomics(true)
+                .vertex_pipeline_stores_and_atomics(true)
+                .multi_draw_indirect(true)
+                .draw_indirect_first_instance(true)
+                .depth_bias_clamp(true),
+            ..Self::default()
+        };
         chain.vk11 = vk::PhysicalDeviceVulkan11Features::default()
             .shader_draw_parameters(true)
             .multiview(true);
@@ -1084,7 +1127,8 @@ impl FeatureChain {
         }
         #[cfg(feature = "line-stipple")]
         {
-            lines.stippled_bresenham_lines = on(f.line_stipple && lines.bresenham_lines == vk::TRUE);
+            lines.stippled_bresenham_lines =
+                on(f.line_stipple && lines.bresenham_lines == vk::TRUE);
             lines.stippled_smooth_lines = on(f.line_stipple && lines.smooth_lines == vk::TRUE);
         }
         let _ = (c, v11, v12, d2, d3, lines);

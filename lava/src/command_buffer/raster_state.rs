@@ -6,14 +6,14 @@ use glam::{I64Vec2, IVec2, UVec2};
 
 pub use crate::vk::{
     BlendFactor, BlendOp, ColorComponentFlags, CompareOp, ConservativeRasterizationModeEXT,
-    CullModeFlags, FrontFace, LineRasterizationModeKHR, LogicOp, PolygonMode,
-    PrimitiveTopology, ProvokingVertexModeEXT, StencilOp,
+    CullModeFlags, FrontFace, LineRasterizationModeKHR, LogicOp, PolygonMode, PrimitiveTopology,
+    ProvokingVertexModeEXT, StencilOp,
 };
 
-use smallvec::SmallVec;
 #[allow(unused_imports)]
 use crate::features::{Features, Gated, On, gate};
 use crate::state::{Ctx, Functions};
+use smallvec::SmallVec;
 
 /// How a color attachment combines a fragment's output `src` with the stored value `dst`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -96,9 +96,10 @@ pub struct DepthBias {
     pub clamp: f32,
 }
 
+/// Made only by the setters of `depth-clamp` and `depth-clamp-control`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum DepthClamp {
+    #[cfg_attr(not(feature = "depth-clamp"), allow(dead_code))]
     Viewport,
     #[cfg_attr(not(feature = "depth-clamp-control"), allow(dead_code))]
     Range { min: f32, max: f32 },
@@ -187,7 +188,8 @@ impl Rect {
     pub(crate) fn check_scissor(self, what: &str) {
         let end = self.offset.as_i64vec2() + self.extent.as_i64vec2();
         assert!(
-            self.offset.cmpge(IVec2::ZERO).all() && end.cmple(I64Vec2::splat(i32::MAX as i64)).all(),
+            self.offset.cmpge(IVec2::ZERO).all()
+                && end.cmple(I64Vec2::splat(i32::MAX as i64)).all(),
             "a {what} starts at a non-negative offset and ends below 2^31, not {} texels at {}",
             self.extent,
             self.offset
@@ -208,62 +210,71 @@ impl From<UVec2> for Rect {
 /// back-face-culled triangles with clockwise front faces, depth-tested with `GREATER` (reversed
 /// depth) and depth-writing, replace every color attachment, and use the rendering's viewport
 /// and scissor.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RasterState<const COLOR_ATTACHMENTS: usize> {
-    pub(super) topology: PrimitiveTopology,
-    pub(super) primitive_restart: bool,
-    pub(super) rasterizer_discard: bool,
-    pub(super) cull_mode: CullModeFlags,
-    pub(super) front_face: FrontFace,
-    pub(super) polygon_mode: PolygonMode,
-    pub(super) line_width: f32,
-    pub(super) line_mode: LineRasterizationModeKHR,
-    pub(super) line_stipple: Option<LineStipple>,
-    pub(super) provoking_vertex: ProvokingVertexModeEXT,
-    pub(super) conservative: ConservativeRasterizationModeEXT,
-    pub(super) depth_test: Option<CompareOp>,
-    pub(super) depth_write: bool,
-    pub(super) depth_bounds: Option<[f32; 2]>,
-    pub(super) depth_bias: Option<DepthBias>,
-    pub(super) depth_clamp: Option<DepthClamp>,
-    /// `None`: clipped unless clamped.
-    pub(super) depth_clip: Option<bool>,
-    pub(super) depth_clip_negative_one_to_one: bool,
-    pub(super) stencil: Option<Stencil>,
-    pub(super) logic_op: Option<LogicOp>,
-    pub(super) blend_constants: [f32; 4],
-    pub(super) viewport: Option<Rect>,
-    pub(super) scissor: Option<Rect>,
+    pub(super) core: RasterCore,
     pub(super) blends: [Blend; COLOR_ATTACHMENTS],
     pub(super) write_masks: [ColorComponentFlags; COLOR_ATTACHMENTS],
+}
+
+/// A draw's state but its blends and write masks, which a draw keeps apart from it, as long as
+/// its attachment count ([`RasterState::split`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RasterCore {
+    pub(crate) topology: PrimitiveTopology,
+    pub(crate) primitive_restart: bool,
+    pub(crate) rasterizer_discard: bool,
+    pub(crate) cull_mode: CullModeFlags,
+    pub(crate) front_face: FrontFace,
+    pub(crate) polygon_mode: PolygonMode,
+    pub(crate) line_width: f32,
+    pub(crate) line_mode: LineRasterizationModeKHR,
+    pub(crate) line_stipple: Option<LineStipple>,
+    pub(crate) provoking_vertex: ProvokingVertexModeEXT,
+    pub(crate) conservative: ConservativeRasterizationModeEXT,
+    pub(crate) depth_test: Option<CompareOp>,
+    pub(crate) depth_write: bool,
+    pub(crate) depth_bounds: Option<[f32; 2]>,
+    pub(crate) depth_bias: Option<DepthBias>,
+    pub(crate) depth_clamp: Option<DepthClamp>,
+    /// `None`: clipped unless clamped.
+    pub(crate) depth_clip: Option<bool>,
+    pub(crate) depth_clip_negative_one_to_one: bool,
+    pub(crate) stencil: Option<Stencil>,
+    pub(crate) logic_op: Option<LogicOp>,
+    pub(crate) blend_constants: [f32; 4],
+    pub(crate) viewport: Option<Rect>,
+    pub(crate) scissor: Option<Rect>,
 }
 
 impl<const COLOR_ATTACHMENTS: usize> Default for RasterState<COLOR_ATTACHMENTS> {
     fn default() -> Self {
         Self {
-            topology: PrimitiveTopology::TRIANGLE_LIST,
-            primitive_restart: false,
-            rasterizer_discard: false,
-            cull_mode: CullModeFlags::BACK,
-            front_face: FrontFace::CLOCKWISE,
-            polygon_mode: PolygonMode::FILL,
-            line_width: 1.0,
-            line_mode: LineRasterizationModeKHR::DEFAULT,
-            line_stipple: None,
-            provoking_vertex: ProvokingVertexModeEXT::FIRST_VERTEX,
-            conservative: ConservativeRasterizationModeEXT::DISABLED,
-            depth_test: Some(CompareOp::GREATER),
-            depth_write: true,
-            depth_bounds: None,
-            depth_bias: None,
-            depth_clamp: None,
-            depth_clip: None,
-            depth_clip_negative_one_to_one: false,
-            stencil: None,
-            logic_op: None,
-            blend_constants: [0.0; 4],
-            viewport: None,
-            scissor: None,
+            core: RasterCore {
+                topology: PrimitiveTopology::TRIANGLE_LIST,
+                primitive_restart: false,
+                rasterizer_discard: false,
+                cull_mode: CullModeFlags::BACK,
+                front_face: FrontFace::CLOCKWISE,
+                polygon_mode: PolygonMode::FILL,
+                line_width: 1.0,
+                line_mode: LineRasterizationModeKHR::DEFAULT,
+                line_stipple: None,
+                provoking_vertex: ProvokingVertexModeEXT::FIRST_VERTEX,
+                conservative: ConservativeRasterizationModeEXT::DISABLED,
+                depth_test: Some(CompareOp::GREATER),
+                depth_write: true,
+                depth_bounds: None,
+                depth_bias: None,
+                depth_clamp: None,
+                depth_clip: None,
+                depth_clip_negative_one_to_one: false,
+                stencil: None,
+                logic_op: None,
+                blend_constants: [0.0; 4],
+                viewport: None,
+                scissor: None,
+            },
             blends: [Blend::Replace; COLOR_ATTACHMENTS],
             write_masks: [ColorComponentFlags::RGBA; COLOR_ATTACHMENTS],
         }
@@ -274,7 +285,7 @@ macro_rules! setters {
     ($($(#[doc = $doc:literal])* $name:ident: $ty:ty,)*) => {
         impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
             $($(#[doc = $doc])* pub fn $name(mut self, $name: $ty) -> Self {
-                self.$name = $name;
+                self.core.$name = $name;
                 self
             })*
         }
@@ -311,7 +322,7 @@ macro_rules! gated_setters {
             $($(#[doc = $doc])*
             #[cfg(feature = $cargo)]
             pub fn $name(mut self, $($arg: $ty),*) -> Gated<gate::$marker, Self> {
-                crate::features::gate::<gate::$marker, _>(move || {
+                crate::features::gated::<gate::$marker, _>(move || {
                     {
                         let $state = &mut self;
                         $body
@@ -326,60 +337,60 @@ macro_rules! gated_setters {
 gated_setters! {
     /// Line or point polygons (`FILL` is the default).
     "fill-mode-non-solid" => FillModeNonSolid: polygon_mode(state, mode: PolygonMode) {
-        state.polygon_mode = mode
+        state.core.polygon_mode = mode
     }
     /// Lines other than 1 wide.
-    "wide-lines" => WideLines: line_width(state, width: f32) { state.line_width = width }
+    "wide-lines" => WideLines: line_width(state, width: f32) { state.core.line_width = width }
     /// Rectangular lines instead of the device's default.
     "rectangular-lines" => RectangularLines: rectangular_lines(state) {
-        state.line_mode = LineRasterizationModeKHR::RECTANGULAR
+        state.core.line_mode = LineRasterizationModeKHR::RECTANGULAR
     }
     /// Bresenham lines instead of the device's default.
     "bresenham-lines" => BresenhamLines: bresenham_lines(state) {
-        state.line_mode = LineRasterizationModeKHR::BRESENHAM
+        state.core.line_mode = LineRasterizationModeKHR::BRESENHAM
     }
     /// Antialiased rectangular lines instead of the device's default.
     "smooth-lines" => SmoothLines: smooth_lines(state) {
-        state.line_mode = LineRasterizationModeKHR::RECTANGULAR_SMOOTH
+        state.core.line_mode = LineRasterizationModeKHR::RECTANGULAR_SMOOTH
     }
     /// Stippled lines, in any line mode.
     "line-stipple" => LineStipple: line_stipple(state, stipple: Option<LineStipple>) {
-        state.line_stipple = stipple
+        state.core.line_stipple = stipple
     }
     /// The vertex whose outputs flat-shaded attributes take (`FIRST_VERTEX` is the default).
     "provoking-vertex" => ProvokingVertex: provoking_vertex(state, mode: ProvokingVertexModeEXT) {
-        state.provoking_vertex = mode
+        state.core.provoking_vertex = mode
     }
     /// Over- or underestimating rasterization.
-    "conservative-rasterization" => ConservativeRasterization: conservative(state, 
+    "conservative-rasterization" => ConservativeRasterization: conservative(state,
         mode: ConservativeRasterizationModeEXT
     ) {
-        state.conservative = mode
+        state.core.conservative = mode
     }
     /// Discards fragments whose stored depth is outside `[min, max]`.
     "depth-bounds" => DepthBounds: depth_bounds(state, bounds: Option<[f32; 2]>) {
-        state.depth_bounds = bounds
+        state.core.depth_bounds = bounds
     }
     /// Clamps depths to the viewport's depth range instead of clipping. Without
     /// `depth-clip-enable` on the device, clamped primitives are also not clipped.
     "depth-clamp" => DepthClamp: depth_clamp(state, on: bool) {
-        state.depth_clamp = on.then_some(DepthClamp::Viewport)
+        state.core.depth_clamp = on.then_some(DepthClamp::Viewport)
     }
     /// Clamps depths to `[min, max]` instead of clipping.
     "depth-clamp-control" => DepthClampControl: depth_clamp_range(state, min: f32, max: f32) {
-        state.depth_clamp = Some(DepthClamp::Range { min, max })
+        state.core.depth_clamp = Some(DepthClamp::Range { min, max })
     }
     /// Whether primitives are clipped against the near and far planes; by default they are
     /// unless depths are clamped (`depth_clamp`), on every device.
     "depth-clip-enable" => DepthClipEnable: depth_clip(state, on: bool) {
-        state.depth_clip = Some(on)
+        state.core.depth_clip = Some(on)
     }
     /// Clip space depth from -1 to 1 (OpenGL's) instead of 0 to 1.
     "depth-clip-control" => DepthClipControl: depth_clip_negative_one_to_one(state, on: bool) {
-        state.depth_clip_negative_one_to_one = on
+        state.core.depth_clip_negative_one_to_one = on
     }
     /// Replaces blending with a logic op on integer attachments.
-    "logic-op" => LogicOp: logic_op(state, op: Option<LogicOp>) { state.logic_op = op }
+    "logic-op" => LogicOp: logic_op(state, op: Option<LogicOp>) { state.core.logic_op = op }
     /// One blend per color attachment, in attachment order ([`Self::blend`] gives all the
     /// same one, which needs no feature).
     "independent-blend" => IndependentBlend: blends(state, blends: [Blend; COLOR_ATTACHMENTS]) {
@@ -407,37 +418,18 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
         self
     }
 
-    pub(super) fn split(self) -> (RasterState<0>, [Blend; COLOR_ATTACHMENTS], [ColorComponentFlags; COLOR_ATTACHMENTS]) {
-        let state = RasterState {
-            topology: self.topology,
-            primitive_restart: self.primitive_restart,
-            rasterizer_discard: self.rasterizer_discard,
-            cull_mode: self.cull_mode,
-            front_face: self.front_face,
-            polygon_mode: self.polygon_mode,
-            line_width: self.line_width,
-            line_mode: self.line_mode,
-            line_stipple: self.line_stipple,
-            provoking_vertex: self.provoking_vertex,
-            conservative: self.conservative,
-            depth_test: self.depth_test,
-            depth_write: self.depth_write,
-            depth_bounds: self.depth_bounds,
-            depth_bias: self.depth_bias,
-            depth_clamp: self.depth_clamp,
-            depth_clip: self.depth_clip,
-            depth_clip_negative_one_to_one: self.depth_clip_negative_one_to_one,
-            stencil: self.stencil,
-            logic_op: self.logic_op,
-            blend_constants: self.blend_constants,
-            viewport: self.viewport,
-            scissor: self.scissor,
-            blends: [],
-            write_masks: [],
-        };
-        (state, self.blends, self.write_masks)
+    pub(super) fn split(
+        self,
+    ) -> (
+        RasterCore,
+        [Blend; COLOR_ATTACHMENTS],
+        [ColorComponentFlags; COLOR_ATTACHMENTS],
+    ) {
+        (self.core, self.blends, self.write_masks)
     }
+}
 
+impl RasterCore {
     /// Whether primitives are clipped against the near and far planes: as set, else unless
     /// depths are clamped.
     pub(crate) fn effective_depth_clip(&self) -> bool {
@@ -455,15 +447,17 @@ impl<const COLOR_ATTACHMENTS: usize> RasterState<COLOR_ATTACHMENTS> {
         let limits = &physical.properties.limits;
         for (i, blend) in blends.iter().enumerate() {
             let Some(e) = blend.equation() else { continue };
-            let src1 = [e.src_color, e.dst_color, e.src_alpha, e.dst_alpha].iter().any(|f| {
-                matches!(
-                    *f,
-                    BlendFactor::SRC1_COLOR
-                        | BlendFactor::ONE_MINUS_SRC1_COLOR
-                        | BlendFactor::SRC1_ALPHA
-                        | BlendFactor::ONE_MINUS_SRC1_ALPHA
-                )
-            });
+            let src1 = [e.src_color, e.dst_color, e.src_alpha, e.dst_alpha]
+                .iter()
+                .any(|f| {
+                    matches!(
+                        *f,
+                        BlendFactor::SRC1_COLOR
+                            | BlendFactor::ONE_MINUS_SRC1_COLOR
+                            | BlendFactor::SRC1_ALPHA
+                            | BlendFactor::ONE_MINUS_SRC1_ALPHA
+                    )
+                });
             if !src1 {
                 continue;
             }
@@ -543,9 +537,10 @@ pub(crate) fn topology_class(topology: PrimitiveTopology) -> PrimitiveTopology {
     use PrimitiveTopology as T;
     match topology {
         T::POINT_LIST => T::POINT_LIST,
-        T::LINE_LIST | T::LINE_STRIP | T::LINE_LIST_WITH_ADJACENCY | T::LINE_STRIP_WITH_ADJACENCY => {
-            T::LINE_LIST
-        }
+        T::LINE_LIST
+        | T::LINE_STRIP
+        | T::LINE_LIST_WITH_ADJACENCY
+        | T::LINE_STRIP_WITH_ADJACENCY => T::LINE_LIST,
         T::PATCH_LIST => T::PATCH_LIST,
         _ => T::TRIANGLE_LIST,
     }
@@ -648,7 +643,7 @@ pub(crate) struct Baked {
 #[allow(unused_variables, unused_mut)]
 impl Baked {
     /// `vertex`: a vertex pipeline, which has a topology.
-    pub(crate) fn of(state: &RasterState<0>, dynamic: &Dynamic, vertex: bool) -> Self {
+    pub(crate) fn of(state: &RasterCore, dynamic: &Dynamic, vertex: bool) -> Self {
         let mut baked = Self::default();
         if vertex && !dynamic.topology_unrestricted {
             baked.topology = topology_class(state.topology);
@@ -702,7 +697,6 @@ pub(crate) fn effective_write_mask(blend: Blend, mask: ColorComponentFlags) -> C
 
 #[derive(Clone, Copy)]
 pub(super) struct Rendering {
-    pub(super) color_attachments: usize,
     pub(super) depth: bool,
     pub(super) stencil: bool,
     /// What draws without a viewport or scissor of their own use.
@@ -714,15 +708,15 @@ pub(super) type Assembly = Option<(PrimitiveTopology, bool)>;
 
 #[derive(Clone, Copy)]
 pub(super) struct DrawState<'s> {
-    pub(super) state: &'s RasterState<0>,
+    pub(super) state: &'s RasterCore,
     pub(super) blends: &'s [Blend],
     pub(super) write_masks: &'s [ColorComponentFlags],
 }
 
 impl Deref for DrawState<'_> {
-    type Target = RasterState<0>;
+    type Target = RasterCore;
 
-    fn deref(&self) -> &RasterState<0> {
+    fn deref(&self) -> &RasterCore {
         self.state
     }
 }
@@ -741,14 +735,10 @@ impl DrawState<'_> {
     ) {
         let device = Ctx::device();
         let (d2, d3) = (Functions::dynamic_state2(), Functions::dynamic_state3());
-        let n = rendering.color_attachments;
-        debug_assert_eq!((self.blends.len(), self.write_masks.len()), (n, n));
+        // Blends and write masks are slices of the rendering's attachment count.
         macro_rules! changed {
             ($field:ident) => {
                 last.is_none_or(|last| last.$field != self.$field)
-            };
-            ($field:ident[..$n:ident]) => {
-                last.is_none_or(|last| last.$field[..$n] != self.$field[..$n])
             };
         }
         unsafe {
@@ -870,10 +860,8 @@ impl DrawState<'_> {
             }
             if changed!(stencil) {
                 let stencil = self.stencil.unwrap_or_default();
-                device.cmd_set_stencil_test_enable(
-                    cmd,
-                    rendering.stencil && self.stencil.is_some(),
-                );
+                device
+                    .cmd_set_stencil_test_enable(cmd, rendering.stencil && self.stencil.is_some());
                 // One set of calls where both faces are alike.
                 let faces: &[_] = if stencil.front == stencil.back {
                     &[(vk::StencilFaceFlags::FRONT_AND_BACK, stencil.front)]
@@ -898,19 +886,21 @@ impl DrawState<'_> {
             if changed!(blend_constants) {
                 device.cmd_set_blend_constants(cmd, &self.blend_constants);
             }
-            let blends_changed = n > 0 && changed!(blends[..n]);
-            if dynamic.blend && blends_changed {
-                let blends = &self.blends[..n];
-                let enables: SmallVec<[vk::Bool32; 8]> =
-                    (blends.iter()).map(|b| b.equation().is_some() as vk::Bool32).collect();
+            let blends_changed = dynamic.blend && !self.blends.is_empty() && changed!(blends);
+            if blends_changed {
+                let blends = self.blends;
+                let enables: SmallVec<[vk::Bool32; 8]> = (blends.iter())
+                    .map(|b| b.equation().is_some() as vk::Bool32)
+                    .collect();
                 let equations: SmallVec<[vk::ColorBlendEquationEXT; 8]> =
                     blends.iter().map(|b| b.vk_equation()).collect();
                 d3.cmd_set_color_blend_enable(cmd, 0, &enables);
                 d3.cmd_set_color_blend_equation(cmd, 0, &equations);
             }
-            if dynamic.blend && (blends_changed || (n > 0 && changed!(write_masks[..n]))) {
-                let masks: SmallVec<[ColorComponentFlags; 8]> = (self.blends[..n].iter())
-                    .zip(&self.write_masks[..n])
+            let masks_changed = !self.blends.is_empty() && changed!(write_masks);
+            if blends_changed || (dynamic.blend && masks_changed) {
+                let masks: SmallVec<[ColorComponentFlags; 8]> = (self.blends.iter())
+                    .zip(self.write_masks)
                     .map(|(blend, mask)| effective_write_mask(*blend, *mask))
                     .collect();
                 d3.cmd_set_color_write_mask(cmd, 0, &masks);

@@ -8,7 +8,7 @@ use crate::{
     state::{Ctx, Functions},
 };
 
-pub struct RaytracingPipeline {
+pub(crate) struct RaytracingPipeline {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) sbt: ShaderBindingTable,
 }
@@ -130,7 +130,8 @@ impl ShaderBindingTable {
         let mut buffer = Buffer::with_flags(
             vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
             Upload,
-            layout.size.max(1),
+            // Never empty: every pass has a raygen.
+            layout.size,
             Some(properties.shader_group_base_alignment as u64),
         )?;
         // The handles come in group order, which is region order.
@@ -194,7 +195,7 @@ pub(crate) fn sbt_layout(
 }
 
 /// The handle of every group of a pipeline; groups carry no shader record data.
-pub struct ShaderBindingTable {
+pub(crate) struct ShaderBindingTable {
     _buffer: Buffer<u8, Upload>,
     /// The raygen, miss, hit and callable regions; an empty one is all zeros.
     pub(crate) regions: [vk::StridedDeviceAddressRegionKHR; 4],

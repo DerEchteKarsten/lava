@@ -36,7 +36,8 @@ pub trait QueueKind: Sealed + Send + Sync + 'static {
     fn check() -> Result<(), MissingFeature>;
 }
 
-/// [`Graphics`] and [`Compute`]: dispatches, traces, acceleration structures, image clears.
+/// [`Graphics`] and `Compute` (`async-compute`): dispatches, traces, acceleration structures,
+/// image clears.
 pub trait HasCompute: QueueKind {}
 
 /// [`Graphics`]: renderings, blits, presents.
@@ -324,7 +325,11 @@ impl FamilyInfo {
     #[track_caller]
     pub(crate) fn index(&self, kind: Kind) -> u32 {
         let index = self.indices[kind.slot()];
-        assert_ne!(index, vk::QUEUE_FAMILY_IGNORED, "lava has no {kind:?} family");
+        assert_ne!(
+            index,
+            vk::QUEUE_FAMILY_IGNORED,
+            "lava has no {kind:?} family"
+        );
         index
     }
 }

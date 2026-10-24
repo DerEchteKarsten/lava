@@ -18,7 +18,11 @@ use smallvec::SmallVec;
 use crate::features::Gated;
 #[cfg(feature = "fifo-latest-ready")]
 use crate::features::On;
-#[cfg(any(feature = "present-fences", feature = "hdr-metadata", feature = "fifo-latest-ready"))]
+#[cfg(any(
+    feature = "present-fences",
+    feature = "hdr-metadata",
+    feature = "fifo-latest-ready"
+))]
 use crate::features::gate;
 use crate::{
     bindless::{self, Allocatable, Combined, ImageHandle, Sampled, Storage},
@@ -54,7 +58,9 @@ impl<K: HasGraphics> CommandBuffer<'_, K> {
     /// Panics if a submission presented it already.
     #[validation_trace]
     pub fn present<U: StaticUsage>(&mut self, surface: &mut PresentSurface<U>) {
-        let current = surface.current.expect("no image is current: `acquire` one first");
+        let current = surface
+            .current
+            .expect("no image is current: `acquire` one first");
         assert!(
             current.presented.is_none(),
             "a submission presented the current image already: `PresentSurface::present` it"
@@ -147,7 +153,12 @@ pub enum CompositeAlpha {
 
 impl CompositeAlpha {
     /// In the order lava picks the default from: the first the surface supports.
-    pub const ALL: [Self; 4] = [Self::Opaque, Self::Inherit, Self::PreMultiplied, Self::PostMultiplied];
+    pub const ALL: [Self; 4] = [
+        Self::Opaque,
+        Self::Inherit,
+        Self::PreMultiplied,
+        Self::PostMultiplied,
+    ];
 
     fn vk(self) -> vk::CompositeAlphaFlagsKHR {
         match self {
@@ -341,12 +352,12 @@ pub struct PresentSurface<U: StaticUsage = usage![ColorAttachment, TransferDst]>
 
 /// The image a surface acquired.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Current {
+struct Current {
     index: u32,
     acquire: vk::Semaphore,
     /// The timeline and value of the recording that presented it (`cmd.present`), set while
     /// it records; `PresentSurface::present` runs only after its submission.
-    pub(crate) presented: Option<(usize, u64)>,
+    presented: Option<(usize, u64)>,
 }
 
 impl<U: StaticUsage> fmt::Debug for PresentSurface<U> {
@@ -361,7 +372,9 @@ impl<U: StaticUsage> fmt::Debug for PresentSurface<U> {
 
 fn surface_fn() -> Result<&'static ash::khr::surface::Instance> {
     Functions::surface().ok_or_else(|| {
-        Error::Unsupported("lava was initialised without a display handle; surfaces are unavailable".into())
+        Error::Unsupported(
+            "lava was initialised without a display handle; surfaces are unavailable".into(),
+        )
     })
 }
 
@@ -408,17 +421,22 @@ impl<U: StaticUsage> PresentSurface<U> {
         let surface_fn = surface_fn()?;
         present_fences()?;
         let (entry, instance) = (Functions::entry(), Functions::instance());
-        let surface = unsafe { ash_window::create_surface(entry, instance, *display, *window, None)? };
+        let surface =
+            unsafe { ash_window::create_surface(entry, instance, *display, *window, None)? };
         let made = (|| {
-            let device = Ctx::physical_device().handel;
+            let device = Ctx::physical_device().handle;
             let family = Ctx::get().queues.graphics().index;
             let can_present =
                 unsafe { surface_fn.get_physical_device_surface_support(device, family, surface)? };
             if !can_present {
-                return Err(Error::Unsupported("the graphics queue family cannot present to this surface".into()));
+                return Err(Error::Unsupported(
+                    "the graphics queue family cannot present to this surface".into(),
+                ));
             }
-            let formats = unsafe { surface_fn.get_physical_device_surface_formats(device, surface)? };
-            let modes = unsafe { surface_fn.get_physical_device_surface_present_modes(device, surface)? };
+            let formats =
+                unsafe { surface_fn.get_physical_device_surface_formats(device, surface)? };
+            let modes =
+                unsafe { surface_fn.get_physical_device_surface_present_modes(device, surface)? };
             let capabilities =
                 unsafe { surface_fn.get_physical_device_surface_capabilities(device, surface)? };
             let usage = U::VK;
@@ -447,7 +465,13 @@ impl<U: StaticUsage> PresentSurface<U> {
             let wanted: SmallVec<[vk::SurfaceFormatKHR; 4]> =
                 preferred.iter().map(|f| f.vk()).collect();
             // No preference of the surface (none, or one `UNDEFINED`): any of `preferred`.
-            let any = matches!(&formats[..], [] | [vk::SurfaceFormatKHR { format: vk::Format::UNDEFINED, .. }]);
+            let any = matches!(
+                &formats[..],
+                [] | [vk::SurfaceFormatKHR {
+                    format: vk::Format::UNDEFINED,
+                    ..
+                }]
+            );
             let chosen = (wanted.iter().copied())
                 .filter(|p| any || formats.contains(p))
                 .find(usable);
@@ -456,11 +480,14 @@ impl<U: StaticUsage> PresentSurface<U> {
                 None => {
                     // Lava reads the image's format as a `format::Dynamic`.
                     let known = |f: &vk::SurfaceFormatKHR| {
-                        format::Dynamic(f.format).known() && ColorSpace::from_vk(f.color_space).is_some()
+                        format::Dynamic(f.format).known()
+                            && ColorSpace::from_vk(f.color_space).is_some()
                     };
                     let format = (formats.iter().copied()).filter(known).find(usable);
                     let format = format.ok_or_else(|| {
-                        Error::Unsupported(format!("the surface has no format whose images support {usage:?}"))
+                        Error::Unsupported(format!(
+                            "the surface has no format whose images support {usage:?}"
+                        ))
                     })?;
                     tracing::warn!(
                         "the surface has none of the formats {preferred:?} with images of {usage:?}: its images are {format:?}"
@@ -475,7 +502,9 @@ impl<U: StaticUsage> PresentSurface<U> {
             let composite_alphas = capabilities.supported_composite_alpha;
             let composite_alpha = (CompositeAlpha::ALL.into_iter())
                 .find(|alpha| composite_alphas.contains(alpha.vk()))
-                .ok_or_else(|| Error::Unsupported("the surface supports no composite alpha".into()))?;
+                .ok_or_else(|| {
+                    Error::Unsupported("the surface supports no composite alpha".into())
+                })?;
             Ok(Self {
                 surface,
                 format,
@@ -580,7 +609,7 @@ impl<U: StaticUsage> PresentSurface<U> {
     /// every swapchain the surface makes later.
     #[cfg(feature = "hdr-metadata")]
     pub fn set_hdr_metadata(&mut self, metadata: &HdrMetadata) -> Gated<gate::HdrMetadata, ()> {
-        crate::features::gate::<gate::HdrMetadata, _>(|| {
+        crate::features::gated::<gate::HdrMetadata, _>(|| {
             if let Some(swapchain) = &self.swapchain {
                 metadata.apply(swapchain.handle);
             }
@@ -598,9 +627,10 @@ impl<U: StaticUsage> PresentSurface<U> {
         match self.capabilities {
             Some((asked, capabilities)) if asked == size && !self.recreate => Ok(capabilities),
             _ => {
-                let physical_device = Ctx::physical_device().handel;
+                let physical_device = Ctx::physical_device().handle;
                 let capabilities = unsafe {
-                    surface_fn()?.get_physical_device_surface_capabilities(physical_device, self.surface)?
+                    surface_fn()?
+                        .get_physical_device_surface_capabilities(physical_device, self.surface)?
                 };
                 self.capabilities = Some((size, capabilities));
                 Ok(capabilities)
@@ -622,8 +652,13 @@ impl<U: StaticUsage> PresentSurface<U> {
                 // Only a failed recording can have used it (one that uses it must present
                 // it), and that one's barriers were dropped: its contents are still undefined.
                 let swapchain = self.swapchain.as_ref().expect("an image is current");
-                let state = ImageState { acquired: true, ..ImageState::UNDEFINED };
-                swapchain.images[current.index as usize].state.store(state.pack(), Ordering::Relaxed);
+                let state = ImageState {
+                    acquired: true,
+                    ..ImageState::UNDEFINED
+                };
+                swapchain.images[current.index as usize]
+                    .state
+                    .store(state.pack(), Ordering::Relaxed);
                 return Ok(size.x > 0 && size.y > 0);
             }
             Some(_) => self.present()?,
@@ -637,16 +672,17 @@ impl<U: StaticUsage> PresentSurface<U> {
             }
             !done
         });
-        let signalled = |fence: &vk::Fence| unsafe { device.get_fence_status(*fence) }.unwrap_or(false);
+        let signalled =
+            |fence: &vk::Fence| unsafe { device.get_fence_status(*fence) }.unwrap_or(false);
         if let Some(swapchain) = &mut self.swapchain {
             for fence in swapchain.fences.extract_if(.., |fence| signalled(fence)) {
                 self.fences.push(fence);
             }
         }
         // A replaced swapchain goes once no frame reaches it and its presents are done.
-        for (swapchain, _) in (self.old)
-            .extract_if(.., |(swapchain, stamp)| swapchain.fences.iter().all(signalled) && stamp.is_done())
-        {
+        for (swapchain, _) in (self.old).extract_if(.., |(swapchain, stamp)| {
+            swapchain.fences.iter().all(signalled) && stamp.is_done()
+        }) {
             swapchain.destroy();
         }
         if size.x == 0 || size.y == 0 {
@@ -678,17 +714,31 @@ impl<U: StaticUsage> PresentSurface<U> {
             let acquired = unsafe {
                 let _span = tracing::info_span!("wait for swapchain image").entered();
                 let fence = vk::Fence::null();
-                Functions::swapchain().acquire_next_image(swapchain.handle, u64::MAX, semaphore, fence)
+                Functions::swapchain().acquire_next_image(
+                    swapchain.handle,
+                    u64::MAX,
+                    semaphore,
+                    fence,
+                )
             };
             match acquired {
                 Ok((index, suboptimal)) => {
                     self.recreate |= suboptimal;
                     // Its contents are discarded, so its first access transitions from
                     // `UNDEFINED` and waits only for the acquire.
-                    let state = ImageState { acquired: true, ..ImageState::UNDEFINED };
-                    swapchain.images[index as usize].state.store(state.pack(), Ordering::Relaxed);
+                    let state = ImageState {
+                        acquired: true,
+                        ..ImageState::UNDEFINED
+                    };
+                    swapchain.images[index as usize]
+                        .state
+                        .store(state.pack(), Ordering::Relaxed);
                     let acquire = semaphore;
-                    self.current = Some(Current { index, acquire, presented: None });
+                    self.current = Some(Current {
+                        index,
+                        acquire,
+                        presented: None,
+                    });
                     return Ok(true);
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -705,13 +755,19 @@ impl<U: StaticUsage> PresentSurface<U> {
     }
 
     /// Replaces the swapchain by one of `extent` (none is current).
-    fn recreate_swapchain(&mut self, caps: &vk::SurfaceCapabilitiesKHR, extent: vk::Extent2D) -> Result<()> {
+    fn recreate_swapchain(
+        &mut self,
+        caps: &vk::SurfaceCapabilitiesKHR,
+        extent: vk::Extent2D,
+    ) -> Result<()> {
         let _span = tracing::info_span!("recreate swapchain").entered();
         let device = Ctx::device();
         // Vulkan retires the old swapchain even when making the new one fails, so it is
         // replaced first: a failed creation leaves none, and the next one starts afresh.
         let old = self.swapchain.take();
-        let old_handle = old.as_ref().map_or_else(vk::SwapchainKHR::null, |s| s.handle);
+        let old_handle = old
+            .as_ref()
+            .map_or_else(vk::SwapchainKHR::null, |s| s.handle);
         if let Some(old) = old {
             self.old.push((old, latest_stamp()));
         }
@@ -719,7 +775,8 @@ impl<U: StaticUsage> PresentSurface<U> {
         let mode = self.present_mode.vk();
         let usage = U::VK;
         let modes = [mode];
-        let mut modes_info = vk::SwapchainPresentModesCreateInfoEXT::default().present_modes(&modes);
+        let mut modes_info =
+            vk::SwapchainPresentModesCreateInfoEXT::default().present_modes(&modes);
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(caps.min_image_count)
@@ -775,15 +832,27 @@ impl<U: StaticUsage> PresentSurface<U> {
                 };
                 let state = ImageState::UNDEFINED.atomic();
                 let handle = ImageHandle::NULL;
-                swapchain.images.push(SwapchainImage { image, view, handle, state, present });
+                swapchain.images.push(SwapchainImage {
+                    image,
+                    view,
+                    handle,
+                    state,
+                    present,
+                });
             }
             // One handle per image, with every descriptor its usage allows.
             let sampled = usage.contains(vk::ImageUsageFlags::SAMPLED);
             let storage = usage.contains(vk::ImageUsageFlags::STORAGE);
             let (width, new): (u32, fn(u32) -> ImageHandle) = match (sampled, storage) {
-                (true, true) => (Combined::WIDTH, |slot| ImageHandle::<Combined>::new(slot).erase()),
-                (true, false) => (Sampled::WIDTH, |slot| ImageHandle::<Sampled>::new(slot).erase()),
-                (false, true) => (Storage::WIDTH, |slot| ImageHandle::<Storage>::new(slot).erase()),
+                (true, true) => (Combined::WIDTH, |slot| {
+                    ImageHandle::<Combined>::new(slot).erase()
+                }),
+                (true, false) => (Sampled::WIDTH, |slot| {
+                    ImageHandle::<Sampled>::new(slot).erase()
+                }),
+                (false, true) => (Storage::WIDTH, |slot| {
+                    ImageHandle::<Storage>::new(slot).erase()
+                }),
                 (false, false) => return Ok(()),
             };
             for image in &mut swapchain.images {
@@ -799,7 +868,11 @@ impl<U: StaticUsage> PresentSurface<U> {
                 layers: (0..1).into(),
                 usage,
             });
-            bindless::bind_raw(images, swapchain.images.iter().map(|image| image.handle), false)?;
+            bindless::bind_raw(
+                images,
+                swapchain.images.iter().map(|image| image.handle),
+                false,
+            )?;
             Ok(())
         })();
         if let Err(err) = made {
@@ -818,7 +891,9 @@ impl<U: StaticUsage> PresentSurface<U> {
     /// The view of the current image, for the submission that draws into it and presents it.
     /// Panics before the first [`Self::acquire`].
     pub fn current_image(&self) -> ImageView<'_, format::Dynamic, U> {
-        let current = self.current.expect("no image is current: `acquire` one first");
+        let current = self
+            .current
+            .expect("no image is current: `acquire` one first");
         let swapchain = self.swapchain.as_ref().expect("an image is current");
         let i = &swapchain.images[current.index as usize];
         ImageView {
@@ -876,7 +951,12 @@ impl<U: StaticUsage> AnySurface for PresentSurface<U> {}
 
 impl<U: StaticUsage> private::Surface for PresentSurface<U> {
     fn prepare(&mut self) -> Result<Option<private::Prepared>> {
-        let Some(Current { index, acquire, presented: Some(presented) }) = self.current else {
+        let Some(Current {
+            index,
+            acquire,
+            presented: Some(presented),
+        }) = self.current
+        else {
             return Ok(None);
         };
         let device = Ctx::device();
@@ -970,7 +1050,11 @@ pub fn present_all(surfaces: &mut [&mut dyn AnySurface]) -> Result<()> {
     };
     let mut first_error = None;
     for ((i, present), result) in prepared.into_iter().zip(results) {
-        let result = if result == unwritten { presented } else { result };
+        let result = if result == unwritten {
+            presented
+        } else {
+            result
+        };
         if let Err(err) = surfaces[i].presented(present, result) {
             first_error.get_or_insert(err);
         }
@@ -1000,8 +1084,8 @@ impl<U: StaticUsage> Drop for PresentSurface<U> {
                     let info = vk::SubmitInfo2::default().wait_semaphore_infos(&waits);
                     unsafe { device.queue_submit2(*queue, &[info], fence) }
                 };
-                let waited =
-                    submitted.and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
+                let waited = submitted
+                    .and_then(|()| unsafe { device.wait_for_fences(&[fence], true, u64::MAX) });
                 unsafe { device.destroy_fence(fence, None) };
                 Ok(waited?)
             })();
@@ -1012,9 +1096,14 @@ impl<U: StaticUsage> Drop for PresentSurface<U> {
         }
         let mut swapchains: Vec<Swapchain> = self.old.drain(..).map(|(s, _)| s).collect();
         swapchains.extend(self.swapchain.take());
-        let fences: Vec<vk::Fence> = swapchains.iter().flat_map(|s| s.fences.iter().copied()).collect();
+        let fences: Vec<vk::Fence> = swapchains
+            .iter()
+            .flat_map(|s| s.fences.iter().copied())
+            .collect();
         let device = Ctx::device();
-        if !fences.is_empty() && unsafe { device.wait_for_fences(&fences, true, 1_000_000_000) }.is_err() {
+        if !fences.is_empty()
+            && unsafe { device.wait_for_fences(&fences, true, 1_000_000_000) }.is_err()
+        {
             tracing::warn!("a present's fence didn't signal before its surface was dropped");
         }
         let mut semaphores = std::mem::take(&mut self.free);

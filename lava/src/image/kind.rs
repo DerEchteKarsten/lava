@@ -15,8 +15,8 @@ pub trait ImageRef: crate::sealed::Sealed + Copy {
     type Format: Format;
     type Usage: ImageUsage;
     type Dim: Dim;
-    /// The view, borrowed for any `'a` it outlives. On a concrete `ImageView`, `.view()` is the
-    /// inherent getter of its `vk::ImageView`, so call this one as `ImageRef::view(view)`.
+    /// The view, borrowed for any `'a` it outlives (its `vk::ImageView` is
+    /// `ImageView::vk_view`).
     fn view<'a>(self) -> ImageView<'a, Self::Format, Self::Usage, Self::Dim>
     where
         Self: 'a;

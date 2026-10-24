@@ -23,7 +23,7 @@ tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 # For the test that compares the SPIR-V capability tables (`src/features.rs`).
-lava = { path = "../lava" }
+lava = { version = "0.1.0", path = "../lava" }
 
 [features]
 # Recompiles changed passes while the application runs (a debugging aid, `src/hot_reload.rs`),

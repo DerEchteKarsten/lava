@@ -1,11 +1,5 @@
 //! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, freed with their images) or in ranges the application reserves (`reserve`, rewritten in submission order by `bind`, as a fitted image's slots are by `rebind`), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap
-use std::{
-    collections::BTreeMap,
-    marker::PhantomData,
-    ops::Range,
-    ptr::NonNull,
-    sync::Mutex,
-};
+use std::{collections::BTreeMap, marker::PhantomData, ops::Range, ptr::NonNull, sync::Mutex};
 
 use crate::error::{Error, Result};
 use crate::vk::{self, BorderColor, CompareOp, Filter, SamplerAddressMode, SamplerMipmapMode};
@@ -15,20 +9,20 @@ use smallvec::SmallVec;
 
 use crate::{
     buffer::{Buffer, Upload},
+    global::{Global, Live},
     image::{
         Dim,
         format::Format,
         slice::{ImageView, single_aspect},
         usage::ImageUsage,
     },
-    global::{Global, Live},
     lifetime,
     queue::{Kind, lock},
     state::{Ctx, Functions},
 };
 
 #[derive(Debug)]
-pub struct Bindless {
+pub(crate) struct Bindless {
     /// The resource heap: image descriptors, then the reserved range.
     images: HeapLayout,
     samplers: HeapLayout,
@@ -136,7 +130,7 @@ unsafe impl Sync for HeapBuffer {}
 impl HeapBuffer {
     fn new(layout: &HeapLayout, alignment: u64) -> Result<Self> {
         let usage = vk::BUFFER_USAGE_DESCRIPTOR_HEAP_EXT;
-        let buffer = Buffer::with_flags(usage, Upload, layout.size.max(1), Some(alignment as u64))?;
+        let buffer = Buffer::with_flags(usage, Upload, layout.size.max(1), Some(alignment))?;
         let mapped = NonNull::new(buffer.host_ptr()).expect("a mapping isn't null");
         // Slots never written read as zeroes rather than whatever the memory held.
         unsafe { mapped.write_bytes(0, layout.size as usize) };
@@ -169,6 +163,8 @@ pub(crate) struct Ranges {
 }
 
 impl Ranges {
+    /// Every slot free: one range of all of them (not a list of the slots).
+    #[allow(clippy::single_range_in_vec_init)]
     pub(crate) fn all(count: u32) -> Self {
         let free = if count == 0 {
             Vec::new()
@@ -300,8 +296,8 @@ impl<K: Allocatable> SlotRange<K> {
     }
 
     /// Its slots in the resource heap, `K::WIDTH` per handle.
-    pub fn slots(&self) -> Range<u32> {
-        self.start..self.start + self.len * K::WIDTH
+    pub fn slots(&self) -> std::range::Range<u32> {
+        (self.start..self.start + self.len * K::WIDTH).into()
     }
 
     /// Its `i`-th handle. Panics past its end.
@@ -316,7 +312,7 @@ impl<K: Allocatable> Drop for SlotRange<K> {
         if self.is_empty() {
             return;
         }
-        let range = self.slots();
+        let range: Range<u32> = self.slots().into();
         let bindless = Bindless::get();
         let mut reserved = lock(&bindless.reserved);
         if let Some(i) = reserved.iter().position(|r| *r == range) {
@@ -975,16 +971,16 @@ impl Bindless {
         let resource_heap = HeapBuffer::new(&images, p.resource_heap_alignment)?;
         let sampler_heap = HeapBuffer::new(&samplers, p.sampler_heap_alignment)?;
         BINDLESS.set(Self {
-                free: Mutex::new(Ranges::all(images.count)),
-                reserved: Default::default(),
-                rebound: Default::default(),
-                free_samplers: Mutex::new(Ranges::all(samplers.count)),
-                images,
-                samplers,
-                resource_heap,
-                sampler_heap,
-                queued: Mutex::new(BTreeMap::new()),
-            });
+            free: Mutex::new(Ranges::all(images.count)),
+            reserved: Default::default(),
+            rebound: Default::default(),
+            free_samplers: Mutex::new(Ranges::all(samplers.count)),
+            images,
+            samplers,
+            resource_heap,
+            sampler_heap,
+            queued: Mutex::new(BTreeMap::new()),
+        });
         Ok(())
     }
 

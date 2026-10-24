@@ -34,6 +34,8 @@ struct Entry<L: Level, K> {
     step: Step<L>,
 }
 
+// A structure in `Compacting` is the large variant, and every entry gets there.
+#[allow(clippy::large_enum_variant)]
 enum Step<L: Level> {
     /// Its size isn't queried yet.
     Added,
@@ -116,7 +118,11 @@ impl<L: Level, K> Compactor<L, K> {
                     // Its recording failed: compact again.
                     Step::Added
                 }
-                Step::Queried { pool, index, at: queried } => {
+                Step::Queried {
+                    pool,
+                    index,
+                    at: queried,
+                } => {
                     let mut size = [0];
                     match pool.read(index, &mut size) {
                         Ok(true) => match entry.source.compacted(size[0]) {
@@ -126,15 +132,27 @@ impl<L: Level, K> Compactor<L, K> {
                             }
                             Err(err) => {
                                 error.get_or_insert(err);
-                                Step::Queried { pool, index, at: queried }
+                                Step::Queried {
+                                    pool,
+                                    index,
+                                    at: queried,
+                                }
                             }
                         },
                         // Done without a size: its recording failed.
                         Ok(false) if completed(queried) => Step::Added,
-                        Ok(false) => Step::Queried { pool, index, at: queried },
+                        Ok(false) => Step::Queried {
+                            pool,
+                            index,
+                            at: queried,
+                        },
                         Err(err) => {
                             error.get_or_insert(err);
-                            Step::Queried { pool, index, at: queried }
+                            Step::Queried {
+                                pool,
+                                index,
+                                at: queried,
+                            }
                         }
                     }
                 }
@@ -150,16 +168,18 @@ impl<L: Level, K> Compactor<L, K> {
             match QueryPool::compacted_sizes(count) {
                 Ok(pool) => {
                     let pool = Arc::new(pool);
-                    let sources: Vec<_> = (self.entries.iter()).filter(|e| added(e)).map(|e| &e.source).collect();
+                    let sources: Vec<_> = (self.entries.iter())
+                        .filter(|e| added(e))
+                        .map(|e| &e.source)
+                        .collect();
                     cmd.query_compacted_sizes(&sources, &pool, 0);
-                    let mut index = 0;
-                    for entry in self.entries.iter_mut().filter(|e| added(e)) {
+                    let queried = self.entries.iter_mut().filter(|e| added(e));
+                    for (index, entry) in (0..).zip(queried) {
                         entry.step = Step::Queried {
                             pool: pool.clone(),
                             index,
                             at,
                         };
-                        index += 1;
                     }
                 }
                 Err(err) => {

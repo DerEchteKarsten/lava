@@ -9,12 +9,12 @@ use std::{
 use common::{Cmd, GpuGuard, zeroed_buffer};
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
+    Ctx,
     buffer::Buffer,
     command_buffer::{Attachment, CullModeFlags, Draw, RasterState},
     image::{Image, format::R8G8B8A8Unorm, usage::usage},
     pipeline::{Reload, reload_pass, save_cache},
     queue::{Graphics, Timeline},
-    state::Ctx,
 };
 use lava_tests::bindings::*;
 
@@ -54,7 +54,14 @@ fn index(name: &str) -> usize {
 
 /// `out[i] = i * factor` for 64 elements, through `TestSpecialized`.
 fn specialized(cmd: &mut Cmd, out: &Buffer<u32, lava::buffer::Readback>, factor: u32) {
-    let bindings = TestSpecialized::push_bindings(TestSpecializedArgs { out: out.range(..), count: 64 }, TestSpecializedConstants { factor }, None);
+    let bindings = TestSpecialized::push_bindings(
+        TestSpecializedArgs {
+            out: out.range(..),
+            count: 64,
+        },
+        TestSpecializedConstants { factor },
+        None,
+    );
     cmd.compute(&bindings, [1, 1, 1]);
 }
 
@@ -160,7 +167,13 @@ fn triangle(gpu: &mut common::Gpu, vertices: &Buffer<TestVertex>) -> Vec<u8> {
     let target = Target::new(UVec2::splat(SIZE)).unwrap();
     let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
     gpu.submit(|cmd| {
-        let bindings = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None);
+        let bindings = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(..),
+                instance_offset: Vec2::ZERO,
+            },
+            None,
+        );
         let state = RasterState::default().cull_mode(CullModeFlags::NONE);
         cmd.raster(
             UVec2::splat(SIZE),
@@ -191,7 +204,15 @@ fn reload_pass_replaces_the_pipelines() {
     let compute = |gpu: &mut common::Gpu| {
         let mut dst = zeroed_buffer::<u32>(4);
         gpu.submit(|cmd| {
-            let bindings = TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: src.range(..), dst: dst.range(..), count: 4, multiplier: 2 }, None);
+            let bindings = TestComputeBuffer::push_bindings(
+                TestComputeBufferArgs {
+                    src: src.range(..),
+                    dst: dst.range(..),
+                    count: 4,
+                    multiplier: 2,
+                },
+                None,
+            );
             cmd.compute(&bindings, [1, 1, 1]);
         });
         dst.host().to_vec()
@@ -213,7 +234,10 @@ fn reload_pass_replaces_the_pipelines() {
 
     for name in ["TestComputeBuffer", "TestSpecialized", "TestRaster"] {
         let pass = &PASS_MAP.passes[index(name)];
-        assert_eq!(reload_pass(index(name), pass.spirv).unwrap(), Reload::Replaced);
+        assert_eq!(
+            reload_pass(index(name), pass.spirv).unwrap(),
+            Reload::Replaced
+        );
         check(&mut gpu, &image);
         assert!(reload_pass(index(name), &[3, 2, 1]).is_err(), "not SPIR-V");
         check(&mut gpu, &image);

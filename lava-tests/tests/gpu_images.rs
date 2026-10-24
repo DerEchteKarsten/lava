@@ -4,19 +4,17 @@ mod common;
 use common::{Cmd, buffer_with, gpu, nearest, panic_message, zeroed_buffer};
 use glam::{IVec2, UVec2, UVec3, Vec2, Vec4};
 use lava::{
-    Error,
+    Ctx, Error,
     bindless::{self, SamplerHandle},
     command_buffer::{Accesses, Attachment, ImageUse},
     image::{
-        D3, Image, MipChain,
+        D3, Filter, Image, MipChain,
         format::{
             self, D32SfloatS8Uint, Format, R8G8B8A8Srgb, R8G8B8A8Uint, R8G8B8A8Unorm,
             R16G16B16A16Unorm, R32G32B32A32Sfloat, R32Sfloat, R32Sint, R32Uint, R64Uint,
         },
-        slice::Filter,
         usage::{self, usage},
     },
-    state::Ctx,
     vk,
 };
 use lava_tests::bindings::*;
@@ -27,7 +25,18 @@ const NO_SAMPLER: SamplerHandle = SamplerHandle { index: !0 };
 fn sample(gpu: &mut common::Gpu, bits: u32, reads: &[ImageUse<'_>]) -> Vec4 {
     let mut out = zeroed_buffer::<Vec4>(3);
     gpu.submit(|cmd| {
-        let bindings = TestSample::push_bindings(TestSampleArgs { out: out.range(..), first: nearest(), second: nearest(), compare: NO_SAMPLER, slot: bits, uv: Vec2::splat(0.5), reference: 0.0 }, Some(Accesses::images(reads)));
+        let bindings = TestSample::push_bindings(
+            TestSampleArgs {
+                out: out.range(..),
+                first: nearest(),
+                second: nearest(),
+                compare: NO_SAMPLER,
+                slot: bits,
+                uv: Vec2::splat(0.5),
+                reference: 0.0,
+            },
+            Some(Accesses::images(reads)),
+        );
         cmd.compute(&bindings, [1, 1, 1]);
     });
     out.host()[0]
@@ -146,15 +155,15 @@ fn host_copies_check_blocks_and_rows() {
     let message = panic_message(|| etc.copy_from(&[0; 1], 0));
     assert!(message.contains("holds 32 bytes"), "{message}");
     let message =
-        panic_message(|| etc.copy_region_from(&[0; 8], 0, UVec2::new(2, 0), UVec2::new(4, 4)));
+        panic_message(|| etc.copy_region_from(&[0; 8], 0, IVec2::new(2, 0), UVec2::new(4, 4)));
     assert!(message.contains("whole 4x4 blocks"), "{message}");
-    etc.copy_region_from(&[0; 8], 0, UVec2::new(4, 4), UVec2::new(4, 4))
+    etc.copy_region_from(&[0; 8], 0, IVec2::new(4, 4), UVec2::new(4, 4))
         .unwrap();
     // One block of a row of two.
-    etc.copy_rows_from(&[0; 16], 0, UVec2::new(4, 0), UVec2::new(4, 4), 8, 0)
+    etc.copy_rows_from(&[0; 16], 0, IVec2::new(4, 0), UVec2::new(4, 4), 8, 0)
         .unwrap();
     let message =
-        panic_message(|| etc.copy_rows_from(&[0; 8], 0, UVec2::ZERO, UVec2::new(4, 8), 0, 0));
+        panic_message(|| etc.copy_rows_from(&[0; 8], 0, IVec2::ZERO, UVec2::new(4, 8), 0, 0));
     assert!(message.contains("16 bytes"), "{message}");
 }
 
@@ -410,7 +419,7 @@ fn rows_of_a_larger_image_copy_a_box_of_it() {
         let mut host =
             Image::<R32Uint, usage![TransferSrc, HostCopy]>::new(UVec2::splat(2)).unwrap();
         let bytes: &[u8] = bytemuck::cast_slice(&texels[8 + 3..]);
-        host.copy_rows_from(bytes, 0, UVec2::ZERO, UVec2::splat(2), 8, 0)
+        host.copy_rows_from(bytes, 0, IVec2::ZERO, UVec2::splat(2), 8, 0)
             .unwrap();
         let mut back = zeroed_buffer::<u32>(4);
         gpu.submit(|cmd| cmd.copy_image_to_buffer(host.whole(), back.range(..)));
@@ -624,9 +633,9 @@ fn sparse_images_bind_tiles_and_mip_tails() {
     };
     let tile = image.granularity().truncate();
     assert!(tile.x > 0 && tile.y > 0);
-    let message = panic_message(|| SparseBind::image(&image, 0, UVec2::ONE, tile, true));
+    let message = panic_message(|| SparseBind::image(&image, 0, IVec2::ONE, tile, true));
     assert!(message.contains("whole tiles"), "{message}");
-    let mut binds = vec![SparseBind::image(&image, 0, UVec2::ZERO, tile, true)];
+    let mut binds = vec![SparseBind::image(&image, 0, IVec2::ZERO, tile, true)];
     if image.mip_tail().is_some() {
         binds.push(SparseBind::mip_tail(&image, true));
     }
@@ -647,7 +656,7 @@ fn sparse_images_bind_tiles_and_mip_tails() {
         assert_eq!(texel.host(), [255, 0, 255, 255]);
     }
     gpu.timeline
-        .bind_sparse(&[SparseBind::image(&image, 0, UVec2::ZERO, tile, false)])
+        .bind_sparse(&[SparseBind::image(&image, 0, IVec2::ZERO, tile, false)])
         .unwrap();
     assert!(!image.is_resident(0, UVec3::ZERO));
     gpu.submit(|_| {});

@@ -1,14 +1,4 @@
 //! Crate-wide error type and Result alias: typed failures of the device and environment that callers match on (device loss, memory, surfaces, missing features and GPUs, exhausted slots), and the rule that programmer errors panic instead
-//!
-//! # Panic or `Err`
-//! Lava panics for programmer errors: arguments a correct program never passes (a mip the image
-//! doesn't have, data of the wrong length, a view bound twice, an access by a family that doesn't
-//! own the image), and states a correct program never reaches. It returns `Err` for what a
-//! correct program can still meet: the device, driver, surface or environment failing or lacking
-//! something (device loss, memory, a surface out of date, a feature or GPU that isn't there, a
-//! full bindless heap or staging ring). Recording is infallible: a pipeline the driver fails to
-//! create while a command is recorded panics, and so does a pass whose bindings were made by
-//! hand for a device that can't run it.
 use std::{borrow::Cow, fmt};
 
 use crate::{features::MissingFeature, vk};
@@ -16,6 +6,16 @@ use crate::{features::MissingFeature, vk};
 /// A failure of the device or environment. `Display` shows only this error's own description;
 /// what caused it, if anything ([`Error::Other`]), is its `source()`. The wrappers of other
 /// crates' errors (`Loading`, `Allocation`, `Io`, `MissingFeature`) display the wrapped error.
+///
+/// # Panic or `Err`
+/// Lava panics for programmer errors: arguments a correct program never passes (a mip the image
+/// doesn't have, data of the wrong length, a view bound twice, an access by a family that doesn't
+/// own the image), and states a correct program never reaches. It returns `Err` for what a
+/// correct program can still meet: the device, driver, surface or environment failing or lacking
+/// something (device loss, memory, a surface out of date, a feature or GPU that isn't there, a
+/// full bindless heap or staging ring). Recording is infallible: a pipeline the driver fails to
+/// create while a command is recorded panics, and so does a pass whose bindings were made by
+/// hand for a device that can't run it.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -160,7 +160,10 @@ impl fmt::Display for Error {
                 limit,
                 requested,
                 max,
-            } => write!(f, "{requested} is more than the device's `{limit}` of {max}"),
+            } => write!(
+                f,
+                "{requested} is more than the device's `{limit}` of {max}"
+            ),
             Error::ArenaFull {
                 requested,
                 capacity,

@@ -96,8 +96,9 @@ pub trait SingleValue: QueryKind {}
 
 /// The device's clock when a command reached a stage (`CommandBuffer::write_timestamp`).
 pub struct Timestamp {
-    /// The valid bits of the family the timestamps were last written on, as a mask.
-    pub(crate) valid_bits: AtomicU64,
+    /// The valid bits of the narrowest family with timestamps, as a mask: differences of
+    /// timestamps written on any family are right below its wrap.
+    valid_bits: u64,
     /// The last calibration of the device's clock against the host's (`instant`).
     #[cfg(feature = "calibrated-timestamps")]
     calibration: Mutex<Option<Calibration>>,
@@ -257,7 +258,10 @@ impl<K: QueryKind> QueryPool<K> {
         for word in &self.used {
             word.store(0, Ordering::Relaxed);
         }
-        if rec.profile.is_some_and(|p| p.pool == self.handle && p.pass > 0) {
+        if rec
+            .profile
+            .is_some_and(|p| p.pool == self.handle && p.pass > 0)
+        {
             return;
         }
         let (timeline, value) = ((last & 7) as usize, last >> 3);
@@ -276,7 +280,10 @@ impl<K: QueryKind> QueryPool<K> {
     pub(crate) fn take(&self, rec: &Recording, first: u32, count: u32) {
         let end = first.checked_add(count).filter(|&end| end <= self.count);
         let Some(end) = end else {
-            panic!("queries {first}.. ({count} of them) of a pool of {}", self.count);
+            panic!(
+                "queries {first}.. ({count} of them) of a pool of {}",
+                self.count
+            );
         };
         self.record(rec);
         for query in first..end {
@@ -290,7 +297,13 @@ impl<K: QueryKind> QueryPool<K> {
         }
     }
 
-    fn read_raw<T>(&self, first: u32, queries: usize, out: &mut [T], stride: usize) -> Result<bool> {
+    fn read_raw<T>(
+        &self,
+        first: u32,
+        queries: usize,
+        out: &mut [T],
+        stride: usize,
+    ) -> Result<bool> {
         let end = (first as usize).checked_add(queries);
         assert!(
             end.is_some_and(|end| end <= self.count as usize),
@@ -337,8 +350,13 @@ impl<K: SingleValue> QueryPool<K> {
 
 impl QueryPool<Timestamp> {
     pub fn timestamps(count: u32) -> Result<Self> {
+        let bits = (Ctx::get().queues.iter())
+            .map(|family| family.timestamp_valid_bits)
+            .filter(|&bits| bits > 0)
+            .min()
+            .unwrap_or(64);
         let kind = Timestamp {
-            valid_bits: AtomicU64::new(0),
+            valid_bits: if bits >= 64 { !0 } else { (1 << bits) - 1 },
             #[cfg(feature = "calibrated-timestamps")]
             calibration: Mutex::new(None),
         };
@@ -348,7 +366,7 @@ impl QueryPool<Timestamp> {
     /// Nanoseconds from timestamp `start` to `end`, which is later, also across a wrap of the
     /// device's clock.
     pub fn elapsed_ns(&self, start: u64, end: u64) -> u64 {
-        let ticks = end.wrapping_sub(start) & self.kind.valid_bits.load(Ordering::Relaxed);
+        let ticks = end.wrapping_sub(start) & self.kind.valid_bits;
         let period = Ctx::device_properties().limits.timestamp_period as f64;
         (ticks as f64 * period) as u64
     }
@@ -359,7 +377,7 @@ impl QueryPool<Timestamp> {
     /// best one).
     #[cfg(feature = "calibrated-timestamps")]
     pub fn instant(&self, tick: u64) -> Gated<gate::CalibratedTimestamps, Option<Instant>> {
-        gate::<gate::CalibratedTimestamps, _>(|| {
+        crate::features::gated::<gate::CalibratedTimestamps, _>(|| {
             let calibration = {
                 let mut cached = crate::queue::lock(&self.kind.calibration);
                 match *cached {
@@ -371,7 +389,7 @@ impl QueryPool<Timestamp> {
                     }
                 }
             };
-            let valid_bits = self.kind.valid_bits.load(Ordering::Relaxed);
+            let valid_bits = self.kind.valid_bits;
             let period = Ctx::device_properties().limits.timestamp_period as f64;
             let ns = |ticks: u64| Duration::from_nanos((ticks as f64 * period) as u64);
             // A tick before the calibration is a positive masked distance, unless the clock
@@ -472,7 +490,10 @@ impl QueryPool<PipelineStatistics> {
     ///
     /// Panics without any `statistics`.
     pub fn statistics(count: u32, statistics: vk::QueryPipelineStatisticFlags) -> Result<Self> {
-        assert!(!statistics.is_empty(), "a pipeline statistics pool counts at least one statistic");
+        assert!(
+            !statistics.is_empty(),
+            "a pipeline statistics pool counts at least one statistic"
+        );
         gate::PipelineStatistics::check()?;
         let mesh = vk::QueryPipelineStatisticFlags::TASK_SHADER_INVOCATIONS_EXT
             | vk::QueryPipelineStatisticFlags::MESH_SHADER_INVOCATIONS_EXT;
@@ -515,7 +536,7 @@ impl QueryPool<ComputeStatistics> {
 
 impl QueryPool<Occlusion> {
     /// Queries that count the samples of their draws. A query that saw samples may report any
-    /// non-zero count ([`Self::precise_occlusion`] counts them exactly).
+    /// non-zero count (`precise_occlusion`, with `precise-occlusion`, counts them exactly).
     pub fn occlusion(count: u32) -> Result<Self> {
         let kind = Occlusion { precise: false };
         Self::create(count, vk::QueryPoolCreateInfo::default(), kind)
@@ -560,8 +581,14 @@ impl QueryPool<Performance> {
             let mut users = crate::queue::lock(&counters::LOCK_USERS);
             if *users == 0 {
                 let info = vk::AcquireProfilingLockInfoKHR::default().timeout(0);
-                if let Err(err) = unsafe { Functions::performance_query().1.acquire_profiling_lock(&info) } {
-                    return Err(Error::from(err).context("the profiling lock is taken by another process"));
+                if let Err(err) = unsafe {
+                    Functions::performance_query()
+                        .1
+                        .acquire_profiling_lock(&info)
+                } {
+                    return Err(
+                        Error::from(err).context("the profiling lock is taken by another process")
+                    );
                 }
             }
             *users += 1;
@@ -644,14 +671,15 @@ impl QueryPool<SerializedSize> {
 
 impl<K: QueryKind> Drop for QueryPool<K> {
     fn drop(&mut self) {
-        let (pool, locked) = (self.handle, K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR);
+        let pool = self.handle;
+        #[cfg(feature = "performance-query")]
+        let locked = K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR;
         lifetime::retire(move || {
             unsafe { Ctx::device().destroy_query_pool(pool, None) };
             #[cfg(feature = "performance-query")]
             if locked {
                 counters::release_lock();
             }
-            let _ = locked;
         });
     }
 }

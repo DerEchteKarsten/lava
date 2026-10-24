@@ -1,21 +1,24 @@
 //! Headless GPU tests: buffers (memory locations, host access, uploads), images, sync, command recording, queries, and golden images per pass type
 mod common;
 
-use common::{Cmd, Gpu, buffer_in, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer};
-use glam::{IVec2, UVec2, UVec3, UVec4, Vec2, Vec4};
+use common::render::*;
+use common::{
+    Cmd, buffer_in, buffer_with, golden::assert_golden, gpu, nearest, panic_message, zeroed_buffer,
+};
+use glam::{IVec2, IVec3, UVec2, UVec3, UVec4, Vec2, Vec4};
 use lava::{
+    Ctx,
     bindless::{self, Combined, ImageHandle, Sampler, SamplerDesc, SamplerHandle, max_image_slots},
     buffer::{Buffer, Dynamic, Location, Memory, Readback, Shared, Upload, UploadStats},
     command_buffer::{
         Accesses, Attachment, BindingOutput, Blend, BlendEquation, BlendFactor, BlendOp,
-        BufferAccess, ColorComponentFlags, CompareOp, CullModeFlags,
-        DispatchIndirectCommand, Draw, DrawIndirectCommand, FrontFace, ImageUse, LogicOp,
-        PolygonMode, PrimitiveTopology, RasterState, Rect, Stencil, StencilFace, StencilOp, kind,
+        BufferAccess, ColorComponentFlags, CompareOp, CullModeFlags, DispatchIndirectCommand, Draw,
+        DrawIndirectCommand, FrontFace, ImageUse, LogicOp, PolygonMode, PrimitiveTopology,
+        RasterState, Rect, Stencil, StencilFace, StencilOp, kind,
     },
     image::{
-        D3, Image, MipChain,
+        D3, Filter, Image, MipChain,
         format::{BC7UnormBlock, D32Sfloat, D32SfloatS8Uint, R8G8B8A8Unorm, R32Sfloat},
-        slice::Filter,
         usage::usage,
     },
     query::{
@@ -23,77 +26,11 @@ use lava::{
         QueryPipelineStatisticFlags as Statistics, QueryPool, QueryRecorder, ScopeInfo,
         ScopeObserver, Timestamp, counters,
     },
-    queue::{Compute, Graphics, Kind, MAX_TIMELINES, GraphicsStage, Timeline, Transfer},
-    state::Ctx,
+    queue::{Compute, Graphics, GraphicsStage, Kind, MAX_TIMELINES, Timeline, Transfer},
 };
 use lava_tests::bindings::*;
 
 // ---- helpers ---------------------------------------------------------------------------------
-
-const SIZE: u32 = 64;
-const EXTENT: UVec2 = UVec2::splat(SIZE);
-const BLACK: [u8; 4] = [0, 0, 0, 255];
-
-type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Storage, TransferSrc, TransferDst]>;
-
-/// Clears a fresh target to opaque black, lets `record` draw into it, and reads it back.
-fn render(gpu: &mut common::Gpu, record: impl FnOnce(&mut Cmd, &Target)) -> Vec<u8> {
-    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
-    let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
-    gpu.submit(|cmd| {
-        cmd.clear_image(target.whole_view(), [0.0, 0.0, 0.0, 1.0]);
-        record(cmd, &target);
-        cmd.copy_image_to_buffer(target.whole(), readback.range(..));
-    });
-    readback.host().to_vec()
-}
-
-fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
-    let i = ((y * SIZE + x) * 4) as usize;
-    pixels[i..i + 4].try_into().unwrap()
-}
-
-fn close(a: [u8; 4], b: [u8; 4]) -> bool {
-    a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 2)
-}
-
-#[track_caller]
-fn assert_pixel(pixels: &[u8], x: u32, y: u32, expected: [u8; 4]) {
-    let actual = pixel(pixels, x, y);
-    assert!(
-        close(actual, expected),
-        "pixel ({x}, {y}) is {actual:?}, expected {expected:?}"
-    );
-}
-
-fn vertex(x: f32, y: f32, z: f32, color: [f32; 4]) -> TestVertex {
-    TestVertex {
-        position: Vec4::new(x, y, z, 1.0),
-        color: Vec4::from_array(color),
-    }
-}
-
-const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
-const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
-const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
-const YELLOW: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
-
-/// Two triangles: a front-facing one (clockwise on screen) in the left half with one colour
-/// per corner, and a back-facing yellow one in the right half.
-fn two_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
-    gpu.buffer(&[
-        vertex(-0.5, -0.8, 0.5, RED),
-        vertex(-0.1, 0.8, 0.5, GREEN),
-        vertex(-0.9, 0.8, 0.5, BLUE),
-        vertex(0.5, -0.8, 0.5, YELLOW),
-        vertex(0.1, 0.8, 0.5, YELLOW),
-        vertex(0.9, 0.8, 0.5, YELLOW),
-    ])
-}
-
-/// A pixel well inside the left (front-facing) and the right (back-facing) triangle.
-const IN_LEFT: (u32, u32) = (16, 44);
-const IN_RIGHT: (u32, u32) = (48, 44);
 
 /// Deterministic RGBA8 test pattern with a distinct colour per texel.
 fn pattern(width: u32, height: u32) -> Vec<u8> {
@@ -196,15 +133,21 @@ fn uploaded_buffers_round_trip_through_a_readback_copy() {
     let data: Vec<u32> = (0..1000).collect();
     let buffer = uploader.from_slice(&data).unwrap();
     assert_eq!(buffer.location(), Location::Gpu);
-    let addresses = uploader.init(3, |address, out: &mut [u64]| out.fill(address)).unwrap();
+    let addresses = uploader
+        .init(3, |address, out: &mut [u64]| out.fill(address))
+        .unwrap();
     let written = Buffer::<u32>::new(4).unwrap();
     uploader.write(&written, 1, &[7, 8]).unwrap();
     let rebar = Ctx::features().rebar;
     if rebar {
-        assert!(!uploader.stages() && uploader.capacity() == 0, "no ring on a rebar device");
+        assert!(
+            !uploader.stages() && uploader.capacity() == 0,
+            "no ring on a rebar device"
+        );
         assert_eq!(uploader.pending(), 0, "written in place");
     }
-    let (mut readback, mut address_out) = (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u64>(3));
+    let (mut readback, mut address_out) =
+        (zeroed_buffer::<u32>(data.len()), zeroed_buffer::<u64>(3));
     let mut written_out = zeroed_buffer::<u32>(4);
     let mut stats = UploadStats::default();
     gpu.submit(|cmd| {
@@ -214,14 +157,23 @@ fn uploaded_buffers_round_trip_through_a_readback_copy() {
         cmd.copy_buffer(written.range(..), written_out.range(..));
     });
     match rebar {
-        true => assert_eq!(stats, UploadStats::default(), "a drain without a ring is a no-op"),
-        false => assert!(stats.copies >= 1 && stats.capacity == uploader.capacity(), "{stats:?}"),
+        true => assert_eq!(
+            stats,
+            UploadStats::default(),
+            "a drain without a ring is a no-op"
+        ),
+        false => assert!(
+            stats.copies >= 1 && stats.capacity == uploader.capacity(),
+            "{stats:?}"
+        ),
     }
     assert_eq!(readback.host(), data);
     assert_eq!(address_out.host(), [addresses.address(); 3]);
     assert_eq!(written_out.host()[1..3], [7, 8]);
     assert_eq!(uploader.pending(), 0);
-    assert!(panic_message(|| uploader.write(&written, 3, &[0, 0])).contains("writing 2 elements at 3"));
+    assert!(
+        panic_message(|| uploader.write(&written, 3, &[0, 0])).contains("writing 2 elements at 3")
+    );
 }
 
 /// Staged image uploads need a ring: a `rebar` device has none (`Image::copy_from` uploads
@@ -231,20 +183,32 @@ fn image_uploads_land_where_the_ring_is_drained() {
     let mut gpu = gpu();
     let uploader = gpu.uploader();
     // The texture of `indexed_draw_samples_a_bindless_texture`.
-    let texels: Vec<u8> = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]].concat();
+    let texels: Vec<u8> = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 0, 255],
+    ]
+    .concat();
     let texture = Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::new(2, 2))
         .unwrap()
         .bind_sampled()
         .unwrap();
     if !uploader.stages() {
-        let message = uploader.image(&texture, 0, &texels).unwrap_err().to_string();
+        let message = uploader
+            .image(&texture, 0, &texels)
+            .unwrap_err()
+            .to_string();
         assert!(message.contains("Image::copy_from"), "{message}");
         return;
     }
     let message = panic_message(|| uploader.image(&texture, 0, &texels[..12]));
     assert!(message.contains("holds"), "one whole mip: {message}");
     let message = panic_message(|| uploader.image(&texture, 1, &texels));
-    assert!(message.contains("out of range"), "it has one mip: {message}");
+    assert!(
+        message.contains("out of range"),
+        "it has one mip: {message}"
+    );
     uploader.image(&texture, 0, &texels).unwrap();
     // Dropped with an upload staged, which goes with it.
     let dropped = Image::<R8G8B8A8Unorm, usage![TransferDst]>::new(UVec2::new(2, 2)).unwrap();
@@ -269,10 +233,18 @@ fn image_uploads_land_where_the_ring_is_drained() {
         cmd.drain_uploads();
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
-                &TestRasterTextured::push_bindings(TestRasterTexturedArgs { vertices: vertices.range(..), tex: texture.whole_view(), sampler: nearest() }, None),
+                &TestRasterTextured::push_bindings(
+                    TestRasterTexturedArgs {
+                        vertices: vertices.range(..),
+                        tex: texture.whole_view(),
+                        sampler: nearest(),
+                    },
+                    None,
+                ),
                 indices.range(..),
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("textured")
     });
     assert_golden("raster_textured", &pixels, [SIZE, SIZE]);
@@ -298,7 +270,10 @@ fn host_access_waits_for_gpu_writes_in_flight() {
         .unwrap();
     assert!(readback.try_host().is_none());
     let message = panic_message(|| readback.host_mut()[0] = 1);
-    assert!(message.contains("the GPU may still write this buffer"), "{message}");
+    assert!(
+        message.contains("the GPU may still write this buffer"),
+        "{message}"
+    );
     // Reads of other buffers don't wait.
     let mut other = zeroed_buffer::<u32>(4);
     assert_eq!(other.host(), [0; 4]);
@@ -312,8 +287,12 @@ fn dynamic_locations_check_host_access_at_runtime() {
     let mut gpu_only = Buffer::<u32>::new(4).unwrap().erase();
     assert_eq!(gpu_only.memory(), Dynamic(Location::Gpu));
     let message = panic_message(|| gpu_only.host().len());
-    assert!(message.contains("can't access a buffer of Gpu memory"), "{message}");
-    let mut either = Buffer::<u32, Dynamic>::with_memory(Dynamic(Location::shared_or_upload()), 4).unwrap();
+    assert!(
+        message.contains("can't access a buffer of Gpu memory"),
+        "{message}"
+    );
+    let mut either =
+        Buffer::<u32, Dynamic>::with_memory(Dynamic(Location::shared_or_upload()), 4).unwrap();
     either.host_mut().copy_from_slice(&[1, 2, 3, 4]);
     assert_eq!(either.get(3), 4);
 }
@@ -368,8 +347,10 @@ fn frame_slots_cycle_and_what_a_submission_used_lives_until_it_is_done() {
     let mut last = None;
     for value in 1..=4 {
         let scratch = zeroed_buffer::<u32>(1024);
-        let image =
-            Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(64, 64)).unwrap();
+        let image = Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(
+            UVec2::new(64, 64),
+        )
+        .unwrap();
         let recording = zeroed_buffer::<u32>(4);
         let buffer = &buffer;
         let submission = gpu.timeline.begin().unwrap();
@@ -398,7 +379,8 @@ fn frame_slots_cycle_and_what_a_submission_used_lives_until_it_is_done() {
 fn a_panicking_recording_still_makes_its_layout_transitions() {
     let mut gpu = gpu();
     let image =
-        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     let readback = zeroed_buffer::<u8>(8 * 8 * 4);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gpu.submit(|cmd| {
@@ -418,7 +400,8 @@ fn a_panicking_recording_still_makes_its_layout_transitions() {
 fn a_recording_thread_runs_no_destructors() {
     let mut gpu = gpu();
     let image =
-        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     drop(image);
     let mut buffer = zeroed_buffer::<u32>(4);
     gpu.submit(|cmd| {
@@ -468,8 +451,18 @@ fn deletions_wait_for_every_timeline() {
     drop(image);
     gpu.submit(|_| {});
     let unrelated = bind();
-    assert_ne!(unrelated.handle::<bindless::Sampled>(), slot, "the other timeline may still read it");
-    other.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
+    assert_ne!(
+        unrelated.handle::<bindless::Sampled>(),
+        slot,
+        "the other timeline may still read it"
+    );
+    other
+        .begin()
+        .unwrap()
+        .submit(|_| {})
+        .unwrap()
+        .block()
+        .unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 }
 
@@ -491,7 +484,13 @@ fn timelines_are_limited_and_reused() {
     drop(last);
     let mut reused = Timeline::<Graphics>::new(2, 0).unwrap();
     assert!(done.is_done());
-    reused.begin().unwrap().submit(|_| {}).unwrap().block().unwrap();
+    reused
+        .begin()
+        .unwrap()
+        .submit(|_| {})
+        .unwrap()
+        .block()
+        .unwrap();
 }
 
 // ---- queue family ownership ------------------------------------------------------------------
@@ -517,7 +516,15 @@ fn a_compute_image_is_released_to_graphics() {
     let red = Vec4::new(1.0, 0.0, 0.0, 1.0);
     let written = (compute.begin().unwrap())
         .submit(|cmd| {
-            let bindings = TestComputeImage::push_bindings(TestComputeImageArgs { target: image.whole_view(), tint: red, offset: UVec2::ZERO, size: UVec2::splat(8) }, None);
+            let bindings = TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: image.whole_view(),
+                    tint: red,
+                    offset: UVec2::ZERO,
+                    size: UVec2::splat(8),
+                },
+                None,
+            );
             cmd.compute(&bindings, [1, 1, 1]);
             cmd.release::<Graphics>(image.whole_view());
         })
@@ -527,10 +534,10 @@ fn a_compute_image_is_released_to_graphics() {
         cmd.copy_image_to_buffer(image.whole(), readback.range(..))
     });
     // Red is the horizontal UV.
-    for (i, texel) in readback.host().chunks_exact(4).enumerate() {
+    for (i, texel) in readback.host().as_chunks::<4>().0.iter().enumerate() {
         let x = (i % 8) as f32;
         let red = ((x + 0.5) / 8.0 * 255.0).round() as u8;
-        assert!(close(texel.try_into().unwrap(), [red, 0, 0, 255]), "texel {i}: {texel:?}");
+        assert!(close(*texel, [red, 0, 0, 255]), "texel {i}: {texel:?}");
     }
 }
 
@@ -561,7 +568,14 @@ fn images_go_to_the_transfer_family_and_back() {
     back.wait_for(drawn);
     let back = back.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)));
     back.unwrap().block().unwrap();
-    assert!(readback.host().chunks_exact(4).all(|t| t == [0, 255, 0, 255]));
+    assert!(
+        readback
+            .host()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&t| t == [0, 255, 0, 255])
+    );
 }
 
 #[test]
@@ -581,7 +595,10 @@ fn an_unreleased_image_panics() {
         gpu.submit(|cmd| cmd.copy_image_to_buffer(image.whole(), readback.range(..)))
     }));
     let message = *panicked.unwrap_err().downcast::<String>().unwrap();
-    assert!(message.contains("`cmd.release::<Graphics>(view)`"), "{message}");
+    assert!(
+        message.contains("`cmd.release::<Graphics>(view)`"),
+        "{message}"
+    );
 }
 
 /// Compute statistics count on a compute family (graphics statistics don't compile there, see
@@ -589,7 +606,10 @@ fn an_unreleased_image_panics() {
 #[test]
 fn compute_statistics_count_on_a_compute_family() {
     let _gpu = gpu();
-    if !has_family("compute_statistics_count_on_a_compute_family", Kind::Compute) {
+    if !has_family(
+        "compute_statistics_count_on_a_compute_family",
+        Kind::Compute,
+    ) {
         return;
     }
     if !Ctx::features().pipeline_statistics {
@@ -601,7 +621,15 @@ fn compute_statistics_count_on_a_compute_family() {
     let pool = QueryPool::compute_statistics(1).unwrap();
     let counted = (compute.begin().unwrap()).submit(|cmd| {
         cmd.query(&pool, 0, |cmd| {
-            let bindings = TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: EXTENT }, None);
+            let bindings = TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: target.whole_view(),
+                    tint: Vec4::ONE,
+                    offset: UVec2::ZERO,
+                    size: EXTENT,
+                },
+                None,
+            );
             cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1]);
         })
     });
@@ -613,19 +641,39 @@ fn compute_statistics_count_on_a_compute_family() {
 
 /// A group of two compute passes, then a rendering if the device has mesh shaders.
 fn record_profiled(cmd: &mut Cmd, target: &Target) {
-    cmd.scope("group", |cmd| {
+    // A name that lives only for the recording: scope names are any `&str`.
+    let group = String::from("group");
+    cmd.scope(&group, |cmd| {
         for color in [Vec4::ONE, Vec4::ZERO] {
             cmd.compute(
-                &TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: color, offset: UVec2::ZERO, size: EXTENT }, None),
-                [SIZE / 8, SIZE / 8, 1]);
+                &TestComputeImage::push_bindings(
+                    TestComputeImageArgs {
+                        target: target.whole_view(),
+                        tint: color,
+                        offset: UVec2::ZERO,
+                        size: EXTENT,
+                    },
+                    None,
+                ),
+                [SIZE / 8, SIZE / 8, 1],
+            );
         }
     });
     if Ctx::features().mesh_shader {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::launch(
-                &TestMesh::push_bindings(TestMeshArgs { color: Vec4::ONE, group_offset: Vec2::new(1.0, 0.0), scale: 0.4 }, None).unwrap(),
+                &TestMesh::push_bindings(
+                    TestMeshArgs {
+                        color: Vec4::ONE,
+                        group_offset: Vec2::new(1.0, 0.0),
+                        scale: 0.4,
+                    },
+                    None,
+                )
+                .unwrap(),
                 [2, 1, 1],
-                RasterState::default().cull_mode(CullModeFlags::NONE),))
+                RasterState::default().cull_mode(CullModeFlags::NONE),
+            ))
             .record("TestMesh");
     }
 }
@@ -640,9 +688,9 @@ struct TestObserver {
     statistics: Option<QueryPool<PipelineStatistics>>,
     counters: Option<QueryPool<Performance>>,
     /// Name, depth, pass, and whether it entered.
-    events: Vec<(&'static str, u16, bool, bool)>,
+    events: Vec<(String, u16, bool, bool)>,
     scopes: usize,
-    passes: Vec<(&'static str, Option<u32>, Option<u32>)>,
+    passes: Vec<(String, Option<u32>, Option<u32>)>,
     /// Scope index and, for a pass, its index in `passes`.
     open: Vec<(usize, Option<usize>)>,
 }
@@ -660,12 +708,19 @@ impl TestObserver {
             open: Vec::new(),
         }
     }
+
+    fn events(&self) -> Vec<(&str, u16, bool, bool)> {
+        let events = self.events.iter();
+        events
+            .map(|(name, depth, pass, enter)| (name.as_str(), *depth, *pass, *enter))
+            .collect()
+    }
 }
 
 impl ScopeObserver for TestObserver {
     fn on_enter(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo) {
         self.events
-            .push((scope.name, scope.depth, scope.pass, true));
+            .push((scope.name.to_owned(), scope.depth, scope.pass, true));
         let index = self.scopes;
         self.scopes += 1;
         let start = 2 * index as u32;
@@ -686,17 +741,18 @@ impl ScopeObserver for TestObserver {
                     used
                 });
             pass = Some(self.passes.len());
-            self.passes.push((scope.name, statistics, counters));
+            self.passes
+                .push((scope.name.to_owned(), statistics, counters));
         }
         self.open.push((index, pass));
     }
 
     fn on_exit(&mut self, queries: &mut QueryRecorder, scope: &ScopeInfo) {
         self.events
-            .push((scope.name, scope.depth, scope.pass, false));
+            .push((scope.name.to_owned(), scope.depth, scope.pass, false));
         let (index, pass) = self.open.pop().unwrap();
         if let Some(pass) = pass {
-            let (_, statistics, counters) = self.passes[pass];
+            let (_, statistics, counters) = self.passes[pass].clone();
             if let (Some(pool), Some(query)) = (&self.counters, counters) {
                 queries.end_query(pool, query);
             }
@@ -716,7 +772,10 @@ impl ScopeObserver for TestObserver {
 #[test]
 fn observers_see_every_scope_and_pass_once_in_nesting_order() {
     let mut gpu = gpu();
-    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
+    let target = Target::new(UVec2::new(SIZE, SIZE))
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     let mut observer = TestObserver::new(Statistics::empty(), &[]);
     submit_profiled(&mut gpu, &mut observer, &target);
     let mut expected = vec![
@@ -732,7 +791,7 @@ fn observers_see_every_scope_and_pass_once_in_nesting_order() {
         expected.extend([("TestMesh", 1, true, true), ("TestMesh", 1, true, false)]);
     }
     expected.push(("frame", 0, false, false));
-    assert_eq!(observer.events, expected);
+    assert_eq!(observer.events(), expected);
 
     // Scopes in entry order: frame, group, the two passes.
     let mut ticks = vec![0; 2 * observer.scopes];
@@ -760,7 +819,10 @@ fn observers_see_every_scope_and_pass_once_in_nesting_order() {
 #[test]
 fn observers_count_passes_and_renderings_with_queries() {
     let mut gpu = gpu();
-    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
+    let target = Target::new(UVec2::new(SIZE, SIZE))
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     let features = Ctx::features();
     let mesh = features.mesh_shader;
     // One counter always fits a single pass; a time counter can't be 0 for a pass. Observers
@@ -782,7 +844,7 @@ fn observers_count_passes_and_renderings_with_queries() {
     let mut observer = TestObserver::new(statistics, &selection);
     submit_profiled(&mut gpu, &mut observer, &target);
 
-    let names: Vec<_> = observer.passes.iter().map(|p| p.0).collect();
+    let names: Vec<_> = observer.passes.iter().map(|p| p.0.as_str()).collect();
     let mut expected = vec!["TestComputeImage", "TestComputeImage"];
     if mesh {
         expected.push("TestMesh");
@@ -824,7 +886,10 @@ fn observers_count_passes_and_renderings_with_queries() {
 #[test]
 fn a_panic_inside_measure_detaches_the_observer() {
     let mut gpu = gpu();
-    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
+    let target = Target::new(UVec2::new(SIZE, SIZE))
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     let mut observer = TestObserver::new(Statistics::empty(), &[]);
     gpu.submit(|cmd| {
         let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -833,11 +898,20 @@ fn a_panic_inside_measure_detaches_the_observer() {
             })
         }));
         assert!(measured.is_err());
-            cmd.compute(
-            &TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: EXTENT }, None),
-            [SIZE / 8, SIZE / 8, 1]);
+        cmd.compute(
+            &TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: target.whole_view(),
+                    tint: Vec4::ONE,
+                    offset: UVec2::ZERO,
+                    size: EXTENT,
+                },
+                None,
+            ),
+            [SIZE / 8, SIZE / 8, 1],
+        );
     });
-    assert_eq!(observer.events, [("frame", 0, false, true)]);
+    assert_eq!(observer.events(), [("frame", 0, false, true)]);
 }
 
 #[test]
@@ -846,7 +920,10 @@ fn statistics_queries_count_their_commands_and_keep_observers_from_nesting_one()
     if !Ctx::features().pipeline_statistics {
         return;
     }
-    let target = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
+    let target = Target::new(UVec2::new(SIZE, SIZE))
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     let compute = Statistics::COMPUTE_SHADER_INVOCATIONS;
     let pool = QueryPool::statistics(1, compute).unwrap();
     let mut observer = TestObserver::new(compute, &[]);
@@ -854,7 +931,15 @@ fn statistics_queries_count_their_commands_and_keep_observers_from_nesting_one()
         cmd.measure(Some(&mut observer), "frame", |cmd| {
             cmd.query(&pool, 0, |cmd| {
                 for color in [Vec4::ONE, Vec4::ZERO] {
-                    let bindings = TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: color, offset: UVec2::ZERO, size: EXTENT }, None);
+                    let bindings = TestComputeImage::push_bindings(
+                        TestComputeImageArgs {
+                            target: target.whole_view(),
+                            tint: color,
+                            offset: UVec2::ZERO,
+                            size: EXTENT,
+                        },
+                        None,
+                    );
                     cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1]);
                 }
             })
@@ -886,8 +971,20 @@ fn occlusion_queries_count_the_samples_of_a_draw() {
     }
     .unwrap();
     render(&mut gpu, |cmd, target| {
-        let near = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None);
-        let far = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(3..), instance_offset: Vec2::ZERO }, None);
+        let near = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(0..3),
+                instance_offset: Vec2::ZERO,
+            },
+            None,
+        );
+        let far = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(3..),
+                instance_offset: Vec2::ZERO,
+            },
+            None,
+        );
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(&Draw::new(&near, 3, 1, RasterState::default()).count_samples(&pool, 0))
@@ -969,29 +1066,47 @@ fn queries_end_where_they_began_and_before_the_recording_ends() {
     let mut gpu = gpu();
     let pool = QueryPool::occlusion(2).unwrap();
     let other = QueryPool::occlusion(1).unwrap();
-    let mut wrong_index = OcclusionObserver { pool: &pool, begin: 0, end: Some(1) };
-    let message = panic_message(|| {
-        gpu.submit(|cmd| cmd.measure(Some(&mut wrong_index), "frame", |_| {}))
-    });
-    assert!(message.contains("query 1 of the pool is ended while query 0"), "{message}");
+    let mut wrong_index = OcclusionObserver {
+        pool: &pool,
+        begin: 0,
+        end: Some(1),
+    };
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.measure(Some(&mut wrong_index), "frame", |_| {})));
+    assert!(
+        message.contains("query 1 of the pool is ended while query 0"),
+        "{message}"
+    );
     // The failed recording's replay still holds the pool until it finished.
     lava::wait_idle().unwrap();
     let message = panic_message(|| {
         gpu.submit(|cmd| {
             cmd.query(&pool, 0, |cmd| {
-                let mut wrong_pool = OcclusionObserver { pool: &other, begin: 0, end: None };
+                let mut wrong_pool = OcclusionObserver {
+                    pool: &other,
+                    begin: 0,
+                    end: None,
+                };
                 cmd.measure(Some(&mut wrong_pool), "frame", |_| {})
             })
         })
     });
     assert!(message.contains("is active"), "{message}");
     lava::wait_idle().unwrap();
-    let mut open = OcclusionObserver { pool: &pool, begin: 0, end: None };
+    let mut open = OcclusionObserver {
+        pool: &pool,
+        begin: 0,
+        end: None,
+    };
     let message = panic_message(|| gpu.submit(|cmd| cmd.measure(Some(&mut open), "frame", |_| {})));
     assert!(message.contains("query 0 still active"), "{message}");
     lava::wait_idle().unwrap();
     // The failed recordings were replaced by their barriers; the next one records as usual.
-    let mut balanced = OcclusionObserver { pool: &pool, begin: 1, end: Some(1) };
+    let mut balanced = OcclusionObserver {
+        pool: &pool,
+        begin: 1,
+        end: Some(1),
+    };
     gpu.submit(|cmd| cmd.measure(Some(&mut balanced), "frame", |_| {}));
     let mut samples = [7];
     assert!(pool.read(1, &mut samples).unwrap());
@@ -1006,13 +1121,19 @@ fn reads_stay_inside_their_pool() {
     assert!(message.contains("of a pool of 4"), "{message}");
     let message = panic_message(|| pool.read(1, &mut [0; 4]));
     assert!(message.contains("of a pool of 4"), "{message}");
-    assert!(pool.read(4, &mut []).unwrap(), "no queries are always ready");
+    assert!(
+        pool.read(4, &mut []).unwrap(),
+        "no queries are always ready"
+    );
 }
 
 /// Counters of one scope, at most `MAX_COUNTERS`.
 fn counters_of(scope: CounterScope) -> Vec<&'static counters::Counter> {
     let all = counters::counters().unwrap_or_default();
-    all.iter().filter(|c| c.scope == scope).take(counters::MAX_COUNTERS).collect()
+    all.iter()
+        .filter(|c| c.scope == scope)
+        .take(counters::MAX_COUNTERS)
+        .collect()
 }
 
 #[test]
@@ -1020,14 +1141,24 @@ fn counter_selections_fit_one_pass_or_need_a_capture() {
     let mut gpu = gpu();
     let all = counters::counters().unwrap_or_default();
     if all.is_empty() {
-        eprintln!("SKIPPED counter_selections_fit_one_pass_or_need_a_capture: no performance queries");
+        eprintln!(
+            "SKIPPED counter_selections_fit_one_pass_or_need_a_capture: no performance queries"
+        );
         return;
     }
     assert!(!counters::fits(&[]), "an empty selection makes no pool");
     assert!(counters::fits(&[&all[0]]));
     let target = Target::new(EXTENT).unwrap().bind_storage().unwrap();
     let dispatch = |cmd: &mut Cmd| {
-        let bindings = TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: EXTENT }, None);
+        let bindings = TestComputeImage::push_bindings(
+            TestComputeImageArgs {
+                target: target.whole_view(),
+                tint: Vec4::ONE,
+                offset: UVec2::ZERO,
+                size: EXTENT,
+            },
+            None,
+        );
         cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1]);
     };
 
@@ -1043,7 +1174,9 @@ fn counter_selections_fit_one_pass_or_need_a_capture() {
         lava::wait_idle().unwrap();
     }
     let submission = gpu.timeline.begin().unwrap();
-    let wait = submission.submit_profiled(&pool, 0, |cmd| dispatch(cmd)).unwrap();
+    let wait = submission
+        .submit_profiled(&pool, 0, |cmd| dispatch(cmd))
+        .unwrap();
     wait.block().unwrap();
     let mut value = [f64::NAN];
     assert!(pool.read(0, &mut value).unwrap());
@@ -1109,10 +1242,15 @@ fn update_buffer_writes_its_elements() {
     assert_eq!(buffer.host(), [[0, 0], [11, 22], [33, 44], [0, 0]]);
     // Empty data records nothing; more than the slice holds or 64 KiB panics.
     gpu.submit(|cmd| cmd.update_buffer(buffer.range(..), &[]));
-    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(buffer.range(3..), &[[1, 2]; 2])));
-    assert!(message.contains("update of 2 elements into a slice of 1"), "{message}");
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.update_buffer(buffer.range(3..), &[[1, 2]; 2])));
+    assert!(
+        message.contains("update of 2 elements into a slice of 1"),
+        "{message}"
+    );
     let large = zeroed_buffer::<u32>(32768);
-    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(large.range(..), &[0; 16385])));
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.update_buffer(large.range(..), &[0; 16385])));
     assert!(message.contains("at most 65536"), "{message}");
     gpu.submit(|cmd| cmd.update_buffer(large.range(..), &[7; 16384]));
     assert_eq!(buffer.host()[1], [11, 22]);
@@ -1155,7 +1293,8 @@ fn fills_and_updates_write_aligned_words() {
     let message = panic_message(|| gpu.submit(|cmd| cmd.fill_buffer(bytes.byte_range(0..6), 0)));
     assert!(message.contains("4-byte"), "{message}");
     let triples = zeroed_buffer::<[u8; 3]>(4);
-    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(triples.range(..), &[[1; 3]])));
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.update_buffer(triples.range(..), &[[1; 3]])));
     assert!(message.contains("4-byte"), "{message}");
     // Empty fills and updates record nothing (Vulkan refuses a size of 0).
     gpu.submit(|cmd| {
@@ -1167,21 +1306,21 @@ fn fills_and_updates_write_aligned_words() {
 #[test]
 fn copies_and_blits_stay_inside_their_mip() {
     let mut gpu = gpu();
-    let image = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+    let image =
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     let buffer = zeroed_buffer::<u8>(8 * 8 * 4);
     let view = image.whole_view();
     let outside = view.region(UVec2::new(4, 4)).offset(IVec2::new(6, 0));
-    let message = panic_message(|| {
-        gpu.submit(|cmd| cmd.copy_buffer_to_image(buffer.range(..), outside))
-    });
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.copy_buffer_to_image(buffer.range(..), outside)));
     assert!(message.contains("outside its mip"), "{message}");
     let message = panic_message(|| {
         gpu.submit(|cmd| cmd.copy_image_to_buffer(view.region(UVec2::new(0, 4)), buffer.range(..)))
     });
     assert!(message.contains("empty"), "{message}");
-    let message = panic_message(|| {
-        gpu.submit(|cmd| cmd.blit_image(image.whole(), outside, Filter::Nearest))
-    });
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.blit_image(image.whole(), outside, Filter::Nearest)));
     assert!(message.contains("outside its mip"), "{message}");
     let negative = view.region(UVec2::new(4, 4)).offset(IVec2::new(-1, 0));
     let message = panic_message(|| {
@@ -1197,7 +1336,8 @@ fn block_compressed_copies_cover_whole_blocks() {
         eprintln!("SKIPPED block_compressed_copies_cover_whole_blocks: no BC compression");
         return;
     }
-    let image = Image::<BC7UnormBlock, usage![Sampled, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+    let image =
+        Image::<BC7UnormBlock, usage![Sampled, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
     let buffer = zeroed_buffer::<u8>(64);
     let view = image.whole_view();
     let message = panic_message(|| {
@@ -1219,8 +1359,15 @@ fn dispatches_stay_within_the_device_limits() {
     };
     let message = panic_message(|| {
         gpu.submit(|cmd| {
-            let bindings =
-                TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: EXTENT }, None);
+            let bindings = TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: target.whole_view(),
+                    tint: Vec4::ONE,
+                    offset: UVec2::ZERO,
+                    size: EXTENT,
+                },
+                None,
+            );
             cmd.compute(&bindings, [1, over, 1])
         })
     });
@@ -1235,7 +1382,15 @@ fn shader_images_are_bound_in_the_sets_they_are_read_through() {
         .bind_sampled()
         .unwrap();
     let message = panic_message(|| {
-        TestComputeImage::push_bindings(TestComputeImageArgs { target: image.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: UVec2::ONE }, None)
+        TestComputeImage::push_bindings(
+            TestComputeImageArgs {
+                target: image.whole_view(),
+                tint: Vec4::ONE,
+                offset: UVec2::ZERO,
+                size: UVec2::ONE,
+            },
+            None,
+        )
     });
     assert!(message.contains("bind_storage"), "{message}");
 }
@@ -1248,9 +1403,14 @@ fn attachments_are_one_mip_at_least_as_large_as_the_rendering() {
     assert!(message.contains("one mip"), "{message}");
     let target = Target::new(EXTENT).unwrap();
     let message = panic_message(|| {
-        gpu.submit(|cmd| drop(cmd.raster(EXTENT * 2, [Attachment::color(target.whole_view(), None)])))
+        gpu.submit(|cmd| {
+            drop(cmd.raster(EXTENT * 2, [Attachment::color(target.whole_view(), None)]))
+        })
     });
-    assert!(message.contains("doesn't fit its color attachment"), "{message}");
+    assert!(
+        message.contains("doesn't fit its color attachment"),
+        "{message}"
+    );
     let depth = Image::<D32Sfloat, usage![DepthAttachment]>::new(EXTENT / 2).unwrap();
     let message = panic_message(|| {
         gpu.submit(|cmd| {
@@ -1258,7 +1418,10 @@ fn attachments_are_one_mip_at_least_as_large_as_the_rendering() {
                 .depth_attachment(depth.whole_view(), None);
         })
     });
-    assert!(message.contains("doesn't fit its depth attachment"), "{message}");
+    assert!(
+        message.contains("doesn't fit its depth attachment"),
+        "{message}"
+    );
     let message = panic_message(|| {
         gpu.submit(|cmd| {
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
@@ -1332,14 +1495,25 @@ fn copy_buffer_regions_copies_each_region() {
     assert_eq!(dst.host(), [8, 0, 0, 0, 0, 0, 1, 2]);
     // Empty regions are skipped, and a list of only those records nothing.
     gpu.submit(|cmd| cmd.copy_buffer_regions(&[(src.range(..0), dst.range(..))]));
-    gpu.submit(|cmd| cmd.copy_buffer_regions(&[(src.range(..0), dst.range(..)), (src.range(..1), dst.range(1..2))]));
+    gpu.submit(|cmd| {
+        cmd.copy_buffer_regions(&[
+            (src.range(..0), dst.range(..)),
+            (src.range(..1), dst.range(1..2)),
+        ])
+    });
     assert_eq!(dst.host(), [8, 1, 0, 0, 0, 0, 1, 2]);
     // No destination may overlap another or a source.
     let message = panic_message(|| {
-        gpu.submit(|cmd| cmd.copy_buffer_regions(&[(src.range(0..2), dst.range(0..2)), (src.range(4..6), dst.range(1..3))]))
+        gpu.submit(|cmd| {
+            cmd.copy_buffer_regions(&[
+                (src.range(0..2), dst.range(0..2)),
+                (src.range(4..6), dst.range(1..3)),
+            ])
+        })
     });
     assert!(message.contains("regions 0 and 1 overlap"), "{message}");
-    let message = panic_message(|| gpu.submit(|cmd| cmd.copy_buffer(src.range(0..4), src.range(2..6))));
+    let message =
+        panic_message(|| gpu.submit(|cmd| cmd.copy_buffer(src.range(0..4), src.range(2..6))));
     assert!(message.contains("region 0 reads and writes"), "{message}");
 }
 
@@ -1350,7 +1524,10 @@ fn reserve_grows_a_buffer_and_keeps_its_contents() {
     let mut readback = zeroed_buffer::<u32>(8);
     let mut grew = (false, false);
     gpu.submit(|cmd| {
-        grew = (buffer.reserve(3, cmd).unwrap(), buffer.reserve(5, cmd).unwrap());
+        grew = (
+            buffer.reserve(3, cmd).unwrap(),
+            buffer.reserve(5, cmd).unwrap(),
+        );
         cmd.fill_buffer(buffer.range(3..), 9);
         cmd.copy_buffer(buffer.range(..), readback.range(..buffer.len()));
     });
@@ -1364,7 +1541,8 @@ fn reserve_grows_a_buffer_and_keeps_its_contents() {
 fn per_frame_values_belong_to_the_slot_a_submission_waited_for() {
     let mut gpu = gpu();
     let timeline = &mut gpu.timeline;
-    let mut rings = lava::queue::PerFrame::new(timeline, |_| Buffer::<u32, Upload>::upload(4)).unwrap();
+    let mut rings =
+        lava::queue::PerFrame::new(timeline, |_| Buffer::<u32, Upload>::upload(4)).unwrap();
     assert_eq!(rings.len(), timeline.in_flight() as usize);
     let mut slots = Vec::new();
     for frame in 0..4u32 {
@@ -1374,11 +1552,21 @@ fn per_frame_values_belong_to_the_slot_a_submission_waited_for() {
         let ring = rings.get(&submission).range(..);
         let mut readback = zeroed_buffer::<u32>(4);
         let readback_slice = readback.range(..);
-        submission.submit(|cmd| cmd.copy_buffer(ring, readback_slice)).unwrap().block().unwrap();
+        submission
+            .submit(|cmd| cmd.copy_buffer(ring, readback_slice))
+            .unwrap()
+            .block()
+            .unwrap();
         assert_eq!(readback.host(), [frame; 4]);
     }
     // The harness timeline has two slots, which earlier tests' submissions left at either.
-    assert!(slots.iter().enumerate().all(|(i, slot)| *slot == (slots[0] + i) % 2), "{slots:?}");
+    assert!(
+        slots
+            .iter()
+            .enumerate()
+            .all(|(i, slot)| *slot == (slots[0] + i) % 2),
+        "{slots:?}"
+    );
     let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
     let submission = other.begin().unwrap();
     let message = panic_message(|| rings.get(&submission).len());
@@ -1400,20 +1588,37 @@ fn raw_buffers_hold_whole_elements_at_power_of_two_alignments() {
 #[test]
 fn structs_with_image_handles_are_written_but_not_zeroed() {
     let _gpu = gpu();
-    let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(EXTENT).unwrap().bind_storage().unwrap();
+    let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(EXTENT)
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     // A generated struct with a handle derives `NoUninit`, not `Pod`, so it has no `zeroed()`;
     // this one comes from the pass's bindings.
-    let made = TestComputeImage::push_bindings(TestComputeImageArgs { target: image.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: EXTENT }, None);
+    let made = TestComputeImage::push_bindings(
+        TestComputeImageArgs {
+            target: image.whole_view(),
+            tint: Vec4::ONE,
+            offset: UVec2::ZERO,
+            size: EXTENT,
+        },
+        None,
+    );
     let push_constants = made.sections().push_constants;
-    assert_eq!(push_constants.len(), size_of::<lava_tests::bindings::CTestComputeImageBindings>());
+    assert_eq!(
+        push_constants.len(),
+        size_of::<lava_tests::bindings::CTestComputeImageBindings>()
+    );
     // SAFETY: the bytes are a `CTestComputeImageBindings`, which every field holds any bits of.
     let bindings: lava_tests::bindings::CTestComputeImageBindings =
         unsafe { std::ptr::read_unaligned(push_constants.as_ptr().cast()) };
-    let mut buffer: Buffer<lava_tests::bindings::CTestComputeImageBindings, Upload> = Buffer::upload(2).unwrap();
+    let mut buffer: Buffer<lava_tests::bindings::CTestComputeImageBindings, Upload> =
+        Buffer::upload(2).unwrap();
     buffer.host_write(1, &[bindings]);
     let mut first = [0u8; 4];
     // SAFETY: element 1 was written, and nothing else reaches the mapping.
-    unsafe { std::ptr::copy_nonoverlapping(buffer.host_ptr().add(1).cast::<u8>(), first.as_mut_ptr(), 4) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(buffer.host_ptr().add(1).cast::<u8>(), first.as_mut_ptr(), 4)
+    };
     let handle = image.handle::<lava::bindless::Storage>();
     assert_eq!(first, bytemuck::bytes_of(&handle));
     assert_ne!(ImageHandle::<lava::bindless::Storage>::default(), handle);
@@ -1444,7 +1649,8 @@ fn partially_overlapping_writes_are_synchronised_with_later_reads() {
 #[test]
 fn image_reports_extent_and_mip_chain() {
     let _gpu = gpu();
-    let image = Image::<R8G8B8A8Unorm, usage![Sampled]>::with_mip_levels(UVec2::new(16, 8), 4).unwrap();
+    let image =
+        Image::<R8G8B8A8Unorm, usage![Sampled]>::with_mip_levels(UVec2::new(16, 8), 4).unwrap();
     assert_eq!(image.extent(), UVec2::new(16, 8));
     assert_eq!(image.mip_levels(), 4);
     assert_eq!(image.mip_extent(0), UVec2::new(16, 8));
@@ -1454,22 +1660,26 @@ fn image_reports_extent_and_mip_chain() {
     let whole = image.whole_view();
     assert_eq!(whole.subresource_range().level_count, 4);
     assert_eq!(whole.extent(), UVec2::new(16, 8));
-    assert_eq!(image.whole().extend, UVec2::new(16, 8));
+    assert_eq!(image.whole().extent, UVec2::new(16, 8));
 }
 
 /// Each sized like its mip and bound at its own slot, the mips' slots contiguous.
 #[test]
 fn mip_chains_have_a_view_and_handle_per_mip() {
     let _gpu = gpu();
-    let chain = MipChain::<R8G8B8A8Unorm, usage![Sampled, Storage]>::with_mip_levels(UVec2::new(16, 8), 4)
-        .unwrap()
-        .bind_sampled()
-        .unwrap()
-        .bind_mips_storage()
-        .unwrap();
+    let chain =
+        MipChain::<R8G8B8A8Unorm, usage![Sampled, Storage]>::with_mip_levels(UVec2::new(16, 8), 4)
+            .unwrap()
+            .bind_sampled()
+            .unwrap()
+            .bind_mips_storage()
+            .unwrap();
     assert!(chain.handle::<bindless::Sampled>().sampled_slot().is_some());
     let unbound = panic_message(|| chain.handle::<bindless::Storage>());
-    assert!(unbound.contains("bind_storage"), "only the mips are storage: {unbound}");
+    assert!(
+        unbound.contains("bind_storage"),
+        "only the mips are storage: {unbound}"
+    );
     let whole = chain.whole_view();
     assert_eq!(whole.subresource_range().level_count, 4);
     let first = chain.mip_view(0).handle::<bindless::Storage>();
@@ -1480,14 +1690,24 @@ fn mip_chains_have_a_view_and_handle_per_mip() {
         assert_eq!((range.base_mip_level, range.level_count), (level, 1));
         assert_eq!(view.extent(), chain.mip_extent(level));
         assert_eq!(view.handle::<bindless::Storage>(), first.mip(level));
-        assert_eq!(view.handle::<bindless::Storage>().storage_slot(), Some(slot + level));
+        assert_eq!(
+            view.handle::<bindless::Storage>().storage_slot(),
+            Some(slot + level)
+        );
         // Descriptors are written without views: only attachments have them.
-        assert_eq!(view.view(), lava::vk::ImageView::null());
+        assert_eq!(view.vk_view(), lava::vk::ImageView::null());
     }
-    assert_eq!(chain.mip_view(2).whole().extend, UVec2::new(4, 2));
-    let targets = MipChain::<R8G8B8A8Unorm, usage![ColorAttachment, Sampled, TransferSrc, TransferDst]>::with_mip_levels(UVec2::new(16, 8), 2)
-        .unwrap();
-    let views = [targets.whole_view().view(), targets.mip_view(0).view(), targets.mip_view(1).view()];
+    assert_eq!(chain.mip_view(2).whole().extent, UVec2::new(4, 2));
+    let targets = MipChain::<
+        R8G8B8A8Unorm,
+        usage![ColorAttachment, Sampled, TransferSrc, TransferDst],
+    >::with_mip_levels(UVec2::new(16, 8), 2)
+    .unwrap();
+    let views = [
+        targets.whole_view().vk_view(),
+        targets.mip_view(0).vk_view(),
+        targets.mip_view(1).vk_view(),
+    ];
     assert!(!views.contains(&lava::vk::ImageView::null()));
     assert!(views[0] != views[1] && views[1] != views[2]);
 }
@@ -1518,7 +1738,11 @@ fn binds_take_free_slots() {
     assert_eq!(st.sampled_slot(), None);
     let st_slot = st.storage_slot().unwrap();
     let pair = b.sampled_slot().unwrap();
-    assert_eq!(b.storage_slot(), Some(pair + 1), "the storage descriptor follows the sampled one");
+    assert_eq!(
+        b.storage_slot(),
+        Some(pair + 1),
+        "the storage descriptor follows the sampled one"
+    );
     let mut slots = vec![s_slot, st_slot, pair, pair + 1];
     slots.sort();
     slots.dedup();
@@ -1535,24 +1759,39 @@ fn binds_take_free_slots() {
             .unwrap()
             .bind_storage()
     });
-    assert!(twice.contains("bind_combined"), "a view is bound once: {twice}");
+    assert!(
+        twice.contains("bind_combined"),
+        "a view is bound once: {twice}"
+    );
 
     // `bind` writes reserved slots only and checks the usage at runtime, static types included.
     let reserved = bindless::reserve::<bindless::Sampled>(4).unwrap();
-    assert_eq!((reserved.len(), reserved.slots().len()), (4, 4));
+    assert_eq!((reserved.len(), reserved.slots().iter().count()), (4, 4));
     assert!(!reserved.slots().contains(&s_slot));
-    bindless::bind([unbound.whole_view(); 4], (0..4).map(|i| reserved.handle(i)));
+    bindless::bind(
+        [unbound.whole_view(); 4],
+        (0..4).map(|i| reserved.handle(i)),
+    );
     let unreserved = std::panic::catch_unwind(|| bindless::bind([unbound.whole_view()], [s]));
-    assert!(unreserved.is_err(), "the sampled image's slot isn't reserved");
+    assert!(
+        unreserved.is_err(),
+        "the sampled image's slot isn't reserved"
+    );
     let storage_slots = bindless::reserve::<bindless::Storage>(1).unwrap();
     let refused = std::panic::catch_unwind(|| {
         bindless::bind([unbound.whole_view()], [storage_slots.handle(0)])
     });
-    assert!(refused.is_err(), "a sampled image can't be bound as storage");
+    assert!(
+        refused.is_err(),
+        "a sampled image can't be bound as storage"
+    );
     assert!(std::panic::catch_unwind(|| reserved.handle(4)).is_err());
     let pairs = bindless::reserve::<Combined>(2).unwrap();
-    assert_eq!((pairs.len(), pairs.slots().len()), (2, 4));
-    assert_eq!(pairs.handle(1).sampled_slot(), Some(pairs.slots().start + 2));
+    assert_eq!((pairs.len(), pairs.slots().iter().count()), (2, 4));
+    assert_eq!(
+        pairs.handle(1).sampled_slot(),
+        Some(pairs.slots().start + 2)
+    );
 }
 
 /// A pair takes the first two neighbouring free slots, past the holes single slots leave.
@@ -1563,7 +1802,10 @@ fn pairs_skip_single_holes() {
     // Single slots until seven in a row: the holes other tests left are filled then.
     let mut taken = Vec::new();
     let in_a_row = |taken: &[bindless::SlotRange<bindless::Sampled>]| {
-        taken.len() >= 7 && taken[taken.len() - 7..].windows(2).all(|w| w[1].slots().start == w[0].slots().end)
+        taken.len() >= 7
+            && taken[taken.len() - 7..]
+                .windows(2)
+                .all(|w| w[1].slots().start == w[0].slots().end)
     };
     while !in_a_row(&taken) {
         taken.push(bindless::reserve::<bindless::Sampled>(1).unwrap());
@@ -1577,9 +1819,17 @@ fn pairs_skip_single_holes() {
     drop(dropped);
     lava::wait_idle().unwrap();
     let pair = bindless::reserve::<Combined>(1).unwrap();
-    assert!(pair.slots().start >= start + 7, "no hole fits a pair: {:?}", pair.slots());
+    assert!(
+        pair.slots().start >= start + 7,
+        "no hole fits a pair: {:?}",
+        pair.slots()
+    );
     let single = bindless::reserve::<bindless::Storage>(1).unwrap();
-    assert_eq!(single.slots().start, start + 1, "a single fills the first hole");
+    assert_eq!(
+        single.slots().start,
+        start + 1,
+        "a single fills the first hole"
+    );
     drop(kept);
 }
 
@@ -1598,21 +1848,29 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
     let image = bind();
     let slot = image.handle::<bindless::Sampled>();
     drop(image);
-    assert_ne!(bind().handle::<bindless::Sampled>(), slot, "taken until no frame reaches it");
+    assert_ne!(
+        bind().handle::<bindless::Sampled>(),
+        slot,
+        "taken until no frame reaches it"
+    );
     lava::wait_idle().unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 
     // A mip chain frees its whole view's slot and each mip's, erased or not.
     lava::wait_idle().unwrap();
-    let chain = MipChain::<R8G8B8A8Unorm, usage![Sampled, Storage]>::with_mip_levels(UVec2::new(4, 4), 3)
-        .unwrap()
-        .bind_sampled()
-        .unwrap()
-        .bind_mips_storage()
-        .unwrap()
-        .erase();
+    let chain =
+        MipChain::<R8G8B8A8Unorm, usage![Sampled, Storage]>::with_mip_levels(UVec2::new(4, 4), 3)
+            .unwrap()
+            .bind_sampled()
+            .unwrap()
+            .bind_mips_storage()
+            .unwrap()
+            .erase();
     assert_eq!(chain.format().0, lava::VkFormat::R8G8B8A8_UNORM);
-    let (whole, mips) = (chain.handle::<bindless::Sampled>(), chain.mip_view(0).handle::<bindless::Storage>());
+    let (whole, mips) = (
+        chain.handle::<bindless::Sampled>(),
+        chain.mip_view(0).handle::<bindless::Storage>(),
+    );
     drop(chain);
     lava::wait_idle().unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), whole);
@@ -1628,7 +1886,10 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
     let written = std::panic::catch_unwind(|| bindless::bind([texture.whole_view()], [handle]));
     assert!(written.is_err());
     lava::wait_idle().unwrap();
-    assert_eq!(bindless::reserve::<bindless::Sampled>(3).unwrap().slots(), slots);
+    assert_eq!(
+        bindless::reserve::<bindless::Sampled>(3).unwrap().slots(),
+        slots
+    );
 }
 
 const NO_SAMPLER: SamplerHandle = SamplerHandle { index: !0 };
@@ -1645,15 +1906,28 @@ fn sample(
 ) -> [Vec4; 3] {
     let mut out = zeroed_buffer::<Vec4>(3);
     gpu.submit(|cmd| {
-        let bindings =
-            TestSample::push_bindings(TestSampleArgs { out: out.range(..), first, second, compare, slot, uv, reference }, Some(reads));
+        let bindings = TestSample::push_bindings(
+            TestSampleArgs {
+                out: out.range(..),
+                first,
+                second,
+                compare,
+                slot,
+                uv,
+                reference,
+            },
+            Some(reads),
+        );
         cmd.compute(&bindings, [1, 1, 1]);
     });
     out.host().try_into().unwrap()
 }
 
 /// A 1x1 sampled image of `color`.
-fn solid(gpu: &mut common::Gpu, color: [f32; 4]) -> Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]> {
+fn solid(
+    gpu: &mut common::Gpu,
+    color: [f32; 4],
+) -> Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]> {
     let image = Image::new(UVec2::ONE).unwrap();
     gpu.submit(|cmd| cmd.clear_image(image.whole_view(), color));
     image
@@ -1668,13 +1942,26 @@ fn reserved_slots_are_rewritten_between_frames_in_flight() {
     let green = solid(&mut gpu, [0.0, 1.0, 0.0, 1.0]);
     let slot = bindless::reserve::<bindless::Sampled>(1).unwrap();
     let mut outs = [zeroed_buffer::<Vec4>(3), zeroed_buffer::<Vec4>(3)];
-    let frame = |gpu: &mut common::Gpu, image: &Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>, out: &Buffer<Vec4, Readback>| {
+    let frame = |gpu: &mut common::Gpu,
+                 image: &Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>,
+                 out: &Buffer<Vec4, Readback>| {
         bindless::bind([image.whole_view()], [slot.handle(0)]);
         let reads = [ImageUse::sampled_read(image.whole_view())];
         let submission = gpu.timeline.begin().unwrap();
         submission
             .submit(|cmd| {
-                let bindings = TestSample::push_bindings(TestSampleArgs { out: out.range(..), first: nearest(), second: nearest(), compare: NO_SAMPLER, slot: slot.handle(0).bits(), uv: Vec2::splat(0.5), reference: 0.0 }, Some(Accesses::images(&reads)));
+                let bindings = TestSample::push_bindings(
+                    TestSampleArgs {
+                        out: out.range(..),
+                        first: nearest(),
+                        second: nearest(),
+                        compare: NO_SAMPLER,
+                        slot: slot.handle(0).bits(),
+                        uv: Vec2::splat(0.5),
+                        reference: 0.0,
+                    },
+                    Some(Accesses::images(&reads)),
+                );
                 cmd.compute(&bindings, [1, 1, 1]);
             })
             .unwrap()
@@ -1699,10 +1986,9 @@ fn samplers_filter_by_their_description_and_free_their_slots() {
         .bind_sampled()
         .unwrap();
     gpu.submit(|cmd| cmd.copy_buffer_to_image(texels.range(..), image.whole_view().whole()));
-    let linear = Sampler::new(
-        &SamplerDesc::new().address_mode(lava::vk::SamplerAddressMode::CLAMP_TO_EDGE),
-    )
-    .unwrap();
+    let linear =
+        Sampler::new(&SamplerDesc::new().address_mode(lava::vk::SamplerAddressMode::CLAMP_TO_EDGE))
+            .unwrap();
     let reads = [ImageUse::sampled_read(image.whole_view())];
     // A quarter of the way from the first texel's centre to the second's.
     let uv = Vec2::new(0.375, 0.5);
@@ -1710,7 +1996,11 @@ fn samplers_filter_by_their_description_and_free_their_slots() {
     let samplers = [nearest(), linear.handle(), NO_SAMPLER];
     let [near, filtered, _] = sample(&mut gpu, slot, samplers, uv, 0.0, Accesses::images(&reads));
     assert_eq!(near.x, 0.0);
-    assert!((filtered.x - 0.25).abs() < 0.01, "linear filtering gave {}", filtered.x);
+    assert!(
+        (filtered.x - 0.25).abs() < 0.01,
+        "linear filtering gave {}",
+        filtered.x
+    );
 
     if Ctx::features().sampler_anisotropy {
         let max = Ctx::device_properties().limits.max_sampler_anisotropy;
@@ -1757,8 +2047,14 @@ fn reduction_samplers_return_the_extremes() {
     let slot = image.handle::<bindless::Sampled>().bits();
     let samplers = [min.handle(), max.handle(), NO_SAMPLER];
     // The centre, where all four texels weigh the same.
-    let [low, high, _] =
-        sample(&mut gpu, slot, samplers, Vec2::splat(0.5), 0.0, Accesses::images(&reads));
+    let [low, high, _] = sample(
+        &mut gpu,
+        slot,
+        samplers,
+        Vec2::splat(0.5),
+        0.0,
+        Accesses::images(&reads),
+    );
     assert_eq!((low.x, high.x), (0.1, 0.4));
 }
 
@@ -1774,7 +2070,10 @@ fn quarter(gpu: &mut common::Gpu) -> Combinable {
 
 /// A combined mip chain of `levels` mips, mip `i` cleared to `(i + 1) / 4`.
 fn combined_chain(gpu: &mut common::Gpu, levels: u32) -> CombinedChain {
-    let chain = CombinedChain::with_mip_levels(UVec2::splat(4), levels).unwrap().bind_mips_combined().unwrap();
+    let chain = CombinedChain::with_mip_levels(UVec2::splat(4), levels)
+        .unwrap()
+        .bind_mips_combined()
+        .unwrap();
     gpu.submit(|cmd| {
         for level in 0..levels {
             cmd.clear_image(chain.mip_view(level), [(level + 1) as f32 / 4.0; 4]);
@@ -1792,8 +2091,14 @@ fn run_combined(
     pair: Option<(ImageHandle<Combined>, &Combinable)>,
     chain: &CombinedChain,
 ) -> Vec<Vec4> {
-    let sampled = Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::ONE).unwrap().bind_sampled().unwrap();
-    let storage = Image::<R8G8B8A8Unorm, usage![Storage, TransferDst]>::new(UVec2::ONE).unwrap().bind_storage().unwrap();
+    let sampled = Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::ONE)
+        .unwrap()
+        .bind_sampled()
+        .unwrap();
+    let storage = Image::<R8G8B8A8Unorm, usage![Storage, TransferDst]>::new(UVec2::ONE)
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     gpu.submit(|cmd| {
         cmd.clear_image(sampled.whole_view(), [1.0, 0.0, 0.0, 1.0]);
         cmd.clear_image(storage.whole_view(), [0.0, 1.0, 0.0, 1.0]);
@@ -1806,10 +2111,28 @@ fn run_combined(
         ImageUse::storage_read(storage.whole_view()),
     ];
     reads.extend((1..levels).map(|level| ImageUse::sampled_read(chain.mip_view(level))));
-    let both = lava::AccessFlags2::SHADER_SAMPLED_READ | lava::AccessFlags2::SHADER_STORAGE_WRITE;
-    reads.extend(pair.map(|(_, image)| image.whole_view().access(lava::PipelineStageFlags2::NONE, both)));
+    let both =
+        lava::vk::AccessFlags2::SHADER_SAMPLED_READ | lava::vk::AccessFlags2::SHADER_STORAGE_WRITE;
+    reads.extend(pair.map(|(_, image)| {
+        image
+            .whole_view()
+            .access(lava::PipelineStageFlags2::NONE, both)
+    }));
     gpu.submit(|cmd| {
-        let bindings = TestCombined::push_bindings(TestCombinedArgs { target: target.whole_view(), pair: pair.map_or(!0, |(handle, _)| handle.bits()), mips: chain.mip_view(0), sampled: sampled.handle::<bindless::Sampled>().erase(), storage: storage.handle::<bindless::Storage>().erase(), none: ImageHandle::NULL, sampler: nearest(), out: out.range(..), levels }, Some(Accesses::images(&reads)));
+        let bindings = TestCombined::push_bindings(
+            TestCombinedArgs {
+                target: target.whole_view(),
+                pair: pair.map_or(!0, |(handle, _)| handle.bits()),
+                mips: chain.mip_view(0),
+                sampled: sampled.handle::<bindless::Sampled>().erase(),
+                storage: storage.handle::<bindless::Storage>().erase(),
+                none: ImageHandle::NULL,
+                sampler: nearest(),
+                out: out.range(..),
+                levels,
+            },
+            Some(Accesses::images(&reads)),
+        );
         cmd.compute(&bindings, [1, 1, 1]);
     });
     out.host().to_vec()
@@ -1834,7 +2157,11 @@ fn combined_images_read_sampled_and_write_storage() {
         assert!(close(texel, [128; 4]), "doubled: {texel:?}");
     }
     assert_eq!(out[0], Vec4::new(1.0, 0.0, 0.0, 1.0), "the sampled image");
-    assert_eq!(out[1], Vec4::new(0.0, 1.0, 0.0, 1.0), "the storage image, nearest");
+    assert_eq!(
+        out[1],
+        Vec4::new(0.0, 1.0, 0.0, 1.0),
+        "the storage image, nearest"
+    );
     assert_eq!(out[2], Vec4::ZERO, "the null handle");
 }
 
@@ -1863,13 +2190,20 @@ fn combined_mips_lie_a_pair_apart() {
     for level in 0..3 {
         let handle = chain.mip_view(level).handle::<Combined>();
         assert_eq!(handle, first.mip(level));
-        assert_eq!((handle.sampled_slot(), handle.storage_slot()), (Some(slot + 2 * level), Some(slot + 2 * level + 1)));
+        assert_eq!(
+            (handle.sampled_slot(), handle.storage_slot()),
+            (Some(slot + 2 * level), Some(slot + 2 * level + 1))
+        );
     }
     let target = quarter(&mut gpu).bind_combined().unwrap();
     let out = run_combined(&mut gpu, &target, None, &chain);
     for level in 0..3 {
         let expected = (level + 1) as f32 / 4.0;
-        assert!((out[3 + level] - Vec4::splat(expected)).abs().max_element() < 0.01, "mip {level}: {}", out[3 + level]);
+        assert!(
+            (out[3 + level] - Vec4::splat(expected)).abs().max_element() < 0.01,
+            "mip {level}: {}",
+            out[3 + level]
+        );
     }
 }
 
@@ -1878,11 +2212,22 @@ fn combined_mips_lie_a_pair_apart() {
 fn push_data_fills_all_256_bytes() {
     let mut gpu = gpu();
     const _: () = assert!(size_of::<lava_tests::bindings::CTestPushDataBindings>() == 256);
-    let values: [UVec4; 15] = std::array::from_fn(|i| UVec4::splat(i as u32) + UVec4::new(0, 100, 200, 300));
+    let values: [UVec4; 15] =
+        std::array::from_fn(|i| UVec4::splat(i as u32) + UVec4::new(0, 100, 200, 300));
     let last = UVec2::new(7, 11);
     let mut out = zeroed_buffer::<UVec4>(16);
     gpu.submit(|cmd| {
-        cmd.compute(&TestPushData::push_bindings(TestPushDataArgs { values, out: out.range(..), last }, None), [1, 1, 1])
+        cmd.compute(
+            &TestPushData::push_bindings(
+                TestPushDataArgs {
+                    values,
+                    out: out.range(..),
+                    last,
+                },
+                None,
+            ),
+            [1, 1, 1],
+        )
     });
     assert_eq!(&out.host()[..15], &values);
     assert_eq!(out.host()[15], UVec4::new(7, 11, 0, 0));
@@ -1892,17 +2237,15 @@ fn push_data_fills_all_256_bytes() {
 fn clear_image_sets_every_texel() {
     let mut gpu = gpu();
     let image =
-        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
     gpu.submit(|cmd| {
         cmd.clear_image(image.whole_view(), [1.0, 0.0, 0.5, 1.0]);
         cmd.copy_image_to_buffer(image.whole(), readback.range(..));
     });
-    for texel in readback.host().chunks_exact(4) {
-        assert!(
-            close(texel.try_into().unwrap(), [255, 0, 128, 255]),
-            "{texel:?}"
-        );
+    for texel in readback.host().as_chunks::<4>().0 {
+        assert!(close(*texel, [255, 0, 128, 255]), "{texel:?}");
     }
 }
 
@@ -1912,7 +2255,8 @@ fn buffer_to_image_and_back_round_trips() {
     let data = pattern(8, 8);
     let upload = buffer_with::<u8>(&data);
     let image =
-        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     let mut readback = zeroed_buffer::<u8>(data.len());
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), image.whole());
@@ -1927,7 +2271,8 @@ fn image_region_copies_address_the_sub_rectangle() {
     let data = pattern(8, 8);
     let upload = buffer_with::<u8>(&data);
     let image =
-        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     let mut readback = zeroed_buffer::<u8>(3 * 2 * 4);
     let region = image
         .whole_view()
@@ -1953,8 +2298,12 @@ fn blit_copies_between_offset_regions() {
     let mut gpu = gpu();
     let data = pattern(8, 8);
     let upload = buffer_with::<u8>(&data);
-    let src = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
-    let dst = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+    let src =
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
+    let dst =
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     let mut readback = zeroed_buffer::<u8>(data.len());
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), src.whole());
@@ -1994,8 +2343,12 @@ fn blit_scales_between_differently_sized_regions() {
     ]
     .concat();
     let upload = buffer_with::<u8>(&data);
-    let src = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(2, 2)).unwrap();
-    let dst = Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8)).unwrap();
+    let src =
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(2, 2))
+            .unwrap();
+    let dst =
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
+            .unwrap();
     let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), src.whole());
@@ -2016,8 +2369,11 @@ fn blit_scales_between_differently_sized_regions() {
 fn host_copy_uploads_a_mip_level() {
     let mut gpu = gpu();
     let mut image =
-        Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc]>::with_mip_levels(UVec2::new(8, 8), 2)
-            .unwrap();
+        Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc]>::with_mip_levels(
+            UVec2::new(8, 8),
+            2,
+        )
+        .unwrap();
     let data = pattern(8, 8);
 
     if !Ctx::features().host_image_copy {
@@ -2034,7 +2390,10 @@ fn host_copy_uploads_a_mip_level() {
     image.copy_from(&pattern(4, 4), 1).unwrap();
     // Programmer errors panic.
     let message = panic_message(|| image.copy_from(&data, 2));
-    assert!(message.contains("out of range"), "the image has two mip levels: {message}");
+    assert!(
+        message.contains("out of range"),
+        "the image has two mip levels: {message}"
+    );
     panic_message(|| image.copy_from(&[], 0));
 
     // The data has to be exactly one mip level.
@@ -2050,8 +2409,9 @@ fn host_copy_uploads_a_mip_level() {
 fn host_copy_writes_only_the_region() {
     let mut gpu = gpu();
     let mut image =
-        Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc]>::new(UVec2::new(8, 8)).unwrap();
-    let (offset, extent) = (UVec2::new(4, 5), UVec2::new(3, 2));
+        Image::<R8G8B8A8Unorm, usage![Sampled, HostCopy, TransferSrc]>::new(UVec2::new(8, 8))
+            .unwrap();
+    let (offset, extent) = (IVec2::new(4, 5), UVec2::new(3, 2));
     let patch = vec![200u8; 3 * 2 * 4];
 
     if !Ctx::features().host_image_copy {
@@ -2063,7 +2423,7 @@ fn host_copy_writes_only_the_region() {
     image.copy_from(&data, 0).unwrap();
     image.copy_region_from(&patch, 0, offset, extent).unwrap();
 
-    panic_message(|| image.copy_region_from(&patch, 0, UVec2::new(6, 5), extent));
+    panic_message(|| image.copy_region_from(&patch, 0, IVec2::new(6, 5), extent));
     panic_message(|| image.copy_region_from(&patch[4..], 0, offset, extent));
 
     let mut readback = zeroed_buffer::<u8>(data.len());
@@ -2089,8 +2449,17 @@ fn compute_image_bindings<'a>(
 ) -> impl FnOnce(&mut Cmd) + 'a {
     move |cmd| {
         cmd.compute(
-            &TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: Vec4::new(1.0, 1.0, 1.0, 1.0), offset, size }, None),
-            [SIZE / 8, SIZE / 8, 1],)
+            &TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: target.whole_view(),
+                    tint: Vec4::new(1.0, 1.0, 1.0, 1.0),
+                    offset,
+                    size,
+                },
+                None,
+            ),
+            [SIZE / 8, SIZE / 8, 1],
+        )
     }
 }
 
@@ -2114,8 +2483,17 @@ fn compute_pass_push_constants_reach_the_shader() {
     let mut gpu = gpu();
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.compute(
-            &TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: Vec4::new(0.0, 1.0, 0.0, 1.0), offset: UVec2::new(16, 24), size: UVec2::new(32, 16) }, None),
-            [SIZE / 8, SIZE / 8, 1],)
+            &TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: target.whole_view(),
+                    tint: Vec4::new(0.0, 1.0, 0.0, 1.0),
+                    offset: UVec2::new(16, 24),
+                    size: UVec2::new(32, 16),
+                },
+                None,
+            ),
+            [SIZE / 8, SIZE / 8, 1],
+        )
     });
 
     // Only the 32x16 rectangle at (16, 24) is written, and the tint removes red and blue.
@@ -2143,14 +2521,34 @@ fn indirect_compute_dispatch_matches_the_direct_one() {
     }]);
     let indirect = render(&mut gpu, |cmd, target| {
         cmd.compute_indirect(
-            &TestComputeImage::push_bindings(TestComputeImageArgs { target: target.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: EXTENT }, None),
-            dispatch.range(..),)
+            &TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: target.whole_view(),
+                    tint: Vec4::ONE,
+                    offset: UVec2::ZERO,
+                    size: EXTENT,
+                },
+                None,
+            ),
+            dispatch.range(..),
+        )
     });
     assert_eq!(indirect, direct);
-    let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(EXTENT).unwrap().bind_storage().unwrap();
+    let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(EXTENT)
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     let message = panic_message(|| {
         gpu.submit(|cmd| {
-            let bindings = TestComputeImage::push_bindings(TestComputeImageArgs { target: image.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: EXTENT }, None);
+            let bindings = TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: image.whole_view(),
+                    tint: Vec4::ONE,
+                    offset: UVec2::ZERO,
+                    size: EXTENT,
+                },
+                None,
+            );
             cmd.compute_indirect(&bindings, dispatch.range(..0))
         })
     });
@@ -2165,8 +2563,17 @@ fn compute_pass_reads_and_writes_buffers() {
     let mut dst = buffer_with::<u32>(&[u32::MAX; 100]);
     gpu.submit(|cmd| {
         cmd.compute(
-            &TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: src.range(..), dst: dst.range(..), count: 90, multiplier: 3 }, None),
-            [2, 1, 1],)
+            &TestComputeBuffer::push_bindings(
+                TestComputeBufferArgs {
+                    src: src.range(..),
+                    dst: dst.range(..),
+                    count: 90,
+                    multiplier: 3,
+                },
+                None,
+            ),
+            [2, 1, 1],
+        )
     });
     let expected: Vec<u32> = (0..100u32)
         .map(|i| {
@@ -2193,8 +2600,16 @@ fn clock_regions_count_every_subgroup_once() {
     let mut out = zeroed_buffer::<u32>(INVOCATIONS);
     gpu.submit(|cmd| {
         cmd.compute(
-            &TestClock::push_bindings(TestClockArgs { clocks: clocks.address(), out: out.range(..) }, None).unwrap(),
-            [INVOCATIONS as u32 / 64, 1, 1],)
+            &TestClock::push_bindings(
+                TestClockArgs {
+                    clocks: clocks.address(),
+                    out: out.range(..),
+                },
+                None,
+            )
+            .unwrap(),
+            [INVOCATIONS as u32 / 64, 1, 1],
+        )
     });
     let expected: Vec<u32> = (1..=INVOCATIONS as u32).collect();
     assert_eq!(out.host(), expected);
@@ -2220,8 +2635,17 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
     gpu.submit(|cmd| {
         cmd.fill_buffer(src.range(..), 5);
         cmd.compute(
-            &TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: src.range(..), dst: dst.range(..), count: 64, multiplier: 2 }, None),
-            [1, 1, 1]);
+            &TestComputeBuffer::push_bindings(
+                TestComputeBufferArgs {
+                    src: src.range(..),
+                    dst: dst.range(..),
+                    count: 64,
+                    multiplier: 2,
+                },
+                None,
+            ),
+            [1, 1, 1],
+        );
         cmd.copy_buffer(dst.range(..), copy.range(..));
     });
     let expected: Vec<u32> = (0..64).map(|i| 10 + i).collect();
@@ -2232,25 +2656,50 @@ fn compute_pass_is_synchronised_with_surrounding_transfers() {
 #[test]
 fn specialization_constants_pick_the_pipeline() {
     let mut gpu = gpu();
-    let (mut a, mut b) = (
-        zeroed_buffer::<u32>(8),
-        zeroed_buffer::<u32>(8),
-    );
+    let (mut a, mut b) = (zeroed_buffer::<u32>(8), zeroed_buffer::<u32>(8));
     let (image_a, image_b) = (
-        Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap(),
-        Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap(),
+        Target::new(UVec2::new(SIZE, SIZE))
+            .unwrap()
+            .bind_storage()
+            .unwrap(),
+        Target::new(UVec2::new(SIZE, SIZE))
+            .unwrap()
+            .bind_storage()
+            .unwrap(),
     );
     let mut pixels = zeroed_buffer::<u8>((SIZE * SIZE * 4 * 2) as usize);
     let half = (SIZE * SIZE * 4) as usize;
     gpu.submit(|cmd| {
         let groups = [SIZE / 8, SIZE / 8, 1];
         let first = |offset| {
-            TestConstants::push_bindings(TestConstantsArgs { offset, count: 8 }, TestConstantsConstants { out: a.range(..), target: image_a.whole_view(), multiplier: 3, brightness: 1.0 }, None)
+            TestConstants::push_bindings(
+                TestConstantsArgs { offset, count: 8 },
+                TestConstantsConstants {
+                    out: a.range(..),
+                    target: image_a.whole_view(),
+                    multiplier: 3,
+                    brightness: 1.0,
+                },
+                None,
+            )
         };
         cmd.compute(&first(100), groups);
         cmd.compute(
-            &TestConstants::push_bindings(TestConstantsArgs { offset: 0, count: 4 }, TestConstantsConstants { out: b.range(..), target: image_b.whole_view(), multiplier: 5, brightness: 0.5 }, None),
-            groups,);
+            &TestConstants::push_bindings(
+                TestConstantsArgs {
+                    offset: 0,
+                    count: 4,
+                },
+                TestConstantsConstants {
+                    out: b.range(..),
+                    target: image_b.whole_view(),
+                    multiplier: 5,
+                    brightness: 0.5,
+                },
+                None,
+            ),
+            groups,
+        );
         // The first set again, now cached, with other push constants.
         cmd.compute(&first(200), groups);
         cmd.copy_image_to_buffer(image_a.whole(), pixels.range(..half));
@@ -2301,7 +2750,8 @@ fn draw_triangles(gpu: &mut common::Gpu, vertex_count: u32, culling: bool) -> Ve
                     CullModeFlags::BACK
                 } else {
                     CullModeFlags::NONE
-                }),))
+                }),
+            ))
             .record("triangles")
     })
 }
@@ -2346,7 +2796,8 @@ fn wireframe_draws_only_the_edges() {
                 1,
                 unculled()
                     .polygon_mode(PolygonMode::LINE)
-                    .expect("the device has `fill-mode-non-solid`"),))
+                    .expect("the device has `fill-mode-non-solid`"),
+            ))
             .record("wireframe")
     });
     // The interior stays empty, the bottom edge (y = 0.8 -> row 57) is drawn.
@@ -2371,7 +2822,8 @@ fn color_attachment_clear_replaces_the_previous_content() {
             &bindings(&vertices),
             3,
             1,
-            RasterState::default(),))
+            RasterState::default(),
+        ))
         .record("cleared")
     });
     assert_pixel(&pixels, 32, 32, [0, 0, 255, 255]);
@@ -2386,10 +2838,17 @@ fn instances_are_drawn_with_their_instance_index() {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             // The second instance of the left triangle lands where the right one would be.
             .draw(&Draw::new(
-                &TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::new(1.0, 0.0) }, None),
+                &TestRaster::push_bindings(
+                    TestRasterArgs {
+                        vertices: vertices.range(..),
+                        instance_offset: Vec2::new(1.0, 0.0),
+                    },
+                    None,
+                ),
                 3,
                 2,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("instanced")
     });
     assert_ne!(pixel(&pixels, IN_LEFT.0, IN_LEFT.1), BLACK);
@@ -2417,7 +2876,8 @@ fn indirect_draw_matches_the_direct_one() {
             .draw(&Draw::indirect(
                 &bindings(&vertices),
                 commands.range(..),
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("indirect")
     });
     assert_eq!(indirect, direct);
@@ -2444,13 +2904,26 @@ fn indirect_count_draws_only_the_counted_commands() {
                     &bindings(&vertices),
                     commands.range(..),
                     count.range(..),
-                    unculled(),))
+                    unculled(),
+                ))
                 .record("indirect count")
         })
     };
-    assert_eq!(draw_counted(&mut gpu, 2), draw_triangles(&mut gpu, 6, false));
-    assert_eq!(draw_counted(&mut gpu, 1), draw_triangles(&mut gpu, 3, false));
-    assert!(draw_counted(&mut gpu, 0).chunks_exact(4).all(|p| p == BLACK));
+    assert_eq!(
+        draw_counted(&mut gpu, 2),
+        draw_triangles(&mut gpu, 6, false)
+    );
+    assert_eq!(
+        draw_counted(&mut gpu, 1),
+        draw_triangles(&mut gpu, 3, false)
+    );
+    assert!(
+        draw_counted(&mut gpu, 0)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&p| p == BLACK)
+    );
 }
 
 #[test]
@@ -2497,18 +2970,6 @@ fn scissor_clips_and_viewport_scales_the_draw() {
     assert_golden("raster_viewport", &quarter, [SIZE, SIZE]);
 }
 
-/// A near green triangle drawn before a far red one covering the same area.
-fn overlapping_triangles(gpu: &mut Gpu) -> Buffer<TestVertex> {
-    gpu.buffer(&[
-        vertex(0.0, -0.8, 0.8, GREEN),
-        vertex(0.8, 0.8, 0.8, GREEN),
-        vertex(-0.8, 0.8, 0.8, GREEN),
-        vertex(0.0, -0.8, 0.2, RED),
-        vertex(0.8, 0.8, 0.2, RED),
-        vertex(-0.8, 0.8, 0.2, RED),
-    ])
-}
-
 #[test]
 fn depth_attachment_keeps_the_nearer_fragment() {
     let mut gpu = gpu();
@@ -2520,7 +2981,8 @@ fn depth_attachment_keeps_the_nearer_fragment() {
                 &bindings(&vertices),
                 6,
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("without depth")
     });
     // Without a depth test the later (far, red) triangle wins.
@@ -2534,7 +2996,8 @@ fn depth_attachment_keeps_the_nearer_fragment() {
                 &bindings(&vertices),
                 6,
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("with depth")
     });
     assert_pixel(&with_depth, 32, 40, [0, 255, 0, 255]);
@@ -2548,7 +3011,12 @@ fn depth_attachment_keeps_the_nearer_fragment() {
             .depth_attachment(stencil.whole_view(), Some((0.0, 0)))
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .discard_depth_after()
-            .draw(&Draw::new(&bindings(&vertices), 6, 1, RasterState::default()))
+            .draw(&Draw::new(
+                &bindings(&vertices),
+                6,
+                1,
+                RasterState::default(),
+            ))
             .record("discarded depth")
     });
     assert_eq!(discarded, with_depth);
@@ -2568,32 +3036,61 @@ fn attachments_discard_their_contents() {
         .bind_mips_sampled()
         .unwrap();
     let scratch = Target::new(UVec2::new(8, 8)).unwrap();
-    let corner = |x: f32, y: f32| TestTexturedVertex { position: Vec2::new(x, y), uv: Vec2::splat(0.5) };
-    let quad = buffer_with::<TestTexturedVertex>(&[corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)]);
+    let corner = |x: f32, y: f32| TestTexturedVertex {
+        position: Vec2::new(x, y),
+        uv: Vec2::splat(0.5),
+    };
+    let quad = buffer_with::<TestTexturedVertex>(&[
+        corner(-1.0, -1.0),
+        corner(1.0, -1.0),
+        corner(1.0, 1.0),
+        corner(-1.0, 1.0),
+    ]);
     let indices = buffer_with::<u32>(&[0, 1, 2, 0, 2, 3]);
     let mut readback = zeroed_buffer::<u8>(8 * 8 * 4);
 
-    let cleared = panic_message(|| Attachment::color(scratch.whole_view(), Some([0.0; 4])).discard_before());
+    let cleared =
+        panic_message(|| Attachment::color(scratch.whole_view(), Some([0.0; 4])).discard_before());
     assert!(cleared.contains("loads nothing anyway"), "{cleared}");
     gpu.submit(|cmd| {
         let message = panic_message(|| {
-            cmd.raster(UVec2::new(8, 8), [Attachment::color(scratch.whole_view(), None)])
-                .discard_depth_after();
+            cmd.raster(
+                UVec2::new(8, 8),
+                [Attachment::color(scratch.whole_view(), None)],
+            )
+            .discard_depth_after();
         });
         assert!(message.contains("needs a `depth_attachment`"), "{message}");
         cmd.clear_image(chain.mip_view(0), [0.0, 1.0, 0.0, 1.0]);
-        let sample = TestRasterTextured::push_bindings(TestRasterTexturedArgs { vertices: quad.range(..), tex: chain.mip_view(0), sampler: nearest() }, None);
+        let sample = TestRasterTextured::push_bindings(
+            TestRasterTexturedArgs {
+                vertices: quad.range(..),
+                tex: chain.mip_view(0),
+                sampler: nearest(),
+            },
+            None,
+        );
         cmd.raster(
             chain.mip_extent(1),
             [Attachment::color(chain.mip_view(1), None).discard_before()],
         )
-        .draw(&Draw::indexed(&sample, indices.range(..), 1, RasterState::default()))
+        .draw(&Draw::indexed(
+            &sample,
+            indices.range(..),
+            1,
+            RasterState::default(),
+        ))
         .record("discard before");
         cmd.raster(
             UVec2::new(8, 8),
             [Attachment::color(scratch.whole_view(), Some([1.0; 4])).discard_after()],
         )
-        .draw(&Draw::indexed(&sample, indices.range(..), 1, RasterState::default()))
+        .draw(&Draw::indexed(
+            &sample,
+            indices.range(..),
+            1,
+            RasterState::default(),
+        ))
         .record("discard after");
         cmd.copy_image_to_buffer(chain.mip_view(1).whole(), readback.range(..));
     });
@@ -2614,7 +3111,8 @@ fn blend_modes_combine_overlapping_fragments() {
                 &bindings(&vertices),
                 6,
                 1,
-                RasterState::default().blend(blend),))
+                RasterState::default().blend(blend),
+            ))
             .record("blended")
         })
     };
@@ -2631,11 +3129,16 @@ fn blend_modes_combine_overlapping_fragments() {
 fn skipped_attachment_keeps_its_content() {
     let mut gpu = gpu();
     if !Ctx::features().independent_blend {
-        eprintln!("SKIPPED skipped_attachment_keeps_its_content: the device lacks `independent-blend`");
+        eprintln!(
+            "SKIPPED skipped_attachment_keeps_its_content: the device lacks `independent-blend`"
+        );
         return;
     }
     let vertices = overlapping_triangles(&mut gpu);
-    let second = Target::new(UVec2::new(SIZE, SIZE)).unwrap().bind_storage().unwrap();
+    let second = Target::new(UVec2::new(SIZE, SIZE))
+        .unwrap()
+        .bind_storage()
+        .unwrap();
     let mut readback = zeroed_buffer::<u8>((SIZE * SIZE * 4) as usize);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(
@@ -2651,13 +3154,20 @@ fn skipped_attachment_keeps_its_content() {
             1,
             RasterState::default()
                 .blends([Blend::Replace, Blend::Skip])
-                .expect("the device has `independent-blend`"),))
+                .expect("the device has `independent-blend`"),
+        ))
         .record("skip");
         cmd.copy_image_to_buffer(second.whole(), readback.range(..));
     });
     assert_pixel(&pixels, 32, 40, [255, 0, 0, 255]);
     let second = readback.host();
-    assert!(second.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
+    assert!(
+        second
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&p| p == [0, 0, 255, 255])
+    );
 }
 
 /// With counter-clockwise front faces the other triangle is culled.
@@ -2686,7 +3196,7 @@ fn line_lists_draw_only_edges() {
             .record("lines");
     });
     assert_pixel(&pixels, IN_LEFT.0, IN_LEFT.1, BLACK);
-    assert!(pixels.chunks_exact(4).any(|p| p != BLACK));
+    assert!(pixels.as_chunks::<4>().0.iter().any(|&p| p != BLACK));
     // `gpu_missing_features` draws it with the topology class baked.
     assert_golden("raster_lines", &pixels, [SIZE, SIZE]);
 }
@@ -2754,7 +3264,8 @@ fn logic_ops_replace_blending() {
 fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
     let mut gpu = gpu();
     let vertices = two_triangles(&mut gpu);
-    let depth = Image::<D32SfloatS8Uint, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
+    let depth =
+        Image::<D32SfloatS8Uint, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
     let mark = StencilFace {
         pass: StencilOp::REPLACE,
         reference: 1,
@@ -2777,7 +3288,13 @@ fn stencil_limits_a_draw_to_what_an_earlier_one_marked() {
             front: marked,
             back: marked,
         }));
-        let left = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None);
+        let left = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(0..3),
+                instance_offset: Vec2::ZERO,
+            },
+            None,
+        );
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some((0.0, 0)))
             .draw(&Draw::new(&left, 3, 1, marking))
@@ -2800,14 +3317,27 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
         .unwrap();
     let mut out = zeroed_buffer::<f32>((SIZE * SIZE) as usize);
     render(&mut gpu, |cmd, target| {
-        let left = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None);
+        let left = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(0..3),
+                instance_offset: Vec2::ZERO,
+            },
+            None,
+        );
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some((0.25, 0)))
             .draw(&Draw::new(&left, 3, 1, unculled()))
             .record("depth");
         cmd.compute(
-            &TestSampleDepth::push_bindings(TestSampleDepthArgs { depth: depth.whole_view(), out: out.range(..) }, None),
-            [SIZE / 8, SIZE / 8, 1]);
+            &TestSampleDepth::push_bindings(
+                TestSampleDepthArgs {
+                    depth: depth.whole_view(),
+                    out: out.range(..),
+                },
+                None,
+            ),
+            [SIZE / 8, SIZE / 8, 1],
+        );
     });
     let mut depth_at = |(x, y): (u32, u32)| out.host()[(y * SIZE + x) as usize];
     assert_eq!(depth_at(IN_LEFT), 0.5);
@@ -2825,7 +3355,14 @@ fn combined_depth_stencil_images_are_sampled_as_depth() {
     let uv = |(x, y): (u32, u32)| (Vec2::new(x as f32, y as f32) + 0.5) / SIZE as f32;
     let reads = [ImageUse::sampled_read(depth.whole_view())];
     let at = |gpu: &mut common::Gpu, texel, reference| {
-        sample(gpu, slot.handle(0).bits(), samplers, uv(texel), reference, Accesses::images(&reads))
+        sample(
+            gpu,
+            slot.handle(0).bits(),
+            samplers,
+            uv(texel),
+            reference,
+            Accesses::images(&reads),
+        )
     };
     let [read, _, compared] = at(&mut gpu, IN_LEFT, 0.4);
     assert_eq!((read.x, compared.x), (0.5, 1.0), "0.4 < 0.5");
@@ -2844,18 +3381,32 @@ fn depth_persists_between_draws_unless_cleared() {
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
                 .depth_attachment(depth.whole_view(), Some([0.0]))
                 .draw(&Draw::new(
-                    &TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None),
+                    &TestRaster::push_bindings(
+                        TestRasterArgs {
+                            vertices: vertices.range(0..3),
+                            instance_offset: Vec2::ZERO,
+                        },
+                        None,
+                    ),
                     3,
                     1,
-                    RasterState::default(),))
+                    RasterState::default(),
+                ))
                 .record("near");
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
                 .depth_attachment(depth.whole_view(), clear_between)
                 .draw(&Draw::new(
-                    &TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(3..), instance_offset: Vec2::ZERO }, None),
+                    &TestRaster::push_bindings(
+                        TestRasterArgs {
+                            vertices: vertices.range(3..),
+                            instance_offset: Vec2::ZERO,
+                        },
+                        None,
+                    ),
                     3,
                     1,
-                    RasterState::default(),))
+                    RasterState::default(),
+                ))
                 .record("far");
         })
     };
@@ -2882,15 +3433,18 @@ fn draws_of_one_rendering_see_the_earlier_depth() {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(&Draw::new(
-                &TestRaster::push_bindings(TestRasterArgs { vertices: near.range(0..3), instance_offset: Vec2::ZERO }, None),
+                &TestRaster::push_bindings(
+                    TestRasterArgs {
+                        vertices: near.range(0..3),
+                        instance_offset: Vec2::ZERO,
+                    },
+                    None,
+                ),
                 3,
                 1,
-                RasterState::default(),))
-            .draw(&Draw::new(
-                &bindings(&far),
-                3,
-                1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
+            .draw(&Draw::new(&bindings(&far), 3, 1, RasterState::default()))
             .record("near then far")
     });
     assert_pixel(&pixels, 32, 40, [0, 255, 0, 255]);
@@ -2928,7 +3482,8 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
                         &bindings(vertices),
                         3,
                         1,
-                        RasterState::default().depth_write(write),))
+                        RasterState::default().depth_write(write),
+                    ))
                     .record("triangle");
             }
         })
@@ -2944,11 +3499,7 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
     let occluded = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some([0.0]))
-            .draw(&Draw::new(
-                &bindings(&near),
-                3,
-                1,
-                RasterState::default(),))
+            .draw(&Draw::new(&bindings(&near), 3, 1, RasterState::default()))
             .record("near");
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), None)
@@ -2956,7 +3507,8 @@ fn read_only_depth_attachment_tests_but_does_not_write() {
                 &bindings(&far),
                 3,
                 1,
-                RasterState::default().depth_write(false),))
+                RasterState::default().depth_write(false),
+            ))
             .record("far");
     });
     assert_pixel(&occluded, 32, 40, [0, 255, 0, 255]);
@@ -2972,26 +3524,47 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(&Draw::new(
-                &TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None),
+                &TestRaster::push_bindings(
+                    TestRasterArgs {
+                        vertices: vertices.range(0..3),
+                        instance_offset: Vec2::ZERO,
+                    },
+                    None,
+                ),
                 3,
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("near");
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some([0.0]))
             .draw(&Draw::new(
-                &TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(0..3), instance_offset: Vec2::ZERO }, None),
+                &TestRaster::push_bindings(
+                    TestRasterArgs {
+                        vertices: vertices.range(0..3),
+                        instance_offset: Vec2::ZERO,
+                    },
+                    None,
+                ),
                 3,
                 1,
-                RasterState::default().depth_write(false),))
+                RasterState::default().depth_write(false),
+            ))
             .record("read-only");
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), None)
             .draw(&Draw::new(
-                &TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(3..), instance_offset: Vec2::ZERO }, None),
+                &TestRaster::push_bindings(
+                    TestRasterArgs {
+                        vertices: vertices.range(3..),
+                        instance_offset: Vec2::ZERO,
+                    },
+                    None,
+                ),
                 3,
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("far");
     });
     assert_pixel(&pixels, 32, 40, [255, 0, 0, 255]);
@@ -3002,7 +3575,8 @@ fn depth_clear_takes_effect_on_a_read_only_attachment() {
 fn depth_stencil_formats_work_as_depth_attachment() {
     let mut gpu = gpu();
     let vertices = overlapping_triangles(&mut gpu);
-    let depth = Image::<D32SfloatS8Uint, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
+    let depth =
+        Image::<D32SfloatS8Uint, usage![DepthAttachment]>::new(UVec2::new(SIZE, SIZE)).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .depth_attachment(depth.whole_view(), Some((0.0, 0)))
@@ -3010,7 +3584,8 @@ fn depth_stencil_formats_work_as_depth_attachment() {
                 &bindings(&vertices),
                 6,
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("depth stencil")
     });
     assert_pixel(&pixels, 32, 40, [0, 255, 0, 255]);
@@ -3030,7 +3605,8 @@ fn indexed_draw_samples_a_bindless_texture() {
     let upload = buffer_with::<u8>(&texels);
     let texture = Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::new(2, 2))
         .unwrap()
-        .bind_sampled().unwrap();
+        .bind_sampled()
+        .unwrap();
 
     let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
         position: Vec2::new(x, y),
@@ -3068,10 +3644,18 @@ fn indexed_draw_samples_a_bindless_texture() {
     let half = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
-                &TestRasterTextured::push_bindings(TestRasterTexturedArgs { vertices: vertices.range(..), tex: texture.whole_view(), sampler: nearest() }, None),
+                &TestRasterTextured::push_bindings(
+                    TestRasterTexturedArgs {
+                        vertices: vertices.range(..),
+                        tex: texture.whole_view(),
+                        sampler: nearest(),
+                    },
+                    None,
+                ),
                 indices.range(..3),
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("half")
     });
     assert_pixel(&half, 40, 24, [0, 255, 0, 255]);
@@ -3091,7 +3675,8 @@ fn bound_textures_are_sampled_from_their_slots() {
         .map(|_| {
             Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::new(1, 1))
                 .unwrap()
-                .bind_sampled().unwrap()
+                .bind_sampled()
+                .unwrap()
         })
         .collect();
     let uploads: Vec<_> = colors
@@ -3124,10 +3709,18 @@ fn bound_textures_are_sampled_from_their_slots() {
         for (quad, texture) in quads.iter().zip(&textures) {
             cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
                 .draw(&Draw::indexed(
-                    &TestRasterTextured::push_bindings(TestRasterTexturedArgs { vertices: quad.range(..), tex: texture.whole_view(), sampler: nearest() }, None),
+                    &TestRasterTextured::push_bindings(
+                        TestRasterTexturedArgs {
+                            vertices: quad.range(..),
+                            tex: texture.whole_view(),
+                            sampler: nearest(),
+                        },
+                        None,
+                    ),
                     indices.range(..),
                     1,
-                    RasterState::default(),))
+                    RasterState::default(),
+                ))
                 .record("quad")
         }
     });
@@ -3170,10 +3763,18 @@ fn a_mip_is_drawn_while_another_is_sampled() {
             [Attachment::color(chain.mip_view(1), Some([0.0; 4]))],
         )
         .draw(&Draw::indexed(
-            &TestRasterTextured::push_bindings(TestRasterTexturedArgs { vertices: quad.range(..), tex: chain.mip_view(0), sampler: nearest() }, None),
+            &TestRasterTextured::push_bindings(
+                TestRasterTexturedArgs {
+                    vertices: quad.range(..),
+                    tex: chain.mip_view(0),
+                    sampler: nearest(),
+                },
+                None,
+            ),
             indices.range(..),
             1,
-            RasterState::default(),))
+            RasterState::default(),
+        ))
         .record("mip");
         cmd.copy_image_to_buffer(chain.mip_view(1).whole(), readback.range(..));
     });
@@ -3198,9 +3799,11 @@ fn volumes_are_uploaded_sampled_and_copied() {
         .unwrap()
         .bind_sampled().unwrap();
     assert_eq!(volume.mip_extent(1), UVec3::new(2, 2, 1));
-    let target = Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(size.truncate())
-        .unwrap()
-        .bind_storage().unwrap();
+    let target =
+        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(size.truncate())
+            .unwrap()
+            .bind_storage()
+            .unwrap();
     let mut whole = zeroed_buffer::<u8>(texels.len());
     let mut slice = zeroed_buffer::<u8>(4 * 4 * 4);
     let mut mip = zeroed_buffer::<u8>(2 * 2 * 4);
@@ -3208,8 +3811,16 @@ fn volumes_are_uploaded_sampled_and_copied() {
     gpu.submit(|cmd| {
         cmd.copy_buffer_to_image(upload.range(..), volume.mip_view(0).whole());
         cmd.compute(
-            &TestComputeVolume::push_bindings(TestComputeVolumeArgs { volume: volume.whole_view(), target: target.whole_view(), slice: 1 }, None),
-            [1, 1, 1]);
+            &TestComputeVolume::push_bindings(
+                TestComputeVolumeArgs {
+                    volume: volume.whole_view(),
+                    target: target.whole_view(),
+                    slice: 1,
+                },
+                None,
+            ),
+            [1, 1, 1],
+        );
         cmd.copy_image_to_buffer(target.whole(), slice.range(..));
         cmd.clear_image(volume.mip_view(1), [1.0, 0.0, 1.0, 1.0]);
         cmd.copy_image_to_buffer(volume.whole(), whole.range(..));
@@ -3223,7 +3834,7 @@ fn volumes_are_uploaded_sampled_and_copied() {
     let mut volume = volume;
     if Ctx::features().host_image_copy {
         let patch = [7u8; 4 * 4 * 4];
-        let offset = UVec3::new(0, 0, 1);
+        let offset = IVec3::new(0, 0, 1);
         volume
             .copy_region_from(&patch, 0, offset, UVec3::new(4, 4, 1))
             .unwrap();
@@ -3262,9 +3873,11 @@ fn host_copy_uploads_block_compressed_mips() {
         bc7_block([127, 127, 0, 127], 1),
     ]
     .concat();
-    let mut texture = Image::<BC7UnormBlock, usage![Sampled, HostCopy]>::with_mip_levels(UVec2::new(8, 8), 4)
-        .unwrap()
-        .bind_sampled().unwrap();
+    let mut texture =
+        Image::<BC7UnormBlock, usage![Sampled, HostCopy]>::with_mip_levels(UVec2::new(8, 8), 4)
+            .unwrap()
+            .bind_sampled()
+            .unwrap();
     texture.copy_from(&blocks, 0).unwrap();
     // The smaller levels are one block each, even the ones smaller than a block.
     for level in 1..4 {
@@ -3275,7 +3888,7 @@ fn host_copy_uploads_block_compressed_mips() {
     panic_message(|| texture.copy_from(&blocks[..48], 0));
     // A region of one block: the yellow block becomes red.
     texture
-        .copy_region_from(&blocks[..16], 0, UVec2::splat(4), UVec2::splat(4))
+        .copy_region_from(&blocks[..16], 0, IVec2::splat(4), UVec2::splat(4))
         .unwrap();
 
     let corner = |x: f32, y: f32, u: f32, v: f32| TestTexturedVertex {
@@ -3292,10 +3905,18 @@ fn host_copy_uploads_block_compressed_mips() {
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::indexed(
-                &TestRasterTextured::push_bindings(TestRasterTexturedArgs { vertices: vertices.range(..), tex: texture.whole_view(), sampler: nearest() }, None),
+                &TestRasterTextured::push_bindings(
+                    TestRasterTexturedArgs {
+                        vertices: vertices.range(..),
+                        tex: texture.whole_view(),
+                        sampler: nearest(),
+                    },
+                    None,
+                ),
                 indices.range(..),
                 1,
-                RasterState::default(),))
+                RasterState::default(),
+            ))
             .record("compressed")
     });
     assert_pixel(&pixels, 24, 24, [255, 1, 1, 255]);
@@ -3314,9 +3935,18 @@ fn mesh_pass_emits_triangles_per_workgroup() {
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::launch(
-                &TestMesh::push_bindings(TestMeshArgs { color: Vec4::new(0.8, 0.8, 0.8, 1.0), group_offset: Vec2::new(1.0, 0.0), scale: 0.4 }, None).unwrap(),
+                &TestMesh::push_bindings(
+                    TestMeshArgs {
+                        color: Vec4::new(0.8, 0.8, 0.8, 1.0),
+                        group_offset: Vec2::new(1.0, 0.0),
+                        scale: 0.4,
+                    },
+                    None,
+                )
+                .unwrap(),
                 [2, 1, 1],
-                unculled(),))
+                unculled(),
+            ))
             .record("mesh")
     });
     // Workgroup 0 draws around the centre, workgroup 1 shifted to the right edge.
@@ -3333,24 +3963,31 @@ fn indirect_mesh_launches_match_the_direct_one() {
         eprintln!("SKIPPED indirect_mesh_launches_match_the_direct_one: no mesh shader support");
         return;
     }
-    let bindings =
-        || TestMesh::push_bindings(TestMeshArgs { color: Vec4::new(0.8, 0.8, 0.8, 1.0), group_offset: Vec2::new(1.0, 0.0), scale: 0.4 }, None).unwrap();
+    let bindings = || {
+        TestMesh::push_bindings(
+            TestMeshArgs {
+                color: Vec4::new(0.8, 0.8, 0.8, 1.0),
+                group_offset: Vec2::new(1.0, 0.0),
+                scale: 0.4,
+            },
+            None,
+        )
+        .unwrap()
+    };
     let direct = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::launch(&bindings(), [2, 1, 1], unculled()))
             .record("direct")
     });
-    let launch = buffer_with::<DispatchIndirectCommand>(&[DispatchIndirectCommand {
-        x: 2,
-        y: 1,
-        z: 1,
-    }]);
+    let launch =
+        buffer_with::<DispatchIndirectCommand>(&[DispatchIndirectCommand { x: 2, y: 1, z: 1 }]);
     let indirect = render(&mut gpu, |cmd, target| {
         cmd.raster(EXTENT, [Attachment::color(target.whole_view(), None)])
             .draw(&Draw::launch_indirect(
                 &bindings(),
                 launch.range(..),
-                unculled(),))
+                unculled(),
+            ))
             .record("indirect")
     });
     assert_eq!(indirect, direct);
@@ -3367,7 +4004,8 @@ fn indirect_mesh_launches_match_the_direct_one() {
                 &bindings(),
                 launches.range(..),
                 count.range(..),
-                unculled(),))
+                unculled(),
+            ))
             .record("indirect count")
     });
     assert_eq!(counted, direct);
@@ -3378,7 +4016,10 @@ fn indirect_mesh_launches_match_the_direct_one() {
 mod generated {
     use super::*;
     use bytemuck::Pod;
-    use lava::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S, pipeline::PassKind};
+    use lava::{
+        pipeline::PassKind,
+        vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S},
+    };
 
     fn push_constants<G: Pod, K>(bindings: &BindingOutput<'_, K>) -> G {
         bytemuck::pod_read_unaligned(&bindings.sections().push_constants[..size_of::<G>()])
@@ -3389,9 +4030,17 @@ mod generated {
         let _gpu = gpu();
         let buffer = zeroed_buffer::<u32>(1);
         let vertices = zeroed_buffer::<TestVertex>(1);
-        let compute = TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: buffer.range(..), dst: buffer.range(..), count: 1, multiplier: 1 }, None)
-            .sections()
-            .pass;
+        let compute = TestComputeBuffer::push_bindings(
+            TestComputeBufferArgs {
+                src: buffer.range(..),
+                dst: buffer.range(..),
+                count: 1,
+                multiplier: 1,
+            },
+            None,
+        )
+        .sections()
+        .pass;
         assert_eq!(
             PASS_MAP.passes[compute].kind,
             PassKind::Compute {
@@ -3399,9 +4048,15 @@ mod generated {
                 subgroup_size: None,
             }
         );
-        let raster = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::ZERO }, None)
-            .sections()
-            .pass;
+        let raster = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(..),
+                instance_offset: Vec2::ZERO,
+            },
+            None,
+        )
+        .sections()
+        .pass;
         assert_eq!(
             PASS_MAP.passes[raster].kind,
             PassKind::RasterVertex {
@@ -3415,11 +4070,16 @@ mod generated {
     #[test]
     fn push_constants_are_the_struct_at_its_size() {
         let _gpu = gpu();
-        let (src, dst) = (
-            zeroed_buffer::<u32>(16),
-            zeroed_buffer::<u32>(16),
+        let (src, dst) = (zeroed_buffer::<u32>(16), zeroed_buffer::<u32>(16));
+        let bindings = TestComputeBuffer::push_bindings(
+            TestComputeBufferArgs {
+                src: src.range(..),
+                dst: dst.range(..),
+                count: 16,
+                multiplier: 3,
+            },
+            None,
         );
-        let bindings = TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: src.range(..), dst: dst.range(..), count: 16, multiplier: 3 }, None);
         let size = size_of::<CTestComputeBufferBindings>();
         assert_eq!(bindings.sections().push_constants.len(), size);
     }
@@ -3427,11 +4087,16 @@ mod generated {
     #[test]
     fn buffer_fields_become_device_addresses_and_accesses() {
         let _gpu = gpu();
-        let (src, dst) = (
-            zeroed_buffer::<u32>(16),
-            zeroed_buffer::<u32>(16),
+        let (src, dst) = (zeroed_buffer::<u32>(16), zeroed_buffer::<u32>(16));
+        let bindings = TestComputeBuffer::push_bindings(
+            TestComputeBufferArgs {
+                src: src.range(..),
+                dst: dst.range(..),
+                count: 16,
+                multiplier: 3,
+            },
+            None,
         );
-        let bindings = TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: src.range(..), dst: dst.range(..), count: 16, multiplier: 3 }, None);
         let constants: CTestComputeBufferBindings = push_constants(&bindings);
         assert_eq!(constants.src, src.range(..).address());
         assert_eq!(constants.dst, dst.range(..).address());
@@ -3458,7 +4123,13 @@ mod generated {
     fn raster_passes_access_their_buffers_in_both_shader_stages() {
         let _gpu = gpu();
         let vertices = zeroed_buffer::<TestVertex>(3);
-        let bindings = TestRaster::push_bindings(TestRasterArgs { vertices: vertices.range(..), instance_offset: Vec2::new(0.5, 0.0) }, None);
+        let bindings = TestRaster::push_bindings(
+            TestRasterArgs {
+                vertices: vertices.range(..),
+                instance_offset: Vec2::new(0.5, 0.0),
+            },
+            None,
+        );
         let constants: CTestRasterBindings = push_constants(&bindings);
         assert_eq!(constants.vertices, vertices.range(..).address());
         let [vertices]: [_; 1] = bindings
@@ -3481,18 +4152,30 @@ mod generated {
             .unwrap();
         let buffer = zeroed_buffer::<u32>(4);
         gpu.submit(|cmd| {
-            let args = || TestComputeImageArgs { target: image.whole_view(), tint: Vec4::ONE, offset: UVec2::ZERO, size: UVec2::new(8, 8) };
+            let args = || TestComputeImageArgs {
+                target: image.whole_view(),
+                tint: Vec4::ONE,
+                offset: UVec2::ZERO,
+                size: UVec2::new(8, 8),
+            };
             let images = [ImageUse::storage_read(image.whole_view())];
             let written = [BufferAccess::write(buffer.range(..))];
-            let writes = TestComputeImage::push_bindings(args(), Some(Accesses::new(&images, &written)));
+            let writes =
+                TestComputeImage::push_bindings(args(), Some(Accesses::new(&images, &written)));
             // The extra accesses follow the fields', at the pass's stages.
             let buffers: Vec<_> = writes.sections().buffers().collect();
             assert_eq!(buffers.len(), 1);
-            assert_eq!((buffers[0].stage, buffers[0].access), (S::COMPUTE_SHADER, written[0].access));
+            assert_eq!(
+                (buffers[0].stage, buffers[0].access),
+                (S::COMPUTE_SHADER, written[0].access)
+            );
             assert_eq!(writes.sections().images().count(), 2);
             cmd.compute(&writes, [1, 1, 1]);
             let read = [BufferAccess::read(buffer.range(..))];
-            cmd.compute(&TestComputeImage::push_bindings(args(), Some(Accesses::buffers(&read))), [1, 1, 1]);
+            cmd.compute(
+                &TestComputeImage::push_bindings(args(), Some(Accesses::buffers(&read))),
+                [1, 1, 1],
+            );
         });
     }
 
@@ -3501,14 +4184,25 @@ mod generated {
         let _gpu = gpu();
         let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(UVec2::new(8, 8))
             .unwrap()
-            .bind_storage().unwrap();
+            .bind_storage()
+            .unwrap();
         let target = image.whole_view();
-        let bindings =
-            TestComputeImage::push_bindings(TestComputeImageArgs { target, tint: Vec4::ONE, offset: UVec2::ZERO, size: UVec2::new(8, 8) }, None);
+        let bindings = TestComputeImage::push_bindings(
+            TestComputeImageArgs {
+                target,
+                tint: Vec4::ONE,
+                offset: UVec2::ZERO,
+                size: UVec2::new(8, 8),
+            },
+            None,
+        );
         // A struct with handles is `NoUninit`, not `Pod`: compare the handle's bytes.
         let offset = core::mem::offset_of!(CTestComputeImageBindings, target);
         let handle = image.handle::<bindless::Storage>();
-        assert_eq!(&bindings.sections().push_constants[offset..offset + 4], bytemuck::bytes_of(&handle));
+        assert_eq!(
+            &bindings.sections().push_constants[offset..offset + 4],
+            bytemuck::bytes_of(&handle)
+        );
         assert!(handle.storage_slot().is_some());
         let [image]: [_; 1] = bindings
             .sections()
@@ -3516,9 +4210,19 @@ mod generated {
             .collect::<Vec<_>>()
             .try_into()
             .expect("one image");
-        assert_eq!(image.access(), A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE);
+        assert_eq!(
+            image.access(),
+            A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE
+        );
         assert_eq!(image.stage(), S::COMPUTE_SHADER);
-        assert_eq!(image.stage(), lava::pipeline::PassKind::Compute { entry: c"", subgroup_size: None }.stages());
+        assert_eq!(
+            image.stage(),
+            lava::pipeline::PassKind::Compute {
+                entry: c"",
+                subgroup_size: None
+            }
+            .stages()
+        );
         assert_eq!(image.layout(), L::GENERAL);
     }
 }

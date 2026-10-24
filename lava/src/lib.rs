@@ -11,7 +11,7 @@
 //! records, submits and returns a [`queue::Wait`] for other timelines and the host. Barriers
 //! within a timeline are automatic; images move between families with
 //! [`command_buffer::CommandBuffer::release`]. Dropped objects are destroyed once every timeline
-//! finished its stamp at the drop ([`lifetime`]). Windows present through a [`present::PresentSurface`] and its current
+//! finished its stamp at the drop ([`Stamp`]). Windows present through a [`present::PresentSurface`] and its current
 //! image, whose acquire and present follow from what the submission does with it. A submission
 //! waits for another timeline's [`queue::Wait`] at a stage of its own family's set
 //! ([`queue::GraphicsStage`], [`queue::ComputeStage`], [`queue::TransferStage`]).
@@ -24,7 +24,7 @@
 //!
 //! # Errors
 //! Programmer errors panic; failures of the device and environment are typed [`Error`]s (see
-//! [`error`] for the rule). Recording never fails: what goes wrong while a command is recorded
+//! [`Error`] for the rule). Recording never fails: what goes wrong while a command is recorded
 //! (a pipeline the driver can't create) panics.
 //!
 //! # Shader contract
@@ -41,7 +41,7 @@
 //!   descriptors, sampled at the slot and storage at the next; all ones for none, and mip `i` of
 //!   a mip chain `i` times its width further), [`bindless::SamplerHandle`] (a `u32` slot; there
 //!   are no samplers but the ones the application creates) and
-//!   [`vkobjects::acceleration_structure::Instance`] (`VkAccelerationStructureInstanceKHR`); a
+//!   `acceleration_structure::Instance` (`VkAccelerationStructureInstanceKHR`); a
 //!   TLAS is a `u64` device address. Image handles aren't `Zeroable` (zero is sampled slot 0,
 //!   not the null handle), so generated structs that hold them are `NoUninit`, not `Pod`.
 //! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) has
@@ -59,35 +59,65 @@
 //! The `dynamic-*` features are dynamic state: where the device has it, draws that differ in it
 //! share a pipeline; elsewhere it is part of the pipeline's key. Asserting one keeps it out of
 //! the key.
-use crate::{bindless::Bindless, global::LIFECYCLE, queue::lock, state::Ctx};
+//!
+//! # Paths and the prelude
+//! The types most code names are re-exported at the crate root (`lava::Buffer`,
+//! `lava::BufferSlice`, `lava::Image`, `lava::ImageView`, `lava::CommandBuffer`,
+//! `lava::Timeline`, ...) and, with the traits their bounds use, in [`prelude`]. Their modules
+//! hold the rest (formats in [`image::format`], usages in [`image::usage`], raster state in
+//! [`command_buffer`]).
+//!
+//! # ash
+//! `ash` is a public dependency: [`vk`] re-exports `ash::vk` (with the additions of newer
+//! headers lava needs), and lava's API takes and returns its types (stage and access flags,
+//! formats, raw handles). An ash upgrade is a breaking lava release; use `lava::vk` rather than
+//! an `ash` of your own, so the versions can't differ.
+use crate::{bindless::Bindless, global::LIFECYCLE, queue::lock};
 use lava_macros::validation_trace;
 
-/// The math types of generated bindings, re-exported so generated code and its users need only
-/// lava.
-pub use glam;
+pub use crate::bindless::{ImageHandle, Sampler, SamplerDesc, SamplerHandle};
+pub use crate::buffer::{Buffer, BufferSlice, Uploader};
+pub use crate::command_buffer::{
+    Accesses, Attachment, BindingOutput, Bindings, BufferAccess, CommandBuffer, Draw, ImageUse,
+    RasterState, Rect,
+};
+pub use crate::error::{Error, Result};
+pub use crate::features::{Features, Gated, MissingFeature};
+pub use crate::image::{DynamicImage, Image, ImageSlice, ImageView, MipChain};
+pub use crate::lifetime::{Stamp, latest_stamp, reclaim};
+pub use crate::present::PresentSurface;
+pub use crate::query::QueryPool;
+pub use crate::queue::{PerFrame, Submission, Timeline, Wait};
+pub use crate::state::{Ctx, FormatProperties};
+/// The stages timestamps and accesses name.
+pub use crate::vk::PipelineStageFlags2;
+/// What `Error::Vulkan` holds, e.g. `ERROR_INITIALIZATION_FAILED`.
+pub use crate::vk::Result as VkResult;
+/// What `format::Dynamic` and `image::usage::Dynamic` hold.
+pub use crate::vk::{Format as VkFormat, ImageUsageFlags};
+#[cfg(feature = "acceleration-structure")]
+pub use crate::vkobjects::acceleration_structure;
+#[cfg(feature = "acceleration-structure")]
+pub use crate::vkobjects::acceleration_structure::{Blas, Tlas};
+pub use crate::vkobjects::physical_device::SubgroupSizes;
 /// The derives and traits of generated bindings (with `derive` and `min_const_generics`, for
 /// arrays of any length), re-exported like `glam`.
 pub use bytemuck;
-pub use crate::error::{Error, Result};
-pub use crate::features::Features;
-pub use crate::lifetime::{Stamp, latest_stamp, reclaim};
-pub use crate::vk::Pipeline as VkPipeline;
-/// What `Error::Vulkan` holds, e.g. `ERROR_INITIALIZATION_FAILED`.
-pub use crate::vk::Result as VkResult;
-pub use crate::vk::ShaderModule as VkShaderModule;
-pub use crate::vk::{AccessFlags2, ImageLayout, PipelineStageFlags2};
-/// What `format::Dynamic` and `image::usage::Dynamic` hold.
-pub use crate::vk::{Format as VkFormat, ImageUsageFlags};
+/// The math types of generated bindings, re-exported so generated code and its users need only
+/// lava.
+pub use glam;
 
 pub mod bindless;
 pub mod buffer;
 pub mod command_buffer;
-pub mod error;
+mod error;
+#[cfg(all(feature = "external-memory", unix))]
+pub mod external;
 pub mod features;
 mod global;
 pub mod half;
 pub mod image;
-pub mod lifetime;
+mod lifetime;
 pub mod memory;
 pub mod pipeline;
 pub mod present;
@@ -95,15 +125,39 @@ pub mod query;
 pub mod queue;
 #[cfg(feature = "sparse-binding")]
 pub mod sparse;
-#[cfg(all(feature = "external-memory", unix))]
-pub mod external;
-pub mod state;
-mod unsized_struct;
+mod state;
 #[cfg(test)]
 mod tests;
+mod unsized_struct;
 pub mod vk;
-pub mod vkobjects;
+mod vkobjects;
 use raw_window_handle::RawDisplayHandle;
+
+/// The common types and traits of lava: `use lava::prelude::*;` brings what recording passes
+/// names (buffers, images and their views, the view traits their bounds use, command buffers,
+/// draws and their state, timelines, surfaces, samplers, handles, the dimension markers and
+/// `usage!`). It also brings the [`glam`] and [`bytemuck`] modules lava re-exports, as modules
+/// (`glam::Vec3`, `bytemuck::Pod`), so their items keep their paths and an application's own
+/// imports of them take precedence. It leaves out `Result` and `Error`, which would shadow
+/// std's.
+pub mod prelude {
+    pub use crate::bindless::{ImageHandle, Sampler, SamplerDesc, SamplerHandle};
+    pub use crate::buffer::{Buffer, BufferSlice, HostVisible, Memory, Uploader};
+    pub use crate::command_buffer::{
+        Accesses, Attachment, Blend, BufferAccess, CommandBuffer, Draw, ImageUse, RasterState, Rect,
+    };
+    pub use crate::image::format::{Format, StaticFormat};
+    pub use crate::image::usage::{ImageUsage, StaticUsage, usage};
+    pub use crate::image::{
+        ColorTarget, D2, D2Array, D3, DepthTarget, Dim, Image, ImageRef, ImageSlice, ImageView,
+        MipChain, SampledView, StencilTarget, StorageView, TransferDstView, TransferSrcView,
+    };
+    pub use crate::present::PresentSurface;
+    pub use crate::queue::{Graphics, PerFrame, Timeline, Wait};
+    #[cfg(feature = "acceleration-structure")]
+    pub use crate::vkobjects::acceleration_structure::{Blas, Tlas};
+    pub use crate::{bytemuck, glam};
+}
 
 /// Supertrait of the traits only lava implements: other crates can bound by them but not
 /// implement them.
@@ -126,9 +180,13 @@ macro_rules! include_passes {
 /// blocks of their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryBlocks {
+    /// The first device-local block.
     pub device: u64,
+    /// The first host-visible block.
     pub host: u64,
+    /// The largest device-local block lava grows to.
     pub max_device: u64,
+    /// The largest host-visible block lava grows to.
     pub max_host: u64,
 }
 
@@ -148,6 +206,10 @@ impl Default for MemoryBlocks {
     }
 }
 
+/// What [`init`] makes lava's context with: the application's passes and display, how it
+/// names itself to drivers, validation, the optional features to leave off, the pipeline cache
+/// file and the allocator's block sizes. Start from [`Config::new`] and set the fields that
+/// differ: `Config { display, validation: cfg!(debug_assertions), ..Config::new(&PASS_MAP) }`.
 #[derive(Clone, Copy)]
 pub struct Config {
     /// The `PASS_MAP` of [`include_passes!`].
@@ -160,7 +222,8 @@ pub struct Config {
     /// `[major, minor, patch]`.
     pub app_version: [u32; 3],
     /// The Khronos validation layer with synchronization validation, best practices and shader
-    /// printf, in any build. Without the layer installed lava warns and runs without it.
+    /// printf (`debugPrintfEXT`, logged at `info`), in any build. Without the layer installed
+    /// lava warns and runs without it.
     /// Messages are `tracing` events (see `state`'s debug callback for their fields).
     pub validation: bool,
     /// GPU-assisted validation on top of `validation`, together with shader printf. Validation
@@ -179,6 +242,23 @@ pub struct Config {
     pub memory_blocks: MemoryBlocks,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let passes: Vec<_> = self.passes.passes.iter().map(|pass| pass.name).collect();
+        f.debug_struct("Config")
+            .field("passes", &passes)
+            .field("display", &self.display)
+            .field("app_name", &self.app_name)
+            .field("app_version", &self.app_version)
+            .field("validation", &self.validation)
+            .field("gpu_assisted_validation", &self.gpu_assisted_validation)
+            .field("disabled", &self.disabled)
+            .field("pipeline_cache", &self.pipeline_cache)
+            .field("memory_blocks", &self.memory_blocks)
+            .finish()
+    }
+}
+
 impl Config {
     /// Headless, without validation, a name or disabled features, with default memory blocks.
     pub fn new(passes: &'static pipeline::PassMap) -> Self {
@@ -189,7 +269,7 @@ impl Config {
             app_version: [0, 0, 0],
             validation: false,
             gpu_assisted_validation: false,
-            disabled: Features::DEFAULT,
+            disabled: Features::NONE,
             pipeline_cache: None,
             memory_blocks: MemoryBlocks::DEFAULT,
         }
@@ -263,8 +343,8 @@ fn device_idle() -> Result<()> {
 /// uploaders, surfaces, samplers, slot ranges, query pools). While one is alive, or another
 /// thread is inside a lava call, it destroys nothing, lava stays initialised, and it returns
 /// `Error::ObjectsAlive`. A lost device is no error here: what is left is destroyed anyway.
-/// [`Wait`](queue::Wait)s and [`Stamp`]s of the old context count as done in the next one;
-/// counters of [`query::counters`] stay valid memory (they are leaked) but can't be queried.
+/// [`Wait`]s and [`Stamp`]s of the old context count as done in the next one; counters of
+/// `query::counters` (`performance-query`) stay valid memory (they are leaked) but can't be queried.
 #[validation_trace]
 pub fn shutdown() -> Result<()> {
     let _lifecycle = lock(&LIFECYCLE);
@@ -288,7 +368,9 @@ unsafe fn teardown() {
     }
     match device_idle() {
         Ok(()) | Err(Error::DeviceLost) => {}
-        Err(err) => tracing::error!(%err, "failed to wait for the device before shutting lava down"),
+        Err(err) => {
+            tracing::error!(%err, "failed to wait for the device before shutting lava down")
+        }
     }
     if let Err(err) = pipeline::save_cache_now() {
         tracing::error!(%err, "failed to save the pipeline cache");

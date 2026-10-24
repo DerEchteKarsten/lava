@@ -44,6 +44,8 @@ const BAKED: &[(&str, &[&str], &str)] = &[
 ];
 
 fn main() {
+    // Features are part of the build script's fingerprint, so only its own source reruns it.
+    println!("cargo::rerun-if-changed=build.rs");
     let on = |feature: &str| {
         let name = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
         env::var_os(name).is_some()

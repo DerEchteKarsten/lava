@@ -50,8 +50,8 @@ pub(crate) const CAPABILITY_FEATURES: &[(u32, &str, &str)] = &[
 pub(crate) fn capabilities(spirv: &[u8]) -> Vec<u32> {
     const OP_EXTENSION: u32 = 10;
     const OP_CAPABILITY: u32 = 17;
-    let words: Vec<u32> = (spirv.chunks_exact(4))
-        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+    let words: Vec<u32> = (spirv.as_chunks::<4>().0.iter())
+        .map(|&w| u32::from_le_bytes(w))
         .collect();
     let mut capabilities = Vec::new();
     // After the five header words, each instruction starts with its word count and opcode.

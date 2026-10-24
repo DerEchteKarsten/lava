@@ -224,7 +224,7 @@ impl<T: Copy + 'static> ExternalBuffer<T> {
         let mut properties = vk::ExternalBufferProperties::default();
         unsafe {
             Functions::instance().get_physical_device_external_buffer_properties(
-                Ctx::physical_device().handel,
+                Ctx::physical_device().handle,
                 &vk::PhysicalDeviceExternalBufferInfo::default()
                     .usage(usage)
                     .handle_type(handle_type.flags()),

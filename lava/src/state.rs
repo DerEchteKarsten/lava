@@ -32,8 +32,6 @@ use crate::{
     vkobjects::physical_device::{PhysicalDevice, QueueFamily, SubgroupSizes, pick_queue_families},
 };
 
-pub use crate::vk as raw_vulkan;
-
 impl Debug for Ctx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ctx")
@@ -183,28 +181,27 @@ fn enabled_severities() -> vk::DebugUtilsMessageSeverityFlagsEXT {
 }
 
 /// What `Ctx::init` learns of one physical device.
-fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Result<PhysicalDevice> {
-    let properties = unsafe { instance.get_physical_device_properties(handel) };
+fn describe_device(instance: &ash::Instance, handle: vk::PhysicalDevice) -> Result<PhysicalDevice> {
+    let properties = unsafe { instance.get_physical_device_properties(handle) };
     let name = properties.device_name_as_c_str().map_or_else(
         |_| "an unnamed device".into(),
         |name| name.to_string_lossy().into_owned(),
     );
-    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(handel) }
+    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(handle) }
         .into_iter()
         .enumerate()
-        .map(|(index, p)| QueueFamily {
-            num_queues: p.queue_count,
+        .map(|(index, properties)| QueueFamily {
             index: index as _,
-            handel: p,
+            properties,
         })
         .collect::<Vec<_>>();
-    let supported_extensions = unsafe { instance.enumerate_device_extension_properties(handel)? }
+    let supported_extensions = unsafe { instance.enumerate_device_extension_properties(handle)? }
         .iter()
         .filter_map(|p| p.extension_name_as_c_str().ok())
         .map(|name| name.to_string_lossy().into_owned())
         .collect::<Vec<String>>();
     let has = |name: &CStr| (supported_extensions.iter()).any(|e| e.as_bytes() == name.to_bytes());
-    let mem_properties = unsafe { instance.get_physical_device_memory_properties(handel) };
+    let mem_properties = unsafe { instance.get_physical_device_memory_properties(handle) };
 
     let mut vk11_properties = vk::PhysicalDeviceVulkan11Properties::default();
     let mut vk12_properties = vk::PhysicalDeviceVulkan12Properties::default();
@@ -222,10 +219,11 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
     // A device below Vulkan 1.4 is rejected for that alone: the 1.1 to 1.3 structs aren't
     // chained into its queries, which it may not know.
     let vulkan_1_4 = properties.api_version >= make_api_version(0, 1, 4, 0);
+    let families = pick_queue_families(&queue_families);
     let (supported_features, lava_missing) = if !vulkan_1_4 {
-        (Features::DEFAULT, vec!["Vulkan 1.4".to_owned()])
+        (Features::NONE, vec!["Vulkan 1.4".to_owned()])
     } else {
-        let chain = FeatureChain::query(instance, handel, &has);
+        let chain = FeatureChain::query(instance, handle, &has);
         multiview_mesh_shader = chain.multiview_mesh_shader();
         subgroup_size_control = chain.subgroup_size_control();
         // Only the structs of extensions the device has.
@@ -254,7 +252,7 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
         if has(vk::descriptor_heap::NAME) {
             properties2 = properties2.push_next(&mut heap_properties);
         }
-        unsafe { instance.get_physical_device_properties2(handel, &mut properties2) };
+        unsafe { instance.get_physical_device_properties2(handle, &mut properties2) };
         let rebar = mem_properties.memory_types[..mem_properties.memory_type_count as usize]
             .iter()
             .any(|e| {
@@ -264,7 +262,6 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
                         | vk::MemoryPropertyFlags::HOST_COHERENT,
                 ) && mem_properties.memory_heaps[e.heap_index as usize].size > 500 * 1024 * 1024
             });
-        let families = pick_queue_families(&queue_families);
         let facts = DeviceFacts {
             rebar,
             strict_lines: properties.limits.strict_lines == vk::TRUE,
@@ -272,7 +269,7 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
             dedicated_transfer: families.as_ref().is_some_and(|f| f.transfer.is_some()),
             sparse_queue: families.as_ref().is_some_and(|f| {
                 f.graphics
-                    .handel
+                    .properties
                     .queue_flags
                     .contains(vk::QueueFlags::SPARSE_BINDING)
             }),
@@ -292,16 +289,21 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
     vk11_properties.p_next = std::ptr::null_mut();
     vk12_properties.p_next = std::ptr::null_mut();
     vk13_properties.p_next = std::ptr::null_mut();
-    rt_pipeline_properties.p_next = std::ptr::null_mut();
-    acc_properties.p_next = std::ptr::null_mut();
+    // Kept only with their features.
+    #[cfg(feature = "ray-tracing-pipeline")]
+    {
+        rt_pipeline_properties.p_next = std::ptr::null_mut();
+    }
+    #[cfg(feature = "acceleration-structure")]
+    {
+        acc_properties.p_next = std::ptr::null_mut();
+    }
     heap_properties.p_next = std::ptr::null_mut();
-    let _ = (&rt_pipeline_properties, &acc_properties);
     Ok(PhysicalDevice {
         properties,
         mesh_shader_properties,
         descriptor_heap_properties: heap_properties,
         vk11_properties,
-        vk12_properties,
         primitive_underestimation: conservative_properties.primitive_underestimation == vk::TRUE,
         topology_unrestricted: eds3_properties.dynamic_primitive_topology_unrestricted == vk::TRUE,
         max_multi_draw_count: multi_draw_properties.max_multi_draw_count,
@@ -314,9 +316,9 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
         }),
         stale_trace_reads: vk12_properties.driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA,
         mem_properties,
-        handel,
+        handle,
         name,
-        queue_families,
+        families,
         supported_extensions,
         #[cfg(feature = "acceleration-structure")]
         acceleration_structure_properties: supported_features
@@ -356,7 +358,7 @@ impl Ctx {
         gate::MeshShader,
         &'static vk::PhysicalDeviceMeshShaderPropertiesEXT<'static>,
     > {
-        crate::features::gate::<gate::MeshShader, _>(|| {
+        crate::features::gated::<gate::MeshShader, _>(|| {
             &Ctx::get().physical_device.mesh_shader_properties
         })
     }
@@ -367,9 +369,12 @@ impl Ctx {
         gate::AccelerationStructure,
         &'static vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
     > {
-        crate::features::gate::<gate::AccelerationStructure, _>(|| {
-            (Ctx::get().physical_device.acceleration_structure_properties.as_ref())
-                .expect("the properties of a device with acceleration structures")
+        crate::features::gated::<gate::AccelerationStructure, _>(|| {
+            (Ctx::get()
+                .physical_device
+                .acceleration_structure_properties
+                .as_ref())
+            .expect("the properties of a device with acceleration structures")
         })
     }
     /// The family index of `kind`'s queues, `None` where lava has none.
@@ -411,7 +416,7 @@ impl Ctx {
             let mut properties = vk::FormatProperties2::default().push_next(&mut properties3);
             unsafe {
                 Functions::instance().get_physical_device_format_properties2(
-                    ctx.physical_device.handel,
+                    ctx.physical_device.handle,
                     format,
                     &mut properties,
                 )
@@ -450,7 +455,7 @@ impl Ctx {
             }
             let result = unsafe {
                 Functions::instance().get_physical_device_image_format_properties2(
-                    ctx.physical_device.handel,
+                    ctx.physical_device.handle,
                     &info,
                     &mut properties,
                 )
@@ -601,7 +606,7 @@ impl Ctx {
         let handles = unsafe { instance.enumerate_physical_devices()? };
         let mut physical_devices = handles
             .into_iter()
-            .map(|handel| describe_device(&instance, handel))
+            .map(|handle| describe_device(&instance, handle))
             .collect::<Result<Vec<PhysicalDevice>>>()?;
         let types: Vec<_> = physical_devices
             .iter()
@@ -620,9 +625,9 @@ impl Ctx {
                     .into_iter()
                     .map(|name| format!("`{name}` (lava asserts it)")),
             );
-            match pick_queue_families(&device.queue_families) {
+            match &device.families {
                 Some(families) if missing.is_empty() => {
-                    selected = Some((i, families));
+                    selected = Some((i, families.clone()));
                     break;
                 }
                 _ => rejected.push(format!("{} lacks {}", device.name, missing.join(", "))),
@@ -631,7 +636,7 @@ impl Ctx {
         let Some((selected, families)) = selected else {
             return Err(Error::NoSuitableGpu { rejected });
         };
-        let physical_device = physical_devices.swap_remove(selected);
+        let mut physical_device = physical_devices.swap_remove(selected);
         if device_rank(physical_device.properties.device_type) >= 2 {
             tracing::warn!(
                 "lava picked {}, a {:?} device, since no discrete or integrated GPU has what it needs",
@@ -689,11 +694,10 @@ impl Ctx {
         #[cfg(not(feature = "async-transfer"))]
         let transfer = None;
         let used = [Some(&families.graphics), compute, transfer];
-        let count = |family: &QueueFamily| family.num_queues.min(MAX_TIMELINES as u32);
-        let mut queue_families: Vec<(u32, u32)> =
+        let count = |family: &QueueFamily| family.properties.queue_count.min(MAX_TIMELINES as u32);
+        // Distinct families: the compute one has no graphics, the transfer one neither.
+        let queue_families: Vec<(u32, u32)> =
             used.iter().flatten().map(|f| (f.index, count(f))).collect();
-        queue_families.sort_unstable();
-        queue_families.dedup_by_key(|(index, _)| *index);
         let queue_priorities = queue_families
             .iter()
             .map(|(_, count)| vec![1.0f32; *count as usize])
@@ -708,7 +712,7 @@ impl Ctx {
             })
             .collect::<Vec<_>>();
         let extension_names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
-        let queried = FeatureChain::query(&instance, physical_device.handel, &device_has);
+        let queried = FeatureChain::query(&instance, physical_device.handle, &device_has);
         let mut enabled = FeatureChain::enabling(&features, &queried);
         let mut features2 = enabled.chain(&|name| extensions.contains(&name));
         let device_create_info = vk::DeviceCreateInfo::default()
@@ -716,7 +720,7 @@ impl Ctx {
             .enabled_extension_names(&extension_names)
             .push_next(&mut features2);
         let device =
-            unsafe { instance.create_device(physical_device.handel, &device_create_info, None)? };
+            unsafe { instance.create_device(physical_device.handle, &device_create_info, None)? };
         let undo_device = Undo(Some({
             let device = device.clone();
             move || unsafe { device.destroy_device(None) }
@@ -728,7 +732,7 @@ impl Ctx {
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
-            physical_device: physical_device.handel,
+            physical_device: physical_device.handle,
             debug_settings: {
                 let mut settings = AllocatorDebugSettings::default();
                 settings.log_allocations = false;
@@ -810,14 +814,17 @@ impl Ctx {
             used[i].map(|family| FamilyQueues {
                 kind: kinds[i],
                 index: family.index,
-                timestamp_valid_bits: family.handel.timestamp_valid_bits,
-                image_granularity: family.handel.min_image_transfer_granularity,
+                timestamp_valid_bits: family.properties.timestamp_valid_bits,
+                image_granularity: family.properties.min_image_transfer_granularity,
                 queues: (0..count(family))
                     .map(|q| Mutex::new(unsafe { device.get_device_queue(family.index, q) }))
                     .collect(),
                 timelines: Mutex::new(vec![0; count(family) as usize].into()),
             })
         }));
+        // Only the selection and the device's creation read them.
+        physical_device.supported_extensions = Vec::new();
+        physical_device.lava_missing = Vec::new();
         STATE.set(Ctx {
             device,
             allocator: Mutex::new(Some(allocator)),
@@ -883,12 +890,12 @@ pub(crate) fn call() -> Live {
 }
 
 thread_local! {
-    pub static CALLSITE: Cell<Option<Location<'static>>> = const { Cell::new(None) };
+    pub(crate) static CALLSITE: Cell<Option<Location<'static>>> = const { Cell::new(None) };
 }
 
 /// Holds the caller location in [`CALLSITE`] while a `#[validation_trace]` function runs; only
 /// the outermost guard on a thread sets and clears it.
-pub struct CallsiteGuard {
+pub(crate) struct CallsiteGuard {
     owns: bool,
 }
 
@@ -955,7 +962,7 @@ unsafe extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
-pub struct Functions {
+pub(crate) struct Functions {
     instance: ash::Instance,
     #[cfg(feature = "host-image-copy")]
     host_image_copy: Loader<gate::HostImageCopy, ash::ext::host_image_copy::Device>,

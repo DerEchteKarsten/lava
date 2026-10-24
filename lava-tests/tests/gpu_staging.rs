@@ -9,11 +9,10 @@ use std::{
 use common::{Cmd, gpu, panic_message, zeroed_buffer};
 use glam::UVec2;
 use lava::{
-    Error, Features,
+    Ctx, Error, Features,
     buffer::{Buffer, Readback, UploadStats},
     image::{Image, MipChain, format::R8G8B8A8Unorm, usage::usage},
     queue::{Graphics, Kind, Timeline, Transfer},
-    state::Ctx,
 };
 use lava_tests::bindings::*;
 
@@ -23,7 +22,7 @@ const RING: u64 = 1 << 20;
 fn gpu_with_ring() -> common::GpuGuard {
     common::disable(Features {
         rebar: true,
-        ..Features::DEFAULT
+        ..Features::NONE
     });
     common::staging(RING);
     let gpu = gpu();
@@ -34,8 +33,17 @@ fn gpu_with_ring() -> common::GpuGuard {
 /// `dst[i] = src[i] + i` for the 4 elements of `src`.
 fn plus_index(cmd: &mut Cmd, src: &Buffer<u32>, dst: &Buffer<u32, Readback>) {
     cmd.compute(
-        &TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: src.range(..), dst: dst.range(..), count: 4, multiplier: 1 }, None),
-        [1, 1, 1]);
+        &TestComputeBuffer::push_bindings(
+            TestComputeBufferArgs {
+                src: src.range(..),
+                dst: dst.range(..),
+                count: 4,
+                multiplier: 1,
+            },
+            None,
+        ),
+        [1, 1, 1],
+    );
 }
 
 fn pattern(width: u32, height: u32) -> Vec<u8> {

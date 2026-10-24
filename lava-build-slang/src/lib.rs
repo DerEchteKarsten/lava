@@ -2,16 +2,18 @@
 use std::{env, fs, path::Path};
 
 mod codegen;
-pub mod compile;
-pub mod describe;
+mod compile;
+mod describe;
 mod features;
+/// What [`watch!`] expands to and the generated `hot_reload.rs` names: not called directly.
 #[cfg(feature = "hot-reload")]
+#[doc(hidden)]
 pub mod hot_reload;
 mod reflect;
 
 /// The Slang side of lava's shader contract (`bindless.slang`, `ray_tracing.slang`) and the
 /// shader clock helpers (`profile.slang`), searched by every session.
-pub const SLANG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/slang");
+pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/slang");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Optimization {
@@ -29,8 +31,8 @@ pub enum Optimization {
 ///     .compile();
 /// ```
 /// The crate includes them with `lava::include_passes!()` and hands `PASS_MAP` to
-/// `lava::init`; with `hot-reload`, [`watch!`] (after `lava::init`, in the same crate)
-/// recompiles them while it runs. Relative paths are resolved against the package's directory.
+/// `lava::init`; with `hot-reload`, `lava_build_slang::watch!()` (after `lava::init`, in the
+/// same crate) recompiles them while it runs. Relative paths are resolved against the package's directory.
 #[derive(Default)]
 #[must_use = "`Shaders` does nothing until `.compile()`"]
 pub struct Shaders {

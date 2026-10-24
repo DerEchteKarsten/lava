@@ -3,6 +3,6 @@
 pub mod acceleration_structure;
 #[cfg(feature = "acceleration-structure")]
 mod compactor;
-pub mod physical_device;
+pub(crate) mod physical_device;
 #[cfg(feature = "ray-tracing-pipeline")]
-pub mod rt_pipeline;
+pub(crate) mod rt_pipeline;

@@ -6,26 +6,31 @@ use std::{
 };
 
 use crate::error::{Error, Result};
-use crate::vk::{self};
+use crate::vk;
 use bytemuck::{AnyBitPattern, NoUninit};
-use smallvec::SmallVec;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
+use smallvec::SmallVec;
 
 use crate::{
-    buffer::slice::BufferSlice,
-    lifetime,
     command_buffer::{BufferAccess, pending::incomplete_write},
     global::Live,
-    queue::{lock, timeline::{INDICES, completed, poll}},
+    lifetime,
+    queue::{
+        lock,
+        timeline::{INDICES, completed, poll},
+    },
     state::Ctx,
 };
 
 pub mod memory;
-pub mod slice;
+pub(crate) mod slice;
 pub(crate) mod staging;
 
-pub use memory::{Dynamic, Gpu, HostVisible, Location, Memory, Readback, Shared, StaticMemory, Upload};
+pub use memory::{
+    Dynamic, Gpu, HostVisible, Location, Memory, Readback, Shared, StaticMemory, Upload,
+};
+pub use slice::BufferSlice;
 pub use staging::{UploadStats, Uploader};
 
 /// The usages of every buffer an application creates: everything lava's commands bind a buffer
@@ -84,14 +89,22 @@ pub struct Buffer<T: Copy + 'static, M: Memory = Gpu> {
 impl<T: Copy + 'static, M: Memory> Drop for Buffer<T, M> {
     fn drop(&mut self) {
         let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
-        retire_buffer(handle, self.address..self.address + self.num_bytes, allocation);
+        retire_buffer(
+            handle,
+            self.address..self.address + self.num_bytes,
+            allocation,
+        );
     }
 }
 
 /// Forgets the uploads into a dropped buffer's addresses `range` and, once no submission
 /// reaches it, its pending accesses, the buffer and its allocation (null for sparse and
 /// external buffers, whose memory their owners free after).
-pub(crate) fn retire_buffer(handle: vk::Buffer, range: std::ops::Range<u64>, allocation: Allocation) {
+pub(crate) fn retire_buffer(
+    handle: vk::Buffer,
+    range: std::ops::Range<u64>,
+    allocation: Allocation,
+) {
     staging::forget_buffer(range.clone());
     lifetime::retire(move || {
         for index in INDICES.iter() {
@@ -107,9 +120,9 @@ pub(crate) fn retire_buffer(handle: vk::Buffer, range: std::ops::Range<u64>, all
     });
 }
 
-impl<'a, T: Copy + 'static, M: Memory> Into<BufferSlice<'a, T>> for &'a Buffer<T, M> {
-    fn into(self) -> BufferSlice<'a, T> {
-        self.range(..)
+impl<'a, T: Copy + 'static, M: Memory> From<&'a Buffer<T, M>> for BufferSlice<'a, T> {
+    fn from(val: &'a Buffer<T, M>) -> Self {
+        val.range(..)
     }
 }
 
@@ -128,7 +141,12 @@ impl<T: Copy + 'static> Buffer<T, Gpu> {
     /// A buffer whose memory its owner bound and frees after it (external memory), with a null
     /// allocation.
     #[cfg(all(feature = "external-memory", unix))]
-    pub(crate) fn from_external(handle: vk::Buffer, address: u64, num_bytes: u64, live: Live) -> Self {
+    pub(crate) fn from_external(
+        handle: vk::Buffer,
+        address: u64,
+        num_bytes: u64,
+        live: Live,
+    ) -> Self {
         Buffer {
             handle,
             address,
@@ -171,7 +189,10 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     #[validation_trace]
     pub fn with_memory(memory: M, len: usize) -> Result<Self> {
         let num_bytes = len.checked_mul(size_of::<T>()).ok_or_else(|| {
-            Error::other(format!("{len} elements of {} bytes overflow", size_of::<T>()))
+            Error::other(format!(
+                "{len} elements of {} bytes overflow",
+                size_of::<T>()
+            ))
         })?;
         Self::raw(memory, num_bytes as u64, Some(align_of::<T>() as u64))
     }
@@ -181,7 +202,7 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     #[validation_trace]
     pub fn raw(memory: M, num_bytes: u64, alignment: Option<u64>) -> Result<Self> {
         assert!(
-            num_bytes % size_of::<T>() as u64 == 0,
+            num_bytes.is_multiple_of(size_of::<T>() as u64),
             "{num_bytes} bytes aren't a whole number of {}-byte elements",
             size_of::<T>()
         );
@@ -207,15 +228,30 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
         alignment: Option<u64>,
         live: Live,
     ) -> Result<Self> {
-        const { assert!(size_of::<T>() > 0, "buffers of zero-sized elements have no length") };
+        const {
+            assert!(
+                size_of::<T>() > 0,
+                "buffers of zero-sized elements have no length"
+            )
+        };
         if let Some(alignment) = alignment {
-            assert!(alignment.is_power_of_two(), "a buffer alignment of {alignment} isn't a power of two");
+            assert!(
+                alignment.is_power_of_two(),
+                "a buffer alignment of {alignment} isn't a power of two"
+            );
         }
         let location = memory.location();
         if location == Location::Gpu && Ctx::features_ref().rebar {
             // Mapped, so uploaders write it in place; plain device-local memory is the
             // fallback once the BAR heap is full.
-            let shared = Self::with_memory_types(usage, memory, num_bytes, alignment, Location::Shared, &live);
+            let shared = Self::with_memory_types(
+                usage,
+                memory,
+                num_bytes,
+                alignment,
+                Location::Shared,
+                &live,
+            );
             if let Ok(buffer) = shared {
                 return Ok(buffer);
             }
@@ -234,7 +270,9 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
         live: &Live,
     ) -> Result<Self> {
         if num_bytes == 0 {
-            return Err(Error::other("a buffer can't be empty: Vulkan needs at least one byte"));
+            return Err(Error::other(
+                "a buffer can't be empty: Vulkan needs at least one byte",
+            ));
         }
         if location == Location::Shared && !Ctx::features_ref().rebar {
             return Err(crate::features::MissingFeature { feature: "rebar" }.into());
@@ -346,16 +384,18 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
         self.address
     }
 
-    pub fn handle(&self) -> vk::Buffer {
-        self.handle
-    }
-
     pub fn size(&self) -> u64 {
         self.num_bytes
     }
 
+    /// How many `T`s it holds.
     pub fn len(&self) -> usize {
         (self.size() / size_of::<T>() as u64) as usize
+    }
+
+    /// Whether it holds no `T` (only a `raw` buffer of fewer bytes than one can).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Where its memory lives.
@@ -382,8 +422,8 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
 
     /// Its mapping where the memory is coherent too, which lava writes without flushing.
     pub(crate) fn coherent_mapping(&self) -> Option<*mut T> {
-        let coherent = (self.allocation.memory_properties())
-            .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+        let coherent =
+            (self.allocation.memory_properties()).contains(vk::MemoryPropertyFlags::HOST_COHERENT);
         coherent.then(|| self.mapping()).flatten()
     }
 
@@ -424,7 +464,10 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
             return Ok(false);
         }
         let grown = Buffer::with_memory(self.memory, len.max(old.saturating_mul(2)))?;
-        cmd.copy_buffer(self.byte_range(..), grown.byte_range(..self.size() as usize));
+        cmd.copy_buffer(
+            self.byte_range(..),
+            grown.byte_range(..self.size() as usize),
+        );
         // Retired, so destroyed once this recording's submission (and every other in flight)
         // completed.
         drop(mem::replace(self, grown));
@@ -459,7 +502,11 @@ impl<T: Copy + 'static, M: HostVisible> Buffer<T, M> {
     fn incomplete_write(&self) -> Option<(usize, u64)> {
         let range = (self.address..self.address + self.num_bytes).into();
         (0..INDICES.len()).find_map(|i| {
-            let value = incomplete_write(lock(&INDICES[i].writes).iter().copied(), range, completed(i))?;
+            let value = incomplete_write(
+                lock(&INDICES[i].writes).iter().copied(),
+                range,
+                completed(i),
+            )?;
             (!poll(i).is_ok_and(|done| done >= value)).then_some((i, value))
         })
     }
@@ -550,7 +597,11 @@ impl<T: AnyBitPattern, M: HostVisible> Buffer<T, M> {
     /// A copy of element `index`, read like [`Self::read_into`].
     #[track_caller]
     pub fn get(&self, index: usize) -> T {
-        assert!(index < self.len(), "element {index} of a buffer of {}", self.len());
+        assert!(
+            index < self.len(),
+            "element {index} of a buffer of {}",
+            self.len()
+        );
         unsafe { self.mapped().add(index).read() }
     }
 }

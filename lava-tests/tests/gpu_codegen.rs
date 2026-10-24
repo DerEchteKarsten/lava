@@ -4,6 +4,7 @@ mod common;
 use common::{buffer_with, gpu, nearest, panic_message, zeroed_buffer};
 use glam::{I64Vec3, Mat3, U64Vec2, UVec2, UVec3, Vec3, Vec4};
 use lava::{
+    Ctx,
     bindless::{self, ImageHandle},
     buffer::{Buffer, Readback, Upload},
     command_buffer::{Attachment, CullModeFlags, Draw, RasterState},
@@ -14,7 +15,6 @@ use lava::{
         usage::usage,
     },
     pipeline::{PassKind, pass_map},
-    state::Ctx,
 };
 use lava_tests::bindings::*;
 
@@ -411,7 +411,6 @@ fn generated_structs_keep_slangs_layout() {
         );
     };
     gpu.submit(|cmd| cmd.compute(&bindings, [1, 1, 1]));
-    drop(bindings);
     let before = layouts(handles[0]);
     // SAFETY: the submission completed, and every bit pattern is a `Layouts` (handles are
     // plain `u32`s, only not `Zeroable`).

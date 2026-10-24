@@ -6,11 +6,11 @@ use std::{
     sync::{Mutex, atomic::AtomicUsize, atomic::Ordering},
 };
 
-use crate::compile::{self, CompiledFile, CompiledPass};
+use crate::compile::{self, CompiledFile, CompiledPass, Stage};
 use crate::describe::{
     Constant, Export, Image, Kind, Pointee, Scalar, Shape, Struct, Ty, capitalize_first,
 };
-use crate::{SLANG_DIR, Shaders};
+use crate::{SHADER_DIR, Shaders};
 
 const CLOCK_TYPE: &str = "Clock";
 /// Copies of `CLOCK_STRIPES`, `CLOCK_STRIPE_WORDS` and `CLOCK_TICK_BITS` in
@@ -580,7 +580,7 @@ fn binding(
                 false => read.to_string(),
             };
             Binding {
-                arg_ty: format!("::lava::buffer::slice::BufferSlice<'a, {element}>"),
+                arg_ty: format!("::lava::BufferSlice<'a, {element}>"),
                 generic: None,
                 lifetime: true,
                 gpu_ty: "u64".into(),
@@ -593,7 +593,7 @@ fn binding(
         Ty::Accel => {
             let trace = format!("__trace_{local}");
             Binding {
-                arg_ty: "&'a ::lava::vkobjects::acceleration_structure::Tlas".into(),
+                arg_ty: "&'a ::lava::Tlas".into(),
                 generic: None,
                 lifetime: true,
                 gpu_ty: "u64".into(),
@@ -965,7 +965,7 @@ const _: () = assert!(::core::mem::size_of::<{packed_name}>() == {constants_size
             (
                 format!("::lava::features::Gated<{gate}, {output}>"),
                 format!(
-                    "::lava::features::gate::<{gate}, _>(move || {{\n            {safety}\n            unsafe {{\n                {make}\n            }}\n        }})"
+                    "::lava::features::gated::<{gate}, _>(move || {{\n            {safety}\n            unsafe {{\n                {make}\n            }}\n        }})"
                 ),
             )
         }
@@ -976,7 +976,7 @@ const _: () = assert!(::core::mem::size_of::<{packed_name}>() == {constants_size
     };
     let workgroup = match desc.kind {
         Kind::Compute => {
-            let entry = desc.entry("compute").unwrap();
+            let entry = desc.entry(Stage::Compute).unwrap();
             let [x, y, z] = entry.workgroup_size.map(|n| n.max(1));
             format!(
                 r#"
@@ -1024,32 +1024,32 @@ impl {name} {{{workgroup}
     ));
 
     // The pass map entry.
-    let optional = |stage: &str| match desc.entry(stage) {
+    let optional = |stage: Stage| match desc.entry(stage) {
         Some(e) => format!("Some(c{:?})", e.name),
         None => "None".to_string(),
     };
-    let required = |stage: &str| format!("c{:?}", desc.entry(stage).unwrap().name);
+    let required = |stage: Stage| format!("c{:?}", desc.entry(stage).unwrap().name);
     let kind_fields = match desc.kind {
         Kind::RasterVertex => format!(
             "RasterVertex {{ fragment: {}, vertex: {} }}",
-            optional("fragment"),
-            required("vertex")
+            optional(Stage::Fragment),
+            required(Stage::Vertex)
         ),
         Kind::RasterMesh => format!(
-            "RasterMesh {{ fragment: {}, mesh: {}, amp: {} }}",
-            optional("fragment"),
-            required("mesh"),
-            optional("amplification")
+            "RasterMesh {{ fragment: {}, mesh: {}, task: {} }}",
+            optional(Stage::Fragment),
+            required(Stage::Mesh),
+            optional(Stage::Task)
         ),
         Kind::Compute => {
-            let wave = desc.entry("compute").unwrap().wave_size;
+            let wave = desc.entry(Stage::Compute).unwrap().wave_size;
             let subgroup = match wave {
                 0 => "None".to_string(),
                 n => format!("Some({n})"),
             };
             format!(
                 "Compute {{ entry: {}, subgroup_size: {subgroup} }}",
-                required("compute")
+                required(Stage::Compute)
             )
         }
         Kind::RayTracing => {
@@ -1250,6 +1250,152 @@ fn compile_all(files: &[String], options: &compile::Options) -> Vec<CompiledFile
         .collect()
 }
 
+/// Every `*.slang` file of `dirs` (not their subdirectories), each directory's sorted, the
+/// directories in call order.
+fn pass_files(dirs: &[String]) -> Vec<String> {
+    let mut pass_files: Vec<String> = Vec::new();
+    for dir in dirs {
+        let mut files: Vec<String> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{dir}: {e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "slang"))
+            .map(|path| path.to_str().expect("shader paths are UTF-8").to_string())
+            .collect();
+        files.sort();
+        pass_files.extend(files);
+    }
+    pass_files
+}
+
+/// Forwards Slang's warnings as cargo warnings and returns every compiled pass with its
+/// source file; failed files and passes of a name taken already go to `failures`.
+fn compiled_passes<'a>(
+    compiled: &'a [CompiledFile],
+    sources: &'a [String],
+    failures: &mut Vec<String>,
+) -> Vec<(&'a CompiledPass, &'a str)> {
+    let mut passes: Vec<(&CompiledPass, &str)> = Vec::new();
+    let mut names: BTreeMap<&str, &str> = BTreeMap::new();
+    for (file, source) in compiled.iter().zip(sources) {
+        for warning in &file.warnings {
+            for line in warning.lines().filter(|l| !l.trim().is_empty()) {
+                println!("cargo::warning={line}");
+            }
+        }
+        match &file.passes {
+            Err(errors) => failures.push(format!("{source}:\n  {}", errors.join("\n  "))),
+            Ok(file_passes) => {
+                for pass in file_passes {
+                    if let Some(other) = names.insert(&pass.name, source) {
+                        failures.push(format!(
+                            "{source}: the pass `{}` comes from {other} too: rename one",
+                            pass.name
+                        ));
+                    }
+                    passes.push((pass, source));
+                }
+            }
+        }
+    }
+    passes
+}
+
+impl Generator {
+    /// Collects the shared structs and exports of `passes` and claims the names of their
+    /// generated items; the errors by source file.
+    fn collect_passes<'a>(
+        &mut self,
+        passes: &[(&CompiledPass, &'a str)],
+    ) -> BTreeMap<&'a str, Vec<String>> {
+        let mut file_errors: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for &(pass, source) in passes {
+            let desc = &pass.desc;
+            let mut errors = Vec::new();
+            let fields = (desc.push_constants.iter())
+                .flat_map(|pc| pc.fields.iter().map(|f| (&f.name, &f.ty)));
+            let constants = desc.constants.iter().map(|c| (&c.name, &c.ty));
+            for (name, ty) in fields.chain(constants) {
+                if let Err(e) = self.collect(ty, source) {
+                    errors.push(format!("`{name}`: {e}"));
+                }
+            }
+            let name = &pass.name;
+            for item in [
+                name.clone(),
+                format!("C{name}Bindings"),
+                format!("{name}Args"),
+                format!("{name}Constants"),
+                format!("C{name}Constants"),
+            ] {
+                if let Err(e) = self.claim(&item, source) {
+                    errors.push(e);
+                }
+            }
+            for export in &desc.exports {
+                match self.exports.get(&export.name) {
+                    Some((other, other_source)) if other != export => errors.push(format!(
+                        "`[RustConst]` `{}` is `{}: {}` here but `{}: {}` in {other_source}",
+                        export.name, export.value, export.ty, other.value, other.ty
+                    )),
+                    Some(_) => {}
+                    None => {
+                        let entry = (export.clone(), source.to_string());
+                        self.exports.insert(export.name.clone(), entry);
+                    }
+                }
+            }
+            file_errors.entry(source).or_default().extend(errors);
+        }
+        file_errors
+    }
+
+    /// Claims the names of the shared structs (mirrors of lava types aren't generated).
+    fn claim_structs(&mut self, failures: &mut Vec<String>) {
+        let shared: Vec<(String, String)> = (self.structs.iter())
+            .filter(|(_, s)| s.mirror.is_none())
+            .map(|(name, s)| (name.clone(), s.source.clone()))
+            .collect();
+        for (name, source) in shared {
+            if let Err(e) = self.claim(&name, &source) {
+                failures.push(e);
+            }
+        }
+    }
+
+    /// The `[RustConst]` exports as Rust constants.
+    fn exported_constants(&self) -> String {
+        let mut text = String::new();
+        for (export, source) in self.exports.values() {
+            let file = Path::new(source)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(source);
+            text.push_str(&format!(
+                "\n/// `[RustConst]` of `{file}`.\npub const {}: {} = {};\n",
+                export.name, export.ty, export.value
+            ));
+        }
+        text
+    }
+}
+
+/// The size asserts of what the push constants' buffers point to, each once.
+fn pointee_asserts(
+    passes: &[(&CompiledPass, &str)],
+    aligns: &BTreeMap<String, u32>,
+) -> Vec<String> {
+    let mut pointees = Vec::new();
+    for (pass, _) in passes {
+        for f in pass.desc.push_constants.iter().flat_map(|pc| &pc.fields) {
+            pointee_checks(&f.ty, aligns, &mut pointees);
+        }
+    }
+    pointees.sort();
+    pointees.dedup();
+    pointees
+}
+
 impl Shaders {
     /// Compiles every pass into `$OUT_DIR/lava/passes/<Pass>.spv` and writes the bindings to
     /// `$OUT_DIR/lava/bindings.rs`, forwarding Slang's warnings as cargo warnings. Panics once,
@@ -1258,26 +1404,13 @@ impl Shaders {
         for dir in self.passes.iter().chain(&self.includes).map(String::as_str) {
             println!("cargo::rerun-if-changed={dir}");
         }
-        println!("cargo::rerun-if-changed={SLANG_DIR}");
+        println!("cargo::rerun-if-changed={SHADER_DIR}");
         let out_dir =
             Path::new(&env::var("OUT_DIR").expect("called from a build script")).join("lava");
         let passes_dir = out_dir.join("passes");
         fs::create_dir_all(&passes_dir).unwrap();
 
-        // Each directory's files sorted, directories in call order.
-        let mut pass_files: Vec<String> = Vec::new();
-        for dir in &self.passes {
-            let mut files: Vec<String> = fs::read_dir(dir)
-                .unwrap_or_else(|e| panic!("{dir}: {e}"))
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "slang"))
-                .map(|path| path.to_str().expect("shader paths are UTF-8").to_string())
-                .collect();
-            files.sort();
-            pass_files.extend(files);
-        }
-
+        let pass_files = pass_files(&self.passes);
         let search_paths: Vec<&str> = self.includes.iter().map(String::as_str).collect();
         let defines: Vec<(&str, &str)> = (self.defines.iter())
             .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -1292,84 +1425,14 @@ impl Shaders {
 
         // Warnings first, then every failure at once.
         let mut failures: Vec<String> = Vec::new();
-        let mut passes: Vec<(&CompiledPass, &str)> = Vec::new();
-        let mut names: BTreeMap<&str, &str> = BTreeMap::new();
-        for (file, source) in compiled.iter().zip(&pass_files) {
-            for warning in &file.warnings {
-                for line in warning.lines().filter(|l| !l.trim().is_empty()) {
-                    println!("cargo::warning={line}");
-                }
-            }
-            match &file.passes {
-                Err(errors) => failures.push(format!("{source}:\n  {}", errors.join("\n  "))),
-                Ok(file_passes) => {
-                    for pass in file_passes {
-                        if let Some(other) = names.insert(&pass.name, source) {
-                            failures.push(format!(
-                                "{source}: the pass `{}` comes from {other} too: rename one",
-                                pass.name
-                            ));
-                        }
-                        passes.push((pass, source));
-                    }
-                }
-            }
-        }
-
+        let passes = compiled_passes(&compiled, &pass_files, &mut failures);
         let mut generator = Generator {
             structs: BTreeMap::new(),
             exports: BTreeMap::new(),
             items: BTreeMap::new(),
         };
-        let mut file_errors: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-        for (pass, source) in &passes {
-            let desc = &pass.desc;
-            let mut errors = Vec::new();
-            let fields = (desc.push_constants.iter())
-                .flat_map(|pc| pc.fields.iter().map(|f| (&f.name, &f.ty)));
-            let constants = desc.constants.iter().map(|c| (&c.name, &c.ty));
-            for (name, ty) in fields.chain(constants) {
-                if let Err(e) = generator.collect(ty, source) {
-                    errors.push(format!("`{name}`: {e}"));
-                }
-            }
-            let name = &pass.name;
-            for item in [
-                name.clone(),
-                format!("C{name}Bindings"),
-                format!("{name}Args"),
-                format!("{name}Constants"),
-                format!("C{name}Constants"),
-            ] {
-                if let Err(e) = generator.claim(&item, source) {
-                    errors.push(e);
-                }
-            }
-            for export in &desc.exports {
-                match generator.exports.get(&export.name) {
-                    Some((other, other_source)) if other != export => errors.push(format!(
-                        "`[RustConst]` `{}` is `{}: {}` here but `{}: {}` in {other_source}",
-                        export.name, export.value, export.ty, other.value, other.ty
-                    )),
-                    Some(_) => {}
-                    None => {
-                        generator
-                            .exports
-                            .insert(export.name.clone(), (export.clone(), source.to_string()));
-                    }
-                }
-            }
-            file_errors.entry(source).or_default().extend(errors);
-        }
-        let shared: Vec<(String, String)> = (generator.structs.iter())
-            .filter(|(_, s)| s.mirror.is_none())
-            .map(|(name, s)| (name.clone(), s.source.clone()))
-            .collect();
-        for (name, source) in shared {
-            if let Err(e) = generator.claim(&name, &source) {
-                failures.push(e);
-            }
-        }
+        let mut file_errors = generator.collect_passes(&passes);
+        generator.claim_structs(&mut failures);
         let aligns = match generator.alignments() {
             Ok(aligns) => aligns,
             Err(e) => {
@@ -1426,26 +1489,7 @@ impl Shaders {
             );
         }
 
-        // Pointee size asserts of the push constants' buffers.
-        let mut pointees = Vec::new();
-        for (pass, _) in &passes {
-            for f in pass.desc.push_constants.iter().flat_map(|pc| &pc.fields) {
-                pointee_checks(&f.ty, &aligns, &mut pointees);
-            }
-        }
-        pointees.sort();
-        pointees.dedup();
-
-        for (export, source) in generator.exports.values() {
-            let file = Path::new(source)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(source);
-            bindings.push_str(&format!(
-                "\n/// `[RustConst]` of `{file}`.\npub const {}: {} = {};\n",
-                export.name, export.ty, export.value
-            ));
-        }
+        bindings.push_str(&generator.exported_constants());
         bindings.push_str(&format!(
             r#"
 /// Every pass; hand it to `lava::init`.
@@ -1458,15 +1502,25 @@ pub static PASS_MAP: ::lava::pipeline::PassMap = ::lava::pipeline::PassMap {{
             passes = pass_map.join("\n"),
         ));
         bindings.push_str(&struct_text);
-        bindings.extend(pointees);
+        bindings.extend(pointee_asserts(&passes, &aligns));
         for (path, spirv) in spirv_files {
             write_if_changed(&path, spirv);
         }
         write_if_changed(&out_dir.join("bindings.rs"), bindings.as_bytes());
+        let build = self.hot_reload_build(&search_paths, &defines, &built_passes);
+        write_if_changed(&out_dir.join("hot_reload.rs"), build.as_bytes());
+    }
 
-        // Only text: the build script's lava-build-slang has no `hot_reload` module.
+    /// The `hot_reload::Build` the hot reload compiles with again, as text: the build
+    /// script's lava-build-slang has no `hot_reload` module.
+    fn hot_reload_build(
+        &self,
+        search_paths: &[&str],
+        defines: &[(&str, &str)],
+        built_passes: &[String],
+    ) -> String {
         let watch_dirs: Vec<&String> = self.passes.iter().chain(&self.includes).collect();
-        let build = format!(
+        format!(
             r#"Build {{
     search_paths: &{search_paths:?},
     defines: &{defines:?},
@@ -1481,8 +1535,7 @@ pub static PASS_MAP: ::lava::pipeline::PassMap = ::lava::pipeline::PassMap {{
             optimization = self.optimization,
             debug_info = self.debug_info,
             passes = built_passes.join("\n"),
-        );
-        write_if_changed(&out_dir.join("hot_reload.rs"), build.as_bytes());
+        )
     }
 }
 

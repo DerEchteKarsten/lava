@@ -3,9 +3,9 @@
 use bytemuck::{NoUninit, bytes_of};
 
 use super::{Accesses, BufferAccess, ImageUse};
-use crate::vk;
 use crate::pipeline::MAX_PUSH_CONSTANTS_SIZE;
 use crate::unsized_struct::unsized_struct;
+use crate::vk;
 
 /// The kind of pass a [`BindingOutput`] was made for, which decides how it can be recorded,
 /// and its shader stages (`STAGES`, also `PassKind::stages`), where the accesses of its
@@ -74,6 +74,8 @@ unsized_struct! {
     }
 }
 
+/// What bindings hold, as commands read them ([`BindingOutput::sections`]): the pass's index in
+/// the pass map, its push constant and specialization constant bytes, and its accesses.
 #[derive(Clone, Copy)]
 pub struct Sections<'s, 'a> {
     pub pass: usize,
@@ -108,6 +110,7 @@ impl<'s, 'a> Sections<'s, 'a> {
 }
 
 impl<'a, K> BindingOutput<'a, K> {
+    /// Its parts, for commands and for checking what a binding generator wrote.
     #[inline]
     pub fn sections(&self) -> Sections<'_, 'a> {
         Sections {

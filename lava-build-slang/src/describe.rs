@@ -4,7 +4,7 @@ use shader_slang::{
     reflection::{Shader, TypeLayout, VariableLayout},
 };
 
-use crate::compile::{self, RayTracingGroups};
+use crate::compile::{self, RayTracingGroups, Stage};
 use crate::reflect::{
     CheckedAttributes, CheckedDecl, CheckedGeneric, CheckedName, CheckedShader, CheckedType,
     CheckedTypeLayout, CheckedVariable, CheckedVariableLayout,
@@ -154,7 +154,7 @@ impl Ty {
 pub const MIRRORED_TYPES: [(&str, &str); 2] = [
     (
         "AccelerationStructureInstance",
-        "::lava::vkobjects::acceleration_structure::Instance",
+        "::lava::acceleration_structure::Instance",
     ),
     ("Sampler", "::lava::bindless::SamplerHandle"),
 ];
@@ -183,7 +183,7 @@ impl Constant {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    pub stage: &'static str,
+    pub stage: Stage,
     pub name: String,
     pub group: Option<i32>,
     pub max_recursion: Option<i32>,
@@ -225,7 +225,7 @@ pub struct PassDesc {
 
 impl PassDesc {
     /// The entry point of a stage.
-    pub fn entry(&self, stage: &str) -> Option<&Entry> {
+    pub fn entry(&self, stage: Stage) -> Option<&Entry> {
         self.entries.iter().find(|e| e.stage == stage)
     }
 
@@ -238,7 +238,7 @@ impl PassDesc {
         h.u8(self.kind as u8);
         h.u32(self.entries.len() as u32);
         for e in &self.entries {
-            h.str(e.stage);
+            h.str(e.stage.name());
             h.str(&e.name);
             h.u32(e.group.map_or(u32::MAX, |g| g as u32));
             h.u32(e.max_recursion.map_or(u32::MAX, |g| g as u32));
@@ -612,7 +612,7 @@ pub fn describe(layout: &Shader, module: &slang::Module) -> Result<PassDesc, Vec
     let mut entries = Vec::new();
     for ep in layout.checked_entry_points() {
         let name = ep.checked_name().unwrap_or("?").to_string();
-        let stage = match compile::stage_name(ep.stage()) {
+        let stage = match Stage::of(ep.stage()) {
             Ok(stage) => stage,
             Err(e) => {
                 errors.push(format!("entry point `{name}`: {e}"));
@@ -634,7 +634,7 @@ pub fn describe(layout: &Shader, module: &slang::Module) -> Result<PassDesc, Vec
             }
         }
         let (workgroup_size, wave_size) = match stage {
-            "compute" => (
+            Stage::Compute => (
                 ep.compute_thread_group_size().map(|n| n as u32),
                 ep.compute_wave_size() as u32,
             ),
@@ -710,25 +710,21 @@ pub fn describe(layout: &Shader, module: &slang::Module) -> Result<PassDesc, Vec
         }
     };
 
-    let mut stages: Vec<&str> = entries.iter().map(|e| e.stage).collect();
+    let mut stages: Vec<Stage> = entries.iter().map(|e| e.stage).collect();
     stages.sort_unstable();
+    use Stage::{Compute, Fragment, Mesh, RayGen, Task, Vertex};
     let kind = match stages.as_slice() {
         // Without a fragment shader, a raster pass draws depth and stencil alone.
-        ["fragment", "vertex"] | ["vertex"] => Some(Kind::RasterVertex),
-        ["fragment", "mesh"]
-        | ["amplification", "fragment", "mesh"]
-        | ["mesh"]
-        | ["amplification", "mesh"] => Some(Kind::RasterMesh),
-        ["compute"] => Some(Kind::Compute),
-        stages
-            if stages.contains(&"raygen")
-                && (stages.iter()).all(|s| compile::RAY_TRACING_STAGES.contains(s)) =>
-        {
+        [Fragment, Vertex] | [Vertex] => Some(Kind::RasterVertex),
+        [Fragment, Mesh] | [Task, Fragment, Mesh] | [Mesh] | [Task, Mesh] => Some(Kind::RasterMesh),
+        [Compute] => Some(Kind::Compute),
+        stages if stages.contains(&RayGen) && stages.iter().all(|s| s.is_ray_tracing()) => {
             Some(Kind::RayTracing)
         }
         other => {
+            let names: Vec<_> = other.iter().map(|s| s.name()).collect();
             errors.push(format!(
-                "the entry points {other:?} don't match any pass pattern"
+                "the entry points {names:?} don't match any pass pattern"
             ));
             None
         }

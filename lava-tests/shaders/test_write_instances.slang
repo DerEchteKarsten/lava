@@ -1,5 +1,5 @@
 // Test pass (compute): writes the instances of the ray tracing test scene on the GPU, the same
-// ones `gpu_headless.rs` writes on the host.
+// ones `gpu_ray_tracing.rs` writes on the host.
 #include "bindless.slang"
 #include "ray_tracing.slang"
 

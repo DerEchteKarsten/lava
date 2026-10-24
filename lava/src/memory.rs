@@ -5,9 +5,9 @@ use crate::vk;
 
 #[cfg(feature = "memory-budget")]
 use crate::features::{Gated, On, gate};
+use crate::state::Ctx;
 #[cfg(feature = "memory-budget")]
 use crate::state::Functions;
-use crate::state::Ctx;
 
 /// Bytes of live allocations, counted by `Ctx::allocator()`'s `allocate` and `free`.
 pub(crate) static ALLOCATED: AtomicU64 = AtomicU64::new(0);
@@ -19,12 +19,16 @@ pub struct MemoryReport {
     pub allocated: u64,
     /// Bytes of the memory blocks they are sub-allocated from.
     pub reserved: u64,
+    /// The device's memory heaps, in Vulkan's order.
     pub heaps: Vec<HeapBudget>,
 }
 
+/// One memory heap of the device.
 #[derive(Clone, Debug)]
 pub struct HeapBudget {
+    /// Its size in bytes (`VkMemoryHeap::size`).
     pub size: u64,
+    /// Whether it is device-local memory (`MEMORY_HEAP_DEVICE_LOCAL`).
     pub device_local: bool,
     /// Bytes in use by this process (`VK_EXT_memory_budget`).
     #[cfg(feature = "memory-budget")]
@@ -46,8 +50,10 @@ pub fn memory_report() -> MemoryReport {
     if gate::MemoryBudget::on() {
         let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
         unsafe {
-            Functions::instance()
-                .get_physical_device_memory_properties2(Ctx::physical_device().handel, &mut properties)
+            Functions::instance().get_physical_device_memory_properties2(
+                Ctx::physical_device().handle,
+                &mut properties,
+            )
         };
     }
     let heaps = (0..memory.memory_heap_count as usize)
@@ -57,9 +63,9 @@ pub fn memory_report() -> MemoryReport {
                 .flags
                 .contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
             #[cfg(feature = "memory-budget")]
-            usage: crate::features::gate::<gate::MemoryBudget, _>(|| budget.heap_usage[i]),
+            usage: crate::features::gated::<gate::MemoryBudget, _>(|| budget.heap_usage[i]),
             #[cfg(feature = "memory-budget")]
-            budget: crate::features::gate::<gate::MemoryBudget, _>(|| budget.heap_budget[i]),
+            budget: crate::features::gated::<gate::MemoryBudget, _>(|| budget.heap_budget[i]),
         })
         .collect();
     MemoryReport {

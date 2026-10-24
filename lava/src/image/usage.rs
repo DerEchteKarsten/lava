@@ -8,7 +8,9 @@ use crate::vk;
             has `HostCopy` only with lava's `host-image-copy` feature and never with an \
             attachment usage, and `MutableFormat` is no usage of its own"
 )]
-pub trait ImageUsage: crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug {
+pub trait ImageUsage:
+    crate::sealed::Sealed + 'static + Copy + Send + Sync + std::fmt::Debug
+{
     fn flags(&self) -> vk::ImageUsageFlags;
     /// The create flags it implies: `MUTABLE_FORMAT` with `EXTENDED_USAGE` for a usage with
     /// `MutableFormat`, else none (a `Dynamic` usage never has them).
@@ -45,7 +47,7 @@ pub trait IsMutableFormat: ImageUsage {}
 ///
 /// `MutableFormat` isn't a usage but a create flag (`MUTABLE_FORMAT` with `EXTENDED_USAGE`): its
 /// images have views of the other formats of their compatibility class
-/// ([`ImageView::reinterpret`](crate::image::slice::ImageView::reinterpret)), and may have
+/// ([`ImageView::reinterpret`](crate::image::ImageView::reinterpret)), and may have
 /// usages their own format lacks if such a format has them (storage of an sRGB image through a
 /// UNORM view). It can cost the driver compression, so give it only to images that need it.
 ///
@@ -76,13 +78,13 @@ pub trait IsMutableFormat: ImageUsage {}
 /// ```
 /// The traits commands bound by follow the flags:
 /// ```compile_fail
-/// # use lava::{command_buffer::Attachment, image::{format::R8G8B8A8Unorm, slice::ImageView, usage::usage}};
+/// # use lava::{command_buffer::Attachment, image::{ImageView, format::R8G8B8A8Unorm, usage::usage}};
 /// fn target(view: ImageView<R8G8B8A8Unorm, usage![Sampled, Storage]>) {
 ///     Attachment::color(view, None);
 /// }
 /// ```
 /// ```
-/// # use lava::{command_buffer::Attachment, image::{format::R8G8B8A8Unorm, slice::ImageView, usage::usage}};
+/// # use lava::{command_buffer::Attachment, image::{ImageView, format::R8G8B8A8Unorm, usage::usage}};
 /// fn target(view: ImageView<R8G8B8A8Unorm, usage![Sampled, ColorAttachment]>) {
 ///     Attachment::color(view, None);
 /// }

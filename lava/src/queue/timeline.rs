@@ -15,12 +15,6 @@ use crate::vk;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
-#[cfg(feature = "performance-query")]
-use crate::{
-    command_buffer::Profile,
-    query::{Performance, QueryPool},
-    queue::Graphics,
-};
 use crate::{
     bindless::Bindless,
     buffer::staging::{Staging, Uploader},
@@ -30,6 +24,12 @@ use crate::{
     lifetime,
     queue::{FamilyInfo, FamilyQueues, Kind, MAX_TIMELINES, QueueKind, StageOf, Wait, lock},
     state::{CALLSITE, Ctx, vk_error},
+};
+#[cfg(feature = "performance-query")]
+use crate::{
+    command_buffer::Profile,
+    query::{Performance, QueryPool},
+    queue::Graphics,
 };
 
 /// One of the `MAX_TIMELINES` timeline semaphores. Its values go on across the timelines that
@@ -91,7 +91,8 @@ pub(crate) fn completed(i: usize) -> u64 {
 pub(crate) fn poll(i: usize) -> Result<u64> {
     let index = &INDICES[i];
     if let Some(semaphore) = semaphore_of(i) {
-        let value = unsafe { Ctx::device().get_semaphore_counter_value(semaphore) }.map_err(vk_error)?;
+        let value =
+            unsafe { Ctx::device().get_semaphore_counter_value(semaphore) }.map_err(vk_error)?;
         index.completed.fetch_max(value, Ordering::AcqRel);
     }
     Ok(completed(i))
@@ -169,7 +170,9 @@ fn host_signal(i: usize, submitted: u64, value: u64) {
     })();
     match signalled {
         Ok(()) | Err(Error::DeviceLost) => {}
-        Err(err) => tracing::error!(%err, "failed to signal a timeline value no submission signals"),
+        Err(err) => {
+            tracing::error!(%err, "failed to signal a timeline value no submission signals")
+        }
     }
 }
 
@@ -245,7 +248,9 @@ impl Drop for Inner {
         let submitted = lock(&index.state).submitted;
         match wait_value(self.index, submitted) {
             Ok(()) | Err(Error::DeviceLost) => {}
-            Err(err) => tracing::error!(%err, "failed to wait for a dropped timeline's submissions"),
+            Err(err) => {
+                tracing::error!(%err, "failed to wait for a dropped timeline's submissions")
+            }
         }
         // A stamp `reserve` or an unsubmitted `begin` raised past the last submission: no
         // submission will signal it, and what was dropped meanwhile waits for it.
@@ -293,21 +298,31 @@ impl<K: QueueKind> Timeline<K> {
         let live = Live::new();
         assert!(in_flight > 0, "a timeline has at least one frame slot");
         K::check()?;
-        let family = (Ctx::get().queues.family(K::KIND)).expect("lava has queues of every family whose feature is on");
+        let family = (Ctx::get().queues.family(K::KIND))
+            .expect("lava has queues of every family whose feature is on");
         let device = Ctx::device();
         let index = {
             let mut live = lock(&LIVE);
-            let index = live.iter().position(|live| !live).ok_or(Error::OutOfTimelines)?;
+            let index = live
+                .iter()
+                .position(|live| !live)
+                .ok_or(Error::OutOfTimelines)?;
             if semaphore_of(index).is_none() {
                 // Values go on from what the index's earlier semaphores reached.
-                let start = INDICES[index].stamp.load(Ordering::SeqCst).max(completed(index));
+                let start = INDICES[index]
+                    .stamp
+                    .load(Ordering::SeqCst)
+                    .max(completed(index));
                 let mut timeline = vk::SemaphoreTypeCreateInfo::default()
                     .semaphore_type(vk::SemaphoreType::TIMELINE)
                     .initial_value(start);
                 let info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
-                let semaphore = unsafe { device.create_semaphore(&info, None) }.map_err(vk_error)?;
+                let semaphore =
+                    unsafe { device.create_semaphore(&info, None) }.map_err(vk_error)?;
                 use vk::Handle;
-                INDICES[index].semaphore.store(semaphore.as_raw(), Ordering::Release);
+                INDICES[index]
+                    .semaphore
+                    .store(semaphore.as_raw(), Ordering::Release);
             }
             live[index] = true;
             index
@@ -353,7 +368,8 @@ impl<K: QueueKind> Timeline<K> {
             }
         }
         let slots = slots.into_boxed_slice();
-        let ring = (staging > 0 && !Ctx::features_ref().rebar).then(|| Staging::new(index, staging));
+        let ring =
+            (staging > 0 && !Ctx::features_ref().rebar).then(|| Staging::new(index, staging));
         let staging = match ring.transpose() {
             Ok(staging) => staging,
             Err(err) => {
@@ -373,8 +389,11 @@ impl<K: QueueKind> Timeline<K> {
             kind: K::KIND,
             timestamp_valid_bits: family.timestamp_valid_bits,
             image_granularity: family.image_granularity,
-            indices: [Kind::Graphics, Kind::Compute, Kind::Transfer]
-                .map(|kind| queues.family(kind).map_or(vk::QUEUE_FAMILY_IGNORED, |f| f.index)),
+            indices: [Kind::Graphics, Kind::Compute, Kind::Transfer].map(|kind| {
+                queues
+                    .family(kind)
+                    .map_or(vk::QUEUE_FAMILY_IGNORED, |f| f.index)
+            }),
         };
         Ok(Timeline {
             inner: Inner {
@@ -408,7 +427,9 @@ impl<K: QueueKind> Timeline<K> {
     /// Counts the stamp up: call it before reading anything the next submission will reach, so
     /// what is dropped after it lives until that submission finished.
     pub fn reserve(&self) {
-        INDICES[self.inner.index].stamp.fetch_add(1, Ordering::SeqCst);
+        INDICES[self.inner.index]
+            .stamp
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     /// Submits a sparse binding through `bind` on the timeline's queue, after every earlier
@@ -456,13 +477,16 @@ impl<K: QueueKind> Timeline<K> {
         let index = &INDICES[inner.index];
         let slot = (inner.begun % inner.slots.len() as u64) as usize;
         inner.begun += 1;
-        index.stamp.fetch_max(lock(&index.state).submitted + 1, Ordering::SeqCst);
+        index
+            .stamp
+            .fetch_max(lock(&index.state).submitted + 1, Ordering::SeqCst);
+        // One poll of every timeline, this one's slot included, then a wait only if it is behind.
+        poll_all()?;
         let signalled = inner.slots[slot].signalled;
-        if poll(inner.index)? < signalled {
+        if completed(inner.index) < signalled {
             let _span = tracing::info_span!("wait for frame slot").entered();
             wait_value(inner.index, signalled)?;
         }
-        poll_all()?;
         lifetime::run_ready();
         let pool = inner.slots[slot].pool;
         unsafe { Ctx::device().reset_command_pool(pool, vk::CommandPoolResetFlags::empty()) }
@@ -591,19 +615,26 @@ impl<K: QueueKind> Submission<'_, K> {
         CALLSITE.set(prev);
 
         let rec = &mut cmd.rec;
-        let unpresented = (rec.acquired.iter()).any(|(image, _)| !rec.presents.iter().any(|p| p.image == *image));
+        let unpresented =
+            (rec.acquired.iter()).any(|(image, _)| !rec.presents.iter().any(|p| p.image == *image));
         let binary_waits: SmallVec<[_; 1]> = (rec.presents.iter())
             .map(|p| {
                 let first = rec.acquired.iter().find(|(image, _)| *image == p.image);
-                (p.acquire, first.map_or(vk::PipelineStageFlags2::ALL_COMMANDS, |(_, stage)| *stage))
+                (
+                    p.acquire,
+                    first.map_or(vk::PipelineStageFlags2::ALL_COMMANDS, |(_, stage)| *stage),
+                )
             })
             .collect();
         let presents: SmallVec<[_; 1]> = rec.presents.iter().map(|p| p.present).collect();
         let queue = &inner.family.queues[inner.queue];
         // After the timeline's last sparse binding, which nothing else orders it after.
         let sparse_wait = std::mem::take(&mut inner.sparse_wait);
-        let own_wait = (sparse_wait > completed(i))
-            .then_some((semaphore(i), sparse_wait, vk::PipelineStageFlags2::ALL_COMMANDS));
+        let own_wait = (sparse_wait > completed(i)).then_some((
+            semaphore(i),
+            sparse_wait,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+        ));
         // The counter pass of a profiled recording; a replay records no queries.
         let submit = |cmd: vk::CommandBuffer, pass: Option<u32>| -> Result<()> {
             let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
@@ -655,7 +686,10 @@ impl<K: QueueKind> Submission<'_, K> {
             Ok(()) if let Some(index) = rec.left_open() => Err(Failed::OpenQuery(index)),
             Ok(())
                 if profiled.is_some_and(|p| {
-                    !rec.open_queries.iter().flatten().any(|&q| q == (p.pool, p.index))
+                    !rec.open_queries
+                        .iter()
+                        .flatten()
+                        .any(|&q| q == (p.pool, p.index))
                 }) =>
             {
                 Err(Failed::ProfileEnded)
@@ -687,12 +721,19 @@ impl<K: QueueKind> Submission<'_, K> {
             let replayed = (|| -> Result<()> {
                 unsafe {
                     device.reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())?;
-                    device.begin_command_buffer(rec.handle, &Default::default())?;
+                    let info = vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                    device.begin_command_buffer(rec.handle, &info)?;
                     // An acquired image without its acquire wait keeps its layout; the surface
                     // resets its state when it keeps it current or acquires it again.
-                    let presented = |image: vk::Image| rec.presents.iter().any(|p| p.image == image);
+                    let presented =
+                        |image: vk::Image| rec.presents.iter().any(|p| p.image == image);
                     for barriers in rec.barrier_log.iter_mut() {
-                        barriers.images.retain(|b| !rec.acquired.iter().any(|&(i, _)| i == b.image && !presented(i)));
+                        barriers.images.retain(|b| {
+                            !rec.acquired
+                                .iter()
+                                .any(|&(i, _)| i == b.image && !presented(i))
+                        });
                     }
                     for barriers in rec.barrier_log.iter() {
                         rec.pipeline_barrier(barriers);
@@ -770,7 +811,11 @@ impl Submission<'_, Graphics> {
         index: u32,
         record: impl FnOnce(&mut CommandBuffer<Graphics>),
     ) -> Result<Wait> {
-        assert!(index < pool.count(), "query {index} of a pool of {}", pool.count());
+        assert!(
+            index < pool.count(),
+            "query {index} of a pool of {}",
+            pool.count()
+        );
         assert!(
             pool.passes() == 1,
             "the counters of this pool take {} submissions: record them with `Timeline::capture`",
@@ -798,10 +843,16 @@ impl Timeline<Graphics> {
         index: u32,
         mut record: impl FnMut(&mut CommandBuffer<Graphics>),
     ) -> Result<Wait> {
-        assert!(index < pool.count(), "query {index} of a pool of {}", pool.count());
+        assert!(
+            index < pool.count(),
+            "query {index} of a pool of {}",
+            pool.count()
+        );
         let mut last = None;
         for pass in 0..pool.passes() {
-            let wait = self.begin()?.submit_inner(Some((pool, index, pass)), &mut record)?;
+            let wait = self
+                .begin()?
+                .submit_inner(Some((pool, index, pass)), &mut record)?;
             wait.block()?;
             last = Some(wait);
         }

@@ -24,9 +24,6 @@ lava-macros = { version = "0.1.0", path = "../lava-macros" }
 smallvec.workspace = true
 hashbrown.workspace = true
 
-[dev-dependencies]
-tracing-subscriber = { workspace = true }
-
 [features]
 # Every optional device feature is two cargo features: `X` compiles it and checks the device at
 # runtime (functions that need it return `lava::features::Gated` values), `assert-X` makes `init`

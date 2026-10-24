@@ -19,11 +19,6 @@ compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
 5. **Raster and draws:** dynamic rendering local read (skipped 2026-10-21, see section 5:
    input attachments don't fit lava's descriptor heaps and Slang yet).
-9. **Surface, cleanup and docs:** 4.14, 4.19 (shallow re-exports, `lava::prelude` (glam and
-   bytemuck are re-exported since 2026-10-24), internals hidden or deleted, every rename, ash
-   as a documented public dependency with only `lava::vk`, the derives), all of section 6
-   (bake table stays) and
-   section 7 (scope observer docs follow the code: scopes start after their barriers).
 10. **Tests:** all of section 8, plus tests for every change above, one GPU-assisted validation
     run, and Miri for `unsized_struct!`; the tools generator fix of section 7.
 
@@ -31,7 +26,9 @@ The engine follows in its own repository, only after the other agent's uncommitt
 is committed: 84, the push constants of 3, 4.11's viewport usage, 4.15, 4.17's `fits`, the
 generated API of 2026-10-24 (argument structs, extra accesses in `push_bindings`, no imports
 into `bindings.rs`, generated padding and `Default`s instead of the shaders' hand padding,
-`WORKGROUP_SIZE`/`groups`, `[RustConst]` instead of copied constants), release builds without
+`WORKGROUP_SIZE`/`groups`, `[RustConst]` instead of copied constants), the surface pass of
+2026-10-24 (root re-exports and the prelude, private `state`/`lifetime`/`error`, `lava::vk` for
+`raw_vulkan`, and its renames), release builds without
 validation, and all of section 9 (drop `dynamic-blend` once checked).
 
 ## 2. Bugs
@@ -91,38 +88,9 @@ validation, and all of section 9 (drop `dynamic-blend` once checked).
 13. **Field projection.** Core slices a struct field out of a buffer with
     `byte_range(offset_of!..).cast::<MeshletDraw>()`. (Indirect draws and dispatches take any
     `T: StartsWith<C>` since 2026-10-21, which removes the 16→12-byte cast.)
-14. **Scope names must be `&'static str`.**
 15. **Resize and grow is hand-rolled in core.** `grow_overflowed` can use `buffer.reserve(len, cmd)`
     (since 2026-10-24) and `RenderResources::fit` with its `fresh` flag `Image::fit(extent)`,
     which keeps the bound slots (since 2026-10-21).
-19. **The surface is messy.**
-    - Deep paths (`lava::image::slice::ImageView`).
-    - No prelude, and glam and bytemuck aren't re-exported.
-    - Unused re-exports: `VkPipeline`, `VkShaderModule`, `ShaderHash`.
-    - Public internals: `PassEntry`, `Functions`, `PhysicalDevice`, `CALLSITE`,
-      `RaytracingPipeline`, `ShaderBindingTable`.
-    - Typos: `handel`, `extend` for extent.
-    - Fix these before 0.1, since renames break users afterwards.
-    - *2026-10-18, more public internals:* `pub use ash::vk::*` makes every ash upgrade a breaking
-      lava release (`vk.rs:6`); `lava::vk` and `lava::state::raw_vulkan` are one module under two
-      paths (`state.rs:35`; the engine and generated code use the second, lava the first);
-      `pub mod error`, `lifetime` and `state` duplicate root re-exports; `CallsiteGuard`;
-      `BindingOutput::sections()` returns an unnameable pub `Sections`; `RawImage`, `MipViews` and
-      the sealed `Views` methods expose `vk::ImageView` and the state atomics; `Buffer::handle()` (no caller anywhere); `lava_build_slang::compile`
-      and its re-export of shader-slang 0.1.0, which ties lava-build-slang's semver to slang-rs.
-    - *2026-10-18, unused:* `Features::union`, `ImageView::cast`,
-      `ImageSlice::cast`, `Image::aspect_check`/`texel_check`, `Dim::texels`,
-      `SlotRange::is_empty` (always false), `Config::gpu_assisted_validation` (no user), the
-      root re-exports `AccessFlags2`/`ImageLayout`.
-    - *2026-10-18, naming traps:* `ImageRef::view()` returns the `ImageView` while
-      `ImageView::view()` returns the `vk::ImageView` (`kind.rs:18-22`); `features::gate` is a
-      function and a module; `lava_build_slang::SLANG_DIR` (the shader directory) shares the
-      name of the `SLANG_DIR` variable (the SDK); `BufferSlice::get_range` returns
-      `std::range::Range` where the rest uses `std::ops::Range`; `RasterMesh.amp` where
-      lava says task; `Features::DEFAULT` means none; `copy_region_from` takes its offset as a
-      `D::Extent`; `image_acceses`, `buffer_acceses`.
-    - *2026-10-18, missing derives:* `RasterState` and `BufferAccess` could be `Copy`; `Filter` has
-      no cubic filter; `Config` has no docs or `Debug`.
 24. **`bind` zips two iterators** (2026-10-18, `bindless.rs:308-345`): a length mismatch binds less
     silently, and core collects a `Vec` per frame to line them up. Take pairs and assert.
 28. **Small API gaps** (2026-10-18): `depth_clamp_range`'s wrapper
@@ -149,6 +117,7 @@ validation, and all of section 9 (drop `dynamic-blend` once checked).
   - **Types:** cube maps (arrays of 6 layers exist since 2026-10-21; a cube view and
     `TexCube` don't), 1D, MSAA.
   - **Views:** swizzles, per-aspect depth/stencil views for shaders.
+  - **Samplers:** `Filter` has no cubic filter (`VK_EXT_filter_cubic`).
   - **Transfers:** mip generation.
   - **Memory:** transient (lazily allocated) attachments, aliasing in shared memory blocks.
 - **Memory:** per-frame transient rings (only `cmd.upload`'s internal ring exists).
@@ -177,97 +146,27 @@ validation, and all of section 9 (drop `dynamic-blend` once checked).
 
 ## 6. Cleanup (2026-10-18)
 
-Small things, by file; none changes behaviour.
-- **Clippy** (default lints) flags `is_multiple_of` (13 places), `From` over `Into`
-  (`buffer/mod.rs:80`, `pipeline.rs:414`), redundant field names, needless borrows, `map().flatten()`,
-  `!= ptr::null()`, `clone()` on `Location`, a single-range `vec!` (`bindless.rs:538`, intended), missing `# Safety` docs (`vk.rs`) and non-const
-  thread-locals. Only one warning reaches `cargo check`: the deprecated `fetch_update`
-  (`image_state.rs:200`), whose `unwrap_or_else` is dead. `cargo fmt --check` reports diffs across lava and lava-tests.
-- **Manifests:** lava's `tracing-subscriber` and lava-tests' `smallvec` dev-dependencies are
-  unused; glam's `mint` feature is used by nothing in the workspace; lava-build-slang's
-  dev-dependency on lava has no version, so its packaged test won't compile; `quote`/`syn` aren't
-  workspace dependencies; `lava/build.rs` has no `rerun-if-changed`, so it reruns on any change,
-  and its bake table repeats knowledge of `Baked`, `Dynamic::of` and the feature implications.
-- **command_buffer:** the `is_read || is_write` test is loop-invariant and
-  `let buffer_access = &buffer_access;` is redundant (`mod.rs:1495-1552`); the "access of no stage
-  (`present`)" fallback comment is stale and its `src_access.is_empty()` branch never fires
-  (`:1641-1650`); the `index < count` assert is repeated in three places instead of
-  `Recording::begin_query`, and `end_query` bounds `QueryKind` where `begin_query` bounds
-  `Scoped`. `pending.rs`: the transitions loop in `made_visible`
-  is redundant *(plausible)* (`:102-123`) and the access sets could be `const`s (`:235-281`).
-  `image_state.rs`: `for_each` ignores `mips.end` without an assert (`:72-79`),
-  `run_mips.end == mips.start` is always true (`:119`), a panic prints `Some(Compute)`
-  (`:153-158`). `binding_output.rs`: runtime asserts of compile-time sizes (`:77-80, 112-114`).
-- **raster_state and pipeline:** `DepthClamp` has two `dead_code` allows (`raster_state.rs:98-104`);
-  `split()` copies 21 fields by hand to make a `RasterState<0>` (`:324-351`); the `[..n]` arm of
-  `changed!` and `Rendering.color_attachments` repeat known lengths, and `blends_changed` is
-  computed when blends aren't dynamic (`:529-535, 658, 668`); `gated_setters!` entries repeat
-  `(state, ..)`. In `pipeline.rs`: `create_raster_pipeline` builds `create_info` in two steps,
-  sets defaults and passes vertex states to mesh pipelines.
-- **features and vk:** `has()` guards on bits of structs only linked when present are redundant
-  (`features.rs:693-780`); `#[allow(unused_mut)]`
-  looks dead (`:459`); `unlink!` guards a reuse no path makes, while `query` returns `p_next`s into
-  its old stack (`:592-618`); missing feature docs on all but the first field of each group
-  (`:328-353`). `vk.rs`: `DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT` is defined in `values` and
-  re-exported (`:61-65`); `with_regions!` repeats `tagged!` (`:91-258`); the function pointer size
-  check could be `const` (`:270`).
-- **state and init:** `get_physical_device_properties` duplicates `properties2`
-  (`describe_device`); `let _ = (&rt_pipeline_properties, &acc_properties);`;
-  `pick_queue_families` runs twice per device (`describe_device` and the selection loop);
-  `sort_unstable` plus `dedup_by_key` of disjoint families removes nothing.
-  `physical_device.rs`: unused `PartialEq for QueueFamily`, `num_queues` duplicating
-  `handel.queue_count`, and init-only data kept for the program's lifetime.
-- **images:** `from_raw(DEPTH.as_raw() | STENCIL.as_raw())` and casts of values already `u32`
-  (`format.rs:187-210`); `PerMip` with one mip makes duplicate views (`image/mod.rs:461-464`); imports at the bottom of
-  `image/mod.rs` under two cfg combinations (`:638-648`); `Dim::Offset` is signed though blit boxes must now lie inside
-  the mip (`dim.rs:11`); `region_fits` duplicates `check_box` (`dim.rs:66-104`); `Copy + Pod`;
-  `subresource_layers` takes a parameter that is always `mip_range.start`; `check_copy_size`
-  lacks `#[track_caller]`.
-- **buffers:** `iter::empty()` and `std::iter::empty()`
-  mixed, `BufferAccess` built by hand beside `slice.access(..)`, `.cloned()` for `.copied()`
-  (`slice.rs:192-278`); `use crate::vk::{self}`.
-- **queues, present, queries:** `begin` polls its index three times (`timeline.rs:245-250`); the
-  replay lacks `ONE_TIME_SUBMIT` (`:406-409`); `MAX_TIMELINES` also caps queues per family
-  (`queue/mod.rs:10-11`); `Current` is `pub(crate)` but module-local (`present.rs:138-145`); a
-  module-wide `#[allow(unused_imports)]` and `let _ = locked;` (`query/mod.rs:8, 459`);
-  `CStr::from_ptr` over fixed arrays (`counters.rs:64-68`); `valid_bits` is 0 until a timestamp
-  is written, so `elapsed_ns` returns 0, and is last-writer-wins across families
-  (`query/mod.rs:51-54, 246-250`).
-- **ray tracing:** the scratch offset is computed in two loops and the infos re-collected
-  (`record_builds`); `with_geometries` checks the gate twice (and `create` again); `layout.size.max(1)` is redundant
-  (`rt_pipeline.rs:79`).
-- **lava-build-slang:** the capability scan duplicates `Features::of_spirv`
-  (`features::capabilities`); stages are strings (`compile::stage_name`); `Shaders::compile` is
-  still some 200 lines.
-- **lava-tests:** `let _ = needs;` is dead (`tests.rs:194`); `gpu_missing_features` copies
-  gpu_headless's render helpers verbatim instead of sharing them in `common`; misindented code
-  and a comment inside an expression (`gpu_headless.rs:680, 2339`).
+Done on 2026-10-24 but for these, which turned out to be meant as they are:
+- **state and init:** `get_physical_device_properties` beside `properties2` (`describe_device`)
+  stays: the API version it reads decides whether the 1.1 to 1.3 structs may be chained into
+  the second call.
+- **features:** `#[allow(unused_mut)]` on `Features::consistent` is needed without features;
+  lava/build.rs's bake table repeats knowledge of `Baked`, `Dynamic::of` and the feature
+  implications (kept, user decision 2026-10-20).
+- **command_buffer:** the transitions loop in `PendingAccesses::made_visible` isn't redundant:
+  an image has a barrier per run of mips, which it merges into one write. `image_state.rs`'s
+  `for_each` needs no assert on `mips.end`: one state covers every mip, and several are indexed
+  (bounds-checked).
+- **raster_state:** `gated_setters!` entries name their `state` because macro hygiene keeps a
+  body from reaching the setter's `self`.
+- **queues:** `MAX_TIMELINES` capping queues per family is intended (documented there): a
+  family never uses more queues than there are timelines to pin to them.
+- **lava-build-slang:** its capability table copies `features::SPIRV_CAPABILITIES` on purpose:
+  the build script's copy never compiles lava, and a test compares the two.
 
 ## 7. Documentation (2026-10-18)
 
-CLAUDE.md, the `//!` line of `command_buffer/mod.rs` and STATE.md's `wait_idle` entry were fixed
-with this survey. Still wrong:
-- **README:** "a draw's raster state is dynamic state, so pipelines depend only on the shaders,
-  their constants and the attachment formats" (`README.md:10`) is stale since extended dynamic
-  state became optional.
-- **lava-build-slang:** `build.rs`'s comment implies `-lslang` is avoided, but shader-slang-sys
-  still emits it *(plausible)*.
-- **rustdoc:** `features::gate` is ambiguous between function and module (`features.rs:93`); the
-  link to `watch` is unresolved (`lava-build-slang/src/lib.rs:31`); the links to `Instance`
-  (`lib.rs:24-26`) and `Compute` (`queue/mod.rs:35-39`) break without their features.
-- **Module docs:** `tests.rs`'s omits the `unsized_struct!` test; `lifetime.rs`'s "in drop order" holds for one
-  reclaimer only.
-- **Scope observers:** `observer.rs` and CLAUDE.md say what `on_enter` records comes before a
-  pass's barriers, but `compute`, `raytrace` and renderings flush the barriers before
-  `rec.enter` (`command_buffer/mod.rs:640-696, 929-939, 994-1002`), so scope timestamps and debug
-  labels exclude them. Change the code or the docs, whichever is meant.
-- **Item docs:** the 16-pipeline warning always blames constants, though raster keys grow too (`:499-507`); `wait_idle`'s doc omits that
-  it reclaims; `Config::validation`'s omits that it enables printf; `ray_tracing.slang`'s
-  `__init` truncates out-of-range fields silently, where Rust asserts; `Img.Load(p)` reads mip 0
-  and a null index is undefined; `memory_report`, `blocks` and several `Features` items have no
-  docs.
-- **Tests:** `ray_scene.slang:2` and `test_write_instances.slang:2` name `gpu_headless.rs`, but the
-  scene lives in `gpu_ray_tracing.rs`; `gpu_missing_features.rs:125` swaps near and far.
+Fixed on 2026-10-24 but for:
 - **Generated context:** the tools generator lists `pub fn` lines inside codegen's raw-string
   templates as lava-build-slang API, and the test copy of `CallsiteGuard` as lava-macros API. Fix
   in `../GameEngine/tools/src/main.rs`: skip string literals and `tests/`.
@@ -385,6 +284,6 @@ Engine-side findings that don't belong to lava's code but came up in this survey
    depth clamp (41).
 3. **Fix the timeline and presenting hangs and leaks (64-84).**
 4. **Redesign the APIs users touch first:** init config, memory locations,
-   frame and ring helpers, errors, naming, and the public internals of 19 before 0.1.
+   frame and ring helpers and errors before 0.1.
 5. **Make the tests able to fail** (section 8), then add features by real-world demand: arrays,
    cubes and MSAA, samplers, staging.

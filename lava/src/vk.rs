@@ -41,7 +41,7 @@ impl DepthClampModeEXT {
 }
 
 mod values {
-    use super::{DynamicState, StructureType};
+    use super::StructureType;
     pub const DEVICE_MEMORY_COPY_KHR: StructureType = StructureType::from_raw(1_000_318_000);
     pub const COPY_DEVICE_MEMORY_INFO_KHR: StructureType = StructureType::from_raw(1_000_318_001);
     pub const DEVICE_MEMORY_IMAGE_COPY_KHR: StructureType = StructureType::from_raw(1_000_318_002);
@@ -60,8 +60,6 @@ mod values {
         StructureType::from_raw(1_000_582_000);
     pub const PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT: StructureType =
         StructureType::from_raw(1_000_581_000);
-    pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
-        DynamicState::from_raw(1_000_582_000);
     pub const IMAGE_DESCRIPTOR_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_001);
     pub const RESOURCE_DESCRIPTOR_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_002);
     pub const BIND_HEAP_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_003);
@@ -78,17 +76,20 @@ mod values {
 
 /// `VK_PRESENT_MODE_FIFO_LATEST_READY_EXT`: FIFO that presents the newest ready image at each
 /// vertical blank, dropping older ones.
-pub const PRESENT_MODE_FIFO_LATEST_READY_EXT: PresentModeKHR = PresentModeKHR::from_raw(1_000_361_000);
-pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
-    values::DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT;
+pub const PRESENT_MODE_FIFO_LATEST_READY_EXT: PresentModeKHR =
+    PresentModeKHR::from_raw(1_000_361_000);
+/// `VK_DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT`.
+pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState = DynamicState::from_raw(1_000_582_000);
 
 /// `VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT`: the pipeline reads the descriptor heaps.
 pub const PIPELINE_CREATE_2_DESCRIPTOR_HEAP_EXT: PipelineCreateFlags2KHR =
     PipelineCreateFlags2KHR::from_raw(0x10_0000_0000);
 /// `VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT`.
-pub const BUFFER_USAGE_DESCRIPTOR_HEAP_EXT: BufferUsageFlags = BufferUsageFlags::from_raw(0x1000_0000);
+pub const BUFFER_USAGE_DESCRIPTOR_HEAP_EXT: BufferUsageFlags =
+    BufferUsageFlags::from_raw(0x1000_0000);
 /// `VK_ACCESS_2_SAMPLER_HEAP_READ_BIT_EXT`.
-pub const ACCESS_2_SAMPLER_HEAP_READ_EXT: AccessFlags2 = AccessFlags2::from_raw(0x200_0000_0000_0000);
+pub const ACCESS_2_SAMPLER_HEAP_READ_EXT: AccessFlags2 =
+    AccessFlags2::from_raw(0x200_0000_0000_0000);
 /// `VK_ACCESS_2_RESOURCE_HEAP_READ_BIT_EXT`.
 pub const ACCESS_2_RESOURCE_HEAP_READ_EXT: AccessFlags2 =
     AccessFlags2::from_raw(0x400_0000_0000_0000);
@@ -254,7 +255,10 @@ tagged! {
         ray_tracing_invocation_reorder: Bool32,
     }
 }
-unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'_> {}
+unsafe impl ExtendsPhysicalDeviceFeatures2
+    for PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'_>
+{
+}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'_> {}
 tagged! {
     PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT =
@@ -262,7 +266,10 @@ tagged! {
         present_mode_fifo_latest_ready: Bool32,
     }
 }
-unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT<'_> {}
+unsafe impl ExtendsPhysicalDeviceFeatures2
+    for PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT<'_>
+{
+}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT<'_> {}
 tagged! {
     PhysicalDeviceDescriptorHeapFeaturesEXT =
@@ -336,46 +343,18 @@ tagged! {
     }
 }
 
+/// A [`tagged!`] struct with a region list, set by `regions`.
 macro_rules! with_regions {
     ($(#[$attr:meta])* $name:ident = $s_type:ident, $region:ident { $($field:ident: $ty:ty),* }) => {
-        $(#[$attr])*
-        #[repr(C)]
-        #[derive(Copy, Clone, Debug)]
-        #[must_use]
-        pub struct $name<'a> {
-            pub s_type: StructureType,
-            pub p_next: *const c_void,
-            $(pub $field: $ty,)*
-            pub region_count: u32,
-            pub p_regions: *const $region<'a>,
-            pub _marker: PhantomData<&'a ()>,
-        }
-        unsafe impl Send for $name<'_> {}
-        unsafe impl Sync for $name<'_> {}
-        impl Default for $name<'_> {
-            #[inline]
-            fn default() -> Self {
-                Self {
-                    s_type: values::$s_type,
-                    p_next: core::ptr::null(),
-                    $($field: Default::default(),)*
-                    region_count: 0,
-                    p_regions: core::ptr::null(),
-                    _marker: PhantomData,
-                }
+        tagged! {
+            $(#[$attr])*
+            $name = $s_type, *const c_void {
+                $($field: $ty,)*
+                region_count: u32,
+                p_regions: *const $region<'a>,
             }
         }
-        unsafe impl TaggedStructure for $name<'_> {
-            const STRUCTURE_TYPE: StructureType = values::$s_type;
-        }
         impl<'a> $name<'a> {
-            $(
-                #[inline]
-                pub fn $field(mut self, $field: $ty) -> Self {
-                    self.$field = $field;
-                    self
-                }
-            )*
             #[inline]
             pub fn regions(mut self, regions: &'a [$region<'a>]) -> Self {
                 self.region_count = regions.len() as _;
@@ -396,7 +375,7 @@ with_regions! {
 }
 
 fn load<T: Copy>(instance: &ash::Instance, device: Device, name: &CStr) -> Option<T> {
-    assert_eq!(size_of::<T>(), size_of::<unsafe extern "system" fn()>());
+    const { assert!(size_of::<T>() == size_of::<unsafe extern "system" fn()>()) };
     let f = unsafe { instance.get_device_proc_addr(device, name.as_ptr()) }?;
     // SAFETY: `T` is the function pointer type of the command `name`.
     Some(unsafe { core::mem::transmute_copy(&f) })
@@ -488,6 +467,10 @@ pub mod device_address_commands {
             impl Device {
                 $(
                     #[doc = concat!("`", $vk_name, "`.")]
+                    ///
+                    /// # Safety
+                    /// The call must be valid usage of the command: a command buffer that is
+                    /// recording, and an `info` whose handles, addresses and chain are valid.
                     #[inline]
                     pub unsafe fn $method(&self, command_buffer: CommandBuffer, info: &$info<'_>) {
                         let f = self.$field.unwrap_or_else(|| missing($vk_name));
@@ -512,6 +495,11 @@ pub mod device_address_commands {
     }
 
     impl Device {
+        /// `vkCmdUpdateMemoryKHR`: writes `data` to `dst_range` from the command buffer.
+        ///
+        /// # Safety
+        /// The call must be valid usage of the command (Vulkan's valid usage rules for its
+        /// arguments).
         #[inline]
         pub unsafe fn cmd_update_memory(
             &self,
@@ -534,6 +522,11 @@ pub mod device_address_commands {
             }
         }
 
+        /// `vkCmdFillMemoryKHR`: fills `dst_range` with the word `data`.
+        ///
+        /// # Safety
+        /// The call must be valid usage of the command (Vulkan's valid usage rules for its
+        /// arguments).
         #[inline]
         pub unsafe fn cmd_fill_memory(
             &self,
@@ -548,6 +541,11 @@ pub mod device_address_commands {
             unsafe { f(command_buffer, dst_range, dst_flags, data) }
         }
 
+        /// `vkCreateAccelerationStructure2KHR`: a structure in `create_info`'s address range.
+        ///
+        /// # Safety
+        /// The call must be valid usage of the command (Vulkan's valid usage rules for its
+        /// arguments).
         #[inline]
         pub unsafe fn create_acceleration_structure2(
             &self,
@@ -615,6 +613,10 @@ pub mod descriptor_heap {
         }
 
         /// Writes the descriptor of `samplers[i]` to `descriptors[i]`.
+        ///
+        /// # Safety
+        /// Every descriptor range must be writable host memory of at least a sampler
+        /// descriptor's size.
         #[inline]
         pub unsafe fn write_sampler_descriptors(
             &self,
@@ -629,6 +631,10 @@ pub mod descriptor_heap {
         }
 
         /// Writes the descriptor of `resources[i]` to `descriptors[i]`.
+        ///
+        /// # Safety
+        /// Every descriptor range must be writable host memory of at least its descriptor's
+        /// size, and every resource info valid (its image and view description).
         #[inline]
         pub unsafe fn write_resource_descriptors(
             &self,
@@ -648,6 +654,10 @@ pub mod descriptor_heap {
             impl Device {
                 $(
                     #[doc = concat!("`", $vk_name, "`.")]
+                    ///
+                    /// # Safety
+                    /// The call must be valid usage of the command: a command buffer that is
+                    /// recording, and an `info` whose handles, addresses and chain are valid.
                     #[inline]
                     pub unsafe fn $method(&self, command_buffer: CommandBuffer, info: &$info<'_>) {
                         let f = self.$field.unwrap_or_else(|| missing($vk_name));
@@ -711,6 +721,10 @@ pub mod depth_clamp_control {
         }
 
         /// `range` is only read with `USER_DEFINED_RANGE`.
+        ///
+        /// # Safety
+        /// `command_buffer` must be recording, with a pipeline bound that sets the range
+        /// dynamically.
         #[inline]
         pub unsafe fn cmd_set_depth_clamp_range(
             &self,

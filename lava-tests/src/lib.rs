@@ -23,10 +23,10 @@ mod tests {
                     [vertex].into_iter().chain(fragment).collect()
                 }
                 PassKind::RasterMesh {
-                    amp,
+                    task,
                     mesh,
                     fragment,
-                } => amp.into_iter().chain([mesh]).chain(fragment).collect(),
+                } => task.into_iter().chain([mesh]).chain(fragment).collect(),
                 PassKind::RayTracing {
                     raygen,
                     miss,
@@ -62,7 +62,11 @@ mod tests {
                 pass.name
             );
             let magic = u32::from_le_bytes(pass.spirv[..4].try_into().unwrap());
-            assert_eq!(magic, 0x0723_0203, "{} lacks the SPIR-V magic number", pass.name);
+            assert_eq!(
+                magic, 0x0723_0203,
+                "{} lacks the SPIR-V magic number",
+                pass.name
+            );
         }
     }
 }

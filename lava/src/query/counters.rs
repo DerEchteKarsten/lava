@@ -88,10 +88,14 @@ static COUNTERS: crate::global::Global<Vec<Counter>> = crate::global::Global::ne
 /// How many query pools use the profiling lock; it is held while there is one.
 pub(crate) static LOCK_USERS: Mutex<usize> = Mutex::new(0);
 
+/// A fixed-size C string of Vulkan's (up to its first NUL, all of it without one).
 fn to_string(chars: &[std::ffi::c_char]) -> String {
-    unsafe { std::ffi::CStr::from_ptr(chars.as_ptr()) }
-        .to_string_lossy()
-        .into_owned()
+    let bytes: Vec<u8> = chars
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub(crate) fn init() -> Result<()> {
@@ -99,7 +103,10 @@ pub(crate) fn init() -> Result<()> {
         return Ok(());
     }
     let (instance, _) = Functions::performance_query();
-    let (device, family) = (Ctx::physical_device().handel, Ctx::get().queues.graphics().index);
+    let (device, family) = (
+        Ctx::physical_device().handle,
+        Ctx::get().queues.graphics().index,
+    );
     let len = unsafe {
         instance
             .enumerate_physical_device_queue_family_performance_query_counters_len(device, family)?
@@ -166,16 +173,23 @@ pub(crate) unsafe fn destroy() {
 /// Panics unless every one of `selection` is a counter of the current context.
 #[track_caller]
 pub(crate) fn check_current(selection: &[&Counter]) {
-    let current = COUNTERS.try_get().map_or(&[][..], Vec::as_slice).as_ptr_range();
+    let current = COUNTERS
+        .try_get()
+        .map_or(&[][..], Vec::as_slice)
+        .as_ptr_range();
     assert!(
-        selection.iter().all(|counter| current.contains(&std::ptr::from_ref(*counter))),
+        selection
+            .iter()
+            .all(|counter| current.contains(&std::ptr::from_ref(*counter))),
         "a counter of an earlier lava context: take them from `counters()` again after `init`"
     );
 }
 
 /// Every counter the graphics queue family offers.
 pub fn counters() -> Gated<gate::PerformanceQuery, &'static [Counter]> {
-    gate::<gate::PerformanceQuery, _>(|| COUNTERS.try_get().map_or(&[][..], Vec::as_slice))
+    crate::features::gated::<gate::PerformanceQuery, _>(|| {
+        COUNTERS.try_get().map_or(&[][..], Vec::as_slice)
+    })
 }
 
 /// How many submissions it takes to read `selection` (0 without performance queries or
@@ -193,7 +207,7 @@ pub fn passes(selection: &[&Counter]) -> u32 {
         .counter_indices(&indices);
     unsafe {
         instance.get_physical_device_queue_family_performance_query_passes(
-            Ctx::physical_device().handel,
+            Ctx::physical_device().handle,
             &info,
         )
     }

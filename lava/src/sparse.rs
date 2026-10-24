@@ -23,6 +23,7 @@ use crate::{
     global::Live,
     image::{
         D2, Dim, Image, RawImage, Single,
+        dim::{box_inside, box_is_empty},
         format::{ColorAspect, Format, StaticFormat},
         usage::{ImageUsage, StaticUsage},
     },
@@ -300,7 +301,7 @@ impl<F: Format + ColorAspect, U: ImageUsage, D: Dim> SparseImage<F, U, D> {
         let vk_format = format.vk_format();
         let device = Ctx::device();
         let instance = crate::state::Functions::instance();
-        let physical = Ctx::physical_device().handel;
+        let physical = Ctx::physical_device().handle;
         let info = vk::PhysicalDeviceSparseImageFormatInfo2::default()
             .format(vk_format)
             .ty(D::IMAGE_TYPE)
@@ -355,7 +356,7 @@ impl<F: Format + ColorAspect, U: ImageUsage, D: Dim> SparseImage<F, U, D> {
             )));
         };
         let mip_tail =
-            (colour_requirements.image_mip_tail_first_lod < mip_levels).then(|| MipTail {
+            (colour_requirements.image_mip_tail_first_lod < mip_levels).then_some(MipTail {
                 first_mip: colour_requirements.image_mip_tail_first_lod,
                 size: colour_requirements.image_mip_tail_size,
                 offset: colour_requirements.image_mip_tail_offset,
@@ -466,7 +467,7 @@ impl<'a> SparseBind<'a> {
     pub fn image<F: Format + ColorAspect, U: ImageUsage, D: Dim>(
         image: &'a SparseImage<F, U, D>,
         mip: u32,
-        offset: D::Extent,
+        offset: D::Offset,
         extent: D::Extent,
         resident: bool,
     ) -> Self {
@@ -483,18 +484,19 @@ impl<'a> SparseBind<'a> {
             );
         }
         let mip_extent = image.mip_extent(mip);
-        assert!(
-            D::region_fits(mip_extent, offset, extent),
-            "the box of {extent:?} at {offset:?} doesn't fit mip {mip} of {mip_extent:?}"
-        );
         let (o, e, m) = (
-            D::unsigned_offset_3d(offset),
+            D::offset_3d(offset),
             D::extent_3d(extent),
             D::extent_3d(mip_extent),
         );
+        assert!(
+            box_inside(o, e, m) && !box_is_empty(e),
+            "the box of {extent:?} at {offset:?} doesn't fit mip {mip} of {mip_extent:?}"
+        );
         let g = image.granularity;
-        let whole =
-            |o: i32, e: u32, m: u32, g: u32| o as u32 % g == 0 && (e % g == 0 || o as u32 + e == m);
+        let whole = |o: i32, e: u32, m: u32, g: u32| {
+            (o as u32).is_multiple_of(g) && (e.is_multiple_of(g) || o as u32 + e == m)
+        };
         assert!(
             whole(o.x, e.width, m.width, g.width)
                 && whole(o.y, e.height, m.height, g.height)

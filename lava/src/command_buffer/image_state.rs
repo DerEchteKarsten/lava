@@ -133,7 +133,8 @@ pub(crate) fn take_checked_states(
     for_each(states, mips, |state, mips| {
         let old = ImageState::unpack(state.swap(new.pack(), Ordering::Relaxed));
         match &mut run {
-            Some((run_mips, run_old)) if *run_old == old && run_mips.end == mips.start => {
+            // `for_each` goes through the mips in order, so a run continues at `mips.start`.
+            Some((run_mips, run_old)) if *run_old == old => {
                 run_mips.end = mips.end;
             }
             _ => {
@@ -167,8 +168,11 @@ pub(crate) fn release_states(
         let mine = state.owner.is_none_or(|owner| owner == kind);
         assert!(
             mine && state.released_to.is_none(),
-            "only the family that owns an image releases it: this one is owned by {:?}{}",
-            state.owner,
+            "only the family that owns an image releases it: this one is owned by the {} family{}",
+            match state.owner {
+                Some(owner) => format!("{owner:?}"),
+                None => "no".into(),
+            },
             match state.released_to {
                 Some(to) => format!(" and released to {to:?}"),
                 None => String::new(),
@@ -217,7 +221,9 @@ pub(crate) fn host_layouts(
     for_each(states, mips, |state, mips| {
         let previous = ImageState::load(state).layout;
         match &mut old {
-            Some((run, run_layout)) if *run_layout == previous => *run = (run.start..mips.end).into(),
+            Some((run, run_layout)) if *run_layout == previous => {
+                *run = (run.start..mips.end).into()
+            }
             _ => {
                 if let Some((run, run_layout)) = old.replace((mips, previous))
                     && run_layout != layout
@@ -238,7 +244,10 @@ pub(crate) fn host_layouts(
 #[cfg(feature = "host-image-copy")]
 pub(crate) fn commit_host_layouts(states: &[AtomicU64], mips: Range<u32>, layout: vk::ImageLayout) {
     for_each(states, mips, |state, _| {
-        let new = ImageState { layout, ..ImageState::load(state) };
+        let new = ImageState {
+            layout,
+            ..ImageState::load(state)
+        };
         state.store(new.pack(), Ordering::Relaxed);
     });
 }

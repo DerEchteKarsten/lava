@@ -6,7 +6,7 @@ mod state {
     use std::{cell::Cell, panic::Location};
 
     thread_local! {
-        pub static CALLSITE: Cell<Option<Location<'static>>> = Cell::new(None);
+        pub static CALLSITE: Cell<Option<Location<'static>>> = const { Cell::new(None) };
     }
 
     pub struct CallsiteGuard {

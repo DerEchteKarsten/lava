@@ -15,7 +15,6 @@ raw-window-handle = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 png = { workspace = true }
-smallvec = { workspace = true }
 
 [features]
 # Every lava feature checked at runtime, so the tests cover what the device has.

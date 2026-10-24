@@ -83,6 +83,8 @@ public struct Img<E : ITexelElement, Shape : __ITextureShape, let U : int> {
 
 __generic<E : ITexelElement, Shape : __ITextureShape>
 public extension Img<E, Shape, 0> {
+    /// The texel at `p` of the first mip the handle names (`Mip(level)` for another). A null
+    /// handle reads an undefined value: check `IsNull()` where one can be null.
     [ForceInline] public E Load(vector<uint, Shape.dimensions> p) {
         return sampled()[p];
     }

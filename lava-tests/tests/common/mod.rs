@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod golden;
+pub mod render;
 
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
@@ -84,7 +85,11 @@ static PIPELINE_CACHE: OnceLock<&'static std::path::Path> = OnceLock::new();
 /// Makes the process's context load and save its pipeline cache at `path`
 /// (`Config::pipeline_cache`); call before the first `gpu()`.
 pub fn pipeline_cache(path: &'static std::path::Path) {
-    assert_eq!(*PIPELINE_CACHE.get_or_init(|| path), path, "one cache per process");
+    assert_eq!(
+        *PIPELINE_CACHE.get_or_init(|| path),
+        path,
+        "one cache per process"
+    );
 }
 
 static GPU: LazyLock<Mutex<Gpu>> = LazyLock::new(|| {

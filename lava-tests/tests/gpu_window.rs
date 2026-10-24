@@ -4,14 +4,17 @@ mod common;
 use std::process::ExitCode;
 
 use lava::{
+    Ctx,
     bindless::{self, ImageHandle, Storage},
     image::{
         format::{self, A2B10G10R10UnormPack32, B8G8R8A8Unorm, ClearValue, R8Unorm},
         usage::usage,
     },
-    present::{ColorSpace, CompositeAlpha, PresentMode, PresentSurface, SurfaceFormat, present_all},
+    present::{
+        ColorSpace, CompositeAlpha, PresentMode, PresentSurface, SurfaceFormat, present_all,
+    },
     queue::{Graphics, Timeline},
-    state::{Ctx, raw_vulkan as vk},
+    vk,
 };
 use lava_tests::bindings::*;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -64,7 +67,11 @@ fn panic_message(f: impl FnOnce()) -> String {
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("it panics");
     match panic.downcast::<String>() {
         Ok(message) => *message,
-        Err(panic) => panic.downcast_ref::<&str>().copied().unwrap_or_default().to_owned(),
+        Err(panic) => panic
+            .downcast_ref::<&str>()
+            .copied()
+            .unwrap_or_default()
+            .to_owned(),
     }
 }
 
@@ -118,7 +125,11 @@ fn run(event_loop: &ActiveEventLoop) {
     step("init_with_display");
 
     let mut surface = surface_for(&window).unwrap();
-    assert_eq!(surface.size(), glam::UVec2::ZERO, "no swapchain before the first acquire");
+    assert_eq!(
+        surface.size(),
+        glam::UVec2::ZERO,
+        "no swapchain before the first acquire"
+    );
     let modes = surface.present_modes();
     assert_eq!(modes[0], PresentMode::Fifo);
     assert!(surface.supports(PresentMode::Fifo));
@@ -130,7 +141,11 @@ fn run(event_loop: &ActiveEventLoop) {
 
     let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
     let mut handles = Vec::new();
-    for color in [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]] {
+    for color in [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ] {
         handles.push(present_frame(&mut timeline, &mut surface, SIZE, color));
     }
     assert_eq!(surface.size(), SIZE);
@@ -145,13 +160,20 @@ fn run(event_loop: &ActiveEventLoop) {
     present_frame(&mut timeline, &mut surface, SIZE / 2, [1.0, 1.0, 0.0, 1.0]);
     assert_eq!(surface.size(), SIZE / 2);
     let new = present_frame(&mut timeline, &mut surface, SIZE / 2, [1.0, 0.0, 1.0, 1.0]);
-    assert!(!handles.contains(&new), "the old swapchain's slots stay taken until it is destroyed");
+    assert!(
+        !handles.contains(&new),
+        "the old swapchain's slots stay taken until it is destroyed"
+    );
     // An acquire destroys the old swapchain once nothing uses it, freeing the lowest slots.
     for _ in 0..2 {
         lava::wait_idle().unwrap();
         present_frame(&mut timeline, &mut surface, SIZE / 2, [0.0, 0.0, 0.0, 1.0]);
     }
-    let lowest = handles.iter().map(|h| h.storage_slot().unwrap()).min().unwrap();
+    let lowest = handles
+        .iter()
+        .map(|h| h.storage_slot().unwrap())
+        .min()
+        .unwrap();
     let reserved = bindless::reserve::<Storage>(old_images as u32).unwrap();
     assert_eq!(reserved.slots().start, lowest);
     drop(reserved);
@@ -177,11 +199,15 @@ fn run(event_loop: &ActiveEventLoop) {
     let submission = timeline.begin().unwrap();
     assert!(surface.acquire(SIZE).unwrap());
     let unpresented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        submission.submit(|cmd| cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4])))
+        submission
+            .submit(|cmd| cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4])))
     }));
     let message = unpresented.expect_err("the submission that uses the current image presents it");
     let message = message.downcast_ref::<&str>().copied().unwrap_or_default();
-    assert!(message.contains("must present it"), "a real panic with a message: {message:?}");
+    assert!(
+        message.contains("must present it"),
+        "a real panic with a message: {message:?}"
+    );
     submit_without_presenting(&mut timeline, &mut surface);
     let submission = timeline.begin().unwrap();
     let twice = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -222,7 +248,10 @@ fn run(event_loop: &ActiveEventLoop) {
             cmd.clear_image(surface.current_image(), ClearValue::Float([0.5; 4]));
         });
     });
-    assert!(message.contains("present must be the image's last command"), "{message}");
+    assert!(
+        message.contains("present must be the image's last command"),
+        "{message}"
+    );
     surface.present().unwrap();
     present_frame(&mut timeline, &mut surface, SIZE, [0.0, 0.0, 0.0, 1.0]);
     step("an_access_after_present_panics");
@@ -240,7 +269,15 @@ fn run(event_loop: &ActiveEventLoop) {
         }
     }
     #[allow(unreachable_patterns)]
-    let latest_ready = PresentMode::ALL.iter().find(|m| !matches!(m, PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::Mailbox | PresentMode::Immediate));
+    let latest_ready = PresentMode::ALL.iter().find(|m| {
+        !matches!(
+            m,
+            PresentMode::Fifo
+                | PresentMode::FifoRelaxed
+                | PresentMode::Mailbox
+                | PresentMode::Immediate
+        )
+    });
     match latest_ready {
         Some(mode) if surface.supports(*mode) => println!("presented with {mode:?}"),
         _ => println!("SKIPPED FifoLatestReady: the surface doesn't support it"),
@@ -324,7 +361,11 @@ fn run(event_loop: &ActiveEventLoop) {
     let third_window = create_window(event_loop, "lava test 3");
     let mut third = surface_preferring(&third_window, &hdr).unwrap();
     assert!(third.is_preferred_format());
-    assert!(hdr.contains(&third.surface_format()), "{:?}", third.surface_format());
+    assert!(
+        hdr.contains(&third.surface_format()),
+        "{:?}",
+        third.surface_format()
+    );
     println!("the HDR test surface presents {:?}", third.surface_format());
     present_frame(&mut timeline, &mut third, SIZE, [0.5, 0.5, 0.5, 1.0]);
     drop(third);

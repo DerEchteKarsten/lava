@@ -4,16 +4,12 @@ use std::{hint::black_box, time::Instant};
 
 use glam::{UVec2, Vec2, Vec4};
 use lava::{
+    Ctx,
     bindless::{Sampler, SamplerDesc},
     buffer::Buffer,
     command_buffer::{Accesses, Attachment, CommandBuffer, Draw, ImageUse, RasterState},
-    image::{
-        Image,
-        format::R8G8B8A8Unorm,
-        usage::usage,
-    },
+    image::{Image, format::R8G8B8A8Unorm, usage::usage},
     queue::{Graphics, Timeline},
-    state::Ctx,
 };
 use lava_tests::bindings::*;
 
@@ -41,18 +37,49 @@ struct Resources {
 fn compute(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     for i in 0..32 {
         cmd.compute(
-            &TestComputeBuffer::push_bindings(TestComputeBufferArgs { src: r.src.range(..), dst: r.dst[i % 16].range(..), count: 64, multiplier: i as u32 }, None),
-            [1, 1, 1]);
+            &TestComputeBuffer::push_bindings(
+                TestComputeBufferArgs {
+                    src: r.src.range(..),
+                    dst: r.dst[i % 16].range(..),
+                    count: 64,
+                    multiplier: i as u32,
+                },
+                None,
+            ),
+            [1, 1, 1],
+        );
     }
     for i in 0..16 {
         cmd.compute(
-            &TestConstants::push_bindings(TestConstantsArgs { offset: i, count: 8 }, TestConstantsConstants { out: r.out.range(..), target: r.target.whole_view(), multiplier: 3, brightness: 1.0 }, None),
-            [1, 1, 1]);
+            &TestConstants::push_bindings(
+                TestConstantsArgs {
+                    offset: i,
+                    count: 8,
+                },
+                TestConstantsConstants {
+                    out: r.out.range(..),
+                    target: r.target.whole_view(),
+                    multiplier: 3,
+                    brightness: 1.0,
+                },
+                None,
+            ),
+            [1, 1, 1],
+        );
     }
     for i in 0..16 {
         cmd.compute(
-            &TestComputeImage::push_bindings(TestComputeImageArgs { target: r.target.whole_view(), tint: Vec4::splat(i as f32 / 16.0), offset: UVec2::ZERO, size: UVec2::splat(8) }, None),
-            [1, 1, 1]);
+            &TestComputeImage::push_bindings(
+                TestComputeImageArgs {
+                    target: r.target.whole_view(),
+                    tint: Vec4::splat(i as f32 / 16.0),
+                    offset: UVec2::ZERO,
+                    size: UVec2::splat(8),
+                },
+                None,
+            ),
+            [1, 1, 1],
+        );
     }
 }
 
@@ -111,7 +138,15 @@ fn declared(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
 /// 8 renderings of 4 mesh-shader launches without accesses: a binding of push constants only.
 fn mesh(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
     let launch = |i: u32| {
-        TestMesh::push_bindings(TestMeshArgs { color: Vec4::ONE, group_offset: Vec2::new(i as f32, 0.0), scale: 0.1 }, None).expect("mesh shaders")
+        TestMesh::push_bindings(
+            TestMeshArgs {
+                color: Vec4::ONE,
+                group_offset: Vec2::new(i as f32, 0.0),
+                scale: 0.1,
+            },
+            None,
+        )
+        .expect("mesh shaders")
     };
     let state = RasterState::default;
     for _ in 0..8 {
@@ -127,6 +162,9 @@ fn mesh(cmd: &mut CommandBuffer<Graphics>, r: &Resources) {
 const WARMUP: usize = 200;
 const FRAMES: usize = 3000;
 
+/// Records one scenario's commands.
+type Scenario = fn(&mut CommandBuffer<Graphics>, &Resources);
+
 fn main() {
     lava::init(&lava::Config::new(&PASS_MAP)).expect("headless lava init failed");
     let mut timeline = Timeline::<Graphics>::new(2, 0).unwrap();
@@ -138,20 +176,19 @@ fn main() {
             .map(|_| {
                 Texture::new(UVec2::splat(4))
                     .unwrap()
-                    .bind_sampled().unwrap()
+                    .bind_sampled()
+                    .unwrap()
             })
             .collect(),
         src: buffer(256),
         dst: (0..16).map(|_| buffer(256)).collect(),
         out: buffer(256),
         vertices: Buffer::new(6).unwrap(),
-        textured: (0..TEXTURES)
-            .map(|_| Buffer::new(4).unwrap())
-            .collect(),
+        textured: (0..TEXTURES).map(|_| Buffer::new(4).unwrap()).collect(),
         indices: Buffer::new(6).unwrap(),
     };
 
-    let mut scenarios: Vec<(&str, fn(&mut CommandBuffer<Graphics>, &Resources))> = vec![
+    let mut scenarios: Vec<(&str, Scenario)> = vec![
         ("compute", compute),
         ("many_draws", many_draws),
         ("declared", declared),

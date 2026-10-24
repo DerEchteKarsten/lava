@@ -7,7 +7,7 @@ A Vulkan abstraction for Rust that keeps Vulkan's model but takes its bookkeepin
 - **Typed passes generated from shaders.** `lava-build-slang` compiles your Slang passes in your build script and generates a Rust function per pass whose arguments are the pass's push constants: buffer slices, image views, plain values. A wrong buffer or image type doesn't compile.
 - **Timelines.** Work is submitted on up to eight timelines (graphics, and async compute and transfer where the device has them), ordered across them with waits, with image ownership transfers recorded on request. Presenting needs no semaphores of your own: the swapchain image's acquire and present follow from what your submission does with it.
 - **Deferred destruction.** Dropped objects are destroyed once no submission in flight can reach them.
-- **Dynamic state.** A draw's raster state (culling, depth, stencil, blending, lines, …) is dynamic state, so pipelines depend only on the shaders, their constants and the attachment formats.
+- **Draw state per draw.** A draw's raster state (culling, depth, stencil, blending, lines, …) is a value of the draw. Core state is always dynamic; extended dynamic state is dynamic where the device has it (the `dynamic-*` features) and otherwise part of the pipeline's key, so a pipeline depends on the shaders, their constants, the attachment formats and the state the device can't set dynamically.
 
 lava is young (0.x) and is developed alongside a game engine. Expect breaking changes.
 
@@ -30,6 +30,9 @@ lava is young (0.x) and is developed alongside a game engine. Expect breaking ch
 - The `dynamic-*` features are extended dynamic state. Where the device has a state, draws that differ in it share a pipeline. Elsewhere the state is part of the pipeline's key. Asserting one keeps it out of the key.
 - An application that turns off lava's defaults (`default-features = false`) must do so in every crate that depends on lava, since cargo enables the union of all of them.
 - The Slang SDK at build time, found through `SLANG_DIR`, and an rpath to it for build scripts and hot-reload binaries. [`lava-build-slang`](lava-build-slang/README.md#setting-up-slang) shows the setup.
+- `ash` is a public dependency: `lava::vk` is ash's `vk` module (with what lava needs from newer headers), and lava's API uses its types. An ash upgrade is a breaking lava release; use `lava::vk` instead of an `ash` of your own.
+
+The common types and traits are at the crate root and in `lava::prelude` (with the `glam` and `bytemuck` modules lava re-exports, which the generated bindings use, so an application needs neither as a dependency of its own).
 
 lava is tested on Linux with Mesa's ANV driver (Intel Arc).
 
@@ -40,8 +43,6 @@ lava is tested on Linux with Mesa's ANV driver (Intel Arc).
 ```toml
 [dependencies]
 lava = "0.1"
-glam = { version = "0.32", features = ["bytemuck"] }
-bytemuck = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 lava-build-slang = "0.1"
@@ -89,31 +90,32 @@ fn main() {
 `src/main.rs`:
 
 ```rust
-use lava::{
-    buffer::Buffer,
-    queue::{Graphics, Timeline},
-};
+use lava::{buffer::Upload, prelude::*};
 
 mod bindings {
     lava::include_passes!();
 }
-use bindings::{Double, PASS_MAP};
+use bindings::{Double, DoubleArgs, PASS_MAP};
 
 fn main() -> lava::Result<()> {
     lava::init(&lava::Config::new(&PASS_MAP))?;
 
-    let mut values = Buffer::<u32>::new(256, true)?;
+    // Host-visible memory the GPU reads and writes through its address.
+    let mut values: Buffer<u32, Upload> = Buffer::upload(256)?;
     values.host_mut().iter_mut().enumerate().for_each(|(i, v)| *v = i as u32);
 
-    let mut timeline = Timeline::<Graphics>::new(2)?;
+    // Two frames in flight, no staging ring.
+    let mut timeline = Timeline::<Graphics>::new(2, 0)?;
     let submission = timeline.begin()?;
     let done = submission.submit(|cmd| {
-        cmd.compute(&Double::push_bindings(values.range(..), 256), [4, 1, 1], None);
+        let args = DoubleArgs { values: values.range(..), count: 256 };
+        cmd.compute(&Double::push_bindings(args, None), Double::groups([256, 1, 1]));
     })?;
     done.block()?;
 
     assert_eq!(values.host()[100], 200);
-    Ok(())
+    drop((values, timeline));
+    lava::shutdown()
 }
 ```
 

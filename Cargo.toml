@@ -12,7 +12,7 @@ repository = "https://github.com/DerEchteKarsten/lava"
 
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics"] }
-glam = { version = "0.32", features = ["bytemuck", "mint"] }
+glam = { version = "0.32", features = ["bytemuck"] }
 ash = "0.38.0"
 ash-window = "0.13.0"
 gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
@@ -25,3 +25,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 notify = "8.2.0"
 png = "0.18"
+quote = "1.0.47"
+syn = { version = "3.0.4", features = ["full"] }

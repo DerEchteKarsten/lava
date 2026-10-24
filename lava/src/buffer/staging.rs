@@ -11,9 +11,9 @@ use std::{
 };
 
 use bytemuck::{AnyBitPattern, NoUninit};
-use std::mem::MaybeUninit;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
+use std::mem::MaybeUninit;
 
 use crate::{
     buffer::{Buffer, Gpu, Memory, Upload, slice::BufferSlice},
@@ -85,7 +85,7 @@ impl Ring {
     /// Reserves `len` bytes (a multiple of `STAGING_ALIGN`, at most the size) at the head and
     /// counts the writer in; `None` while they don't fit before the tail.
     pub(crate) fn reserve(&self, len: u64) -> Option<Reservation> {
-        debug_assert!(len % STAGING_ALIGN == 0 && len <= self.size);
+        debug_assert!(len.is_multiple_of(STAGING_ALIGN) && len <= self.size);
         let mut packed = self.head.load(SeqCst);
         loop {
             let (pos, writers) = (packed & POSITION_MASK, packed >> POSITION_BITS);
@@ -225,7 +225,7 @@ impl Staging {
     /// registered in its index.
     pub(crate) fn new(timeline: usize, size: u64) -> Result<Arc<Self>> {
         let size = size.next_multiple_of(STAGING_ALIGN);
-        let buffer = Buffer::raw(Upload, size, Some(STAGING_ALIGN as u64))?;
+        let buffer = Buffer::raw(Upload, size, Some(STAGING_ALIGN))?;
         let staging = Arc::new(Self {
             buffer,
             ring: Ring::new(size),
@@ -494,7 +494,9 @@ impl Uploader {
         let ptr = staging.buffer.mapping().expect("upload memory is mapped");
         // SAFETY: the reserved region is the writer's alone until it is published and drained.
         let data = unsafe {
-            let ptr = ptr.add(reservation.offset as usize).cast::<MaybeUninit<T>>();
+            let ptr = ptr
+                .add(reservation.offset as usize)
+                .cast::<MaybeUninit<T>>();
             assert!(
                 ptr.is_aligned(),
                 "staged {}s at a misaligned {ptr:?}",
@@ -528,7 +530,9 @@ impl Uploader {
     ) -> Result<Buffer<T, Gpu>> {
         self.init_uninit(len, |address, data| {
             // SAFETY: any bytes are a valid `T`, and mapped memory holds bytes.
-            fill(address, unsafe { &mut *(data as *mut [MaybeUninit<T>] as *mut [T]) })
+            fill(address, unsafe {
+                &mut *(data as *mut [MaybeUninit<T>] as *mut [T])
+            })
         })
     }
 
@@ -583,7 +587,9 @@ impl Uploader {
         }
         if self.staging.is_some() {
             let address = buffer.address() + (offset * size_of::<T>()) as u64;
-            return self.stage(data.len(), Target::Buffer(address), |out| write_slice(out, data));
+            return self.stage(data.len(), Target::Buffer(address), |out| {
+                write_slice(out, data)
+            });
         }
         let Some(ptr) = buffer.coherent_mapping() else {
             return Err(Error::other(
@@ -611,7 +617,9 @@ impl Uploader {
     ) -> Result<()> {
         self.ring()?;
         let copy = image_copy(image, level, data.len())?;
-        self.stage(data.len(), Target::Image(copy), |out| write_slice(out, data))
+        self.stage(data.len(), Target::Image(copy), |out| {
+            write_slice(out, data)
+        })
     }
 }
 
@@ -619,7 +627,9 @@ impl Uploader {
 fn write_slice<T: Copy>(out: &mut [MaybeUninit<T>], data: &[T]) {
     assert_eq!(out.len(), data.len());
     // SAFETY: both hold `data.len()` elements and don't overlap (`out` is exclusive).
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out.as_mut_ptr().cast::<T>(), data.len()) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), out.as_mut_ptr().cast::<T>(), data.len())
+    };
 }
 
 /// The copy of `len` bytes into the whole mip `level` of `image`, checked: a colour image with
@@ -630,7 +640,7 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
     level: u32,
     len: usize,
 ) -> Result<ImageCopy> {
-    image.aspect_check(vk::ImageAspectFlags::COLOR);
+    image.format().aspect_check(vk::ImageAspectFlags::COLOR);
     image.usage_check(vk::ImageUsageFlags::TRANSFER_DST);
     assert!(
         level < image.mip_levels(),
@@ -643,7 +653,7 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
     let block = copy_block_of(&format, vk::ImageAspectFlags::COLOR);
     // Staged bytes start on `STAGING_ALIGN`, and a copy's address is a multiple of its block.
     assert!(
-        STAGING_ALIGN % block.bytes as u64 == 0,
+        STAGING_ALIGN.is_multiple_of(block.bytes as u64),
         "staged uploads into {:?} aren't supported: its {}-byte texel blocks don't divide the \
          ring's {STAGING_ALIGN}-byte alignment",
         format.vk_format(),

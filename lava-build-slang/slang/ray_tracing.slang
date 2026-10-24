@@ -37,13 +37,15 @@ public struct AccelerationStructureInstance {
     /// The BLAS's address (`AccelerationStructure::address`).
     public uint64_t blas;
 
+    /// `custom_index` and `sbt_offset` keep their low 24 bits, `mask` and `flags` their low 8:
+    /// larger values are cut silently (lava's Rust `Instance` asserts them).
     public __init(float3x4 object_to_world, uint64_t blas, uint custom_index = 0, uint mask = 0xFF,
                   uint sbt_offset = 0, uint flags = 0) {
         for (int row = 0; row < 3; row++) {
             transform[row] = object_to_world[row];
         }
-        custom_index_and_mask = (custom_index & 0xFFFFFF) | (mask << 24);
-        sbt_offset_and_flags = (sbt_offset & 0xFFFFFF) | (flags << 24);
+        custom_index_and_mask = (custom_index & 0xFFFFFF) | ((mask & 0xFF) << 24);
+        sbt_offset_and_flags = (sbt_offset & 0xFFFFFF) | ((flags & 0xFF) << 24);
         this.blas = blas;
     }
 }

@@ -1,5 +1,5 @@
 #pragma once
-// The scene of lava's ray tracing tests (`gpu_headless.rs` builds it): orthographic rays along +Z
+// The scene of lava's ray tracing tests (`gpu_ray_tracing.rs` builds it): orthographic rays along +Z
 // onto a wall at z = 0, with triangles and a sphere in front of it.
 
 /// The ray mask of every test ray: an instance with mask 0x02 is invisible.
