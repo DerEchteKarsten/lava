@@ -577,8 +577,7 @@ impl<T: Copy + 'static, M: HostVisible> Buffer<T, M> {
     }
 
     /// Writes `data` from element `first` on, checked like [`Self::host_mut`]. Only writes, so
-    /// it takes any `NoUninit` element (structs with image handles among them, which aren't
-    /// `AnyBitPattern`), where `host_mut` needs elements of any bit pattern.
+    /// it takes any `NoUninit` element, where `host_mut` needs elements of any bit pattern.
     #[track_caller]
     pub fn host_write(&mut self, first: usize, data: &[T])
     where

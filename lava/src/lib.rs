@@ -38,12 +38,12 @@
 //!   Specialization constants have no size limit.
 //! - Shaders see [`bindless::ImageHandle`] (a `u32`: bits 0 to 29 the slot of its first
 //!   descriptor, bit 30 that descriptor's kind, 0 sampled and 1 storage, bit 31 set for two
-//!   descriptors, sampled at the slot and storage at the next; all ones for none, and mip `i` of
-//!   a mip chain `i` times its width further), [`bindless::SamplerHandle`] (a `u32` slot; there
-//!   are no samplers but the ones the application creates) and
+//!   descriptors, sampled at the slot and storage at the next; zero for none (slot 0 of the
+//!   resource heap is never handed out), and mip `i` of a mip chain `i` times its width
+//!   further), [`bindless::SamplerHandle`] (a `u32` slot; slot 0 holds lava's default sampler,
+//!   every other one a sampler the application created) and
 //!   `acceleration_structure::Instance` (`VkAccelerationStructureInstanceKHR`); a
-//!   TLAS is a `u64` device address. Image handles aren't `Zeroable` (zero is sampled slot 0,
-//!   not the null handle), so generated structs that hold them are `NoUninit`, not `Pod`.
+//!   TLAS is a `u64` device address. Zeroed handles are null, so generated structs are `Pod`.
 //! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) has
 //!   bindings [`features::Gated`] by it.
 //!

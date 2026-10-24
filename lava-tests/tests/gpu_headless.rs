@@ -2612,7 +2612,9 @@ fn run_combined(
         let bindings = TestCombined::push_bindings(
             TestCombinedArgs {
                 target: target.whole_view(),
-                pair: pair.map_or(!0, |(handle, _)| handle.bits()),
+                pair: pair.map_or(ImageHandle::<Combined>::NULL.bits(), |(handle, _)| {
+                    handle.bits()
+                }),
                 mips: chain.mip_view(0),
                 sampled: sampled.handle::<bindless::Sampled>().erase(),
                 storage: storage.handle::<bindless::Storage>().erase(),
@@ -4766,7 +4768,7 @@ mod generated {
             },
             None,
         );
-        // A struct with handles is `NoUninit`, not `Pod`: compare the handle's bytes.
+        // The handle's bytes in the pushed struct.
         let offset = core::mem::offset_of!(CTestComputeImageBindings, target);
         let handle = image.handle::<bindless::Storage>();
         assert_eq!(

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, marker::PhantomData, ops::Range, ptr::NonNull, 
 
 use crate::error::{Error, Result};
 use crate::vk::{self, BorderColor, CompareOp, Filter, SamplerAddressMode, SamplerMipmapMode};
-use bytemuck::{NoUninit, Pod, Zeroable};
+use bytemuck::{Pod, Zeroable};
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -503,14 +503,7 @@ impl Sampler {
             })?;
         // From here on `Drop` frees the slot.
         let sampler = Sampler { index, _live: live };
-        let layout = &bindless.samplers;
-        let range = bindless
-            .sampler_heap
-            .host_range(layout.offset(index), layout.stride);
-        desc.with_create_info(|info| unsafe {
-            Functions::descriptor_heap()
-                .write_sampler_descriptors(std::slice::from_ref(info), &[range])
-        })??;
+        write_sampler(index, desc)?;
         Ok(sampler)
     }
 
@@ -526,14 +519,32 @@ impl Drop for Sampler {
     }
 }
 
+/// Writes `desc` into slot `index` of the sampler heap.
+fn write_sampler(index: u32, desc: &SamplerDesc) -> Result<()> {
+    let bindless = Bindless::get();
+    let layout = &bindless.samplers;
+    let range = bindless
+        .sampler_heap
+        .host_range(layout.offset(index), layout.stride);
+    desc.with_create_info(|info| unsafe {
+        Functions::descriptor_heap().write_sampler_descriptors(std::slice::from_ref(info), &[range])
+    })??;
+    Ok(())
+}
+
 /// A [`Sampler`] as shaders see it (`Sampler` in `bindless.slang`): its slot in the sampler
-/// heap. Unlike [`ImageHandle`] it stays `Pod` (so `Zeroable`): samplers have no null pattern
-/// shaders test for, and a zeroed one is the first sampler's slot, an ordinary sampler, not a
-/// descriptor of another kind.
+/// heap. A zeroed one ([`Self::DEFAULT`]) is slot 0, which lava fills with
+/// [`SamplerDesc::new`]'s sampler (trilinear, repeating) and never hands out, so zeroed structs
+/// sample sensibly.
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct SamplerHandle {
     pub index: u32,
+}
+
+impl SamplerHandle {
+    /// Slot 0: lava's default sampler, what a zeroed handle names.
+    pub const DEFAULT: Self = SamplerHandle { index: 0 };
 }
 
 /// The kinds of descriptors an [`ImageHandle`] names: [`Sampled`], [`Storage`], [`Combined`]
@@ -607,12 +618,11 @@ const PAIR: u32 = 1 << 31;
 /// An image as shaders see it (`Img` and `DynImg` in `bindless.slang`), one `u32`: bits 0 to 29
 /// are the slot of its first descriptor in the resource heap, bit 30 that descriptor's kind (0
 /// sampled, 1 storage), bit 31 how many there are (0 one, 1 two: sampled at the slot, storage
-/// at the next). [`Self::NULL`], all ones (storage first, two of them), names nothing.
-///
-/// It isn't `Zeroable`, since zero names sampled slot 0, not [`Self::NULL`] (its `Default`),
-/// so structs that hold handles start from `Default` and are written as `NoUninit`:
-/// ```compile_fail
+/// at the next). [`Self::NULL`], zero (sampled slot 0, which lava never hands out), names
+/// nothing, so a zeroed struct of handles holds null ones:
+/// ```
 /// let handle: lava::bindless::ImageHandle = bytemuck::Zeroable::zeroed();
+/// assert!(handle.is_null());
 /// ```
 ///
 /// `K` is what it is known to name: lava's binds and [`reserve`] make the typed kinds, which
@@ -624,11 +634,11 @@ pub struct ImageHandle<K: HandleKind = Dynamic> {
     kind: PhantomData<K>,
 }
 
-// SAFETY: a `u32` and a zero-sized marker, so no padding. Deliberately not `Zeroable` (and so
-// not `Pod`): zero is sampled slot 0, a real image, while the default is [`ImageHandle::NULL`],
-// so structs that hold handles are `NoUninit` (writes) and start from `Default`, never from
-// `zeroed()`.
-unsafe impl<K: HandleKind> NoUninit for ImageHandle<K> {}
+// SAFETY: a `u32` and a zero-sized marker: no padding, every bit pattern a value, and zero is
+// `NULL`.
+unsafe impl<K: HandleKind> bytemuck::Zeroable for ImageHandle<K> {}
+// SAFETY: as above.
+unsafe impl<K: HandleKind> bytemuck::Pod for ImageHandle<K> {}
 
 impl<K: HandleKind> Clone for ImageHandle<K> {
     fn clone(&self) -> Self {
@@ -665,8 +675,9 @@ impl<K: HandleKind> std::fmt::Debug for ImageHandle<K> {
 }
 
 impl<K: HandleKind> ImageHandle<K> {
-    /// No image; a `DynImg` reads zeroes from it.
-    pub const NULL: Self = Self::from_bits(!0);
+    /// No image (zero, sampled slot 0, which lava never hands out); a `DynImg` reads zeroes
+    /// from it.
+    pub const NULL: Self = Self::from_bits(0);
 
     pub(crate) const fn from_bits(bits: u32) -> Self {
         Self {
@@ -752,6 +763,10 @@ impl<K: Allocatable> ImageHandle<K> {
         assert!(
             slot + K::WIDTH - 1 <= SLOT,
             "image slot {slot} doesn't fit a handle"
+        );
+        assert!(
+            slot > 0,
+            "image slot 0 is reserved: its sampled handle is `NULL`"
         );
         Self::from_bits(slot | K::BITS)
     }
@@ -970,18 +985,24 @@ impl Bindless {
         );
         let resource_heap = HeapBuffer::new(&images, p.resource_heap_alignment)?;
         let sampler_heap = HeapBuffer::new(&samplers, p.sampler_heap_alignment)?;
+        // Slot 0 of each heap is never handed out: a zeroed image handle (`ImageHandle::NULL`)
+        // names no image, and a zeroed `SamplerHandle` lava's default sampler, written below.
+        let (mut free, mut free_samplers) =
+            (Ranges::all(images.count), Ranges::all(samplers.count));
+        let reserved = (free.take(1), free_samplers.take(1));
+        debug_assert_eq!(reserved, (Some(0), Some(0)));
         BINDLESS.set(Self {
-            free: Mutex::new(Ranges::all(images.count)),
+            free: Mutex::new(free),
             reserved: Default::default(),
             rebound: Default::default(),
-            free_samplers: Mutex::new(Ranges::all(samplers.count)),
+            free_samplers: Mutex::new(free_samplers),
             images,
             samplers,
             resource_heap,
             sampler_heap,
             queued: Mutex::new(BTreeMap::new()),
         });
-        Ok(())
+        write_sampler(0, &SamplerDesc::new())
     }
 
     /// Binds both heaps, unless `kind` is a transfer family, which runs no shaders.

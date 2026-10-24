@@ -6,11 +6,12 @@
 //
 // An image handle (`lava::bindless::ImageHandle`) is one `uint32_t`: bits 0 to 29 are the slot
 // of its first descriptor, bit 30 that descriptor's kind (0 sampled, 1 storage), bit 31 how many
-// there are (0 one, 1 two: sampled at the slot, storage at the next). `NULL_HANDLE` names
-// nothing.
+// there are (0 one, 1 two: sampled at the slot, storage at the next). `NULL_HANDLE`, zero
+// (sampled slot 0, which lava never hands out), names nothing, so zeroed structs hold null
+// handles; a zeroed `Sampler` is slot 0 of the sampler heap, lava's default sampler.
 
 /// The handle of no image; matches `lava::bindless::ImageHandle::NULL`.
-public static const uint32_t NULL_HANDLE = 0xFFFFFFFF;
+public static const uint32_t NULL_HANDLE = 0;
 static const uint32_t HANDLE_SLOT = 0x3FFFFFFF;
 
 /// The slot of a handle's sampled descriptor, if `handleHasSampled`.
@@ -22,7 +23,7 @@ static const uint32_t HANDLE_SLOT = 0x3FFFFFFF;
     return (handle & HANDLE_SLOT) + (handle >> 31);
 }
 [ForceInline] internal bool handleHasSampled(uint32_t handle) {
-    return (handle & (1u << 30)) == 0;
+    return handle != NULL_HANDLE && (handle & (1u << 30)) == 0;
 }
 [ForceInline] internal bool handleHasStorage(uint32_t handle) {
     return handle != NULL_HANDLE && (handle >> 30) != 0;

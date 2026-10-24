@@ -462,23 +462,13 @@ fn layout_checks(rust_name: &str, fields: &[(String, u32)], size: u32) -> String
     out
 }
 
-fn derives(handles: bool) -> &'static str {
-    match handles {
-        true => "::lava::bytemuck::NoUninit",
-        false => "::lava::bytemuck::Pod, ::lava::bytemuck::Zeroable",
-    }
+fn derives(_handles: bool) -> &'static str {
+    "::lava::bytemuck::Pod, ::lava::bytemuck::Zeroable"
 }
 
-/// The value of a zeroed `ty` in `Default`: null handles, zero elsewhere.
-fn zero(ty: &Ty) -> String {
-    match ty {
-        Ty::Image(_) | Ty::DynImg => "::lava::bindless::ImageHandle::NULL".into(),
-        Ty::Array { element, count, .. } if ty.holds_handles() => {
-            format!("[{}; {count}]", zero(element))
-        }
-        Ty::Struct(_) if ty.holds_handles() => "::core::default::Default::default()".into(),
-        _ => "::lava::bytemuck::Zeroable::zeroed()".into(),
-    }
+/// The value of a zeroed `ty` in `Default`: zero, null for handles (`ImageHandle::NULL` is 0).
+fn zero(_ty: &Ty) -> String {
+    "::lava::bytemuck::Zeroable::zeroed()".into()
 }
 
 /// The texel type lava's formats have for an image of `texel`s (`HasTexels`): halves read as

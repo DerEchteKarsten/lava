@@ -343,8 +343,8 @@ fn layouts(tex: ImageHandle<bindless::Sampled>) -> Layouts {
 #[test]
 fn generated_structs_keep_slangs_layout() {
     let mut gpu = gpu();
-    // Gaps are zeroed pads, `Default` nulls handles, and a struct Slang doesn't round up is
-    // packed.
+    // Gaps are zeroed pads, `Default` is all zeroes (null handles), and a struct Slang doesn't
+    // round up is packed.
     assert_eq!(size_of::<Layouts>(), 376);
     assert_eq!(size_of::<Inner>(), 12);
     let default = Layouts::default();
@@ -353,11 +353,7 @@ fn generated_structs_keep_slangs_layout() {
         (ImageHandle::NULL, ImageHandle::NULL)
     );
     let bytes = bytemuck::bytes_of(&default);
-    assert_eq!(
-        bytes.iter().filter(|b| **b != 0).count(),
-        8,
-        "only the two null handles"
-    );
+    assert!(bytes.iter().all(|b| *b == 0), "null handles are zeroes too");
 
     let first = Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::ONE)
         .unwrap()
@@ -413,7 +409,7 @@ fn generated_structs_keep_slangs_layout() {
     gpu.submit(|cmd| cmd.compute(&bindings, [1, 1, 1]));
     let before = layouts(handles[0]);
     // SAFETY: the submission completed, and every bit pattern is a `Layouts` (handles are
-    // plain `u32`s, only not `Zeroable`).
+    // plain `u32`s).
     let after: Layouts = unsafe { output.host_ptr().read() };
     assert_eq!((after.a, after.b), (2, (1 << 40) + 1));
     assert_eq!((after.h.to_f32(), after.after_half), (3.0, 3.0));

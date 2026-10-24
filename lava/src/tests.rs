@@ -954,7 +954,10 @@ fn image_handles_encode_their_slots_and_kind() {
     assert_eq!(storage.erase().narrow::<Sampled>(), None);
 
     let null = ImageHandle::<Combined>::NULL;
-    assert_eq!(null.bits(), !0);
+    assert_eq!(null.bits(), 0);
+    let message = panic_message(|| ImageHandle::<Sampled>::new(0));
+    assert!(message.contains("slot 0 is reserved"), "{message}");
+    assert!(<ImageHandle<Combined> as bytemuck::Zeroable>::zeroed() == null);
     assert!(null.is_null() && ImageHandle::<Sampled>::default().is_null());
     assert_eq!((null.sampled_slot(), null.storage_slot()), (None, None));
     assert_eq!(null.erase().narrow::<Sampled>(), None);
