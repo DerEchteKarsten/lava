@@ -301,6 +301,7 @@ fn describe_device(instance: &ash::Instance, handel: vk::PhysicalDevice) -> Resu
         topology_unrestricted: eds3_properties.dynamic_primitive_topology_unrestricted == vk::TRUE,
         max_multi_draw_count: multi_draw_properties.max_multi_draw_count,
         multiview_mesh_shader,
+        stale_trace_reads: vk12_properties.driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA,
         mem_properties,
         handel,
         name,
@@ -341,6 +342,18 @@ impl Ctx {
     > {
         crate::features::gate::<gate::MeshShader, _>(|| {
             &Ctx::get().physical_device.mesh_shader_properties
+        })
+    }
+    /// The acceleration structure limits (`maxGeometryCount`, `maxInstanceCount`,
+    /// `maxPrimitiveCount`, ...), which structure creation checks.
+    #[cfg(feature = "acceleration-structure")]
+    pub fn acceleration_structure_properties() -> crate::features::Gated<
+        gate::AccelerationStructure,
+        &'static vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
+    > {
+        crate::features::gate::<gate::AccelerationStructure, _>(|| {
+            (Ctx::get().physical_device.acceleration_structure_properties.as_ref())
+                .expect("the properties of a device with acceleration structures")
         })
     }
     /// The family index of `kind`'s queues, `None` where lava has none.

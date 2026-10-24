@@ -9,7 +9,7 @@ use std::{
 
 use crate::error::{Error, Result};
 use crate::vk::{self, BorderColor, CompareOp, Filter, SamplerAddressMode, SamplerMipmapMode};
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{NoUninit, Pod, Zeroable};
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -136,7 +136,7 @@ unsafe impl Sync for HeapBuffer {}
 impl HeapBuffer {
     fn new(layout: &HeapLayout, alignment: u64) -> Result<Self> {
         let usage = vk::BUFFER_USAGE_DESCRIPTOR_HEAP_EXT;
-        let buffer = Buffer::with_flags(usage, Upload, layout.size.max(1), Some(alignment as u32))?;
+        let buffer = Buffer::with_flags(usage, Upload, layout.size.max(1), Some(alignment as u64))?;
         let mapped = NonNull::new(buffer.host_ptr()).expect("a mapping isn't null");
         // Slots never written read as zeroes rather than whatever the memory held.
         unsafe { mapped.write_bytes(0, layout.size as usize) };
@@ -169,7 +169,7 @@ pub(crate) struct Ranges {
 }
 
 impl Ranges {
-    fn all(count: u32) -> Self {
+    pub(crate) fn all(count: u32) -> Self {
         let free = if count == 0 {
             Vec::new()
         } else {
@@ -531,7 +531,9 @@ impl Drop for Sampler {
 }
 
 /// A [`Sampler`] as shaders see it (`Sampler` in `bindless.slang`): its slot in the sampler
-/// heap.
+/// heap. Unlike [`ImageHandle`] it stays `Pod` (so `Zeroable`): samplers have no null pattern
+/// shaders test for, and a zeroed one is the first sampler's slot, an ordinary sampler, not a
+/// descriptor of another kind.
 #[derive(Pod, Zeroable, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct SamplerHandle {
@@ -611,6 +613,12 @@ const PAIR: u32 = 1 << 31;
 /// sampled, 1 storage), bit 31 how many there are (0 one, 1 two: sampled at the slot, storage
 /// at the next). [`Self::NULL`], all ones (storage first, two of them), names nothing.
 ///
+/// It isn't `Zeroable`, since zero names sampled slot 0, not [`Self::NULL`] (its `Default`),
+/// so structs that hold handles start from `Default` and are written as `NoUninit`:
+/// ```compile_fail
+/// let handle: lava::bindless::ImageHandle = bytemuck::Zeroable::zeroed();
+/// ```
+///
 /// `K` is what it is known to name: lava's binds and [`reserve`] make the typed kinds, which
 /// [`Self::erase`] turns into [`Dynamic`], and [`Self::as_sampled`]/[`Self::as_storage`] into
 /// the part of a [`Combined`] handle a shader reads; every one of them keeps the bits.
@@ -620,9 +628,11 @@ pub struct ImageHandle<K: HandleKind = Dynamic> {
     kind: PhantomData<K>,
 }
 
-// SAFETY: a `u32` and a zero-sized marker.
-unsafe impl<K: HandleKind> Zeroable for ImageHandle<K> {}
-unsafe impl<K: HandleKind> Pod for ImageHandle<K> {}
+// SAFETY: a `u32` and a zero-sized marker, so no padding. Deliberately not `Zeroable` (and so
+// not `Pod`): zero is sampled slot 0, a real image, while the default is [`ImageHandle::NULL`],
+// so structs that hold handles are `NoUninit` (writes) and start from `Default`, never from
+// `zeroed()`.
+unsafe impl<K: HandleKind> NoUninit for ImageHandle<K> {}
 
 impl<K: HandleKind> Clone for ImageHandle<K> {
     fn clone(&self) -> Self {

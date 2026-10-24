@@ -1,4 +1,4 @@
-//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones, checked against GPU writes still in flight; the staging rings and uploaders (`staging`); casts, and their destruction once no frame can reach them (`retire_buffer`, which sparse and external buffers share)
+//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones (writes of `NoUninit` elements, reads of `AnyBitPattern` ones), checked against GPU writes still in flight; growth that keeps the contents (`reserve`); the staging rings and uploaders (`staging`); casts, and their destruction once no frame can reach them (`retire_buffer`, which sparse and external buffers share)
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -7,7 +7,7 @@ use std::{
 
 use crate::error::{Error, Result};
 use crate::vk::{self};
-use bytemuck::Pod;
+use bytemuck::{AnyBitPattern, NoUninit};
 use smallvec::SmallVec;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
@@ -38,8 +38,17 @@ pub const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
 
-/// A buffer of `T`s (`u8` when untyped) in memory `M` ([`Gpu`] by default). Only
-/// host-visible memory has host access:
+/// A buffer of `T`s (`u8` when untyped) in memory `M` ([`Gpu`] by default). Any `Copy` element
+/// works for what the GPU does with it; host writes and uploads take `NoUninit` elements
+/// (generated structs with image handles among them), host reads `AnyBitPattern` ones. Elements
+/// have a size:
+/// ```compile_fail
+/// # fn f() -> lava::Result<()> {
+/// let buffer: lava::buffer::Buffer<(), lava::buffer::Upload> = lava::buffer::Buffer::upload(1)?;
+/// # Ok(()) }
+/// # let _ = f();
+/// ```
+/// Only host-visible memory has host access:
 /// ```compile_fail
 /// # fn f() -> lava::Result<()> {
 /// let mut buffer = lava::buffer::Buffer::<u32>::new(1)?;
@@ -61,7 +70,7 @@ pub const USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// # Ok(()) }
 /// ```
 #[derive(Debug)]
-pub struct Buffer<T: Copy + Pod, M: Memory = Gpu> {
+pub struct Buffer<T: Copy + 'static, M: Memory = Gpu> {
     pub(crate) handle: vk::Buffer,
     address: u64,
     num_bytes: u64,
@@ -72,7 +81,7 @@ pub struct Buffer<T: Copy + Pod, M: Memory = Gpu> {
     live: Live,
 }
 
-impl<T: Copy + Pod, M: Memory> Drop for Buffer<T, M> {
+impl<T: Copy + 'static, M: Memory> Drop for Buffer<T, M> {
     fn drop(&mut self) {
         let (handle, allocation) = (self.handle, mem::take(&mut self.allocation));
         retire_buffer(handle, self.address..self.address + self.num_bytes, allocation);
@@ -98,13 +107,13 @@ pub(crate) fn retire_buffer(handle: vk::Buffer, range: std::ops::Range<u64>, all
     });
 }
 
-impl<'a, T: Copy + Pod, M: Memory> Into<BufferSlice<'a, T>> for &'a Buffer<T, M> {
+impl<'a, T: Copy + 'static, M: Memory> Into<BufferSlice<'a, T>> for &'a Buffer<T, M> {
     fn into(self) -> BufferSlice<'a, T> {
         self.range(..)
     }
 }
 
-impl<T: Copy + Pod> Buffer<T, Gpu> {
+impl<T: Copy + 'static> Buffer<T, Gpu> {
     /// A device-local buffer of `len` elements the host can't access; fill it with commands, or
     /// make it filled with [`Uploader::init`]/[`Uploader::from_slice`]. On a `rebar` device it
     /// is allocated from [`Shared`]'s memory types where they have room (the BAR heap is all of
@@ -115,7 +124,7 @@ impl<T: Copy + Pod> Buffer<T, Gpu> {
     }
 }
 
-impl<T: Copy + Pod> Buffer<T, Gpu> {
+impl<T: Copy + 'static> Buffer<T, Gpu> {
     /// A buffer whose memory its owner bound and frees after it (external memory), with a null
     /// allocation.
     #[cfg(all(feature = "external-memory", unix))]
@@ -132,7 +141,7 @@ impl<T: Copy + Pod> Buffer<T, Gpu> {
     }
 }
 
-impl<T: Copy + Pod> Buffer<T, Upload> {
+impl<T: Copy + 'static> Buffer<T, Upload> {
     /// A buffer of `len` elements the host writes and the GPU reads (`Upload`).
     #[validation_trace]
     pub fn upload(len: usize) -> Result<Self> {
@@ -140,7 +149,7 @@ impl<T: Copy + Pod> Buffer<T, Upload> {
     }
 }
 
-impl<T: Copy + Pod> Buffer<T, Readback> {
+impl<T: Copy + 'static> Buffer<T, Readback> {
     /// A buffer of `len` elements the GPU writes and the host reads (`Readback`).
     #[validation_trace]
     pub fn readback(len: usize) -> Result<Self> {
@@ -148,7 +157,7 @@ impl<T: Copy + Pod> Buffer<T, Readback> {
     }
 }
 
-impl<T: Copy + Pod> Buffer<T, Shared> {
+impl<T: Copy + 'static> Buffer<T, Shared> {
     /// A device-local buffer of `len` elements the host reads and writes (`Shared`);
     /// `MissingFeature` without `rebar`.
     #[validation_trace]
@@ -157,20 +166,25 @@ impl<T: Copy + Pod> Buffer<T, Shared> {
     }
 }
 
-impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
+impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     /// A buffer of `len` elements in `memory`, any location, a [`Dynamic`] one included.
     #[validation_trace]
     pub fn with_memory(memory: M, len: usize) -> Result<Self> {
         let num_bytes = len.checked_mul(size_of::<T>()).ok_or_else(|| {
             Error::other(format!("{len} elements of {} bytes overflow", size_of::<T>()))
         })?;
-        Self::raw(memory, num_bytes as u64, Some(align_of::<T>() as u32))
+        Self::raw(memory, num_bytes as u64, Some(align_of::<T>() as u64))
     }
 
-    /// A buffer of `num_bytes` (at least 1) in `memory`, aligned to `alignment` or what the
-    /// device requires.
+    /// A buffer of `num_bytes` (at least 1, a whole number of `T`s) in `memory`, its address
+    /// aligned to `alignment` (a power of two) or what the device requires, whichever is more.
     #[validation_trace]
-    pub fn raw(memory: M, num_bytes: u64, alignment: Option<u32>) -> Result<Self> {
+    pub fn raw(memory: M, num_bytes: u64, alignment: Option<u64>) -> Result<Self> {
+        assert!(
+            num_bytes % size_of::<T>() as u64 == 0,
+            "{num_bytes} bytes aren't a whole number of {}-byte elements",
+            size_of::<T>()
+        );
         Self::create(USAGE, memory, num_bytes, alignment, Live::new())
     }
 
@@ -181,7 +195,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
         usage: vk::BufferUsageFlags,
         memory: M,
         num_bytes: u64,
-        alignment: Option<u32>,
+        alignment: Option<u64>,
     ) -> Result<Self> {
         Self::create(usage, memory, num_bytes, alignment, Live::internal())
     }
@@ -190,9 +204,13 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
         usage: vk::BufferUsageFlags,
         memory: M,
         num_bytes: u64,
-        alignment: Option<u32>,
+        alignment: Option<u64>,
         live: Live,
     ) -> Result<Self> {
+        const { assert!(size_of::<T>() > 0, "buffers of zero-sized elements have no length") };
+        if let Some(alignment) = alignment {
+            assert!(alignment.is_power_of_two(), "a buffer alignment of {alignment} isn't a power of two");
+        }
         let location = memory.location();
         if location == Location::Gpu && Ctx::features_ref().rebar {
             // Mapped, so uploaders write it in place; plain device-local memory is the
@@ -211,7 +229,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
         usage: vk::BufferUsageFlags,
         memory: M,
         num_bytes: u64,
-        alignment: Option<u32>,
+        alignment: Option<u64>,
         location: Location,
         live: &Live,
     ) -> Result<Self> {
@@ -250,7 +268,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
             requirements.memory_requirements
         };
         if let Some(a) = alignment {
-            requirements.alignment = requirements.alignment.max(a as u64);
+            requirements.alignment = requirements.alignment.max(a);
         }
         requirements.memory_type_bits = location.memory_type_bits(
             requirements.memory_type_bits,
@@ -371,7 +389,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
 
     /// The same buffer of `B`s; panics unless its size is a multiple of `B`'s and its address
     /// aligned to `B`.
-    pub fn cast<B: Copy + Pod>(self) -> Buffer<B, M> {
+    pub fn cast<B: Copy + 'static>(self) -> Buffer<B, M> {
         slice::cast_check::<B>(self.address, self.num_bytes);
         // `self` is left without memory and never dropped.
         let mut this = ManuallyDrop::new(self);
@@ -384,6 +402,33 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
             _type_marker: PhantomData,
             live: mem::replace(&mut this.live, Live::internal()),
         }
+    }
+
+    /// Grows the buffer to at least `len` elements (at least twice its length, so repeated
+    /// growth stays linear), keeping its contents: a new buffer in the same memory location,
+    /// which `cmd` fills with a copy of the old one before its later commands. Returns whether
+    /// it grew; a buffer of `len` or more elements stays as it is.
+    ///
+    /// Only the old buffer's addresses can outlive this call (the `&mut` borrow ends its
+    /// slices): addresses stored in other buffers or push constants stay valid until the old
+    /// buffer is destroyed, once no frame reaches it, but point to the old memory, so rewrite
+    /// them. Host writes to the old mapping after the copy is recorded are lost.
+    #[validation_trace]
+    pub fn reserve<K: crate::queue::QueueKind>(
+        &mut self,
+        len: usize,
+        cmd: &mut crate::command_buffer::CommandBuffer<'_, K>,
+    ) -> Result<bool> {
+        let old = self.len();
+        if len <= old {
+            return Ok(false);
+        }
+        let grown = Buffer::with_memory(self.memory, len.max(old.saturating_mul(2)))?;
+        cmd.copy_buffer(self.byte_range(..), grown.byte_range(..self.size() as usize));
+        // Retired, so destroyed once this recording's submission (and every other in flight)
+        // completed.
+        drop(mem::replace(self, grown));
+        Ok(true)
     }
 
     /// The same buffer with its location as a runtime value.
@@ -401,7 +446,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
     }
 }
 
-impl<T: Copy + Pod, M: HostVisible> Buffer<T, M> {
+impl<T: Copy + 'static, M: HostVisible> Buffer<T, M> {
     #[track_caller]
     fn mapped(&self) -> *mut T {
         self.memory.host_check();
@@ -419,6 +464,50 @@ impl<T: Copy + Pod, M: HostVisible> Buffer<T, M> {
         })
     }
 
+    #[track_caller]
+    fn checked(&self) -> *mut T {
+        let ptr = self.mapped();
+        if let Some((timeline, value)) = self.incomplete_write() {
+            panic!(
+                "the GPU may still write this buffer: wait for value {value} of timeline \
+                 {timeline} (the `Wait` of the submission that writes it) before the host \
+                 accesses it, or use `try_host`"
+            );
+        }
+        ptr
+    }
+
+    /// Writes `data` from element `first` on, checked like [`Self::host_mut`]. Only writes, so
+    /// it takes any `NoUninit` element (structs with image handles among them, which aren't
+    /// `AnyBitPattern`), where `host_mut` needs elements of any bit pattern.
+    #[track_caller]
+    pub fn host_write(&mut self, first: usize, data: &[T])
+    where
+        T: NoUninit,
+    {
+        let end = first.checked_add(data.len());
+        assert!(
+            end.is_some_and(|end| end <= self.len()),
+            "writing {} elements from {first} on into a buffer of {}",
+            data.len(),
+            self.len()
+        );
+        let ptr = self.checked();
+        // SAFETY: inside the mapping, which no reference covers while `self` is borrowed.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(first), data.len()) };
+    }
+
+    /// The mapping as a pointer, for elements owned one at a time through a shared reference.
+    /// A dereference must own its element, with no `host`/`host_mut` borrow live and no GPU
+    /// write of it in flight, and a read of an element needs it to have been written as a `T`.
+    pub fn host_ptr(&self) -> *mut T {
+        self.mapped()
+    }
+}
+
+/// Host reads see whatever bytes the GPU (or nothing) wrote, so they take elements of any bit
+/// pattern.
+impl<T: AnyBitPattern, M: HostVisible> Buffer<T, M> {
     /// The mapping as a slice, or `None` while a submitted GPU write of the buffer hasn't
     /// completed.
     pub fn try_host(&mut self) -> Option<&[T]> {
@@ -427,17 +516,6 @@ impl<T: Copy + Pod, M: HostVisible> Buffer<T, M> {
             Some(_) => None,
             None => Some(unsafe { std::slice::from_raw_parts(ptr, self.len()) }),
         }
-    }
-
-    #[track_caller]
-    fn checked(&self) -> *mut T {
-        let ptr = self.mapped();
-        if let Some((timeline, value)) = self.incomplete_write() {
-            panic!(
-                "the GPU may still write this buffer: wait for value {value} of timeline                  {timeline} (the `Wait` of the submission that writes it) before the host                  accesses it, or use `try_host`"
-            );
-        }
-        ptr
     }
 
     /// The mapping as a slice; panics while a submitted GPU write of the buffer hasn't
@@ -449,7 +527,8 @@ impl<T: Copy + Pod, M: HostVisible> Buffer<T, M> {
     }
 
     /// The mapping as a mutable slice, checked like [`Self::host`]. A frame in flight may
-    /// still read it: per-frame data goes into one range per frame slot.
+    /// still read it: per-frame data goes into one range per frame slot, or one buffer per slot
+    /// ([`crate::queue::PerFrame`]). Elements that aren't `AnyBitPattern` use [`Self::host_write`].
     #[track_caller]
     pub fn host_mut(&mut self) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut(self.checked(), self.len()) }
@@ -473,12 +552,5 @@ impl<T: Copy + Pod, M: HostVisible> Buffer<T, M> {
     pub fn get(&self, index: usize) -> T {
         assert!(index < self.len(), "element {index} of a buffer of {}", self.len());
         unsafe { self.mapped().add(index).read() }
-    }
-
-    /// The mapping as a pointer, for elements owned one at a time through a shared reference.
-    /// A dereference must own its element, with no `host`/`host_mut` borrow live and no GPU
-    /// write of it in flight.
-    pub fn host_ptr(&self) -> *mut T {
-        self.mapped()
     }
 }

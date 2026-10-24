@@ -49,6 +49,19 @@ pub enum Error {
     /// A staging ring of `capacity` bytes had no room for `requested` bytes within the
     /// uploader's timeout, or the write is larger than the ring.
     StagingFull { requested: u64, capacity: u64 },
+    /// `requested` is more than the device's `limit` allows (`max`), e.g. an acceleration
+    /// structure of more geometries than `maxGeometryCount`.
+    OverLimit {
+        limit: &'static str,
+        requested: u64,
+        max: u64,
+    },
+    /// An acceleration structure arena of `capacity` bytes had no free range of `requested`
+    /// bytes.
+    ArenaFull { requested: u64, capacity: u64 },
+    /// Serialized data this device can't read (`vkGetDeviceAccelerationStructureCompatibilityKHR`):
+    /// it was written by another device or driver.
+    Incompatible,
     /// `lava::shutdown` found `count` lava objects (or calls in progress on other threads)
     /// alive, so it destroyed nothing and lava stays initialised.
     ObjectsAlive { count: u64 },
@@ -143,9 +156,24 @@ impl fmt::Display for Error {
                 f,
                 "the staging ring of {capacity} bytes had no room for {requested} bytes within the timeout: drain it or make it larger"
             ),
+            Error::OverLimit {
+                limit,
+                requested,
+                max,
+            } => write!(f, "{requested} is more than the device's `{limit}` of {max}"),
+            Error::ArenaFull {
+                requested,
+                capacity,
+            } => write!(
+                f,
+                "the acceleration structure arena of {capacity} bytes has no free range of {requested} bytes"
+            ),
+            Error::Incompatible => {
+                f.write_str("the serialized data was written by another device or driver")
+            }
             Error::ObjectsAlive { count } => write!(
                 f,
-                "{count} lava objects or calls are still alive, so lava wasn't shut down: drop every buffer, image, timeline, uploader, surface, sampler, slot range, query pool and acceleration structure first"
+                "{count} lava objects or calls are still alive, so lava wasn't shut down: drop every buffer, image, timeline, uploader, surface, sampler, slot range, query pool, acceleration structure and structure arena first"
             ),
             Error::Vulkan(result) => write!(f, "Vulkan error {result:?} ({result})"),
             Error::Loading(err) => write!(f, "the Vulkan library couldn't be loaded: {err}"),

@@ -142,6 +142,10 @@ pub struct Performance {
 #[cfg(feature = "acceleration-structure")]
 pub struct CompactedSize;
 
+/// The serialized size of an acceleration structure (`CommandBuffer::query_serialized_sizes`).
+#[cfg(feature = "acceleration-structure")]
+pub struct SerializedSize;
+
 macro_rules! kinds {
     ($($kind:ident: $ty:ident $(+ $trait:ident)*;)*) => {$(
         impl Sealed for $kind {}
@@ -188,6 +192,7 @@ impl<Q: HasGraphics> RecordedOn<Q> for Performance {}
 #[cfg(feature = "acceleration-structure")]
 kinds! {
     CompactedSize: ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR + SingleValue;
+    SerializedSize: ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR + SingleValue;
 }
 
 impl Scoped for Occlusion {
@@ -626,6 +631,14 @@ impl QueryPool<CompactedSize> {
     pub fn compacted_sizes(count: u32) -> Result<Self> {
         crate::vkobjects::acceleration_structure::functions()?;
         Self::create(count, vk::QueryPoolCreateInfo::default(), CompactedSize)
+    }
+}
+
+#[cfg(feature = "acceleration-structure")]
+impl QueryPool<SerializedSize> {
+    pub fn serialized_sizes(count: u32) -> Result<Self> {
+        crate::vkobjects::acceleration_structure::functions()?;
+        Self::create(count, vk::QueryPoolCreateInfo::default(), SerializedSize)
     }
 }
 

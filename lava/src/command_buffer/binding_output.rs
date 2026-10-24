@@ -1,6 +1,6 @@
 //! Pass bindings as generated code builds them (`Bindings`, sized by the pass, through `unsafe` constructors whose contract generators keep) and as commands borrow them (`BindingOutput`, unsized, an `unsized_struct!`): the push constants, accesses and specialization constants of one pass; and the pass kind markers (`kind::Kind`) with the stages their accesses happen in
 
-use bytemuck::{Pod, bytes_of};
+use bytemuck::{NoUninit, bytes_of};
 
 use super::{BufferAccess, ImageUse};
 use crate::pipeline::MAX_PUSH_CONSTANTS_SIZE;
@@ -126,7 +126,7 @@ impl<'a, K: kind::Kind, const P: usize, const I: usize, const B: usize>
     ///   is recorded.
     ///
     /// Debug builds check the kind once lava is initialised.
-    pub unsafe fn new<G: Pod>(
+    pub unsafe fn new<G: NoUninit>(
         pass: usize,
         bindings: &G,
         images: [ImageUse<'a>; I],
@@ -152,7 +152,7 @@ impl<'a, K: kind::Kind, const P: usize, const I: usize, const B: usize>
     /// (debug builds check the size once lava is initialised); `images` and `buffers` name what
     /// the constants reach, as for [`Self::new`].
     pub unsafe fn with_constants<
-        G: Pod,
+        G: NoUninit,
         const C: usize,
         const I2: usize,
         const B2: usize,

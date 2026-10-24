@@ -1119,11 +1119,20 @@ fn fill_buffer_fills_exactly_the_slice() {
 }
 
 #[test]
-fn update_buffer_writes_one_element() {
+fn update_buffer_writes_its_elements() {
     let mut gpu = gpu();
     let mut buffer = zeroed_buffer::<[u32; 2]>(4);
-    gpu.submit(|cmd| cmd.update_buffer(buffer.range(2..), &[11, 22]));
-    assert_eq!(buffer.host(), [[0, 0], [0, 0], [11, 22], [0, 0]]);
+    gpu.submit(|cmd| cmd.update_buffer(buffer.range(1..), &[[11, 22], [33, 44]]));
+    assert_eq!(buffer.host(), [[0, 0], [11, 22], [33, 44], [0, 0]]);
+    // Empty data records nothing; more than the slice holds or 64 KiB panics.
+    gpu.submit(|cmd| cmd.update_buffer(buffer.range(..), &[]));
+    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(buffer.range(3..), &[[1, 2]; 2])));
+    assert!(message.contains("update of 2 elements into a slice of 1"), "{message}");
+    let large = zeroed_buffer::<u32>(32768);
+    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(large.range(..), &[0; 16385])));
+    assert!(message.contains("at most 65536"), "{message}");
+    gpu.submit(|cmd| cmd.update_buffer(large.range(..), &[7; 16384]));
+    assert_eq!(buffer.host()[1], [11, 22]);
 }
 
 // ---- argument checks -------------------------------------------------------------------------
@@ -1163,10 +1172,13 @@ fn fills_and_updates_write_aligned_words() {
     let message = panic_message(|| gpu.submit(|cmd| cmd.fill_buffer(bytes.byte_range(0..6), 0)));
     assert!(message.contains("4-byte"), "{message}");
     let triples = zeroed_buffer::<[u8; 3]>(4);
-    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(triples.range(..), &[1; 3])));
+    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(triples.range(..), &[[1; 3]])));
     assert!(message.contains("4-byte"), "{message}");
-    let message = panic_message(|| gpu.submit(|cmd| cmd.update_buffer(bytes.range(..0), &0)));
-    assert!(message.contains("empty"), "{message}");
+    // Empty fills and updates record nothing (Vulkan refuses a size of 0).
+    gpu.submit(|cmd| {
+        cmd.fill_buffer(bytes.byte_range(4..4), 0);
+        cmd.update_buffer(bytes.range(..0), &[]);
+    });
 }
 
 #[test]
@@ -1332,6 +1344,95 @@ fn copy_buffer_regions_copies_each_region() {
     ];
     gpu.submit(|cmd| cmd.copy_buffer_regions(&regions));
     assert_eq!(dst.host(), [8, 0, 0, 0, 0, 0, 1, 2]);
+    // Empty regions are skipped, and a list of only those records nothing.
+    gpu.submit(|cmd| cmd.copy_buffer_regions(&[(src.range(..0), dst.range(..))]));
+    gpu.submit(|cmd| cmd.copy_buffer_regions(&[(src.range(..0), dst.range(..)), (src.range(..1), dst.range(1..2))]));
+    assert_eq!(dst.host(), [8, 1, 0, 0, 0, 0, 1, 2]);
+    // No destination may overlap another or a source.
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.copy_buffer_regions(&[(src.range(0..2), dst.range(0..2)), (src.range(4..6), dst.range(1..3))]))
+    });
+    assert!(message.contains("regions 0 and 1 overlap"), "{message}");
+    let message = panic_message(|| gpu.submit(|cmd| cmd.copy_buffer(src.range(0..4), src.range(2..6))));
+    assert!(message.contains("region 0 reads and writes"), "{message}");
+}
+
+#[test]
+fn reserve_grows_a_buffer_and_keeps_its_contents() {
+    let mut gpu = gpu();
+    let mut buffer = gpu.buffer(&[1u32, 2, 3]);
+    let mut readback = zeroed_buffer::<u32>(8);
+    let mut grew = (false, false);
+    gpu.submit(|cmd| {
+        grew = (buffer.reserve(3, cmd).unwrap(), buffer.reserve(5, cmd).unwrap());
+        cmd.fill_buffer(buffer.range(3..), 9);
+        cmd.copy_buffer(buffer.range(..), readback.range(..buffer.len()));
+    });
+    assert_eq!(grew, (false, true));
+    // At least twice the old length.
+    assert_eq!(buffer.len(), 6);
+    assert_eq!(&readback.host()[..6], [1, 2, 3, 9, 9, 9]);
+}
+
+#[test]
+fn per_frame_values_belong_to_the_slot_a_submission_waited_for() {
+    let mut gpu = gpu();
+    let timeline = &mut gpu.timeline;
+    let mut rings = lava::queue::PerFrame::new(timeline, |_| Buffer::<u32, Upload>::upload(4)).unwrap();
+    assert_eq!(rings.len(), timeline.in_flight() as usize);
+    let mut slots = Vec::new();
+    for frame in 0..4u32 {
+        let submission = timeline.begin().unwrap();
+        slots.push(submission.slot());
+        rings.host_mut(&submission).fill(frame);
+        let ring = rings.get(&submission).range(..);
+        let mut readback = zeroed_buffer::<u32>(4);
+        let readback_slice = readback.range(..);
+        submission.submit(|cmd| cmd.copy_buffer(ring, readback_slice)).unwrap().block().unwrap();
+        assert_eq!(readback.host(), [frame; 4]);
+    }
+    // The harness timeline has two slots, which earlier tests' submissions left at either.
+    assert!(slots.iter().enumerate().all(|(i, slot)| *slot == (slots[0] + i) % 2), "{slots:?}");
+    let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
+    let submission = other.begin().unwrap();
+    let message = panic_message(|| rings.get(&submission).len());
+    assert!(message.contains("timeline it was made for"), "{message}");
+    submission.submit(|_| {}).unwrap().block().unwrap();
+}
+
+#[test]
+fn raw_buffers_hold_whole_elements_at_power_of_two_alignments() {
+    let _gpu = gpu();
+    let message = panic_message(|| Buffer::<u32, Upload>::raw(Upload, 6, None));
+    assert!(message.contains("whole number"), "{message}");
+    let message = panic_message(|| Buffer::<u8, Upload>::raw(Upload, 6, Some(48)));
+    assert!(message.contains("power of two"), "{message}");
+    let buffer = Buffer::<u8, Upload>::raw(Upload, 7, Some(1024)).unwrap();
+    assert_eq!((buffer.len(), buffer.address() % 1024), (7, 0));
+}
+
+#[test]
+fn structs_with_image_handles_are_written_but_not_zeroed() {
+    let _gpu = gpu();
+    let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(EXTENT).unwrap().bind_storage().unwrap();
+    // A generated struct with a handle derives `NoUninit`, not `Pod`, so it has no `zeroed()`;
+    // this one comes from the pass's bindings.
+    let made = TestComputeImage::push_bindings(image.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT);
+    let push_constants = made.sections().push_constants;
+    assert_eq!(push_constants.len(), size_of::<lava_tests::bindings::CTestComputeImageBindings>());
+    // SAFETY: the bytes are a `CTestComputeImageBindings`, which every field holds any bits of.
+    let bindings: lava_tests::bindings::CTestComputeImageBindings =
+        unsafe { std::ptr::read_unaligned(push_constants.as_ptr().cast()) };
+    let mut buffer: Buffer<lava_tests::bindings::CTestComputeImageBindings, Upload> = Buffer::upload(2).unwrap();
+    buffer.host_write(1, &[bindings]);
+    let mut first = [0u8; 4];
+    // SAFETY: element 1 was written, and nothing else reaches the mapping.
+    unsafe { std::ptr::copy_nonoverlapping(buffer.host_ptr().add(1).cast::<u8>(), first.as_mut_ptr(), 4) };
+    let handle = image.handle::<lava::bindless::Storage>();
+    assert_eq!(first, bytemuck::bytes_of(&handle));
+    assert_ne!(ImageHandle::<lava::bindless::Storage>::default(), handle);
+    let message = panic_message(|| buffer.host_write(2, &[bindings]));
+    assert!(message.contains("into a buffer of 2"), "{message}");
 }
 
 /// Synchronisation validation reports the missing barrier if the first write is forgotten.
@@ -2093,6 +2194,14 @@ fn indirect_compute_dispatch_matches_the_direct_one() {
         )
     });
     assert_eq!(indirect, direct);
+    let image = Image::<R8G8B8A8Unorm, usage![Storage]>::new(EXTENT).unwrap().bind_storage().unwrap();
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            let bindings = TestComputeImage::push_bindings(image.whole_view(), Vec4::ONE, UVec2::ZERO, EXTENT);
+            cmd.compute_indirect(&bindings, dispatch.range(..0), None)
+        })
+    });
+    assert!(message.contains("empty slice"), "{message}");
 }
 
 #[test]
@@ -3512,9 +3621,11 @@ mod generated {
         let target = image.whole_view();
         let bindings =
             TestComputeImage::push_bindings(target, Vec4::ONE, UVec2::ZERO, UVec2::new(8, 8));
-        let constants: CTestComputeImageBindings = push_constants(&bindings);
-        assert_eq!(constants.target, image.handle::<bindless::Storage>());
-        assert!(constants.target.storage_slot().is_some());
+        // A struct with handles is `NoUninit`, not `Pod`: compare the handle's bytes.
+        let offset = core::mem::offset_of!(CTestComputeImageBindings, target);
+        let handle = image.handle::<bindless::Storage>();
+        assert_eq!(&bindings.sections().push_constants[offset..offset + 4], bytemuck::bytes_of(&handle));
+        assert!(handle.storage_slot().is_some());
         let [image]: [_; 1] = bindings
             .sections()
             .images()

@@ -438,6 +438,16 @@ impl<K: QueueKind> Timeline<K> {
         })
     }
 
+    /// Its frame slots: how many submissions can be in flight.
+    pub fn in_flight(&self) -> u32 {
+        self.inner.slots.len() as u32
+    }
+
+    /// Its index among the timeline semaphores, which a later timeline may reuse.
+    pub(crate) fn index(&self) -> usize {
+        self.inner.index
+    }
+
     /// Waits until the next frame slot's last submission finished and destroys what that frees.
     /// The submission borrows the timeline, so it has one at a time.
     #[validation_trace]
@@ -485,9 +495,15 @@ impl<K: QueueKind> fmt::Debug for Submission<'_, K> {
 }
 
 impl<K: QueueKind> Submission<'_, K> {
-    /// Its frame slot, which per-frame resources (rings, query pools) index by.
+    /// Its frame slot, which per-frame resources (rings, query pools, a [`PerFrame`](super::PerFrame))
+    /// index by: `begin` waited for its last submission, so nothing on the GPU reads them any more.
     pub fn slot(&self) -> usize {
         self.slot
+    }
+
+    /// The timeline's index and frame slot count, which a `PerFrame` checks.
+    pub(crate) fn timeline(&self) -> (usize, usize) {
+        (self.inner.index, self.inner.slots.len())
     }
 
     /// Waits for `wait` at its stage, one of this family's ([`StageOf`]; masked by the device's
@@ -697,6 +713,8 @@ impl<K: QueueKind> Submission<'_, K> {
                 host_signal(i, state.submitted, value);
             }
         }
+        #[cfg(feature = "acceleration-structure")]
+        cmd.rec.finish_structure_builds(result.is_ok());
         drop(cmd);
         slot.barrier_log.clear();
         slot.signalled = value;

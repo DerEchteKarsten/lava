@@ -1,4 +1,4 @@
-//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands`, `VK_EXT_descriptor_heap`, `VK_KHR_shader_untyped_pointers`, `VK_EXT_depth_clamp_control` and `VK_EXT_present_mode_fifo_latest_ready`, their types and their device functions
+//! ash's Vulkan bindings (0.38, headers 1.3.281) plus what lava needs from newer headers: `VK_KHR_device_address_commands`, `VK_EXT_descriptor_heap`, `VK_KHR_shader_untyped_pointers`, `VK_EXT_depth_clamp_control`, `VK_EXT_present_mode_fifo_latest_ready` and `VK_EXT_ray_tracing_invocation_reorder`, their types and their device functions
 
 use core::ffi::{CStr, c_void};
 use core::marker::PhantomData;
@@ -58,6 +58,8 @@ mod values {
         StructureType::from_raw(1_000_318_015);
     pub const PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT: StructureType =
         StructureType::from_raw(1_000_582_000);
+    pub const PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT: StructureType =
+        StructureType::from_raw(1_000_581_000);
     pub const DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT: DynamicState =
         DynamicState::from_raw(1_000_582_000);
     pub const IMAGE_DESCRIPTOR_INFO_EXT: StructureType = StructureType::from_raw(1_000_135_001);
@@ -246,6 +248,14 @@ tagged! {
 }
 unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
 unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceDepthClampControlFeaturesEXT<'_> {}
+tagged! {
+    PhysicalDeviceRayTracingInvocationReorderFeaturesEXT =
+        PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT, *mut c_void {
+        ray_tracing_invocation_reorder: Bool32,
+    }
+}
+unsafe impl ExtendsPhysicalDeviceFeatures2 for PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'_> {}
+unsafe impl ExtendsDeviceCreateInfo for PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'_> {}
 tagged! {
     PhysicalDevicePresentModeFifoLatestReadyFeaturesEXT =
         PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_EXT, *mut c_void {
@@ -666,6 +676,13 @@ pub mod present_mode_fifo_latest_ready {
     use super::*;
 
     pub const NAME: &CStr = c"VK_EXT_present_mode_fifo_latest_ready";
+}
+
+/// `VK_EXT_ray_tracing_invocation_reorder`: shader execution reordering, no commands.
+pub mod ray_tracing_invocation_reorder {
+    use super::*;
+
+    pub const NAME: &CStr = c"VK_EXT_ray_tracing_invocation_reorder";
 }
 
 /// `VK_EXT_depth_clamp_control`: a depth clamp range other than the viewport's.

@@ -4,7 +4,6 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
 };
 
-use bytemuck::Pod;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -168,20 +167,20 @@ fn allocate(
 /// A device-local buffer of `T`s whose memory is exported to or imported from a file
 /// descriptor. It derefs to its [`Buffer`], whose slices commands take as any buffer's.
 #[derive(Debug)]
-pub struct ExternalBuffer<T: Copy + Pod> {
+pub struct ExternalBuffer<T: Copy + 'static> {
     buffer: Buffer<T, Gpu>,
     /// After the buffer, so it is freed once the buffer is destroyed.
     memory: Memory,
 }
 
-impl<T: Copy + Pod> Deref for ExternalBuffer<T> {
+impl<T: Copy + 'static> Deref for ExternalBuffer<T> {
     type Target = Buffer<T, Gpu>;
     fn deref(&self) -> &Buffer<T, Gpu> {
         &self.buffer
     }
 }
 
-impl<T: Copy + Pod> ExternalBuffer<T> {
+impl<T: Copy + 'static> ExternalBuffer<T> {
     /// A buffer of `len` elements whose memory [`Self::export`] hands out as `handle_type`.
     /// `Unsupported` where the device doesn't export buffers as it.
     #[validation_trace]

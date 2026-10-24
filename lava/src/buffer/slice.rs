@@ -1,6 +1,6 @@
-//! Typed buffer slices: the address ranges commands take (no buffer handle or offset; a sparse buffer's not claimed fully bound), sub-ranges, byte views and casts, and the buffer transfer commands (fill, update, copy)
+//! Typed buffer slices: the address ranges commands take (no buffer handle or offset; a sparse buffer's not claimed fully bound), sub-ranges, byte views and casts, and the buffer transfer commands (fill, update, copy; empty ones record nothing, copy regions may not overlap)
 use crate::vk;
-use bytemuck::Pod;
+use bytemuck::NoUninit;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::range::Range;
@@ -20,7 +20,7 @@ use crate::{
 /// A range of a buffer as the GPU sees it: an address and a size. It borrows the buffer but
 /// gives no host access, so copies of it alias nothing.
 #[derive(Copy, Clone, Debug)]
-pub struct BufferSlice<'a, T: Copy + Pod> {
+pub struct BufferSlice<'a, T: Copy + 'static> {
     pub(crate) address: u64,
     pub(crate) size: u64,
     /// Of a sparse buffer, whose pages may be unbound: commands don't claim it fully bound.
@@ -29,7 +29,7 @@ pub struct BufferSlice<'a, T: Copy + Pod> {
 }
 
 #[track_caller]
-pub(crate) fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
+pub(crate) fn new_slice<'a, T: Copy + 'static, R: RangeBounds<usize>>(
     index: R,
     address: u64,
     size: u64,
@@ -39,7 +39,7 @@ pub(crate) fn new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
 
 /// The `index` range of `T`s within the `size` bytes at `address`, or
 /// [`Error::SliceOutOfRange`] when it starts after it ends or ends past `size`.
-pub(crate) fn try_new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
+pub(crate) fn try_new_slice<'a, T: Copy + 'static, R: RangeBounds<usize>>(
     index: R,
     address: u64,
     size: u64,
@@ -72,7 +72,7 @@ pub(crate) fn try_new_slice<'a, T: Pod + Copy, R: RangeBounds<usize>>(
     })
 }
 
-impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
+impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     /// The `index` range of the buffer's elements; panics where [`Self::try_range`] fails.
     #[track_caller]
     pub fn range<'a, R: RangeBounds<usize>>(&'a self, index: R) -> BufferSlice<'a, T> {
@@ -98,7 +98,7 @@ impl<T: Copy + Pod, M: Memory> Buffer<T, M> {
     }
 }
 
-impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
+impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
     /// The `size` bytes at `address`, which the caller keeps alive for `'a`.
     pub(crate) fn new(address: u64, size: u64) -> Self {
         BufferSlice {
@@ -178,7 +178,7 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
     }
     /// The same range of `B`s; panics unless its size is a multiple of `B`'s and its address
     /// aligned to `B`.
-    pub fn cast<B: Copy + Pod>(self) -> BufferSlice<'a, B> {
+    pub fn cast<B: Copy + 'static>(self) -> BufferSlice<'a, B> {
         cast_check::<B>(self.address, self.size);
         BufferSlice {
             address: self.address,
@@ -215,6 +215,7 @@ impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
 
 #[track_caller]
 pub(crate) fn cast_check<B>(address: u64, size: u64) {
+    const { assert!(size_of::<B>() > 0, "buffers of zero-sized elements have no length") };
     let (element, align) = (size_of::<B>() as u64, align_of::<B>() as u64);
     assert!(
         element != 0 && size % element == 0,
@@ -235,15 +236,18 @@ fn check_words(address: u64, size: u64, what: &str) {
     );
 }
 
-/// `vkCmdUpdateBuffer`'s limit on the bytes of one update.
+/// `vkCmdUpdateMemoryKHR`'s limit on the bytes of one update.
 pub(crate) const MAX_UPDATE: usize = 65536;
 
 impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Writes `data`, repeated, into every 4-byte word of `buffer`, whose address and size have
-    /// to be multiples of 4.
+    /// to be multiples of 4. An empty slice records nothing.
     #[validation_trace]
-    pub fn fill_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: u32) {
+    pub fn fill_buffer<'a, T: Copy + 'static>(&mut self, buffer: BufferSlice<'a, T>, data: u32) {
         check_words(buffer.address, buffer.size, "a fill");
+        if buffer.is_empty() {
+            return;
+        }
         self.rec.flush_pending(
             std::iter::empty(),
             std::iter::once(BufferAccess {
@@ -263,21 +267,28 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         };
     }
 
-    /// Writes `data` into the first element of `buffer`, from the command buffer itself: for
-    /// small writes (at most 64 KiB, whole 4-byte words at a 4-byte aligned address).
+    /// Writes `data` to the start of `buffer`, from the command buffer itself: for small
+    /// writes (at most 64 KiB, whole 4-byte words at a 4-byte aligned address); larger ones go
+    /// through an [`Uploader`](crate::buffer::Uploader). Empty `data` records nothing.
     #[validation_trace]
-    pub fn update_buffer<'a, T: Copy + Pod>(&mut self, buffer: BufferSlice<'a, T>, data: &T) {
+    pub fn update_buffer<'a, T: NoUninit>(&mut self, buffer: BufferSlice<'a, T>, data: &[T]) {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
         assert!(
-            !buffer.is_empty(),
-            "an update writes the first element of an empty slice"
+            data.len() <= buffer.len(),
+            "an update of {} elements into a slice of {}",
+            data.len(),
+            buffer.len()
         );
         assert!(
-            size_of::<T>() <= MAX_UPDATE,
+            bytes.len() <= MAX_UPDATE,
             "an update writes at most {MAX_UPDATE} bytes, not {}",
-            size_of::<T>()
+            bytes.len()
         );
-        let buffer = buffer.range(..1);
+        let buffer = buffer.byte_range(..bytes.len());
         check_words(buffer.address, buffer.size, "an update");
+        if bytes.is_empty() {
+            return;
+        }
         self.rec.flush_pending(
             iter::empty(),
             iter::once(BufferAccess {
@@ -292,55 +303,55 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 self.rec.handle,
                 &buffer.address_range(),
                 buffer.address_flags(),
-                bytemuck::bytes_of(data),
+                bytes,
             )
         };
     }
-    /// Copies `src` to the start of `dst`, which must be at least as long.
+    /// Copies `src` to the start of `dst`, which must be at least as long and not overlap it.
     #[validation_trace]
-    pub fn copy_buffer<'a, T: Copy + Pod>(
-        &mut self,
-        src: BufferSlice<'a, T>,
-        dst: BufferSlice<'a, T>,
-    ) {
+    pub fn copy_buffer<'a, T: Copy + 'static>(&mut self, src: BufferSlice<'a, T>, dst: BufferSlice<'a, T>) {
         self.copy_buffer_regions(&[(src, dst)]);
     }
-    /// One `copy_buffer` per pair, in one command.
+    /// One `copy_buffer` per pair, in one command. No region's destination may overlap
+    /// another destination or any source; empty regions are skipped, and a list of only those
+    /// records nothing.
     #[validation_trace]
-    pub fn copy_buffer_regions<'a, T: Copy + Pod>(
+    pub fn copy_buffer_regions<'a, T: Copy + 'static>(
         &mut self,
         regions: &[(BufferSlice<'a, T>, BufferSlice<'a, T>)],
     ) {
-        let accesses = regions
+        // Every region as the bytes it reads and writes.
+        let regions: SmallVec<[_; 4]> = regions
             .iter()
-            .flat_map(|(src, dst)| {
+            .filter(|(src, _)| !src.is_empty())
+            .map(|&(src, dst)| {
                 assert!(
                     src.size <= dst.size,
                     "cannot copy {} bytes into a buffer slice of {} bytes",
                     src.size,
                     dst.size
                 );
-                [
-                    src.access(
-                        vk::PipelineStageFlags2::TRANSFER,
-                        vk::AccessFlags2::TRANSFER_READ,
-                    ),
-                    dst.range(..src.len()).access(
-                        vk::PipelineStageFlags2::TRANSFER,
-                        vk::AccessFlags2::TRANSFER_WRITE,
-                    ),
-                ]
+                (src.bytes(), dst.byte_range(..src.size as usize))
             })
-            .collect::<SmallVec<[_; 4]>>();
-        self.rec
-            .flush_pending(iter::empty(), accesses.iter().cloned());
+            .collect();
+        if regions.is_empty() {
+            return;
+        }
+        check_copy_overlaps(regions.iter().map(|(src, dst)| (src.get_range(), dst.get_range())));
+        let accesses = regions.iter().flat_map(|(src, dst)| {
+            [
+                src.access(vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ),
+                dst.access(vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE),
+            ]
+        });
+        self.rec.flush_pending(iter::empty(), accesses);
         let copies = regions
             .iter()
             .map(|(src, dst)| {
                 vk::DeviceMemoryCopyKHR::default()
                     .src_range(src.address_range())
                     .src_flags(src.address_flags())
-                    .dst_range(dst.range(..src.len()).address_range())
+                    .dst_range(dst.address_range())
                     .dst_flags(dst.address_flags())
             })
             .collect::<SmallVec<[_; 4]>>();
@@ -350,5 +361,49 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                 &vk::CopyDeviceMemoryInfoKHR::default().regions(&copies),
             )
         };
+    }
+}
+
+/// Panics if a copy's destination overlaps another destination or any source (`(src, dst)`
+/// address ranges, none empty): sorted by their starts, a range overlaps an earlier one exactly
+/// when it starts before that one's end.
+#[track_caller]
+pub(crate) fn check_copy_overlaps(regions: impl Iterator<Item = (Range<u64>, Range<u64>)>) {
+    let mut ranges: SmallVec<[(Range<u64>, bool, usize); 8]> = SmallVec::new();
+    for (i, (src, dst)) in regions.enumerate() {
+        ranges.push((src, false, i));
+        ranges.push((dst, true, i));
+    }
+    ranges.sort_unstable_by_key(|(range, ..)| range.start);
+    // The furthest end of the destinations so far, and of every range, with their regions.
+    let (mut dst_end, mut any_end): ((u64, usize), (u64, usize)) = ((0, 0), (0, 0));
+    for &(range, is_dst, i) in &ranges {
+        let earlier = if range.start < dst_end.0 {
+            Some(dst_end.1)
+        } else if is_dst && range.start < any_end.0 {
+            Some(any_end.1)
+        } else {
+            None
+        };
+        if earlier == Some(i) {
+            panic!(
+                "copy region {i} reads and writes the addresses {:#x}..{:#x}: a copy's source \
+                 and destination may not overlap",
+                range.start, range.end
+            );
+        }
+        if let Some(j) = earlier {
+            panic!(
+                "copy regions {j} and {i} overlap (the addresses {:#x}..{:#x}): no region may write \
+                 what another reads or writes",
+                range.start, range.end
+            );
+        }
+        if is_dst && range.end > dst_end.0 {
+            dst_end = (range.end, i);
+        }
+        if range.end > any_end.0 {
+            any_end = (range.end, i);
+        }
     }
 }

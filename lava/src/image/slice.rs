@@ -1,7 +1,6 @@
 use std::{iter, range::Range, sync::atomic::AtomicU64};
 
 use crate::vk;
-use bytemuck::Pod;
 use lava_macros::validation_trace;
 
 use crate::{
@@ -533,7 +532,7 @@ pub struct TexelBuffer<'a> {
     pub(crate) image_height: u32,
 }
 
-impl<'a, T: Copy + Pod> From<BufferSlice<'a, T>> for TexelBuffer<'a> {
+impl<'a, T: Copy + 'static> From<BufferSlice<'a, T>> for TexelBuffer<'a> {
     fn from(slice: BufferSlice<'a, T>) -> Self {
         TexelBuffer {
             slice: slice.bytes(),
@@ -543,7 +542,7 @@ impl<'a, T: Copy + Pod> From<BufferSlice<'a, T>> for TexelBuffer<'a> {
     }
 }
 
-impl<'a, T: Copy + Pod> BufferSlice<'a, T> {
+impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
     /// The slice as the buffer side of an image copy whose rows start `row_length` texels apart
     /// and whose slices (and layers) `image_height` rows apart: a box of a larger image in the
     /// buffer. 0 for either is the box's own width or height, as a plain slice has them;

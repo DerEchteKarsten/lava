@@ -4,7 +4,7 @@
 //! Lava's globals ([`Global`]) are pointers that `init` sets and `shutdown` (or a failed `init`)
 //! takes, so reads stay cheap: one atomic load, no lock. What they point to is destroyed only
 //! while nothing can read it:
-//! - Every lava object (buffer, image, acceleration structure, query pool, sampler, slot range,
+//! - Every lava object (buffer, image, acceleration structure and arena, query pool, sampler, slot range,
 //!   present surface, timeline, uploader) holds a [`Live`] count from before its constructor
 //!   touches lava's state until after its `Drop` finished (it is the last field, so it drops
 //!   last), and every public function that touches lava's state without such an object takes a

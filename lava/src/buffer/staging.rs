@@ -10,7 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytemuck::Pod;
+use bytemuck::{AnyBitPattern, NoUninit};
+use std::mem::MaybeUninit;
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
@@ -224,7 +225,7 @@ impl Staging {
     /// registered in its index.
     pub(crate) fn new(timeline: usize, size: u64) -> Result<Arc<Self>> {
         let size = size.next_multiple_of(STAGING_ALIGN);
-        let buffer = Buffer::raw(Upload, size, Some(STAGING_ALIGN as u32))?;
+        let buffer = Buffer::raw(Upload, size, Some(STAGING_ALIGN as u64))?;
         let staging = Arc::new(Self {
             buffer,
             ring: Ring::new(size),
@@ -480,7 +481,12 @@ impl Uploader {
     }
 
     /// Stages `len` `T`s written by `fill`, for `target`.
-    fn stage<T: Pod>(&self, len: usize, target: Target, fill: impl FnOnce(&mut [T])) -> Result<()> {
+    fn stage<T: NoUninit>(
+        &self,
+        len: usize,
+        target: Target,
+        fill: impl FnOnce(&mut [MaybeUninit<T>]),
+    ) -> Result<()> {
         let staging = self.ring()?;
         let size = (len * size_of::<T>()) as u64;
         let reservation = staging.reserve(size, self.timeout)?;
@@ -488,7 +494,7 @@ impl Uploader {
         let ptr = staging.buffer.mapping().expect("upload memory is mapped");
         // SAFETY: the reserved region is the writer's alone until it is published and drained.
         let data = unsafe {
-            let ptr = ptr.add(reservation.offset as usize).cast::<T>();
+            let ptr = ptr.add(reservation.offset as usize).cast::<MaybeUninit<T>>();
             assert!(
                 ptr.is_aligned(),
                 "staged {}s at a misaligned {ptr:?}",
@@ -512,18 +518,30 @@ impl Uploader {
     /// (for data that embeds addresses into itself). Where its memory is mapped (`rebar`
     /// devices, integrated GPUs) `fill` writes it in place and nothing is left to drain;
     /// elsewhere `fill` writes the ring and the next drain copies it. Either way the buffer is
-    /// a [`Gpu`] one without host access.
+    /// a [`Gpu`] one without host access. `fill` sees what the memory held before, so the
+    /// elements are `AnyBitPattern`; [`Self::from_slice`] takes any `NoUninit` ones.
     #[validation_trace]
-    pub fn init<T: Copy + Pod>(
+    pub fn init<T: NoUninit + AnyBitPattern>(
         &self,
         len: usize,
         fill: impl FnOnce(u64, &mut [T]),
+    ) -> Result<Buffer<T, Gpu>> {
+        self.init_uninit(len, |address, data| {
+            // SAFETY: any bytes are a valid `T`, and mapped memory holds bytes.
+            fill(address, unsafe { &mut *(data as *mut [MaybeUninit<T>] as *mut [T]) })
+        })
+    }
+
+    fn init_uninit<T: NoUninit>(
+        &self,
+        len: usize,
+        fill: impl FnOnce(u64, &mut [MaybeUninit<T>]),
     ) -> Result<Buffer<T, Gpu>> {
         let buffer = Buffer::<T, Gpu>::new(len)?;
         match buffer.coherent_mapping() {
             // SAFETY: no submission has seen the new buffer, whose mapping holds `len`.
             Some(ptr) => fill(buffer.address(), unsafe {
-                std::slice::from_raw_parts_mut(ptr, len)
+                std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<T>>(), len)
             }),
             None => self.stage(len, Target::Buffer(buffer.address()), |data| {
                 fill(buffer.address(), data)
@@ -535,8 +553,8 @@ impl Uploader {
     /// A device-local buffer holding `data`, made like [`Self::init`]. Empty data is an error,
     /// like an empty buffer.
     #[validation_trace]
-    pub fn from_slice<T: Copy + Pod>(&self, data: &[T]) -> Result<Buffer<T, Gpu>> {
-        self.init(data.len(), |_, out| out.copy_from_slice(data))
+    pub fn from_slice<T: NoUninit>(&self, data: &[T]) -> Result<Buffer<T, Gpu>> {
+        self.init_uninit(data.len(), |_, out| write_slice(out, data))
     }
 
     /// Writes `data` at element `offset` of `buffer`, any buffer. With a ring it is staged, and
@@ -546,7 +564,7 @@ impl Uploader {
     /// be reading: double-buffer such data. A buffer that isn't mapped is an error then.
     /// Panics unless `data` fits.
     #[validation_trace]
-    pub fn write<T: Copy + Pod, M: Memory>(
+    pub fn write<T: NoUninit, M: Memory>(
         &self,
         buffer: &Buffer<T, M>,
         offset: usize,
@@ -565,9 +583,7 @@ impl Uploader {
         }
         if self.staging.is_some() {
             let address = buffer.address() + (offset * size_of::<T>()) as u64;
-            return self.stage(data.len(), Target::Buffer(address), |out| {
-                out.copy_from_slice(data)
-            });
+            return self.stage(data.len(), Target::Buffer(address), |out| write_slice(out, data));
         }
         let Some(ptr) = buffer.coherent_mapping() else {
             return Err(Error::other(
@@ -595,10 +611,15 @@ impl Uploader {
     ) -> Result<()> {
         self.ring()?;
         let copy = image_copy(image, level, data.len())?;
-        self.stage(data.len(), Target::Image(copy), |out| {
-            out.copy_from_slice(data)
-        })
+        self.stage(data.len(), Target::Image(copy), |out| write_slice(out, data))
     }
+}
+
+/// Copies `data` into `out`, which is as long.
+fn write_slice<T: Copy>(out: &mut [MaybeUninit<T>], data: &[T]) {
+    assert_eq!(out.len(), data.len());
+    // SAFETY: both hold `data.len()` elements and don't overlap (`out` is exclusive).
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out.as_mut_ptr().cast::<T>(), data.len()) };
 }
 
 /// The copy of `len` bytes into the whole mip `level` of `image`, checked: a colour image with

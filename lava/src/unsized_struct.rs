@@ -1,29 +1,21 @@
-//! `unsized_struct!`: a sized struct whose const generics are the lengths of its array sections, and the unsized struct it derefs to, which keeps the fixed fields and reads the sections back as slices (pass bindings, draws)
+//! `unsized_struct!`: a sized struct whose const generics are the lengths of its array sections, and the unsized struct it derefs to, which keeps the fixed fields and reads the sections back as slices at the offsets stored at construction (pass bindings, draws)
 use std::mem::MaybeUninit;
 
-/// 8-aligned and a multiple of 8 long, so the sections after it start at the same offset in
-/// both structs.
+/// Each section's offset in the tail and its length, stored at construction so accessors don't
+/// walk the earlier sections. 8-aligned and a multiple of 8 long, so the sections after it start
+/// at the same offset in both structs.
 #[repr(C, align(8))]
-pub(crate) struct Lens<const S: usize>(pub(crate) [u32; S]);
+pub(crate) struct Lens<const S: usize>(pub(crate) [[u32; 2]; S]);
 
 /// # Safety
-/// `tail` is an unsized struct's tail and `T` the type of its section `index`.
+/// `tail` is an unsized struct's tail, `place` its section's offset and length, and `T` the
+/// section's type.
 #[inline]
-pub(crate) unsafe fn section<'s, T>(
-    tail: &'s [MaybeUninit<u8>],
-    lens: &[u32],
-    layouts: &[(usize, usize)],
-    index: usize,
-) -> &'s [T] {
-    let align = |offset: usize, align: usize| (offset + align - 1) & !(align - 1);
-    let mut offset = 0usize;
-    for (&len, &(size, alignment)) in lens.iter().zip(layouts).take(index) {
-        offset = align(offset, alignment) + len as usize * size;
-    }
-    let offset = align(offset, layouts[index].1);
-    let len = lens[index] as usize;
+pub(crate) unsafe fn section<T>(tail: &[MaybeUninit<u8>], [offset, len]: [u32; 2]) -> &[T] {
+    let (offset, len) = (offset as usize, len as usize);
     debug_assert!(offset + len * size_of::<T>() <= tail.len());
-    // SAFETY: the sized struct wrote `len` `T`s there, aligned since the tail is 8-aligned.
+    // SAFETY: the sized struct wrote `len` `T`s there, aligned since the tail is 8-aligned and
+    // the section's alignment at most 8 (`SECTIONS_ALIGNED`).
     unsafe { std::slice::from_raw_parts(tail.as_ptr().add(offset).cast::<T>(), len) }
 }
 
@@ -64,11 +56,16 @@ macro_rules! unsized_struct {
                 $($field: $field_ty,)*
                 $($section: [$section_ty; $section_len],)*
             ) -> Self {
-                const { $(assert!(align_of::<$section_ty>() <= 8);)* }
+                let () = $unsized::<$lt, $($param),*>::SECTIONS_ALIGNED;
+                let tail = ::std::mem::offset_of!(Self, lens)
+                    + size_of::<$crate::unsized_struct::Lens<{ [$(stringify!($section)),*].len() }>>();
                 Self {
                     $($field,)*
                     marker: ::std::marker::PhantomData,
-                    lens: $crate::unsized_struct::Lens([$($section_len as u32),*]),
+                    lens: $crate::unsized_struct::Lens([$([
+                        (::std::mem::offset_of!(Self, $section) - tail) as u32,
+                        $section_len as u32,
+                    ]),*]),
                     $($section,)*
                 }
             }
@@ -92,8 +89,9 @@ macro_rules! unsized_struct {
         }
 
         impl<$lt, $($param),*> $unsized<$lt, $($param),*> {
-            const LAYOUTS: &'static [(usize, usize)] =
-                &[$((size_of::<$section_ty>(), align_of::<$section_ty>())),*];
+            /// Evaluated by every accessor's monomorphisation (and `from_parts`), since their
+            /// safety depends on it: the tail is 8-aligned, so no section may need more.
+            const SECTIONS_ALIGNED: () = { $(assert!(align_of::<$section_ty>() <= 8);)* };
 
             $crate::unsized_struct::unsized_struct!(@accessors [0]
                 $($(#[$section_attr])* ($section_vis) $section: $section_ty,)*);
@@ -106,10 +104,9 @@ macro_rules! unsized_struct {
         $(#[$attr])*
         #[inline]
         $vis fn $section(&self) -> &[$ty] {
-            // SAFETY: section `$index` is the `$ty`s.
-            unsafe {
-                $crate::unsized_struct::section(&self.tail, &self.lens.0, Self::LAYOUTS, $($index)*)
-            }
+            let () = Self::SECTIONS_ALIGNED;
+            // SAFETY: section `$index` is the `$ty`s, at the place `from_parts` stored.
+            unsafe { $crate::unsized_struct::section(&self.tail, self.lens.0[$($index)*]) }
         }
         $crate::unsized_struct::unsized_struct!(@accessors [$($index)* + 1] $($rest)*);
     };

@@ -268,6 +268,12 @@ features! {
     /// Ray flags that skip triangles or AABBs (`RayTraversalPrimitiveCullingKHR`): with ray
     /// queries, or with ray tracing pipelines on a device with `rayTraversalPrimitiveCulling`.
     ray_traversal_primitive_culling: "ray-traversal-primitive-culling" / "assert-ray-traversal-primitive-culling" => RayTraversalPrimitiveCulling,
+    /// `VK_KHR_ray_tracing_position_fetch`: hit shaders and ray queries read the vertex
+    /// positions of the triangles they hit, in structures built with `allow_data_access`.
+    ray_tracing_position_fetch: "ray-tracing-position-fetch" / "assert-ray-tracing-position-fetch" => RayTracingPositionFetch,
+    /// `VK_EXT_ray_tracing_invocation_reorder`: shader execution reordering in ray tracing
+    /// passes (`HitObject` and `ReorderThread`).
+    ray_tracing_invocation_reorder: "ray-tracing-invocation-reorder" / "assert-ray-tracing-invocation-reorder" => RayTracingInvocationReorder,
     /// Pipeline statistics queries (invocation counts per pass).
     pipeline_statistics: "pipeline-statistics" / "assert-pipeline-statistics" => PipelineStatistics,
     /// Occlusion queries that count samples exactly (`QueryPool::precise_occlusion`).
@@ -426,6 +432,9 @@ pub const SPIRV_CAPABILITIES: &[(u32, &str)] = &[
     (5254, "shader-output-layer"),
     (5055, "shader-clock"),
     (5283, "mesh-shader"),
+    (5336, "ray-tracing-position-fetch"),
+    (5388, "ray-tracing-invocation-reorder"),
+    (5391, "ray-tracing-position-fetch"),
 ];
 
 /// The operands of a SPIR-V module's `OpCapability`s, read in place: they and the
@@ -496,6 +505,11 @@ impl Features {
                         || crate::command_buffer::on!(&self, "ray-tracing-pipeline", ray_tracing_pipeline)),
             "mesh-shader-queries" => mesh_shader_queries =
                 self.mesh_shader_queries && self.mesh_shader && self.pipeline_statistics,
+            "ray-tracing-position-fetch" => ray_tracing_position_fetch =
+                self.ray_tracing_position_fetch && self.acceleration_structure,
+            "ray-tracing-invocation-reorder" => ray_tracing_invocation_reorder =
+                self.ray_tracing_invocation_reorder
+                    && crate::command_buffer::on!(&self, "ray-tracing-pipeline", ray_tracing_pipeline),
             "depth-clamp-control" => depth_clamp_control =
                 self.depth_clamp_control && self.depth_clamp,
             "dynamic-depth-clip" => dynamic_depth_clip =
@@ -568,6 +582,12 @@ impl Features {
             ],
             "ray-query" => ray_query: [ash::khr::ray_query::NAME],
             "ray-tracing-pipeline" => ray_tracing_pipeline: [ash::khr::ray_tracing_pipeline::NAME],
+            "ray-tracing-position-fetch" => ray_tracing_position_fetch: [
+                ash::khr::ray_tracing_position_fetch::NAME
+            ],
+            "ray-tracing-invocation-reorder" => ray_tracing_invocation_reorder: [
+                crate::vk::ray_tracing_invocation_reorder::NAME
+            ],
             "depth-clamp-control" => depth_clamp_control: [crate::vk::depth_clamp_control::NAME],
             "depth-clip-enable" => depth_clip_enable: [ash::ext::depth_clip_enable::NAME],
             "depth-clip-control" => depth_clip_control: [ash::ext::depth_clip_control::NAME],
@@ -639,6 +659,8 @@ pub(crate) struct FeatureChain {
     acceleration_structure: vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
     ray_query: vk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
     ray_tracing_pipeline: vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
+    position_fetch: vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR<'static>,
+    invocation_reorder: vk::PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'static>,
     host_image_copy: vk::PhysicalDeviceHostImageCopyFeaturesEXT<'static>,
     clock: vk::PhysicalDeviceShaderClockFeaturesKHR<'static>,
     performance: vk::PhysicalDevicePerformanceQueryFeaturesKHR<'static>,
@@ -681,6 +703,8 @@ impl FeatureChain {
             acceleration_structure,
             ray_query,
             ray_tracing_pipeline,
+            position_fetch,
+            invocation_reorder,
             host_image_copy,
             clock,
             performance,
@@ -712,6 +736,8 @@ impl FeatureChain {
             acceleration_structure,
             ray_query,
             ray_tracing_pipeline,
+            position_fetch,
+            invocation_reorder,
             host_image_copy,
             clock,
             performance,
@@ -746,6 +772,8 @@ impl FeatureChain {
             ash::khr::acceleration_structure::NAME => acceleration_structure,
             ash::khr::ray_query::NAME => ray_query,
             ash::khr::ray_tracing_pipeline::NAME => ray_tracing_pipeline,
+            ash::khr::ray_tracing_position_fetch::NAME => position_fetch,
+            crate::vk::ray_tracing_invocation_reorder::NAME => invocation_reorder,
             ash::ext::host_image_copy::NAME => host_image_copy,
             ash::khr::shader_clock::NAME => clock,
             ash::khr::performance_query::NAME => performance,
@@ -822,6 +850,12 @@ impl FeatureChain {
                     && (t(self.ray_query.ray_query)
                         || t(self.ray_tracing_pipeline.ray_tracing_pipeline)
                             && t(self.ray_tracing_pipeline.ray_traversal_primitive_culling)),
+            "ray-tracing-position-fetch" => ray_tracing_position_fetch = acceleration_structure
+                && has(ash::khr::ray_tracing_position_fetch::NAME)
+                && t(self.position_fetch.ray_tracing_position_fetch),
+            "ray-tracing-invocation-reorder" => ray_tracing_invocation_reorder =
+                has(crate::vk::ray_tracing_invocation_reorder::NAME)
+                    && t(self.invocation_reorder.ray_tracing_invocation_reorder),
             "pipeline-statistics" => pipeline_statistics = t(c.pipeline_statistics_query),
             "precise-occlusion" => precise_occlusion = t(c.occlusion_query_precise),
             "memory-budget" => memory_budget = has(ash::ext::memory_budget::NAME),
@@ -1075,6 +1109,11 @@ impl FeatureChain {
                         && crate::command_buffer::on!(f, "ray-tracing-pipeline", ray_tracing_pipeline)
                         && has(queried.ray_tracing_pipeline.ray_traversal_primitive_culling)
                 ),
+            "ray-tracing-position-fetch" => position_fetch.ray_tracing_position_fetch =
+                on(f.ray_tracing_position_fetch),
+            "ray-tracing-invocation-reorder" =>
+                invocation_reorder.ray_tracing_invocation_reorder =
+                    on(f.ray_tracing_invocation_reorder),
             "host-image-copy" => host_image_copy.host_image_copy = on(f.host_image_copy),
             "shader-clock" => clock.shader_subgroup_clock = on(f.shader_clock),
             "shader-clock" => clock.shader_device_clock =

@@ -1,4 +1,4 @@
-//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, texel blocks, copy sizes with row pitches, 64-bit clear values and format compatibility classes, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads, topology classes and render areas
+//! lava's unit tests: the barrier tracking, the host-access check, buffer memory locations, image states, image usage types, texel blocks, copy sizes with row pitches, 64-bit clear values and format compatibility classes, the slot allocator, the staging ring's positions, the descriptor heap layout, feature detection and the capability scan, pipeline cache headers, queue family picking, device ranking, wait stage masks, error mapping, calls before init, the layouts the GPU reads, topology classes and render areas, half floats, and copy region overlaps
 use std::{
     iter,
     sync::atomic::AtomicU64,
@@ -537,14 +537,90 @@ fn binding_table_regions_are_aligned_and_empty_ones_have_no_size() {
 #[cfg(feature = "acceleration-structure")]
 #[test]
 fn instances_have_the_layout_of_the_vulkan_struct() {
-    use crate::vkobjects::acceleration_structure::Instance;
+    use crate::vkobjects::acceleration_structure::{Instance, InstanceFlags};
+    use std::mem::offset_of;
     assert_eq!(size_of::<Instance>(), size_of::<vk::AccelerationStructureInstanceKHR>());
-    let instance = Instance::from_address(0xABC, glam::Affine3A::IDENTITY)
-        .custom_index(5)
-        .mask(0x0F)
-        .sbt_offset(7);
+    assert_eq!(offset_of!(Instance, transform), offset_of!(vk::AccelerationStructureInstanceKHR, transform));
+    assert_eq!(
+        offset_of!(Instance, custom_index_and_mask),
+        offset_of!(vk::AccelerationStructureInstanceKHR, instance_custom_index_and_mask)
+    );
+    assert_eq!(
+        offset_of!(Instance, sbt_offset_and_flags),
+        offset_of!(vk::AccelerationStructureInstanceKHR, instance_shader_binding_table_record_offset_and_flags)
+    );
+    assert_eq!(
+        offset_of!(Instance, blas),
+        offset_of!(vk::AccelerationStructureInstanceKHR, acceleration_structure_reference)
+    );
+    let transform = glam::Affine3A::from_translation(glam::Vec3::new(1.0, 2.0, 3.0));
+    let flags = InstanceFlags::FORCE_OPAQUE | InstanceFlags::TRIANGLE_FLIP_FACING;
+    let instance = Instance::from_address(0xABC, transform)
+        .with_custom_index(5)
+        .with_mask(0x0F)
+        .with_sbt_offset(7)
+        .with_flags(flags);
     assert_eq!(instance.custom_index_and_mask, 0x0F00_0005);
-    assert_eq!(instance.sbt_offset_and_flags & 0xFF_FFFF, 7);
+    assert_eq!(instance.sbt_offset_and_flags, 0x0600_0007);
+    assert_eq!(
+        (instance.custom_index(), instance.mask(), instance.sbt_offset(), instance.flags()),
+        (5, 0x0F, 7, flags)
+    );
+    assert_eq!((instance.blas_address(), instance.transform()), (0xABC, transform));
+    assert_eq!(flags.bits(), vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE.as_raw() as u8 | 2);
+    assert!(flags.contains(InstanceFlags::FORCE_OPAQUE) && !flags.contains(InstanceFlags::FORCE_NO_OPAQUE));
+}
+
+#[cfg(feature = "acceleration-structure")]
+#[test]
+fn half_floats_round_to_nearest_even() {
+    use crate::vkobjects::acceleration_structure::f16_bits;
+    let cases = [
+        (0.0, 0x0000),
+        (-0.0, 0x8000),
+        (1.0, 0x3C00),
+        (-2.0, 0xC000),
+        (0.5, 0x3800),
+        (65504.0, 0x7BFF),
+        (65520.0, 0x7C00),
+        (1e9, 0x7C00),
+        (f32::INFINITY, 0x7C00),
+        (2f32.powi(-14), 0x0400),
+        (2f32.powi(-24), 0x0001),
+        (2f32.powi(-25), 0x0000),
+        (1.5 * 2f32.powi(-25), 0x0001),
+        // 1 + 2^-11 is halfway between 1 and the next half: ties to even, 1.
+        (1.0 + 2f32.powi(-11), 0x3C00),
+        (1.0 + 3.0 * 2f32.powi(-11), 0x3C02),
+        (0.1, 0x2E66),
+    ];
+    for (value, bits) in cases {
+        assert_eq!(f16_bits(value), bits, "{value}");
+    }
+    assert_eq!(f16_bits(f32::NAN) & 0x7C00, 0x7C00);
+    assert_ne!(f16_bits(f32::NAN) & 0x3FF, 0);
+}
+
+#[test]
+fn copy_regions_may_not_write_what_others_read_or_write() {
+    use crate::buffer::slice::check_copy_overlaps;
+    let r = |a: u64, b: u64| -> std::range::Range<u64> { (a..b).into() };
+    let check = |regions: &[(std::range::Range<u64>, std::range::Range<u64>)]| {
+        std::panic::catch_unwind(|| check_copy_overlaps(regions.iter().copied()))
+            .map_err(|e| e.downcast_ref::<String>().cloned().unwrap_or_default())
+    };
+    assert!(check(&[(r(0, 8), r(8, 16)), (r(16, 24), r(24, 32))]).is_ok());
+    // Sources may overlap each other; touching ranges don't overlap.
+    assert!(check(&[(r(0, 8), r(16, 24)), (r(4, 12), r(24, 32))]).is_ok());
+    let message = check(&[(r(0, 8), r(16, 24)), (r(4, 12), r(20, 28))]).unwrap_err();
+    assert!(message.contains("regions 0 and 1 overlap"), "{message}");
+    let message = check(&[(r(0, 8), r(16, 24)), (r(20, 28), r(32, 40))]).unwrap_err();
+    assert!(message.contains("regions 0 and 1 overlap"), "{message}");
+    let message = check(&[(r(0, 8), r(4, 12))]).unwrap_err();
+    assert!(message.contains("region 0 reads and writes"), "{message}");
+    // A destination after a long source it overlaps.
+    let message = check(&[(r(0, 100), r(200, 208)), (r(300, 308), r(50, 58))]).unwrap_err();
+    assert!(message.contains("overlap"), "{message}");
 }
 
 #[test]

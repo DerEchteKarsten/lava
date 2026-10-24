@@ -131,7 +131,7 @@ impl ShaderBindingTable {
             vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
             Upload,
             layout.size.max(1),
-            Some(properties.shader_group_base_alignment),
+            Some(properties.shader_group_base_alignment as u64),
         )?;
         // The handles come in group order, which is region order.
         let mut handles = handles.chunks_exact(handle_size);

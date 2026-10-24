@@ -1,10 +1,12 @@
-//! Queues: the kinds of queue family lava submits to (graphics, and with `async-compute`/`async-transfer` dedicated compute and transfer families), the device's queues of each, the stages each family's submissions can wait at, and the `Wait`s that order work across timelines and block the host
+//! Queues: the kinds of queue family lava submits to (graphics, and with `async-compute`/`async-transfer` dedicated compute and transfer families), the device's queues of each, the stages each family's submissions can wait at, the `Wait`s that order work across timelines and block the host, and `PerFrame` resources indexed by frame slot
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{error::Result, features::MissingFeature, sealed::Sealed, vk};
 
+mod per_frame;
 pub(crate) mod timeline;
 
+pub use per_frame::PerFrame;
 pub use timeline::{Submission, Timeline};
 
 /// The most timelines that can exist at once, and the most queues lava creates per family.

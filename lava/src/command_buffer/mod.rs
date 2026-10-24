@@ -24,7 +24,7 @@ use crate::{
     queue::{FamilyInfo, HasCompute, HasGraphics, Kind, QueueKind},
     state::{Ctx, Functions, with_debug_name},
 };
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{NoUninit, Pod, Zeroable};
 use glam::UVec2;
 #[cfg(feature = "multi-draw")]
 use crate::features::{Gated, gate};
@@ -179,6 +179,10 @@ pub(crate) struct Recording<'p> {
     bound_compute: Option<Bound<vk::Pipeline>>,
     #[cfg(feature = "ray-tracing-pipeline")]
     bound_ray_tracing: Option<Bound<BoundRayTracing>>,
+    /// The acceleration structure builds (and copies into structures) it recorded, applied
+    /// once it reaches the GPU (`finish_structure_builds`).
+    #[cfg(feature = "acceleration-structure")]
+    pub(crate) structure_builds: crate::vkobjects::acceleration_structure::RecordedBuilds,
 }
 
 /// A pipeline a recording bound, with the pass and constant bytes it was looked up for.
@@ -275,8 +279,29 @@ pub struct RasterBuilder<'a, 'p, const N: usize> {
     view_mask: u32,
     color: [Attachment<'a>; N],
     depth_stencil: Option<DepthStencil<'a>>,
+    draws: DrawList<'a>,
+}
+
+/// The draws a rendering borrows: pointers, tied to `'a` by the marker, so draws can be
+/// temporaries of the recording statement that drop before the builder (a `SmallVec` of
+/// references would need them alive at its `Drop`).
+struct DrawList<'a> {
     draws: SmallVec<[NonNull<DrawOutput<'static>>; INLINE_DRAWS]>,
     marker: PhantomData<&'a DrawOutput<'a>>,
+}
+
+impl<'a> DrawList<'a> {
+    fn push(&mut self, draw: &'a DrawOutput<'a>) {
+        let draw = draw as *const DrawOutput<'a> as *mut DrawOutput<'static>;
+        // SAFETY: from a reference.
+        self.draws.push(unsafe { NonNull::new_unchecked(draw) });
+    }
+
+    /// The draws, borrowed for no longer than the list, which lives within `'a`.
+    fn iter(&self) -> impl Iterator<Item = &DrawOutput<'a>> + Clone + '_ {
+        // SAFETY: every pointer came from a `&'a DrawOutput<'a>` in `push`.
+        (self.draws.iter()).map(|draw| unsafe { &*(draw.as_ptr() as *const DrawOutput<'a>) })
+    }
 }
 
 /// A color attachment of a rendering, cleared to `clear` first unless that is `None`, else
@@ -1147,7 +1172,7 @@ impl DrawCommand<'_> {
 /// # Safety
 /// `Self` is `#[repr(C)]` (or `#[repr(transparent)]` over such a type) and holds a `C` at offset
 /// 0. Its size being a multiple of 4 and at least `C`'s is checked at compile time.
-pub unsafe trait StartsWith<C: Pod>: Pod {}
+pub unsafe trait StartsWith<C: Pod>: NoUninit {}
 
 /// `VkDrawIndirectCommand`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -1227,12 +1252,6 @@ impl IndexFormat for u16 {
 impl crate::sealed::Sealed for u32 {}
 impl IndexFormat for u32 {
     const TYPE: vk::IndexType = vk::IndexType::UINT32;
-}
-
-fn iter_draws<'a>(
-    draws: &SmallVec<[NonNull<DrawOutput<'static>>; INLINE_DRAWS]>,
-) -> impl Iterator<Item = &'a DrawOutput<'a>> + Clone {
-    (draws.iter()).map(|draw| unsafe { &*(draw.as_ptr() as *const DrawOutput<'a>) })
 }
 
 impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
@@ -1370,8 +1389,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     }
 
     pub fn draw<const E: usize>(&mut self, draw: &'a Draw<'a, N, E>) -> &mut Self {
-        let draw = (draw.deref()) as *const DrawOutput<'a> as *mut DrawOutput<'static>;
-        self.draws.push(unsafe { NonNull::new_unchecked(draw) });
+        self.draws.push(draw.deref());
         self
     }
 
@@ -1397,7 +1415,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         }
         if self.view_mask != 0 && !Ctx::physical_device().multiview_mesh_shader {
             assert!(
-                iter_draws(&self.draws).all(|d| d.is_vertex()),
+                self.draws.iter().all(|d| d.is_vertex()),
                 "the device draws no mesh passes in multiview renderings (`multiviewMeshShader`)"
             );
         }
@@ -1408,7 +1426,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     #[track_caller]
     fn check_blends(&self) {
         let blending = |i: usize| {
-            iter_draws(&self.draws).any(|d| d.blends()[i].equation().is_some())
+            self.draws.iter().any(|d| d.blends()[i].equation().is_some())
         };
         for (i, color) in self.color.iter().enumerate() {
             if blending(i) {
@@ -1440,7 +1458,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                     && mips.start < a.mip_range.end
                     && a.mip_range.start < mips.end
             };
-            if iter_draws(&self.draws).any(|draw| draw.image_accesses().any(overlaps)) {
+            if self.draws.iter().any(|draw| draw.image_accesses().any(overlaps)) {
                 access.access.layout = vk::ImageLayout::GENERAL;
             }
             access
@@ -1454,12 +1472,12 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             };
             // `DONT_CARE` loads and stores write too.
             let discards = ds.discard.before || ds.discard.after;
-            if ds.clear.is_some() || discards || iter_draws(&self.draws).any(writes) {
+            if ds.clear.is_some() || discards || self.draws.iter().any(writes) {
                 access.access.access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
             }
             in_layout(access)
         });
-        let draws = iter_draws(&self.draws);
+        let draws = self.draws.iter();
         check_hazards(name, draws.clone());
         self.cmd_buf.flush_pending(
             draws
@@ -1530,7 +1548,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         let mut state: Option<DrawState> = None;
         let mut assembly: Assembly = None;
         let mut bound: Option<(usize, RasterKeyRef)> = None;
-        for draw in iter_draws(&self.draws) {
+        for draw in self.draws.iter() {
             if let Some((pool, query)) = draw.samples {
                 self.cmd_buf.begin_query(pool, query);
             }
@@ -1585,7 +1603,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         unsafe { device.cmd_end_rendering(handle) };
         self.cmd_buf.in_rendering = false;
         self.cmd_buf.exit(name, true);
-        self.draws.clear();
+        self.draws.draws.clear();
     }
 }
 
@@ -1617,9 +1635,14 @@ fn check_groups(groups: [u32; 3], max: [u32; 3], total: u64, what: &str) {
 
 /// The address range of the first command of `buffer` an indirect dispatch or trace reads, and
 /// its access.
+#[track_caller]
 fn first_command<C: Pod, T: StartsWith<C>>(
     buffer: BufferSlice<'_, T>,
 ) -> (vk::DeviceAddressRangeKHR, BufferAccess) {
+    assert!(
+        !buffer.is_empty(),
+        "an indirect dispatch or trace reads its command from an empty slice"
+    );
     const {
         assert!(
             size_of::<T>() >= size_of::<C>() && size_of::<T>() % 4 == 0,
@@ -1638,7 +1661,7 @@ fn address_flags() -> vk::AddressCommandFlagsKHR {
     vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE | vk::AddressCommandFlagsKHR::FULLY_BOUND
 }
 
-fn indirect_access<T: Copy + Pod>(buffer: BufferSlice<'_, T>) -> BufferAccess {
+fn indirect_access<T: Copy + 'static>(buffer: BufferSlice<'_, T>) -> BufferAccess {
     buffer.access(
         vk::PipelineStageFlags2::DRAW_INDIRECT,
         vk::AccessFlags2::INDIRECT_COMMAND_READ,
@@ -1673,8 +1696,10 @@ impl<'p, K: HasGraphics> CommandBuffer<'p, K> {
             view_mask: 0,
             color,
             depth_stencil: None,
-            draws: SmallVec::new(),
-            marker: PhantomData,
+            draws: DrawList {
+                draws: SmallVec::new(),
+                marker: PhantomData,
+            },
         }
     }
 }
@@ -2035,6 +2060,8 @@ impl<'p> Recording<'p> {
             bound_compute: None,
             #[cfg(feature = "ray-tracing-pipeline")]
             bound_ray_tracing: None,
+            #[cfg(feature = "acceleration-structure")]
+            structure_builds: Vec::new(),
         }
     }
 
@@ -2108,7 +2135,7 @@ impl<'p> Recording<'p> {
         );
     }
 
-    fn enter(&mut self, name: &'static str, pass: bool) {
+    pub(crate) fn enter(&mut self, name: &'static str, pass: bool) {
         if let Some(debug_utils) = Functions::debug_utils() {
             with_debug_name(name, |name| {
                 let label = vk::DebugUtilsLabelEXT::default().label_name(name);
@@ -2127,7 +2154,7 @@ impl<'p> Recording<'p> {
         }
     }
 
-    fn exit(&mut self, name: &'static str, pass: bool) {
+    pub(crate) fn exit(&mut self, name: &'static str, pass: bool) {
         if let Some(mut observer) = self.observer {
             self.depth -= 1;
             let scope = ScopeInfo {
@@ -2357,12 +2384,12 @@ impl<'a> ImageUse<'a> {
 /// The buffer accesses of [`Accesses`]; the command sets the stage.
 impl BufferAccess {
     /// The pass reads `buffer` through a pointer (`Buf`).
-    pub fn read<V: Copy + Pod>(buffer: BufferSlice<'_, V>) -> Self {
+    pub fn read<V: Copy + 'static>(buffer: BufferSlice<'_, V>) -> Self {
         buffer.access(S2::NONE, vk::AccessFlags2::SHADER_STORAGE_READ)
     }
 
     /// The pass reads and writes `buffer` through a pointer (`MutBuf`).
-    pub fn write<V: Copy + Pod>(buffer: BufferSlice<'_, V>) -> Self {
+    pub fn write<V: Copy + 'static>(buffer: BufferSlice<'_, V>) -> Self {
         let access = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
         buffer.access(S2::NONE, access)
     }

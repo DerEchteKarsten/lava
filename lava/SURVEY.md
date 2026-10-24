@@ -19,14 +19,6 @@ compiles, `VK_KHR_unified_image_layouts`, bind pairs and `ImageView::erase`).
 
 5. **Raster and draws:** dynamic rendering local read (skipped 2026-10-21, see section 5:
    input attachments don't fit lava's descriptor heaps and Slang yet).
-7. **Buffers and acceleration structures:** 28-30 (full shapes, `built` applied when the
-   recording reaches the GPU, a cheap built flag for traces), 34, 36, 37, 47, 48, 59, 4.16 (all
-   of part 1 and 2: scratch type and `build_all`, compactor, arena placement,
-   `Blas::with_capacity`, flags, sealed `VertexPosition` with `Vec3A`, getters, scopes, safety
-   docs), copies and serialization, position fetch, half and snorm positions, shader execution
-   reordering, 4.27, `Buffer::reserve`, 4.6 (`PerFrame<T>`), 4.23 (`ImageHandle` loses
-   `Zeroable`; upload and host-write bounds become `NoUninit`), the ANV workaround only on Intel
-   Mesa, stored `unsized_struct!` offsets.
 8. **lava-build-slang:** 4.2 (two generated argument structs, push constants and specialization
    constants, plus the extra accesses as a third argument of `push_bindings`; no
    `IncompletePass`), 4.12 (`WORKGROUP_SIZE` and exported constants), 4.20, 4.21 (qualified
@@ -50,36 +42,13 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 ## 2. Bugs
 
 ### Undefined behaviour from safe code (2026-10-18)
-28. **Tracing never checks that the TLAS was built** (`acceleration_structure.rs:352-354`,
-    `mod.rs:1477`, generated `Accel` bindings): a fresh `Tlas::new` traced reads uninitialised
-    memory. Update, compaction and queries check `built`; an `AtomicBool` makes this cheap.
-29. **A build is checked against the creation only by counts** (`acceleration_structure.rs:771-798`).
-    Vulkan sizes memory and scratch from an identical build info (geometry type, vertex format,
-    max vertex, index type, transform, flags). Building AABBs into a BLAS created from triangles,
-    or more vertices, passes. Keep the creation `Shape` and compare.
-30. **`built` is set when the build is recorded** *(plausible)* (`acceleration_structure.rs:851-853`):
-    a recording that never reaches the GPU leaves the structure counted as built.
 31. **`compacted_from` stores the source's raw handle** *(plausible)* (`:181, :306, :961`): a
     handle value reused after the source's destruction passes `compact`'s check. Use an id.
-34. **Indirect commands read past an empty slice** (`mod.rs:958-965, 1014-1021, 1055-1062`):
-    `compute_indirect` and `raytrace_indirect` pass only the address. Assert `len() >= 1`.
 35. **lava-build-slang calls an unchecked 0.1.0 accessor** (`compile.rs:61`, `codegen.rs:585, 594,
     633`): `VariableLayout::category()` is `self.type_layout().parameter_category()`, the unchecked
     `type_layout` the crate forbids. Use `checked_type_layout()`.
-36. **`unsized_struct!`'s alignment assert sits only in `from_parts`** (`unsized_struct.rs:67`),
-    though the accessors' safety depends on it. Hardening: move it into `Deref` or `LAYOUTS`.
-37. **`iter_draws<'a>` returns `&'a DrawOutput<'a>` for any caller-chosen `'a`** (`mod.rs:546-550`).
-    Internal; make it a method of the builder so the lifetime is its own.
 
 ### Vulkan valid usage (2026-10-18)
-47. **Empty work reaches the driver.** `build(&[])`, `update(&[])` and `query_compacted_sizes(&[], ..)`
-    pass a count of 0 (`acceleration_structure.rs:754-945`); an empty `fill_buffer`, copy region or
-    region list does too (`buffer/slice.rs:185-295`, *plausible* for the address variants). Return
-    early.
-48. **Overlapping copy regions pass** *(plausible)* (`buffer/slice.rs:253-288`), and `src.len()`
-    truncates a range that isn't a whole number of elements.
-59. **Acceleration structure limits aren't checked** (`acceleration_structure.rs:335-349`):
-    `maxGeometryCount`, `maxPrimitiveCount`, `maxInstanceCount`.
 63. **`bindless.slang`** *(plausible)*: `DynImg.Sample` returns an uninitialised `zero`.
 
 ### Presenting (2026-10-18)
@@ -136,15 +105,11 @@ imports, 4.22's padding, release builds without validation, and all of section 9
   buffers sharing an image be recorded in order.
 
 ### Found 2026-10-18
-- **Small per-call costs:** `unsized_struct!` accessors walk every earlier section
-  (`unsized_struct.rs:12-28`).
 - **The engine's specialization constants change at runtime** (engine `render.rs:723-729, 793`):
   `BvhCull`'s buffer lengths double on overflow and `Composite`'s sky slot changes per sky, so
   each value compiles a pipeline mid-frame.
 
 ### Other
-- **The ANV `MEMORY_READ` workaround on trace reads applies to every vendor.** Gate it on
-  `DriverId::INTEL_OPEN_SOURCE_MESA` (`acceleration_structure.rs:25-32`).
 - **Shader builds.** Each pass has its own Slang session, compiled serially, and there is never
   debug info, so no source-level shader debugging. `Shaders::optimization` exists now; core
   doesn't call it.
@@ -162,11 +127,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
      support), extra extensions and a pNext hook, validation settings and queue counts.
    - **Direction:** `lava::init(Config) -> Result<DeviceInfo>`, with `DeviceInfo` reporting
      supported vs enabled features, limits, subgroup, mesh and ray tracing properties.
-6. **Per-frame resources are a convention.** A `Timeline` owns its frame slots
-   (`Submission::slot()`), but core builds per-frame rings four ways: instance offsets, gizmo
-   `first`, UI buffers per slot, and the cull `variables` readback per slot. **Direction:**
-   - `PerFrame<Buffer<T, Upload>>` whose `host_mut(&submission)` ties writes to the waited slot;
-   - a growable stream buffer.
+6. **Per-frame resources:** core builds per-frame rings four ways (instance offsets, gizmo
+   `first`, UI buffers per slot, the cull `variables` readback per slot); `queue::PerFrame<T>`
+   exists since 2026-10-24 for the per-slot ones. Missing: a growable stream buffer.
 10. **Transfers take one region per call,** and there is no `generate_mips` (`ImageSlice::mip`
     reaches any mip of a `Single` image since 2026-10-21).
 11. **Mixed image types are awkward.**
@@ -182,26 +145,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     `byte_range(offset_of!..).cast::<MeshletDraw>()`. (Indirect draws and dispatches take any
     `T: StartsWith<C>` since 2026-10-21, which removes the 16→12-byte cast.)
 14. **Scope names must be `&'static str`.**
-15. **Resize and grow is hand-rolled.** `grow_overflowed` could become `Buffer::reserve(len)`
-    (`Image::fit(extent)`, which keeps the bound slots, exists since 2026-10-21; core's
-    `RenderResources::fit` and its `fresh` flag can use it).
-16. **Ray tracing ergonomics.**
-    - Scratch: users call `Buffer::raw(.., Some(scratch_alignment() as u32))`, sum the sizes by
-      hand, and a batch that doesn't fit panics. Add a scratch type and a `build_all` that splits
-      into batches.
-    - Compaction is a six-step sequence; add a compactor. `compacted()` checks neither
-      `allow_compaction` nor that the source was built, and copies its build scratch size
-      (`acceleration_structure.rs:299-308`).
-    - Every structure owns a `VkBuffer`. Allow placement in an arena slice.
-    - Sizing a BLAS needs real buffers; add `Blas::with_capacity(desc)`.
-    - `BuildFlags` can't say "no preference"; flags are raw `vk::GeometryInstanceFlagsKHR`;
-      `VertexPosition` is open and exposes `vk::Format`, and has no impl for glam's `Vec3A`.
-    - `Instance` has no getters, and `Describe`/`Described` are public.
-    - Builds, updates, compaction and size queries open no scope or label, so observers and
-      captures miss them (`:731-945`).
-    - `every_structure_read` picks its access by comparing the stage with `BUILD` (`:60-61`).
-    - `Instances::new`'s safety contract covers tracing but not the TLAS build, which reads every
-      named BLAS, which must be built (`:701-705`).
+15. **Resize and grow is hand-rolled in core.** `grow_overflowed` can use `buffer.reserve(len, cmd)`
+    (since 2026-10-24) and `RenderResources::fit` with its `fresh` flag `Image::fit(extent)`,
+    which keeps the bound slots (since 2026-10-21).
 19. **The surface is messy.**
     - Deep paths (`lava::image::slice::ImageView`).
     - No prelude, and glam and bytemuck aren't re-exported.
@@ -243,15 +189,8 @@ imports, 4.22's padding, release builds without validation, and all of section 9
     so the engine's shaders pad by hand (`datatypes.slang`, `raster_ui.slang`) and core sets `pad`.
     A pass without push constants panics instead of getting an empty struct (`:583-588`); `i64`,
     `f64` and `bool` vectors panic; arrays above 32 need bytemuck's `min_const_generics`.
-23. **`ImageHandle` is `Zeroable` but its default is null** (2026-10-18): `X::zeroed()` of a
-    generated struct names sampled slot 0.
 24. **`bind` zips two iterators** (2026-10-18, `bindless.rs:308-345`): a length mismatch binds less
     silently, and core collects a `Vec` per frame to line them up. Take pairs and assert.
-27. **Buffer creation edges** (2026-10-18, `buffer/mod.rs:107-146, 205-207`): a zero-sized `T`
-    makes `len()` divide by zero; a size that isn't a whole number of elements keeps tail bytes in
-    `range(..)` but not in `range(..len())`; `alignment: Option<u32>` isn't checked for a power of
-    two and is narrower than Vulkan's `u64`. `update_buffer` writes one element only
-    (`slice.rs:217-222`).
 28. **Small API gaps** (2026-10-18): `depth_clamp_range`'s wrapper
     takes a reference where Vulkan's is optional (`vk.rs:466-475`);
     `dynamic-line-mode` implies no capability (`Cargo.toml:179`); `#[validation_trace(anything)]`
@@ -306,10 +245,9 @@ imports, 4.22's padding, release builds without validation, and all of section 9
 - **Ray tracing:**
   - **Pipelines:** deferred host operations, pipeline libraries,
     `vkCmdSetRayTracingPipelineStackSizeKHR`.
-  - **Structures:** serialization and copies (BLAS disk cache, clones), position fetch
-    (`ALLOW_DATA_ACCESS`), opacity micromaps.
-  - **Shaders:** shader execution reordering, `NO_DUPLICATE_ANY_HIT_INVOCATION`.
-  - **Formats:** half and snorm vertex positions.
+  - **Structures:** opacity micromaps; position fetch in ray queries
+    (`RayQueryPositionFetchKHR` is mapped, but no test reads positions from a ray query).
+  - **Shaders:** `NO_DUPLICATE_ANY_HIT_INVOCATION`.
 - **Hot reload:** per-pass include sets from Slang's module dependencies, for reloads and for
   exact `rerun-if-changed` (which would also catch imports outside the given directories).
 
@@ -375,8 +313,7 @@ Small things, by file; none changes behaviour.
   is written, so `elapsed_ns` returns 0, and is last-writer-wins across families
   (`query/mod.rs:51-54, 246-250`).
 - **ray tracing:** the scratch offset is computed in two loops and the infos re-collected
-  (`acceleration_structure.rs:813-889`); `with_geometries` checks the gate twice and `Drop` uses
-  the checked loader, leaking on `Err` (`:214-361`); `layout.size.max(1)` is redundant
+  (`record_builds`); `with_geometries` checks the gate twice (and `create` again); `layout.size.max(1)` is redundant
   (`rt_pipeline.rs:79`); the generated code calls `trace_accesses` twice per `Accel`
   (`codegen.rs:424-427`).
 - **lava-build-slang:** `compile()` is one 570-line function (`codegen.rs:488-1057`);
@@ -406,8 +343,7 @@ with this survey. Still wrong:
   pass's barriers, but `compute`, `raytrace` and renderings flush the barriers before
   `rec.enter` (`command_buffer/mod.rs:640-696, 929-939, 994-1002`), so scope timestamps and debug
   labels exclude them. Change the code or the docs, whichever is meant.
-- **Item docs:** the 16-pipeline warning always blames constants, though raster keys grow too (`:499-507`); the `update` doc of acceleration structures
-  says primitive counts where the whole shape must match (`:743-745`); `wait_idle`'s doc omits that
+- **Item docs:** the 16-pipeline warning always blames constants, though raster keys grow too (`:499-507`); `wait_idle`'s doc omits that
   it reclaims; `Config::validation`'s omits that it enables printf; `ray_tracing.slang`'s
   `__init` truncates out-of-range fields silently, where Rust asserts; `SCONST` splits on
   commas, so generic images need an alias; `Img.Load` reads mip 0 and a null index is undefined;
@@ -432,7 +368,6 @@ with this survey. Still wrong:
 - The "submit in parallel" test (`:200-221`) checks results, not concurrency.
 - Bare `catch_unwind(..).is_err()` without the message passes on any panic (`:441-453, 1094-1103,
   2095-2098`, `gpu_ray_tracing.rs:428-433`, `gpu_window.rs:159-168`); `panic_message` exists.
-- The `instances_have_the_layout_of_the_vulkan_struct` unit test compares sizes, not offsets.
 - The capability unit test checks only the bits it sets (`tests.rs:181-195`).
 
 ### Tests that fail or skip wrongly
@@ -498,7 +433,7 @@ Each was checked by grep over lava-tests and `lava/src/tests.rs`.
 - **Queries:** the pool-reuse panic, `QueryRecorder` misuse, `instant()` on a device that has
   it, `memory_report` with the budget.
 - **Commands and families:** `flush_all`; transfer-family alignment and granularity;
-  acceleration structure transforms, `Instance::flags`, building from a different geometry.
+  acceleration structure transforms.
 - **Presenting:** dropping a surface with a current image, the format fallback.
 - **Host access:** `host_ptr`; `Shared` memory where the device lacks `rebar` (only its error).
 - **Validation:** GPU-assisted validation is never on, so bindless indices, layouts and buffer

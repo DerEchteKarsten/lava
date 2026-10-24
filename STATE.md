@@ -68,11 +68,15 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 ## lava: ray tracing (tested by `gpu_ray_tracing`, not used by core yet)
 ----intended----
 - Binding table records hold only shader group handles: no shader record data, since shaders read everything through push constants and addresses.
-- A TLAS names its BLASes by address, which lava doesn't track: a BLAS dropped while a TLAS still names it is destroyed once the submissions in flight are done, so rebuild the TLAS before tracing it again. `Instances::new` is `unsafe` with that contract (`Instance::from_address` stays safe: `Instance`'s fields are public and passes write instances).
+- A TLAS names its BLASes by address, which lava doesn't track: a BLAS dropped while a TLAS still names it is destroyed once the submissions in flight are done, so rebuild the TLAS before tracing it again, and every BLAS it names must be built when its build runs. `Instances::new` is `unsafe` with that contract (`Instance::from_address` stays safe: `Instance`'s fields are public and passes write instances).
+- A structure counts as built (`is_built`, what traces, compaction and copies check) once a recording that didn't fail recorded its build; its last build's shapes, which updates keep, apply once the recording reached the GPU. A trace recorded on one timeline while another timeline's recording that builds the TLAS is still being recorded passes the check and would read the old contents (or nothing) if that recording failed; the reading timeline must `wait_for` the building one anyway.
+- A deserialized structure has no known shapes: it can be traced, copied and serialized, but not built, updated or compacted. A serialized TLAS names its BLASes by their old addresses (rebuild it instead).
+- A `Compactor` places compacted structures in their own memory, not an arena, and waits for each compaction to complete before handing it back (one frame-in-flight cycle more than needed on one timeline).
 - `compacted(size)` takes the compacted size on the caller's word (decided 2026-10-18): `compact` checks only that the destination was made by `compacted` of its source, which was built.
 - No indirect builds (`vkCmdBuildAccelerationStructuresIndirectKHR`): instance and primitive counts come from the host, so a GPU-culled TLAS builds every instance slot (cull with the mask or a zero transform).
 - Any acceleration structure write waits for every pending trace and TLAS build (the read of `EVERY_ACCELERATION_STRUCTURE`), also of unrelated structures.
-- Trace reads carry `MEMORY_READ` for Mesa's ANV (26.2.2): with `ACCELERATION_STRUCTURE_READ` alone, a trace after a TLAS rebuilt in the same submission (traced before it) saw stale nodes. Worth reporting to Mesa and dropping once fixed.
+- Trace reads carry `MEMORY_READ` on Mesa's ANV (26.2.2, `DriverId::INTEL_OPEN_SOURCE_MESA`, decided at init: `PhysicalDevice::stale_trace_reads`): with `ACCELERATION_STRUCTURE_READ` alone, a trace after a TLAS rebuilt in the same submission (traced before it) saw stale nodes. Worth reporting to Mesa and dropping once fixed.
+- Shader execution reordering (`ray-tracing-invocation-reorder`, `VK_EXT_ray_tracing_invocation_reorder`) is untested on a device that has it: the Arc B390 (Mesa 26.2.5) has neither the EXT nor the NV extension, so `reordered_traces_hit_like_plain_ones` only checks that its bindings are refused. Slang emits `ShaderInvocationReorderEXT` for `HitObject`, so lava doesn't map the NV capability.
 - Ray tracing's triangle facing against lava's clockwise front faces is unverified (the tests cull nothing).
 
 ## lava: passes from lava-build-slang (lava's Slang frontend)
@@ -84,13 +88,14 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 
 ## lava: buffer memory and uploads (memory locations 2026-10-19, explicit uploads 2026-10-20)
 ----intended----
-- Host writes racing GPU reads aren't checked: `host_mut` on an `Upload` or `Shared` range a frame in flight still reads is a logic race, not undefined behaviour, and per-frame data takes one range per frame slot by convention (the instance, gizmo and UI rings). SURVEY 4.6 (`PerFrame<Buffer<T, Upload>>`) would make it a type.
+- Host writes racing GPU reads aren't checked: `host_mut` on an `Upload` or `Shared` range a frame in flight still reads is a logic race, not undefined behaviour. `queue::PerFrame<T>` keeps one value per frame slot, reached only through the `Submission` whose `begin` waited for the slot (`get_mut`, `host_mut`); data written into one range per slot of a single buffer stays a convention.
+- Host access takes elements by what it does: writes (`host_write`, `Uploader::write`/`from_slice`, `cmd.update_buffer`) `NoUninit` ones, reads and `&mut` mappings (`host`, `host_mut`, `Uploader::init`) `AnyBitPattern` ones, so structs with image handles (not `Zeroable`) are written but not read back; GPU-only uses take any `Copy + 'static` element (`Vec3A` positions).
 - The host-access check (`host`, `host_mut`, `try_host`) sees the declared buffer writes of submitted recordings: not writes a pass makes through an address it doesn't declare in `Accesses` (core's shader clocks), and not writes recorded but not submitted yet (the `&mut` borrow keeps new recordings off the buffer, so only another thread's recording begun before the borrow could still reach it). `read_into` and `get` copy without checking. It reads each timeline's snapshot of its submissions' writes (`Index::writes`), never their pending accesses, so it never waits for a recording.
 - Uploads are explicit (2026-10-20): a timeline's `Uploader`s publish writes into its staging ring, which only a `cmd.drain_uploads` of that timeline copies, at that point of the recording. Another timeline sees the data only after a `Wait` on that submission, and a drain on a family other than an uploader's destination releases its images, so the recording can't use them after it. An image another family owns has to be uploaded through that family's timeline.
 - No staging ring on `rebar` devices (integrated GPUs included): every `Gpu` buffer comes from `Shared`'s memory types, `init` and `write` write it in place, so `Uploader::write` into a buffer a frame in flight reads races it (double-buffer, as with `host_mut`), and images without `HostCopy` can't be uploaded there without `host-image-copy` (`Uploader::image` errors). Elsewhere `write` always stages, since a frame in flight may read the target.
 - `init` writes in place wherever the buffer's memory is mapped, also without `rebar` (integrated GPUs map device-local memory), so `gpu_staging` tests the ring through `write`, which stages wherever there is a ring.
 - The ring's tail never passes a writer still counted in (reserved, not published): a slow fill (a large mesh) holds the tail for its duration, and concurrent writers that find the ring full wait for it (`StagingFull` after the uploader's timeout).
-- `cmd.upload`, the `vkCmdUpdateMemoryKHR` shortcut inside a recording, is gone: an ordered write is `uploader.write` followed by `cmd.drain_uploads`. `cmd.update_buffer` keeps the small-update path.
+- `cmd.upload`, the `vkCmdUpdateMemoryKHR` shortcut inside a recording, is gone: an ordered write is `uploader.write` followed by `cmd.drain_uploads`. `cmd.update_buffer(slice, &data)` keeps the small-update path: up to 64 KiB of whole words, recorded in place.
 
 ----future work----
 - `Shared` needs `rebar`, which needs a device-local host-visible heap of more than 500 MiB; on a discrete GPU without ReBAR the 256 MiB BAR window would still serve small buffers. `Location::shared_or_upload` falls back to `Upload` there.
@@ -105,7 +110,7 @@ Found in a read-only review; details and directions are in `lava/SURVEY.md` sect
 ## lava: bugs from the second survey (2026-10-18)
 Found in a read-only review; details, line numbers and the lower-severity rest (bugs 17-98) are in `lava/SURVEY.md` section 2.
 ----find solutions----
-- Safe code reaches undefined behaviour: tracing an unbuilt TLAS; building a BLAS from another geometry than its creation's; empty indirect slices (SURVEY 28-37).
+- `compact` recognises the source a compacted structure was made for by its raw handle, so a structure created at a handle value reused after the source's destruction passes (31); lava-build-slang calls 0.1.0's unchecked `VariableLayout::category()` (35).
 - The hot reload's `layout_hash` ignores field types: `Tex2D` to `Buf<uint>` reloads and the shader reads a handle as an address (85). Codegen merges same-named structs with different field types, and pointees and array elements of handles become generated structs instead of `ImageHandle` (87, 88).
 
 ## Performance

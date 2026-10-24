@@ -62,6 +62,9 @@ pub struct PhysicalDevice {
     pub max_multi_draw_count: u32,
     /// `multiviewMeshShader`: mesh passes in multiview renderings.
     pub multiview_mesh_shader: bool,
+    /// The driver is Mesa's ANV, whose traces need `MEMORY_READ` to see a rebuild of a
+    /// structure traced earlier in the submission (`acceleration_structure::trace_read`).
+    pub stale_trace_reads: bool,
     /// Zeroed on a device without `VK_EXT_descriptor_heap`, which lava never picks.
     pub descriptor_heap_properties: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
     pub queue_families: Vec<QueueFamily>,

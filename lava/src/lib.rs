@@ -42,7 +42,8 @@
 //!   a mip chain `i` times its width further), [`bindless::SamplerHandle`] (a `u32` slot; there
 //!   are no samplers but the ones the application creates) and
 //!   [`vkobjects::acceleration_structure::Instance`] (`VkAccelerationStructureInstanceKHR`); a
-//!   TLAS is a `u64` device address.
+//!   TLAS is a `u64` device address. Image handles aren't `Zeroable` (zero is sampled slot 0,
+//!   not the null handle), so generated structs that hold them are `NoUninit`, not `Pod`.
 //! - A pass whose SPIR-V declares a capability behind an optional feature ([`Features`]) has
 //!   bindings [`features::Gated`] by it.
 //!

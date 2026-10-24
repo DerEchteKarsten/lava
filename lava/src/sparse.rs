@@ -11,7 +11,6 @@
 )]
 use std::{collections::HashMap, marker::PhantomData, ops::Deref, sync::Mutex};
 
-use bytemuck::Pod;
 use glam::UVec3;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use lava_macros::validation_trace;
@@ -109,7 +108,7 @@ fn residency_check<F: On>(feature: &'static str) -> Result<()> {
 /// undefined values (zeros where the device has `residencyNonResidentStrict`) and writes to them
 /// are dropped. The host can't access it.
 #[derive(Debug)]
-pub struct SparseBuffer<T: Copy + Pod> {
+pub struct SparseBuffer<T: Copy + 'static> {
     handle: vk::Buffer,
     address: u64,
     num_bytes: u64,
@@ -121,7 +120,7 @@ pub struct SparseBuffer<T: Copy + Pod> {
 }
 
 #[cfg(feature = "sparse-residency-buffer")]
-impl<T: Copy + Pod> SparseBuffer<T> {
+impl<T: Copy + 'static> SparseBuffer<T> {
     /// A buffer of `len` elements with no page resident, with every usage of [`buffer::USAGE`].
     /// `MissingFeature` without `sparse-residency-buffer`.
     #[validation_trace]
@@ -218,7 +217,7 @@ impl<T: Copy + Pod> SparseBuffer<T> {
 }
 
 #[cfg(feature = "sparse-residency-buffer")]
-impl<T: Copy + Pod> Drop for SparseBuffer<T> {
+impl<T: Copy + 'static> Drop for SparseBuffer<T> {
     fn drop(&mut self) {
         let handle = self.handle;
         let range = self.address..self.address + self.num_bytes;
@@ -436,7 +435,7 @@ impl<'a> SparseBind<'a> {
     /// Pages `pages` of `buffer`. Panics for pages it doesn't have.
     #[cfg(feature = "sparse-residency-buffer")]
     #[track_caller]
-    pub fn buffer<T: Copy + Pod>(
+    pub fn buffer<T: Copy + 'static>(
         buffer: &'a SparseBuffer<T>,
         pages: std::ops::Range<u64>,
         resident: bool,

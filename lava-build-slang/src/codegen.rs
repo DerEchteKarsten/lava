@@ -19,7 +19,25 @@ struct StructDef {
     size: usize,
     /// It mirrors a lava type (`MIRRORED_TYPES`), which isn't generated, only checked.
     mirror: bool,
+    /// It holds an `ImageHandle`, directly or in a field, so it derives `NoUninit` instead of
+    /// `Pod`: a zeroed handle would name sampled slot 0, not the null handle.
+    handles: bool,
     impls: String,
+}
+
+/// Whether a generated field type holds an `ImageHandle`: one, or (an array of) a generated
+/// struct that does.
+fn holds_handles(ty: &str, structs: &Structs) -> bool {
+    let base = ty.trim_start_matches('[').split(';').next().unwrap_or(ty).trim();
+    ty.contains("ImageHandle") || structs.get(base).is_some_and(|def| def.handles)
+}
+
+/// The derives of a generated struct: `Pod` unless it holds image handles.
+fn derives(handles: bool) -> &'static str {
+    match handles {
+        true => "Clone, Copy, NoUninit",
+        false => "Clone, Copy, Pod, Zeroable",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +157,7 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
                     signature,
                     size,
                     mirror: true,
+                    handles: false,
                     impls: String::new(),
                 });
                 return rust.to_string();
@@ -163,16 +182,16 @@ fn rust_type(t: &TypeLayout, structs: &mut Structs) -> String {
                     signature,
                     size,
                     mirror: false,
+                    handles: false,
                     impls: String::new(),
                 },
             );
             let mut body = String::new();
+            let mut handles = false;
             for f in t.checked_fields() {
-                body.push_str(&format!(
-                    "    pub {}: {},\n",
-                    field_name(f),
-                    gpu_type(f.checked_type_layout().unwrap(), structs)
-                ));
+                let ty = gpu_type(f.checked_type_layout().unwrap(), structs);
+                handles |= holds_handles(&ty, structs);
+                body.push_str(&format!("    pub {}: {ty},\n", field_name(f)));
             }
             // The clock readout: `take` on `Clock`, `regions` on a struct of only `Clock`s.
             let impls = if name == CLOCK_TYPE {
@@ -218,6 +237,7 @@ impl {name} {{
             };
             let def = structs.get_mut(&name).unwrap();
             def.body = body;
+            def.handles = handles;
             def.checks = layout_checks(&name, t);
             def.impls = impls;
             name
@@ -509,7 +529,7 @@ impl Shaders {
 #[allow(unused_imports)]
 use glam::*;
 #[allow(unused_imports)]
-use bytemuck::{{Pod, Zeroable}};
+use bytemuck::{{NoUninit, Pod, Zeroable}};
 #[allow(unused_imports)]
 use lava::state::raw_vulkan as vk;
 #[allow(unused_imports)]
@@ -770,7 +790,7 @@ use lava::pipeline::*;
             );
 
             // Every gap Slang leaves, up to its size, is a zeroed `_pad` field, so the struct
-            // has no padding bytes and derives `Pod`.
+            // has no padding bytes and derives `Pod` (`NoUninit` with image handles).
             let mut gaps = Vec::new();
             let mut end = 0;
             for f in pc.checked_fields() {
@@ -783,15 +803,13 @@ use lava::pipeline::*;
             if size > end {
                 gaps.push((end, size - end));
             }
+            let mut handles = false;
             let mut fields: Vec<(usize, String)> = pc
                 .checked_fields()
                 .map(|f| {
-                    let line = format!(
-                        "    pub {}: {},",
-                        field_name(f),
-                        gpu_type(f.checked_type_layout().unwrap(), &mut structs)
-                    );
-                    (f.offset(Cat::Uniform), line)
+                    let ty = gpu_type(f.checked_type_layout().unwrap(), &mut structs);
+                    handles |= holds_handles(&ty, &structs);
+                    (f.offset(Cat::Uniform), format!("    pub {}: {ty},", field_name(f)))
                 })
                 .collect();
             fields.extend(
@@ -803,9 +821,10 @@ use lava::pipeline::*;
             let fields: Vec<String> = fields.into_iter().map(|(_, line)| line).collect();
             let fields = fields.join("\n");
             let checks = layout_checks(&gpu_name, pc);
+            let derives = derives(handles);
             bindings.push_str(&format!(
                 r#"
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive({derives})]
 #[repr(C)]
 pub struct {gpu_name} {{
 {fields}
@@ -996,8 +1015,11 @@ pub static PASS_MAP: PassMap = PassMap {{
                 continue;
             }
             bindings.push_str(&format!(
-                "\n#[derive(Pod, Copy, Clone, Zeroable, Debug)]\n#[repr(C)]\npub struct {name} {{\n{}}}\n{}{}",
-                def.body, def.checks, def.impls
+                "\n#[derive({}, Debug)]\n#[repr(C)]\npub struct {name} {{\n{}}}\n{}{}",
+                derives(def.handles),
+                def.body,
+                def.checks,
+                def.impls
             ));
         }
 

@@ -41,6 +41,8 @@ default = [
     "ray-query",
     "ray-tracing-pipeline",
     "ray-traversal-primitive-culling",
+    "ray-tracing-position-fetch",
+    "ray-tracing-invocation-reorder",
     "pipeline-statistics",
     "precise-occlusion",
     "memory-budget",
@@ -113,6 +115,10 @@ ray-query = ["acceleration-structure"]
 assert-ray-query = ["ray-query", "assert-acceleration-structure"]
 ray-tracing-pipeline = ["acceleration-structure"]
 assert-ray-tracing-pipeline = ["ray-tracing-pipeline", "assert-acceleration-structure"]
+ray-tracing-position-fetch = ["acceleration-structure"]
+assert-ray-tracing-position-fetch = ["ray-tracing-position-fetch", "assert-acceleration-structure"]
+ray-tracing-invocation-reorder = ["ray-tracing-pipeline"]
+assert-ray-tracing-invocation-reorder = ["ray-tracing-invocation-reorder", "assert-ray-tracing-pipeline"]
 # The capability comes with ray queries, or with ray tracing pipelines and its own device bit.
 ray-traversal-primitive-culling = ["acceleration-structure"]
 assert-ray-traversal-primitive-culling = ["ray-traversal-primitive-culling", "assert-acceleration-structure"]

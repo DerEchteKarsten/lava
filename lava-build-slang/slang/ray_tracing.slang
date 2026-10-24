@@ -1,5 +1,14 @@
 #pragma once
 // Ray tracing passes: lava's entry point attributes and the instance layout of its `Tlas`.
+//
+// Slang's own ray tracing intrinsics need nothing of lava's but their features, which gate the
+// pass's bindings by the capabilities they declare:
+// - `HitTriangleVertexPosition(i)` in hit shaders (and ray queries' vertex positions) read the
+//   hit triangle's object-space vertices from a BLAS built with `BuildFlags::allow_data_access`
+//   (`ray-tracing-position-fetch`, `VK_KHR_ray_tracing_position_fetch`).
+// - `HitObject::TraceRay`, `ReorderThread(hit)` and `HitObject::Invoke` in raygen shaders are
+//   shader execution reordering (`ray-tracing-invocation-reorder`,
+//   `VK_EXT_ray_tracing_invocation_reorder`); devices without it run no such pass.
 
 /// The index of a miss, hit or callable entry point within its region of the shader binding
 /// table: TraceRay's miss index, an instance's hit group offset (`Instance::sbt_offset`), or

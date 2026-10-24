@@ -24,6 +24,9 @@ pub(crate) const CAPABILITY_FEATURES: &[(u32, &str, &str)] = &[
     (5254, "shader-output-layer", "ShaderOutputLayer"),
     (5055, "shader-clock", "ShaderClock"),
     (5283, "mesh-shader", "MeshShader"),
+    (5336, "ray-tracing-position-fetch", "RayTracingPositionFetch"),
+    (5388, "ray-tracing-invocation-reorder", "RayTracingInvocationReorder"),
+    (5391, "ray-tracing-position-fetch", "RayTracingPositionFetch"),
 ];
 
 /// The operands of a SPIR-V module's `OpCapability`s, like lava's scan: they and the
