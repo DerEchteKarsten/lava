@@ -1,5 +1,10 @@
-//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, written right away, freed with their images; slot 0 never, the null handle), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap (slot 0 lava's default sampler)
-use std::{marker::PhantomData, ops::Range, ptr::NonNull, sync::Mutex};
+//! Global bindless descriptor heaps (`VK_EXT_descriptor_heap`), which shaders index directly: image descriptors at slots lava allocates (first fit, written right away, freed with their images; slot 0 never, the null handle), the one-`u32` `ImageHandle<K>` that names them, and runtime `Sampler`s in the sampler heap (slot 0 lava's default sampler, each other in an `Arc` that referencing buffers hold); handles are `AnyBitPattern` but not `NoUninit`, so only reference infos (`ImageReference` for bare handles) write them into buffers
+use std::{
+    marker::PhantomData,
+    ops::Range,
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+};
 
 use crate::error::{Error, Result};
 use crate::vk::{self, BorderColor, CompareOp, Filter, SamplerAddressMode, SamplerMipmapMode};
@@ -17,6 +22,7 @@ use crate::{
         usage::ImageUsage,
     },
     lifetime,
+    object::{Header, Object},
     queue::{Kind, lock},
     state::{Ctx, Functions},
 };
@@ -362,8 +368,21 @@ impl Default for SamplerDesc {
 /// Dropping it frees its slot once no submission reaches it.
 #[derive(Debug)]
 pub struct Sampler {
+    pub(crate) internal: Arc<SamplerInternal>,
+}
+
+/// A sampler as lava owns it: its slot, freed with the last owner (the [`Sampler`], buffers that
+/// reference it) once no submission reaches it.
+#[derive(Debug)]
+pub(crate) struct SamplerInternal {
     index: u32,
-    _live: Live,
+    header: Header,
+}
+
+impl Object for SamplerInternal {
+    fn header(&self) -> &Header {
+        &self.header
+    }
 }
 
 impl Sampler {
@@ -380,17 +399,22 @@ impl Sampler {
                 count: 1,
             })?;
         // From here on `Drop` frees the slot.
-        let sampler = Sampler { index, _live: live };
+        let internal = Arc::new(SamplerInternal {
+            index,
+            header: Header::new(live),
+        });
         write_sampler(index, desc)?;
-        Ok(sampler)
+        Ok(Sampler { internal })
     }
 
     pub fn handle(&self) -> SamplerHandle {
-        SamplerHandle { index: self.index }
+        SamplerHandle {
+            index: self.internal.index,
+        }
     }
 }
 
-impl Drop for Sampler {
+impl Drop for SamplerInternal {
     fn drop(&mut self) {
         let index = self.index;
         lifetime::retire(move || lock(&Bindless::get().free_samplers).give(index..index + 1));
@@ -512,11 +536,42 @@ pub struct ImageHandle<K: HandleKind = Dynamic> {
     kind: PhantomData<K>,
 }
 
-// SAFETY: a `u32` and a zero-sized marker: no padding, every bit pattern a value, and zero is
-// `NULL`.
+// SAFETY: a `u32` and a zero-sized marker: every bit pattern a value, and zero is `NULL`. Not
+// `NoUninit`: a handle names an image, which a buffer of handles keeps alive only when they are
+// written with references (`ReferencingData`); generated push constants, which commands track,
+// implement `NoUninit` themselves.
 unsafe impl<K: HandleKind> bytemuck::Zeroable for ImageHandle<K> {}
 // SAFETY: as above.
-unsafe impl<K: HandleKind> bytemuck::Pod for ImageHandle<K> {}
+unsafe impl<K: HandleKind> bytemuck::AnyBitPattern for ImageHandle<K> {}
+
+// SAFETY: one handle, one reference: what `ImageReference` writes.
+unsafe impl<K: HandleKind> crate::reference::ReferencingData for ImageHandle<K> {
+    const REFERENCES: usize = 1;
+    const WRITES: u64 = 0;
+    const UNORDERED: u64 = 0;
+}
+
+/// A bare handle as a buffer element (`Buf<Tex2D>`, a buffer of `ImageHandle<K>`): the view
+/// it names, read through `K`'s descriptors (the buffer's element type decides `K`).
+pub struct ImageReference<K, V>(V, PhantomData<K>);
+
+impl<K, V> ImageReference<K, V> {
+    pub fn new(view: V) -> Self {
+        ImageReference(view, PhantomData)
+    }
+}
+
+impl<'a, K: Allocatable, V: crate::image::ImageRef + 'a> crate::reference::ReferenceInfo<'a>
+    for ImageReference<K, V>
+{
+    type Data = ImageHandle<K>;
+    #[track_caller]
+    fn write(self, data: &mut ImageHandle<K>, references: &mut [crate::reference::Reference<'a>]) {
+        let view = self.0.view();
+        *data = view.handle::<K>();
+        references[0] = crate::reference::Reference::image(view);
+    }
+}
 
 impl<K: HandleKind> Clone for ImageHandle<K> {
     fn clone(&self) -> Self {

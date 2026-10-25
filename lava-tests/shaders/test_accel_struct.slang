@@ -1,4 +1,4 @@
-// Test pass (compute, ray queries): the ray query test's trace, through a TLAS and ray mask named inside a struct behind a `Buf` (a `u64` there, whose trace accesses the bindings get by hand).
+// Test pass (compute, ray queries): the ray query test's trace, through a TLAS and ray mask named inside a struct behind a `Buf` (a `u64` there, written with the TLAS as its reference, which the trace reaches).
 #include "bindless.slang"
 #include "include/ray_scene.slang"
 

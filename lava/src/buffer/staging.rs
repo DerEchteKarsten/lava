@@ -588,10 +588,8 @@ impl Uploader {
         items: impl IntoIterator<Item = impl ReferenceInfo<'a, Data = T>>,
     ) -> Result<()> {
         let len = buffer.len();
-        let elements: Vec<(T, SmallVec<[Reference<'a>; 4]>)> = items
-            .into_iter()
-            .map(|item| item.with_output(|data, references| (*data, references.into())))
-            .collect();
+        let elements: Vec<(T, SmallVec<[Reference<'a>; 8]>)> =
+            items.into_iter().map(crate::reference::output).collect();
         assert!(
             first
                 .checked_add(elements.len())

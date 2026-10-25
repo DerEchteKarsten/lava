@@ -655,11 +655,10 @@ impl<T: ReferencingData, M: HostVisible> Buffer<T, M> {
         let mut released = Vec::new();
         for (i, item) in (first..).zip(items) {
             assert!(i < len, "writing element {i} into a buffer of {len}");
-            item.with_output(|data, references| {
-                // SAFETY: inside the mapping, which no reference covers while `self` is borrowed.
-                unsafe { ptr.add(i).write(*data) };
-                keep_alive.replace(&self.internal, len, i, references, &mut released);
-            });
+            let (data, references) = crate::reference::output(item);
+            // SAFETY: inside the mapping, which no reference covers while `self` is borrowed.
+            unsafe { ptr.add(i).write(data) };
+            keep_alive.replace(&self.internal, len, i, &references, &mut released);
         }
         drop(keep_alive);
         drop(released);

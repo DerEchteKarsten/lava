@@ -446,8 +446,7 @@ public struct MutBuf<T> {
 }
 
 /// A top-level acceleration structure by its device address: lava's `&Tlas` in push constants
-/// and `SCONST`s, a `u64` inside structs (pass `BufferAccess::trace(&tlas)` in the bindings'
-/// `Accesses`).
+/// and `SCONST`s, a `u64` inside structs (whose reference info takes the `&Tlas`).
 public struct Accel {
     public uint64_t address;
 
@@ -468,6 +467,12 @@ public struct Accel {
 /// (`[RustConst] static const uint MESHLET_STRIDE = 64;`).
 [__AttributeUsage(_AttributeTargets.Var)]
 public struct RustConstAttribute {};
+
+/// Marks a write reference in a struct behind a pointer (`[Unordered] MutBuf<uint> hits;`):
+/// draws of one rendering may write through it in any order (commuting atomics, or elements no
+/// other draw touches), so lava lets them share it.
+[__AttributeUsage(_AttributeTargets.Var)]
+public struct UnorderedAttribute {};
 
 /// Marks the `uint64_t` behind an `SCONST`; lava-build-slang reads the type from it.
 [__AttributeUsage(_AttributeTargets.Var)]

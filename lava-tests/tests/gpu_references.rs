@@ -1,58 +1,17 @@
-//! GPU tests of referencing buffers, with a hand-written `ReferencingData` type over a generated struct of image handles: what a buffer references gets its barriers and layout transitions from commands that name the buffer, without `Accesses`, stays alive after its handles are dropped, survives `Buffer::reserve`, and isn't written by commands
+//! GPU tests of referencing buffers, through generated reference infos (`TestImagePair`'s, nested arrays of `RefNode`'s with samplers, buffers, a `DynImg` and write references, and the write references of `TestReferenceDraw`'s draws): what a buffer references gets its barriers and layout transitions from commands that name the buffer, without `Accesses`, stays alive after its handles are dropped, survives `Buffer::reserve`, and isn't written by commands
 mod common;
 
 use common::{Cmd, gpu, nearest, panic_message, zeroed_buffer};
 use glam::{UVec2, Vec4};
 use lava::{
     Buffer,
+    bindless::{Sampler, SamplerDesc},
     buffer::Upload,
-    command_buffer::Attachment,
-    image::{Image, SampledView, StorageView, format::R8G8B8A8Unorm, usage::usage},
-    reference::{Reference, ReferenceInfo, ReferencingData},
+    command_buffer::{Attachment, CullModeFlags, Draw, RasterState},
+    image::{Image, format::R8G8B8A8Unorm, usage::usage},
+    reference::DynImage,
 };
 use lava_tests::bindings::*;
-
-/// `TestImagePair` as a referencing type: its storage and sampled handles are references.
-#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
-#[repr(transparent)]
-struct Pair(TestImagePair);
-
-// SAFETY: its two handles, in field order, come with their references from `PairInfo`, and
-// the pass only reads through them.
-unsafe impl ReferencingData for Pair {
-    const REFERENCES: usize = 2;
-    const WRITES: u64 = 0;
-    const UNORDERED: u64 = 0;
-}
-
-struct PairInfo<'a, S, T>
-where
-    S: StorageView + 'a,
-    T: SampledView + 'a,
-{
-    storage: S,
-    sampled: T,
-    _marker: std::marker::PhantomData<&'a ()>,
-}
-
-impl<'a, S, T> ReferenceInfo<'a> for PairInfo<'a, S, T>
-where
-    S: StorageView + 'a,
-    T: SampledView + 'a,
-{
-    type Data = Pair;
-    fn with_output<R>(self, f: impl FnOnce(&Pair, &[Reference<'a>]) -> R) -> R {
-        let (storage, sampled) = (self.storage.view(), self.sampled.view());
-        let pair = Pair(TestImagePair {
-            storage: storage.handle(),
-            sampled: sampled.handle(),
-        });
-        f(
-            &pair,
-            &[Reference::image(storage), Reference::image(sampled)],
-        )
-    }
-}
 
 type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Sampled, Storage]>;
 
@@ -78,13 +37,13 @@ fn render(cmd: &mut Cmd, image: &Target, color: [f32; 4]) {
 fn read_pair(
     cmd: &mut Cmd,
     top: &Target,
-    pairs: &Buffer<Pair, impl lava::buffer::Memory>,
+    pairs: &Buffer<TestImagePair, impl lava::buffer::Memory>,
     out: &Buffer<Vec4, lava::buffer::Readback>,
 ) {
     let bindings = TestImage2d::push_bindings(
         TestImage2dArgs {
             image: top.whole_view(),
-            images: pairs.range(..).cast::<TestImagePair>(),
+            images: pairs.range(..),
             sampler: nearest(),
             out: out.range(..),
         },
@@ -112,13 +71,12 @@ fn check(out: &mut Buffer<Vec4, lava::buffer::Readback>, colors: [[f32; 4]; 3]) 
 fn what_a_buffer_references_gets_its_barriers() {
     let mut gpu = gpu();
     let (top, storage, sampled) = (target(), target(), target());
-    let mut pairs: Buffer<Pair, Upload> = Buffer::upload(1).unwrap();
+    let mut pairs: Buffer<TestImagePair, Upload> = Buffer::upload(1).unwrap();
     pairs.host_write_referencing(
         0,
-        [PairInfo {
+        [TestImagePairReferenceInfo {
             storage: storage.whole_view(),
             sampled: sampled.whole_view(),
-            _marker: Default::default(),
         }],
     );
     let mut out = zeroed_buffer::<Vec4>(12);
@@ -151,15 +109,14 @@ fn what_a_buffer_references_lives_with_it() {
         render(cmd, &storage, GREEN);
         render(cmd, &sampled, BLUE);
     });
-    let mut pairs = Buffer::<Pair>::new(1).unwrap();
+    let mut pairs = Buffer::<TestImagePair>::new(1).unwrap();
     gpu.uploader()
         .write_referencing(
             &pairs,
             0,
-            [PairInfo {
+            [TestImagePairReferenceInfo {
                 storage: storage.whole_view(),
                 sampled: sampled.whole_view(),
-                _marker: Default::default(),
             }],
         )
         .unwrap();
@@ -186,13 +143,12 @@ fn what_a_buffer_references_lives_with_it() {
 fn referencing_buffers_refuse_command_writes() {
     let mut gpu = gpu();
     let (storage, sampled) = (target(), target());
-    let mut pairs: Buffer<Pair, Upload> = Buffer::upload(1).unwrap();
+    let mut pairs: Buffer<TestImagePair, Upload> = Buffer::upload(1).unwrap();
     pairs.host_write_referencing(
         0,
-        [PairInfo {
+        [TestImagePairReferenceInfo {
             storage: storage.whole_view(),
             sampled: sampled.whole_view(),
-            _marker: Default::default(),
         }],
     );
     let message = panic_message(|| gpu.submit(|cmd| cmd.fill_buffer(pairs.range(..), 0)));
@@ -200,4 +156,180 @@ fn referencing_buffers_refuse_command_writes() {
         message.contains("is written with `host_write_referencing`"),
         "{message}"
     );
+}
+
+/// Nested arrays of referencing structs: what each element's handles and addresses name is
+/// sampled, read and written through them, alive after its handles are dropped, and the
+/// writes through write references are waited for by a copy of the same submission.
+#[test]
+fn nested_references_are_reached_and_kept() {
+    let mut gpu = gpu();
+    let (red, green, blue) = (target(), target(), target());
+    let samplers = [
+        Sampler::new(&SamplerDesc::new()).unwrap(),
+        Sampler::new(&SamplerDesc::new()).unwrap(),
+    ];
+    let weights = common::buffer_with(&[0.25f32, 0.5]);
+    let hits = Buffer::<u32>::new(1).unwrap();
+    let slots = Buffer::<u32>::new(1).unwrap();
+    gpu.submit(|cmd| {
+        render(cmd, &red, RED);
+        render(cmd, &green, GREEN);
+        render(cmd, &blue, BLUE);
+        cmd.fill_buffer(hits.range(..), 0);
+    });
+    let mut nodes: Buffer<RefNode, Upload> = Buffer::upload(1).unwrap();
+    nodes.host_write_referencing(
+        0,
+        [RefNodeReferenceInfo {
+            materials: [
+                RefMaterialReferenceInfo {
+                    color: red.whole_view(),
+                    sampler: &samplers[0],
+                },
+                RefMaterialReferenceInfo {
+                    color: green.whole_view(),
+                    sampler: &samplers[1],
+                },
+            ],
+            weights: weights.range(..),
+            counter: RefCounterReferenceInfo {
+                hits: hits.range(..),
+                slots: slots.range(..),
+            },
+            r#dyn: DynImage::new(blue.whole_view()),
+            scale: 3.0,
+        }],
+    );
+    let node = nodes.host_ptr();
+    // SAFETY: written above, and nothing else reaches the mapping.
+    let written = unsafe { node.read() };
+    assert_eq!(written.materials[1].sampler, samplers[1].handle());
+    assert_eq!(
+        written.r#dyn,
+        blue.handle::<lava::bindless::Combined>().erase()
+    );
+    drop((red, green, blue, samplers, weights));
+    let read = |gpu: &mut common::Gpu, nodes: &Buffer<RefNode, Upload>| {
+        let out = zeroed_buffer::<Vec4>(4);
+        let counts = zeroed_buffer::<u32>(2);
+        gpu.submit(|cmd| {
+            let bindings = TestReferences::push_bindings(
+                TestReferencesArgs {
+                    nodes: nodes.range(..),
+                    out: out.range(..),
+                },
+                None,
+            );
+            cmd.compute(&bindings, [1, 1, 1]);
+            // Written through the node's write references, which the dispatch reached.
+            cmd.copy_buffer(hits.range(..), counts.range(0..1));
+            cmd.copy_buffer(slots.range(..), counts.range(1..2));
+        });
+        (out, counts)
+    };
+    let (mut out, mut counts) = read(&mut gpu, &nodes);
+    assert_eq!(
+        out.host(),
+        [
+            Vec4::from(RED),
+            Vec4::from(GREEN),
+            Vec4::new(0.25, 0.5, 3.0, 0.0),
+            Vec4::from(BLUE)
+        ]
+    );
+    assert_eq!(counts.host(), [1, 10]);
+    let (_, mut counts) = read(&mut gpu, &nodes);
+    assert_eq!(counts.host(), [2, 11]);
+
+    // A null `DynImg` names nothing.
+    let (red, green) = (target(), target());
+    let samplers = [Sampler::new(&SamplerDesc::new()).unwrap()];
+    let weights = common::buffer_with(&[1.0f32, 2.0]);
+    let material = |view| RefMaterialReferenceInfo {
+        color: view,
+        sampler: &samplers[0],
+    };
+    nodes.host_write_referencing(
+        0,
+        [RefNodeReferenceInfo {
+            materials: [material(red.whole_view()), material(green.whole_view())],
+            weights: weights.range(..),
+            counter: RefCounterReferenceInfo {
+                hits: hits.range(..),
+                slots: slots.range(..),
+            },
+            r#dyn: DynImage::NULL,
+            scale: 0.0,
+        }],
+    );
+    (out, counts) = read(&mut gpu, &nodes);
+    assert_eq!(out.host()[3], Vec4::splat(-1.0));
+    assert_eq!(counts.host(), [3, 12]);
+}
+
+/// Draws of one rendering may share an `[Unordered]` write reference but not an ordered one:
+/// what they write through references is checked like what they name.
+#[test]
+fn draws_writing_through_references_follow_their_ordering() {
+    let mut gpu = gpu();
+    let image = target();
+    let hits = Buffer::<u32>::new(1).unwrap();
+    let slots = [
+        Buffer::<u32>::new(1).unwrap(),
+        Buffer::<u32>::new(1).unwrap(),
+    ];
+    let mut shared: Buffer<RefHits, Upload> = Buffer::upload(1).unwrap();
+    shared.host_write_referencing(
+        0,
+        [RefHitsReferenceInfo {
+            hits: hits.range(..),
+        }],
+    );
+    // Two buffers that name the first slot, one the second.
+    let mut slot_refs: [Buffer<RefSlot, Upload>; 3] =
+        std::array::from_fn(|_| Buffer::upload(1).unwrap());
+    for (refs, slot) in slot_refs.iter_mut().zip([&slots[0], &slots[1], &slots[0]]) {
+        refs.host_write_referencing(
+            0,
+            [RefSlotReferenceInfo {
+                slot: slot.range(..),
+            }],
+        );
+    }
+    let [first, second, first_again] = slot_refs.each_ref().map(|slot| {
+        TestReferenceDraw::push_bindings(
+            TestReferenceDrawArgs {
+                hits: shared.range(..),
+                slot: slot.range(..),
+            },
+            None,
+        )
+    });
+    let state = || RasterState::default().cull_mode(CullModeFlags::NONE);
+    let mut counts = zeroed_buffer::<u32>(1);
+    gpu.submit(|cmd| {
+        cmd.fill_buffer(hits.range(..), 0);
+        cmd.raster(
+            UVec2::splat(2),
+            [Attachment::color(image.whole_view(), None)],
+        )
+        .draw(&Draw::new(&first, 3, 1, state()))
+        .draw(&Draw::new(&second, 3, 1, state()))
+        .record("unordered hits");
+        cmd.copy_buffer(hits.range(..), counts.range(..));
+    });
+    assert_eq!(counts.host()[0], 8, "4 fragments each");
+    let message = panic_message(|| {
+        gpu.submit(|cmd| {
+            cmd.raster(
+                UVec2::splat(2),
+                [Attachment::color(image.whole_view(), None)],
+            )
+            .draw(&Draw::new(&first, 3, 1, state()))
+            .draw(&Draw::new(&first_again, 3, 1, state()))
+            .record("one slot");
+        })
+    });
+    assert!(message.contains("both access"), "{message}");
 }

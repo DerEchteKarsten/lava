@@ -2055,7 +2055,7 @@ fn structs_with_image_handles_are_written_but_not_zeroed() {
         std::ptr::copy_nonoverlapping(buffer.host_ptr().add(1).cast::<u8>(), first.as_mut_ptr(), 4)
     };
     let handle = image.handle::<lava::bindless::Storage>();
-    assert_eq!(first, bytemuck::bytes_of(&handle));
+    assert_eq!(first, handle.bits().to_ne_bytes());
     assert_ne!(ImageHandle::<lava::bindless::Storage>::default(), handle);
     let message = panic_message(|| buffer.host_write(2, &[bindings]));
     assert!(message.contains("into a buffer of 2"), "{message}");
@@ -4753,7 +4753,7 @@ mod generated {
         let handle = image.handle::<bindless::Storage>();
         assert_eq!(
             &bindings.sections().push_constants[offset..offset + 4],
-            bytemuck::bytes_of(&handle)
+            handle.bits().to_ne_bytes()
         );
         assert!(handle.storage_slot().is_some());
         let [image]: [_; 1] = bindings

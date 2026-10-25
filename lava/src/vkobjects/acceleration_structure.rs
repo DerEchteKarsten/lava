@@ -23,7 +23,7 @@ use crate::{
     features::{Feature, gate},
     global::Live,
     lifetime,
-    object::Header,
+    object::{Header, Object},
     query::{CompactedSize, QueryKind, QueryPool, SerializedSize},
     queue::{HasCompute, lock},
     state::{Ctx, Functions},
@@ -43,7 +43,7 @@ const STRUCTURE_ALIGNMENT: u64 = 256;
 /// rebuilt, the structure read alone lets the next trace see stale nodes
 /// (`a_tlas_rebuilt_between_two_traces_waits_for_the_first`). Decided once at init
 /// (`PhysicalDevice::stale_trace_reads`).
-fn trace_read() -> vk::AccessFlags2 {
+pub(crate) fn trace_read() -> vk::AccessFlags2 {
     match Ctx::physical_device().stale_trace_reads {
         true => READ | vk::AccessFlags2::MEMORY_READ,
         false => READ,
@@ -358,10 +358,24 @@ pub(crate) struct StructureInternal {
     origin: Origin,
     state: Arc<BuildState>,
     /// The device addresses of its memory, which barriers track.
-    range: Range<u64>,
+    pub(crate) range: Range<u64>,
     memory: Memory,
-    #[allow(dead_code, reason = "held for its count")]
     header: Header,
+}
+
+impl std::fmt::Debug for StructureInternal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (f.debug_struct("StructureInternal"))
+            .field("handle", &self.handle)
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Object for StructureInternal {
+    fn header(&self) -> &Header {
+        &self.header
+    }
 }
 
 impl StructureInternal {

@@ -1,11 +1,11 @@
-//! GPU tests of what lava-build-slang generates and `bindless.slang` offers: struct layouts with gaps, packing, half and 16-bit fields, matrices and handles behind pointers, read-only storage images and image handles read through a pointer, image operations (gathers, gradient and bias samples, mip loads, combined samples, atomics), workgroup sizes and `groups`, dispatch bases, required subgroup sizes, several compute entry points per file, and exported constants
+//! GPU tests of what lava-build-slang generates and `bindless.slang` offers: struct layouts with gaps, packing, half and 16-bit fields, matrices and handles behind pointers (written through generated reference infos), read-only storage images and image handles read through a pointer, image operations (gathers, gradient and bias samples, mip loads, combined samples, atomics), workgroup sizes and `groups`, dispatch bases, required subgroup sizes, several compute entry points per file, and exported constants
 mod common;
 
 use common::{buffer_with, gpu, nearest, panic_message, zeroed_buffer};
 use glam::{I64Vec3, Mat3, U64Vec2, UVec2, UVec3, Vec3, Vec4};
 use lava::{
-    Ctx,
-    bindless::{self, ImageHandle},
+    Ctx, ImageView,
+    bindless::{self, ImageHandle, ImageReference},
     buffer::{Buffer, Readback, Upload},
     command_buffer::{Attachment, CullModeFlags, Draw, RasterState},
     half::F16,
@@ -15,6 +15,7 @@ use lava::{
         usage::usage,
     },
     pipeline::{PassKind, pass_map},
+    reference::DynImage,
 };
 use lava_tests::bindings::*;
 
@@ -304,7 +305,12 @@ fn wave_size_requires_the_subgroup_size() {
     assert_eq!(out.host(), [32; 64]);
 }
 
-fn layouts(tex: ImageHandle<bindless::Sampled>) -> Layouts {
+type Texture = Image<R8G8B8A8Unorm, usage![Sampled]>;
+
+/// The input `Layouts`, reading `tex`.
+fn layouts(
+    tex: &Texture,
+) -> LayoutsReferenceInfo<'_, ImageView<'_, R8G8B8A8Unorm, usage![Sampled]>> {
     let mut arr = [0.0; 40];
     arr.iter_mut()
         .enumerate()
@@ -314,7 +320,7 @@ fn layouts(tex: ImageHandle<bindless::Sampled>) -> Layouts {
         .flatten()
         .enumerate()
         .for_each(|(i, m)| *m = i as f32);
-    Layouts {
+    LayoutsReferenceInfo {
         a: 1,
         b: 1 << 40,
         h: F16::new(1.5),
@@ -327,8 +333,8 @@ fn layouts(tex: ImageHandle<bindless::Sampled>) -> Layouts {
         m33: Mat3::from_cols_array(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]),
         m34,
         arr,
-        tex,
-        r#dyn: ImageHandle::NULL,
+        tex: tex.whole_view(),
+        r#dyn: DynImage::NULL,
         r#type: 5,
         inner: Inner {
             wide: u64::MAX - 1,
@@ -336,7 +342,6 @@ fn layouts(tex: ImageHandle<bindless::Sampled>) -> Layouts {
         },
         tail_vec: [1.0, 2.0, 3.0, 4.0],
         tail: 77,
-        ..Default::default()
     }
 }
 
@@ -346,40 +351,38 @@ fn generated_structs_keep_slangs_layout() {
     // Gaps are zeroed pads, `Default` is all zeroes (null handles), and a struct Slang doesn't
     // round up is packed.
     assert_eq!(size_of::<Layouts>(), 376);
+    assert_eq!(size_of::<LayoutsOut>(), 376);
     assert_eq!(size_of::<Inner>(), 12);
     let default = Layouts::default();
     assert_eq!(
         (default.tex, default.r#dyn),
         (ImageHandle::NULL, ImageHandle::NULL)
     );
-    let bytes = bytemuck::bytes_of(&default);
-    assert!(bytes.iter().all(|b| *b == 0), "null handles are zeroes too");
+    let out = LayoutsOut::default();
+    assert!(bytemuck::bytes_of(&out).iter().all(|b| *b == 0));
 
-    let first = Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::ONE)
-        .unwrap()
-        .bind_sampled()
-        .unwrap();
-    let second = Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::ONE)
-        .unwrap()
-        .bind_sampled()
-        .unwrap();
+    let first = Texture::new(UVec2::ONE).unwrap().bind_sampled().unwrap();
+    let second = Texture::new(UVec2::ONE).unwrap().bind_sampled().unwrap();
     let handles = [
         first.handle::<bindless::Sampled>(),
         second.handle::<bindless::Sampled>(),
     ];
-    // Structs with handles are `NoUninit`: written with `host_write`, read through the pointer.
+    // Referencing structs are written with their references: views, slices, `DynImage`s.
     let mut input: Buffer<Layouts, Upload> = Buffer::upload(1).unwrap();
-    input.host_write(0, &[layouts(handles[0])]);
+    input.host_write_referencing(0, [layouts(&first)]);
     let mut handle_buffer: Buffer<ImageHandle<bindless::Sampled>, Upload> =
         Buffer::upload(2).unwrap();
-    handle_buffer.host_write(0, &handles);
+    handle_buffer.host_write_referencing(
+        0,
+        [&first, &second].map(|t| ImageReference::new(t.whole_view())),
+    );
     let points = buffer_with(&[
         Vec3::new(1.0, 10.0, 100.0),
         Vec3::new(2.0, 20.0, 200.0),
         Vec3::new(3.0, 30.0, 300.0),
     ]);
-    let mut output: Buffer<Layouts, Readback> = Buffer::readback(1).unwrap();
-    output.host_write(0, &[Layouts::default()]);
+    let mut output: Buffer<LayoutsOut, Readback> = Buffer::readback(1).unwrap();
+    output.host_write(0, &[LayoutsOut::default()]);
     let mut sums = zeroed_buffer::<f32>(1);
     let rotation = Mat3::from_cols(
         Vec3::new(2.0, 0.0, 0.0),
@@ -407,10 +410,8 @@ fn generated_structs_keep_slangs_layout() {
         );
     };
     gpu.submit(|cmd| cmd.compute(&bindings, [1, 1, 1]));
-    let before = layouts(handles[0]);
-    // SAFETY: the submission completed, and every bit pattern is a `Layouts` (handles are
-    // plain `u32`s).
-    let after: Layouts = unsafe { output.host_ptr().read() };
+    let before = layouts(&first);
+    let after = output.host()[0];
     assert_eq!((after.a, after.b), (2, (1 << 40) + 1));
     assert_eq!((after.h.to_f32(), after.after_half), (3.0, 3.0));
     assert_eq!((after.s, after.u), (-4, 251));
@@ -430,8 +431,9 @@ fn generated_structs_keep_slangs_layout() {
             .all(|(i, a)| *a == 100.0 + 2.0 * i as f32)
     );
     assert_eq!(
-        after.tex, handles[1],
-        "a handle read through a `Buf<Tex2D>`"
+        (after.tex, after.r#dyn),
+        (handles[1].bits(), 0),
+        "a handle read through a `Buf<Tex2D>`, and a null `DynImg`"
     );
     assert_eq!(after.r#type, 15);
     let inner = after.inner;
@@ -445,7 +447,7 @@ fn generated_structs_keep_slangs_layout() {
 }
 
 /// `Image2D` reads through the storage descriptor; `Image2D` and `Tex2D` handles inside a
-/// struct behind a `Buf` read through theirs (their accesses passed by hand).
+/// struct behind a `Buf` read through theirs, reached through the buffer.
 #[test]
 fn storage_images_and_handles_behind_pointers_are_read() {
     let mut gpu = gpu();
@@ -466,19 +468,15 @@ fn storage_images_and_handles_behind_pointers_are_read() {
     };
     let (top, storage, sampled) = (make(&mut gpu, 10), make(&mut gpu, 50), make(&mut gpu, 90));
     let mut images: Buffer<TestImagePair, Upload> = Buffer::upload(1).unwrap();
-    images.host_write(
+    images.host_write_referencing(
         0,
-        &[TestImagePair {
-            storage: storage.handle::<bindless::Storage>(),
-            sampled: sampled.handle::<bindless::Sampled>(),
+        [TestImagePairReferenceInfo {
+            storage: storage.whole_view(),
+            sampled: sampled.whole_view(),
         }],
     );
     let mut out = zeroed_buffer::<Vec4>(12);
     gpu.submit(|cmd| {
-        let reached = [
-            lava::command_buffer::ImageUse::storage_read(storage.whole_view()),
-            lava::command_buffer::ImageUse::sampled_read(sampled.whole_view()),
-        ];
         let bindings = TestImage2d::push_bindings(
             TestImage2dArgs {
                 image: top.whole_view(),
@@ -486,7 +484,7 @@ fn storage_images_and_handles_behind_pointers_are_read() {
                 sampler: nearest(),
                 out: out.range(..),
             },
-            Some(lava::command_buffer::Accesses::images(&reached)),
+            None,
         );
         cmd.compute(&bindings, [1, 1, 1]);
     });

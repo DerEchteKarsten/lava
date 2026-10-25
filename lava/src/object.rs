@@ -1,4 +1,4 @@
-//! GPU objects as lava owns them: each lives in an `Arc` of its internal (buffers, images, acceleration structures), whose `Header` counts it as a lava user until its drop finished and keeps what references between objects need (the buffers that reference it, and dirty bits a write marks them with), and the typed strong references (`Strong`) a referencing buffer holds its children by
+//! GPU objects as lava owns them: each lives in an `Arc` of its internal (buffers, images, acceleration structures, samplers), whose `Header` counts it as a lava user until its drop finished and keeps what references between objects need (the buffers that reference it, and dirty bits a write marks them with), and the typed strong references (`Strong`) a referencing buffer holds its children by
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
@@ -6,8 +6,11 @@ use std::sync::{
 
 use smallvec::SmallVec;
 
+#[cfg(feature = "acceleration-structure")]
+use crate::vkobjects::acceleration_structure::StructureInternal;
 use crate::{
-    buffer::BufferInternal, global::Live, image::ImageInternal, queue::lock, reference::KeepAlive,
+    bindless::SamplerInternal, buffer::BufferInternal, global::Live, image::ImageInternal,
+    queue::lock, reference::KeepAlive,
 };
 
 /// The dirty bit of a layout: an image of the object or below it may be outside `GENERAL`.
@@ -63,6 +66,10 @@ pub(crate) trait Object: Send + Sync + 'static {
 pub(crate) enum Strong {
     Buffer(Arc<BufferInternal>),
     Image(Arc<ImageInternal>),
+    /// No barriers: the GPU never writes a sampler.
+    Sampler(Arc<SamplerInternal>),
+    #[cfg(feature = "acceleration-structure")]
+    Structure(Arc<StructureInternal>),
 }
 
 impl Strong {
@@ -70,15 +77,15 @@ impl Strong {
         match self {
             Strong::Buffer(buffer) => &**buffer,
             Strong::Image(image) => &**image,
+            Strong::Sampler(sampler) => &**sampler,
+            #[cfg(feature = "acceleration-structure")]
+            Strong::Structure(structure) => &**structure,
         }
     }
 
     /// Its address, which tells two references of the same object apart from others.
     pub(crate) fn key(&self) -> usize {
-        match self {
-            Strong::Buffer(buffer) => Arc::as_ptr(buffer) as *const () as usize,
-            Strong::Image(image) => Arc::as_ptr(image) as *const () as usize,
-        }
+        std::ptr::from_ref(self.object()) as *const () as usize
     }
 }
 

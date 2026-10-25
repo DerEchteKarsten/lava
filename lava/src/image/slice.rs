@@ -1,4 +1,4 @@
-//! Image views and the boxes of texels transfers take: `ImageView` (a borrowed range of an image's mips and layers, its handle (`bind` for a view bound on its own), its `VkImageView` and reinterpreted formats), `ImageSlice` (a box of one of a view's mips), `TexelBuffer` (buffer rows for copies), and the image transfer commands (clears, blits, image and buffer copies) with their format, box and block checks
+//! Image views and the boxes of texels transfers take: `ImageView` (a borrowed range of an image's mips and layers, its handle (`bind` for a view bound on its own, `dynamic_handle` for a `DynImg`), its `VkImageView` and reinterpreted formats), `ImageSlice` (a box of one of a view's mips), `TexelBuffer` (buffer rows for copies), and the image transfer commands (clears, blits, image and buffer copies) with their format, box and block checks
 use std::{iter, range::Range, sync::Arc};
 
 use crate::vk;
@@ -119,6 +119,37 @@ impl<'a, F: Format, U: ImageUsage, D: Dim> ImageView<'a, F, U, D> {
                     std::any::type_name::<K>().rsplit("::").next().unwrap(),
                 )
             })
+    }
+
+    /// The handle a `DynImg` takes: the view's own (the image's `bind_*`) of whatever kind it
+    /// has, else one [`Self::bind`] made (combined first); panics where it has none.
+    #[track_caller]
+    pub fn dynamic_handle(&self) -> ImageHandle {
+        if !self.handle.is_null() {
+            return self.handle;
+        }
+        let key = self.key();
+        let cache = &self.internal.cache;
+        (cache
+            .handle::<bindless::Combined>(key)
+            .map(ImageHandle::erase))
+        .or_else(|| {
+            cache
+                .handle::<bindless::Sampled>(key)
+                .map(ImageHandle::erase)
+        })
+        .or_else(|| {
+            cache
+                .handle::<bindless::Storage>(key)
+                .map(ImageHandle::erase)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "a `DynImg` names the view of {:?}, which isn't bound: call a `bind_*` on \
+                     its image, or `bind` on a view of some of its layers, mips or another format",
+                self.internal.image
+            )
+        })
     }
 
     /// Binds this view (its mips, layers and format) with `K`'s descriptors at free slots,

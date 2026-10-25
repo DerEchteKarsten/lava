@@ -1492,7 +1492,8 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                 let images = (draw.image_accesses().map(shorter_image))
                     .chain(found.clone().filter_map(Reached::image_use));
                 let buffers = (draw.buffer_accesses().map(shorter_buffer))
-                    .chain(found.filter_map(Reached::buffer_access));
+                    .chain(found.clone().filter_map(Reached::buffer_access))
+                    .chain(found.filter_map(Reached::structure_read));
                 (images, buffers)
             })
             .collect();
@@ -2168,7 +2169,8 @@ impl<'p> Recording<'p> {
         let images = (image_accesses.map(shorter_image))
             .chain(reached.iter().filter_map(Reached::image_use));
         let buffers = (buffer_accesses.map(shorter_buffer))
-            .chain(reached.iter().filter_map(Reached::buffer_access));
+            .chain(reached.iter().filter_map(Reached::buffer_access))
+            .chain(reached.iter().filter_map(Reached::structure_read));
         self.flush_accesses(images, buffers);
     }
 
@@ -2788,17 +2790,38 @@ impl Reached {
         }
     }
 
+    /// A buffer's access, or a TLAS's read of its memory. Samplers have none: the GPU never
+    /// writes them.
     pub(crate) fn buffer_access(&self) -> Option<BufferAccess<'_>> {
-        let Strong::Buffer(buffer) = &self.object else {
-            return None;
-        };
-        Some(BufferAccess {
-            stage: INDIRECT_STAGES,
-            access: self.access(),
-            range: self.range,
-            unordered: self.write && self.unordered,
-            buffer: Some(buffer),
-        })
+        match &self.object {
+            Strong::Buffer(buffer) => Some(BufferAccess {
+                stage: INDIRECT_STAGES,
+                access: self.access(),
+                range: self.range,
+                unordered: self.write && self.unordered,
+                buffer: Some(buffer),
+            }),
+            #[cfg(feature = "acceleration-structure")]
+            Strong::Structure(structure) => Some(structure.access(
+                INDIRECT_STAGES,
+                crate::vkobjects::acceleration_structure::trace_read(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// A TLAS's read of the BLASes it names, which lava can't list.
+    pub(crate) fn structure_read(&self) -> Option<BufferAccess<'_>> {
+        match &self.object {
+            #[cfg(feature = "acceleration-structure")]
+            Strong::Structure(_) => Some(
+                crate::vkobjects::acceleration_structure::every_structure_read(
+                    INDIRECT_STAGES,
+                    crate::vkobjects::acceleration_structure::trace_read(),
+                ),
+            ),
+            _ => None,
+        }
     }
 
     pub(crate) fn image_use(&self) -> Option<ImageUse<'_>> {

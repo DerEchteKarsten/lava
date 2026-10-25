@@ -1,4 +1,4 @@
-//! Generates the typed pass bindings (an argument struct per pass, one for its specialization constants, `push_bindings` with the extra `Accesses`, workgroup sizes), the shared structs (padded, `Default`), the exported constants and `PASS_MAP` from the descriptions of the compiled passes, compiled in parallel; and what the hot reload compiles them with again
+//! Generates the typed pass bindings (an argument struct per pass, one for its specialization constants, `push_bindings` with the extra `Accesses`, workgroup sizes), the shared structs (padded, `Default`; referencing ones `AnyBitPattern` with their `ReferencingData` impl and `{Name}ReferenceInfo`, and GPU writes of references refused), the exported constants and `PASS_MAP` from the descriptions of the compiled passes, compiled in parallel; and what the hot reload compiles them with again
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -462,13 +462,15 @@ fn layout_checks(rust_name: &str, fields: &[(String, u32)], size: u32) -> String
     out
 }
 
-fn derives(_handles: bool) -> &'static str {
-    "::lava::bytemuck::Pod, ::lava::bytemuck::Zeroable"
-}
-
-/// The value of a zeroed `ty` in `Default`: zero, null for handles (`ImageHandle::NULL` is 0).
-fn zero(_ty: &Ty) -> String {
-    "::lava::bytemuck::Zeroable::zeroed()".into()
+/// Whether `ty` is `Pod` in Rust: no handles (`ImageHandle` is only `AnyBitPattern`) and no
+/// referencing struct by value.
+fn is_pod(ty: &Ty) -> bool {
+    match ty {
+        Ty::Image(_) | Ty::DynImg => false,
+        Ty::Struct(_) => reference_count(ty, &BTreeMap::new()) == 0,
+        Ty::Array { element, .. } => is_pod(element),
+        _ => true,
+    }
 }
 
 /// The texel type lava's formats have for an image of `texel`s (`HasTexels`): halves read as
@@ -509,34 +511,16 @@ fn binding(
     let sampled = "::lava::vk::AccessFlags2::SHADER_SAMPLED_READ";
     Ok(match ty {
         Ty::Image(image) => {
-            let dim = match image.shape {
-                Shape::D2 => "::lava::image::D2",
-                Shape::D3 => "::lava::image::D3",
-                Shape::D2Array => "::lava::image::D2Array",
-            };
-            let texels = texels(image)?;
-            let bounds = format!("Dim = {dim}, Format: ::lava::image::format::HasTexels<{texels}>");
-            let (traits, flags, access) = match image.usage {
-                0 => (
-                    format!("::lava::image::SampledView<{bounds}>"),
-                    "SAMPLED",
-                    sampled.to_string(),
-                ),
-                1 => (
-                    format!("::lava::image::StorageView<{bounds}>"),
-                    "STORAGE",
-                    read.to_string(),
-                ),
-                2 => (
-                    format!("::lava::image::StorageView<{bounds}>"),
-                    "STORAGE",
-                    format!("{read} | {write}"),
-                ),
-                _ => (
-                    format!("::lava::image::SampledView<{bounds}> + ::lava::image::StorageView"),
-                    "SAMPLED | ::lava::vk::ImageUsageFlags::STORAGE",
-                    format!("{sampled} | {write}"),
-                ),
+            let ImageView {
+                traits,
+                flags,
+                texels,
+            } = image_view(image)?;
+            let access = match image.usage {
+                0 => sampled.to_string(),
+                1 => read.to_string(),
+                2 => format!("{read} | {write}"),
+                _ => format!("{sampled} | {write}"),
             };
             let view = format!("__view_{local}");
             let kind = handle_kind(image);
@@ -610,6 +594,379 @@ fn binding(
             }
         }
     })
+}
+
+/// What a generated image parameter is: its view traits (its shape's dimension and its texel
+/// type), the usage flags it checks and its texel type.
+struct ImageView {
+    traits: String,
+    flags: &'static str,
+    texels: String,
+}
+
+fn image_view(image: &Image) -> Result<ImageView, String> {
+    let dim = match image.shape {
+        Shape::D2 => "::lava::image::D2",
+        Shape::D3 => "::lava::image::D3",
+        Shape::D2Array => "::lava::image::D2Array",
+    };
+    let texels = texels(image)?;
+    let bounds = format!("Dim = {dim}, Format: ::lava::image::format::HasTexels<{texels}>");
+    let (traits, flags) = match image.usage {
+        0 => (format!("::lava::image::SampledView<{bounds}>"), "SAMPLED"),
+        1 | 2 => (format!("::lava::image::StorageView<{bounds}>"), "STORAGE"),
+        _ => (
+            format!("::lava::image::SampledView<{bounds}> + ::lava::image::StorageView"),
+            "SAMPLED | ::lava::vk::ImageUsageFlags::STORAGE",
+        ),
+    };
+    Ok(ImageView {
+        traits,
+        flags,
+        texels,
+    })
+}
+
+/// The Rust path of the mirror of Slang's `Sampler`.
+const SAMPLER_MIRROR: &str = "::lava::bindless::SamplerHandle";
+
+/// The references `ty` holds (its handles and addresses lava keeps alive: buffers, images,
+/// `DynImg`s, TLASes, samplers), in field order, each as `(write, unordered)`: whether the
+/// shader may write through it and its field is `[Unordered]`. `structs` resolves structs
+/// reached again by name.
+pub(crate) fn references(
+    ty: &Ty,
+    unordered: bool,
+    structs: &BTreeMap<String, Struct>,
+    out: &mut Vec<(bool, bool)>,
+) {
+    match ty {
+        Ty::Image(image) => out.push((image.usage >= 2, unordered)),
+        Ty::Buffer { writable, .. } => out.push((*writable, unordered)),
+        Ty::DynImg | Ty::Accel => out.push((false, false)),
+        Ty::Mirror(path, _) if *path == SAMPLER_MIRROR => out.push((false, false)),
+        Ty::Array { element, count, .. } => {
+            for _ in 0..*count {
+                references(element, unordered, structs, out);
+            }
+        }
+        Ty::Struct(s) => {
+            for f in &s.fields {
+                references(&f.ty, f.unordered, structs, out);
+            }
+        }
+        Ty::Named(name) => {
+            if let Some(s) = structs.get(name) {
+                for f in &s.fields {
+                    references(&f.ty, f.unordered, structs, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// How many references `ty` holds.
+fn reference_count(ty: &Ty, structs: &BTreeMap<String, Struct>) -> usize {
+    let mut out = Vec::new();
+    references(ty, false, structs, &mut out);
+    out.len()
+}
+
+/// A field that writes references, which lava couldn't follow (it keeps what a buffer
+/// references only for the writes that name it): a `MutBuf` of a type with references, in
+/// `ty` or below it. Its field path and the type.
+pub(crate) fn writes_references(
+    ty: &Ty,
+    path: &str,
+    structs: &BTreeMap<String, Struct>,
+    seen: &mut Vec<String>,
+) -> Option<(String, String)> {
+    match ty {
+        Ty::Buffer { pointee, writable } => {
+            if *writable && reference_count(&pointee.ty, structs) > 0 {
+                return Some((path.to_string(), type_name(&pointee.ty)));
+            }
+            writes_references(&pointee.ty, path, structs, seen)
+        }
+        Ty::Pointer(Some(pointee)) => writes_references(&pointee.ty, path, structs, seen),
+        Ty::Array { element, .. } => writes_references(element, path, structs, seen),
+        Ty::Struct(s) => {
+            if seen.contains(&s.name) {
+                return None;
+            }
+            seen.push(s.name.clone());
+            (s.fields.iter()).find_map(|f| {
+                writes_references(&f.ty, &format!("{path}.{}", f.name), structs, seen)
+            })
+        }
+        Ty::Named(name) => match structs.get(name) {
+            Some(s) => writes_references(&Ty::Struct(s.clone()), path, structs, seen),
+            None => None,
+        },
+        _ => None,
+    }
+}
+
+fn type_name(ty: &Ty) -> String {
+    match ty {
+        Ty::Struct(s) => s.name.clone(),
+        Ty::Named(name) => name.clone(),
+        Ty::Image(_) => "an image handle".into(),
+        Ty::DynImg => "a `DynImg`".into(),
+        Ty::Buffer { .. } => "a buffer address".into(),
+        Ty::Accel => "a TLAS address".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The `{name}ReferenceInfo` of a referencing shared struct and its `ReferencingData` impl:
+/// the info takes each field as what it references (a view per image, a slice per buffer, the
+/// `Tlas`, the `Sampler`, an info per nested referencing struct) and writes the struct and its
+/// references in field order.
+fn reference_info(
+    desc: &Struct,
+    types: &[Rust],
+    aligns: &BTreeMap<String, u32>,
+    structs: &BTreeMap<String, Struct>,
+) -> Result<String, String> {
+    let name = &desc.name;
+    let mut positions = Vec::new();
+    for f in &desc.fields {
+        references(&f.ty, f.unordered, structs, &mut positions);
+    }
+    if positions.len() > 64 {
+        return Err(format!(
+            "`{name}` holds {} references, more than lava's 64 per element",
+            positions.len()
+        ));
+    }
+    let mask = |pick: fn(&(bool, bool)) -> bool| {
+        (positions.iter().enumerate())
+            .filter(|(_, p)| pick(p))
+            .fold(0u64, |mask, (i, _)| mask | 1 << i)
+    };
+    let (writes, unordered) = (mask(|p| p.0), mask(|p| p.0 && p.1));
+    let mut lifetime = false;
+    let mut generics: Vec<(String, String)> = Vec::new();
+    let mut fields = Vec::new();
+    let mut code = Vec::new();
+    let mut at = 0usize;
+    let pascal = |field: &str| -> String { field.split('_').map(capitalize_first).collect() };
+    for (f, rust) in desc.fields.iter().zip(types) {
+        let field = ident(&f.name)?;
+        if f.unordered
+            && !matches!(
+                &f.ty,
+                Ty::Buffer { writable: true, .. } | Ty::Image(Image { usage: 2.., .. })
+            )
+        {
+            return Err(format!(
+                "`{name}.{}` is `[Unordered]` but no write reference (`MutBuf`, `MutImage*`, `MutTex*`)",
+                f.name
+            ));
+        }
+        let count = reference_count(&f.ty, structs);
+        let element = match &f.ty {
+            Ty::Array { element, count, .. } if reference_count(element, structs) > 0 => {
+                if matches!(**element, Ty::Array { .. }) {
+                    return Err(format!(
+                        "`{name}.{}`: arrays of arrays of references aren't supported",
+                        f.name
+                    ));
+                }
+                Some((element.as_ref(), *count))
+            }
+            _ => None,
+        };
+        let one = match element {
+            Some((element, _)) => element,
+            None => &f.ty,
+        };
+        // The argument type of one element, its generic, and the statements that write it to
+        // `target` with its references from `index` on.
+        let generic_of = |suffix: &str| {
+            let mut g = format!("{}{suffix}", pascal(&f.name));
+            while aligns.contains_key(&g) {
+                g.push('_');
+            }
+            g
+        };
+        let (arg, generic, write): (
+            String,
+            Option<(String, String)>,
+            Box<dyn Fn(&str, &str, &str) -> String>,
+        ) = match one {
+            Ty::Image(image) => {
+                let view = image_view(image)?;
+                let kind = handle_kind(image);
+                let g = generic_of("View");
+                let (texels, flags) = (view.texels.clone(), view.flags);
+                (
+                    g.clone(),
+                    Some((g, format!("{} + 'a", view.traits))),
+                    Box::new(move |source: &str, target: &str, index: &str| {
+                        format!(
+                            "let __view = ::lava::image::ImageRef::view({source});\n            \
+                             __view.texel_check::<{texels}>();\n            \
+                             __view.usage_check(::lava::vk::ImageUsageFlags::{flags});\n            \
+                             {target} = __view.handle::<::lava::bindless::{kind}>();\n            \
+                             references[{index}] = ::lava::reference::Reference::image(__view);"
+                        )
+                    }),
+                )
+            }
+            Ty::DynImg => {
+                lifetime = true;
+                (
+                    "::lava::reference::DynImage<'a>".into(),
+                    None,
+                    Box::new(|source: &str, target: &str, index: &str| {
+                        format!(
+                            "{target} = {source}.handle();\n            \
+                             references[{index}] = {source}.reference();"
+                        )
+                    }),
+                )
+            }
+            Ty::Buffer { pointee, .. } => {
+                lifetime = true;
+                (
+                    format!("::lava::BufferSlice<'a, {}>", pointee_ty(pointee, aligns)?),
+                    None,
+                    Box::new(|source: &str, target: &str, index: &str| {
+                        format!(
+                            "{target} = {source}.address();\n            \
+                             references[{index}] = ::lava::reference::Reference::buffer({source});"
+                        )
+                    }),
+                )
+            }
+            Ty::Accel => {
+                lifetime = true;
+                (
+                    "&'a ::lava::Tlas".into(),
+                    None,
+                    Box::new(|source: &str, target: &str, index: &str| {
+                        format!(
+                            "{target} = {source}.address();\n            \
+                             references[{index}] = ::lava::reference::Reference::tlas({source});"
+                        )
+                    }),
+                )
+            }
+            Ty::Mirror(path, _) if *path == SAMPLER_MIRROR => {
+                lifetime = true;
+                (
+                    "&'a ::lava::bindless::Sampler".into(),
+                    None,
+                    Box::new(|source: &str, target: &str, index: &str| {
+                        format!(
+                            "{target} = {source}.handle();\n            \
+                             references[{index}] = ::lava::reference::Reference::sampler({source});"
+                        )
+                    }),
+                )
+            }
+            Ty::Struct(s) if count > 0 => {
+                let g = generic_of("Info");
+                let n = reference_count(one, structs);
+                (
+                    g.clone(),
+                    Some((
+                        g,
+                        format!("::lava::reference::ReferenceInfo<'a, Data = {}>", s.name),
+                    )),
+                    Box::new(move |source: &str, target: &str, index: &str| {
+                        format!(
+                            "let mut __inner = {target};\n            \
+                             ::lava::reference::ReferenceInfo::write({source}, &mut __inner, \
+                             &mut references[{index}..{index} + {n}]);\n            \
+                             {target} = __inner;"
+                        )
+                    }),
+                )
+            }
+            _ => (
+                rust.ty.clone(),
+                None,
+                Box::new(|source: &str, target: &str, _: &str| format!("{target} = {source};")),
+            ),
+        };
+        let per_element = match element {
+            Some((element, _)) => reference_count(element, structs),
+            None => count,
+        };
+        match element {
+            Some((_, n)) => {
+                fields.push(format!("    pub {field}: [{arg}; {n}],"));
+                let body = write(
+                    "__element",
+                    "__array[__i]",
+                    &format!("{at} + __i * {per_element}"),
+                );
+                code.push(format!(
+                    "        {{\n            let mut __array = data.{field};\n            \
+                     for (__i, __element) in self.{field}.into_iter().enumerate() {{\n            \
+                     {body}\n            }}\n            data.{field} = __array;\n        }}"
+                ));
+            }
+            None => {
+                fields.push(format!("    pub {field}: {arg},"));
+                let body = write(
+                    &format!("self.{field}"),
+                    &format!("data.{field}"),
+                    &at.to_string(),
+                );
+                code.push(format!("        {{\n            {body}\n        }}"));
+            }
+        }
+        if let Some(g) = generic {
+            generics.push(g);
+        }
+        at += count;
+    }
+    let mut params: Vec<String> = Vec::new();
+    if lifetime {
+        params.push("'a".into());
+    }
+    params.extend(generics.iter().map(|(g, _)| g.clone()));
+    let struct_params = match params.is_empty() {
+        true => String::new(),
+        false => format!("<{}>", params.join(", ")),
+    };
+    let mut impl_params = vec!["'a".to_string()];
+    impl_params.extend(generics.iter().map(|(g, bound)| format!("{g}: {bound}")));
+    let n = positions.len();
+    Ok(format!(
+        r#"
+// SAFETY: generated from the struct's Slang declaration: every handle and address of `{name}`
+// comes with its reference from `{name}ReferenceInfo`, in field order; `WRITES` marks its
+// `MutBuf`, `MutImage*` and `MutTex*` fields, `UNORDERED` those of them that are `[Unordered]`.
+unsafe impl ::lava::reference::ReferencingData for {name} {{
+    const REFERENCES: usize = {n};
+    const WRITES: u64 = {writes:#b};
+    const UNORDERED: u64 = {unordered:#b};
+}}
+
+/// A `{name}` as what its handles and addresses reference, for `host_write_referencing` and
+/// `Uploader::write_referencing`.
+pub struct {name}ReferenceInfo{struct_params} {{
+{fields}
+}}
+
+impl<{impl_params}> ::lava::reference::ReferenceInfo<'a> for {name}ReferenceInfo{struct_params} {{
+    type Data = {name};
+    #[track_caller]
+    fn write(self, data: &mut {name}, references: &mut [::lava::reference::Reference<'a>]) {{
+{code}
+    }}
+}}
+"#,
+        fields = fields.join("\n"),
+        impl_params = impl_params.join(", "),
+        code = code.join("\n"),
+    ))
 }
 
 /// The element type of a `BufferSlice` of `pointee`, checked against its stride.
@@ -733,7 +1090,7 @@ fn generate_pass(
             .collect();
         let (body, pads) = struct_fields(&gpu_fields, push_size, false);
         gaps = pads;
-        let handles = pc.fields.iter().any(|f| f.ty.holds_handles());
+        let pod = pc.fields.iter().all(|f| is_pod(&f.ty));
         let checks = layout_checks(
             &gpu_name,
             &(fields.iter())
@@ -750,8 +1107,20 @@ fn generate_pass(
 pub struct {gpu_name} {{
 {body}
 }}
-{checks}"#,
-            derives = derives(handles),
+{checks}{no_uninit}"#,
+            derives = match pod {
+                true => "::lava::bytemuck::Pod, ::lava::bytemuck::Zeroable",
+                false => "::lava::bytemuck::Zeroable",
+            },
+            no_uninit = match pod {
+                true => String::new(),
+                false => format!(
+                    "// SAFETY: `repr(C)` with a `_pad` field for every gap (the layout checks \
+                     above), so\n// every byte is a field's; a binding pushes its handles \
+                     with their accesses.\nunsafe impl ::lava::bytemuck::NoUninit for \
+                     {gpu_name} {{}}\n"
+                ),
+            },
         ));
     }
 
@@ -1100,22 +1469,23 @@ impl {name} {{{workgroup}
     Ok(GeneratedPass { code, entry })
 }
 
-/// The text of a shared struct (behind a pointer): padded, deriving `Pod` (`NoUninit` with
-/// handles), `Default` zeroed with null handles, layout-checked, and the clock readout on
-/// `profile.slang`'s `Clock`.
+/// The text of a shared struct (behind a pointer): padded, deriving `Pod` (`AnyBitPattern` with
+/// references, plus its `ReferencingData` impl and `{name}ReferenceInfo`), `Default` zeroed
+/// (null handles), layout-checked, and the clock readout on `profile.slang`'s `Clock`.
 fn shared_struct(
     s: &SharedStruct,
     structs: &BTreeMap<String, u32>,
+    descs: &BTreeMap<String, Struct>,
     clocks: &[String],
 ) -> Result<String, String> {
     let desc = &s.desc;
     let mut fields = Vec::new();
     let mut checks = Vec::new();
     let (types, align) = struct_layout(desc, structs)?;
-    for (f, rust) in desc.fields.iter().zip(types) {
+    for (f, rust) in desc.fields.iter().zip(&types) {
         let name = ident(&f.name)?;
         checks.push((name.clone(), f.offset));
-        fields.push((name, f.offset, f.size, rust.ty));
+        fields.push((name, f.offset, f.size, rust.ty.clone()));
     }
     let repr = match align.effective < align.natural {
         true => format!("C, packed({})", align.effective),
@@ -1126,9 +1496,9 @@ fn shared_struct(
     }
     let name = &desc.name;
     let (body, gaps) = struct_fields(&fields, desc.size, true);
-    let handles = desc.fields.iter().any(|f| f.ty.holds_handles());
-    let mut zeros: Vec<String> = (fields.iter().zip(&desc.fields))
-        .map(|((field, ..), f)| format!("            {field}: {},", zero(&f.ty)))
+    let referencing = reference_count(&Ty::Struct(desc.clone()), descs) > 0;
+    let mut zeros: Vec<String> = (fields.iter())
+        .map(|(field, ..)| format!("            {field}: ::lava::bytemuck::Zeroable::zeroed(),"))
         .collect();
     zeros.extend(
         gaps.iter()
@@ -1136,8 +1506,7 @@ fn shared_struct(
     );
     let mut text = format!(
         r#"
-#[derive(Clone, Copy, Debug, {derives})]
-#[bytemuck(crate = "::lava::bytemuck")]
+{derive}
 #[repr({repr})]
 pub struct {name} {{
 {body}
@@ -1152,10 +1521,29 @@ impl ::core::default::Default for {name} {{
     }}
 }}
 "#,
-        derives = derives(handles),
+        // A referencing struct isn't `NoUninit`: only its info writes it, with its references.
+        derive = match referencing {
+            true => "#[derive(Clone, Copy, Debug)]",
+            false => {
+                "#[derive(Clone, Copy, Debug, ::lava::bytemuck::Pod, ::lava::bytemuck::Zeroable)]\n\
+                 #[bytemuck(crate = \"::lava::bytemuck\")]"
+            }
+        },
         checks = layout_checks(name, &checks, desc.size),
         zeros = zeros.join("\n"),
     );
+    if referencing {
+        // By hand: bytemuck has no `AnyBitPattern` for arrays of non-`Pod` types (nested
+        // referencing structs, handles).
+        text.push_str(&format!(
+            "// SAFETY: `repr(C)` of scalars, vectors, matrices, handles, pads and referencing \
+             structs\n// (the layout checks above): every bit pattern is a value, zero too.\n\
+             unsafe impl ::lava::bytemuck::Zeroable for {name} {{}}\n\
+             // SAFETY: as above.\n\
+             unsafe impl ::lava::bytemuck::AnyBitPattern for {name} {{}}\n"
+        ));
+        text.push_str(&reference_info(desc, &types, structs, descs)?);
+    }
     // The clock readout: `take` on `Clock`, `regions` on a struct of only `Clock`s.
     if is_clock(desc) {
         text.push_str(&format!(
@@ -1305,9 +1693,22 @@ impl Generator {
             let fields = (desc.push_constants.iter())
                 .flat_map(|pc| pc.fields.iter().map(|f| (&f.name, &f.ty)));
             let constants = desc.constants.iter().map(|c| (&c.name, &c.ty));
-            for (name, ty) in fields.chain(constants) {
+            let roots: Vec<(&String, &Ty)> = fields.chain(constants).collect();
+            for &(name, ty) in &roots {
                 if let Err(e) = self.collect(ty, source) {
                     errors.push(format!("`{name}`: {e}"));
+                }
+            }
+            let descs = self.descs();
+            for &(name, ty) in &roots {
+                if let Some((path, written)) = writes_references(ty, name, &descs, &mut Vec::new())
+                {
+                    errors.push(format!(
+                        "`{path}` lets the GPU write `{written}`, which holds references: lava \
+                         keeps what a buffer references only from the host's writes \
+                         (`host_write_referencing`, `Uploader::write_referencing`); read it \
+                         through a `Buf`, or write raw addresses (`T*`)"
+                    ));
                 }
             }
             let name = &pass.name;
@@ -1340,17 +1741,29 @@ impl Generator {
         file_errors
     }
 
-    /// Claims the names of the shared structs (mirrors of lava types aren't generated).
+    /// Claims the names of the shared structs and the reference infos of referencing ones
+    /// (mirrors of lava types aren't generated).
     fn claim_structs(&mut self, failures: &mut Vec<String>) {
-        let shared: Vec<(String, String)> = (self.structs.iter())
-            .filter(|(_, s)| s.mirror.is_none())
-            .map(|(name, s)| (name.clone(), s.source.clone()))
-            .collect();
+        let descs = self.descs();
+        let mut shared: Vec<(String, String)> = Vec::new();
+        for (name, s) in self.structs.iter().filter(|(_, s)| s.mirror.is_none()) {
+            shared.push((name.clone(), s.source.clone()));
+            if reference_count(&Ty::Struct(s.desc.clone()), &descs) > 0 {
+                shared.push((format!("{name}ReferenceInfo"), s.source.clone()));
+            }
+        }
         for (name, source) in shared {
             if let Err(e) = self.claim(&name, &source) {
                 failures.push(e);
             }
         }
+    }
+
+    /// The shared structs' descriptions by name.
+    fn descs(&self) -> BTreeMap<String, Struct> {
+        (self.structs.iter())
+            .map(|(name, s)| (name.clone(), s.desc.clone()))
+            .collect()
     }
 
     /// The `[RustConst]` exports as Rust constants.
@@ -1460,8 +1873,9 @@ impl Shaders {
             .map(|s| s.desc.name.clone())
             .collect();
         let mut struct_text = String::new();
+        let descs = generator.descs();
         for s in generator.structs.values() {
-            match shared_struct(s, &aligns, &clocks) {
+            match shared_struct(s, &aligns, &descs, &clocks) {
                 Ok(text) => struct_text.push_str(&text),
                 Err(e) => file_errors.entry(&s.source).or_default().push(e),
             }
@@ -1683,6 +2097,7 @@ mod tests {
             offset,
             size,
             ty,
+            unordered: false,
         }
     }
 
@@ -1718,6 +2133,111 @@ mod tests {
         );
     }
 
+    /// The generator's errors and generated struct text for a compute pass of these push
+    /// constant fields and declarations.
+    fn generate(stem: &str, decls: &str, fields: &str) -> (Vec<String>, String) {
+        let source = format!(
+            "#include \"bindless.slang\"\n{decls}\nstruct Pc {{ {fields} }}\n\
+             [[vk::push_constant]] Pc pc;\n\
+             [shader(\"compute\")] [numthreads(1, 1, 1)] void main() {{}}\n"
+        );
+        let compiled = crate::describe::tests::compile(stem, &source);
+        let passes = compiled.passes.unwrap();
+        let mut generator = Generator {
+            structs: BTreeMap::new(),
+            exports: BTreeMap::new(),
+            items: BTreeMap::new(),
+        };
+        let mut errors: Vec<String> = (generator.collect_passes(&[(&passes[0], "p.slang")]))
+            .into_values()
+            .flatten()
+            .collect();
+        generator.claim_structs(&mut errors);
+        let aligns = generator.alignments().unwrap();
+        let descs = generator.descs();
+        let mut text = String::new();
+        for s in generator.structs.values() {
+            match shared_struct(s, &aligns, &descs, &[]) {
+                Ok(t) => text.push_str(&t),
+                Err(e) => errors.push(e),
+            }
+        }
+        (errors, text)
+    }
+
+    #[test]
+    fn referencing_structs_get_reference_infos() {
+        let decls = "struct M { Tex2D<float4> color; Sampler sampler; }\n\
+                     struct C { [Unordered] MutBuf<uint> hits; MutBuf<uint> slots; }\n\
+                     struct N { M materials[2]; Buf<float> weights; C counter; DynImg<float4> dyn; \
+                     float plain; }";
+        let (errors, text) = generate("infos", decls, "Buf<N> n;");
+        assert!(errors.is_empty(), "{errors:?}");
+        // References in field order: two materials of two, weights, hits, slots, dyn.
+        assert!(text.contains("unsafe impl ::lava::reference::ReferencingData for N {"));
+        assert!(text.contains("const REFERENCES: usize = 8;"), "{text}");
+        assert!(text.contains("const WRITES: u64 = 0b1100000;"), "{text}");
+        assert!(text.contains("const UNORDERED: u64 = 0b100000;"), "{text}");
+        assert!(
+            text.contains("const UNORDERED: u64 = 0b1;"),
+            "C's own: {text}"
+        );
+        assert!(
+            text.contains("pub materials: [MaterialsInfo; 2],"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pub r#dyn: ::lava::reference::DynImage<'a>,"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pub sampler: &'a ::lava::bindless::Sampler,"),
+            "{text}"
+        );
+        assert!(
+            text.contains("&mut references[0 + __i * 2..0 + __i * 2 + 2]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("references[4] = ::lava::reference::Reference::buffer(self.weights);")
+        );
+        assert!(text.contains("unsafe impl ::lava::bytemuck::AnyBitPattern for N {}"));
+        assert!(!text.contains("PlainReferenceInfo"));
+    }
+
+    #[test]
+    fn gpu_written_references_are_refused() {
+        let decls = "struct R { Buf<uint> data; }\nstruct Outer { MutBuf<R> inner; }";
+        let (errors, _) = generate("written", decls, "MutBuf<R> r;");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`r` lets the GPU write `R`")),
+            "{errors:?}"
+        );
+        let (errors, _) = generate("written_below", decls, "Buf<Outer> outer;");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`outer.inner` lets the GPU write `R`")),
+            "{errors:?}"
+        );
+        // Read, or through a raw pointer: fine.
+        let (errors, _) = generate("read", decls, "Buf<R> r; R* raw;");
+        assert!(errors.is_empty(), "{errors:?}");
+        let (errors, _) = generate(
+            "unordered_plain",
+            "struct U { [Unordered] uint x; Buf<uint> b; }",
+            "Buf<U> u;",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`U.x` is `[Unordered]` but no write reference")),
+            "{errors:?}"
+        );
+    }
+
     #[test]
     fn structs_slang_doesnt_round_up_are_packed() {
         let inner = Struct {
@@ -1735,7 +2255,7 @@ mod tests {
             source: "a.slang".into(),
             mirror: None,
         };
-        let text = shared_struct(&shared, &BTreeMap::new(), &[]).unwrap();
+        let text = shared_struct(&shared, &BTreeMap::new(), &BTreeMap::new(), &[]).unwrap();
         assert!(text.contains("#[repr(C, packed(4))]"), "{text}");
         assert!(
             text.contains("impl ::core::default::Default for Inner"),
@@ -1776,7 +2296,7 @@ mod tests {
             mirror: None,
         };
         assert!(
-            !shared_struct(&shared, &BTreeMap::new(), &[])
+            !shared_struct(&shared, &BTreeMap::new(), &BTreeMap::new(), &[])
                 .unwrap()
                 .contains("fn take")
         );
@@ -1816,8 +2336,7 @@ mod tests {
         );
         let bindless = include_str!("../slang/bindless.slang");
         let null = lava::bindless::ImageHandle::<lava::bindless::Dynamic>::NULL;
-        let null = u32::from_ne_bytes(lava::bytemuck::bytes_of(&null).try_into().unwrap());
-        assert_eq!(slang_const(bindless, "NULL_HANDLE"), null as u64);
+        assert_eq!(slang_const(bindless, "NULL_HANDLE"), null.bits() as u64);
         assert_eq!(slang_const(bindless, "HANDLE_SLOT"), (1 << 30) - 1);
     }
 }

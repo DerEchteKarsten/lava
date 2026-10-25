@@ -15,7 +15,7 @@ use lava::{
         Tlas, TransformMatrix, Triangles, TrianglesDesc, VertexPosition, scratch_alignment,
     },
     buffer::{Buffer, Gpu, Readback, Upload},
-    command_buffer::{Accesses, BufferAccess, TraceRaysIndirectCommand},
+    command_buffer::TraceRaysIndirectCommand,
     image::{Image, format::R8G8B8A8Unorm, usage::usage},
     query::{QueryPool, QueryRecorder, ScopeInfo, ScopeObserver},
 };
@@ -1449,24 +1449,23 @@ fn structures_named_inside_structs_behind_pointers_are_traced() {
     let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
     let trace = |gpu: &mut common::Gpu, mask: u32| {
         let mut named: Buffer<TestSceneRef, Upload> = Buffer::upload(1).unwrap();
-        named.host_write(
+        named.host_write_referencing(
             0,
-            &[TestSceneRef {
-                tlas: scene.tlas.address(),
+            [TestSceneRefReferenceInfo {
+                tlas: &scene.tlas,
                 mask,
-                ..Default::default()
+                unused: 0,
             }],
         );
         render(gpu, |cmd, target| {
-            // Only named through the struct: its accesses go in by hand.
-            let traced = BufferAccess::trace(&scene.tlas);
+            // Only named through the struct, which reaches it.
             let bindings = TestAccelStruct::push_bindings(
                 TestAccelStructArgs {
                     target: target.whole_view(),
                     scene: named.range(..),
                     size: EXTENT,
                 },
-                Some(Accesses::buffers(&traced)),
+                None,
             )
             .unwrap();
             cmd.compute(&bindings, [SIZE / 8, SIZE / 8, 1]);

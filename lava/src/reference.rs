@@ -1,4 +1,4 @@
-//! Referencing buffers: element types whose handles and addresses reference other GPU objects (`ReferencingData`, implemented by generated code), written only with their references (`ReferenceInfo`, `Buffer::host_write_referencing`, `Uploader::write_referencing`), which the buffer keeps alive (`KeepAlive`: its distinct children, four looked up branch-free and more through a hash index, and a child index per reference) and which commands that name the buffer reach for barriers
+//! Referencing buffers: element types whose handles and addresses reference other GPU objects (`ReferencingData`, implemented by generated code), written only with their references (`ReferenceInfo`, `DynImage` for a `DynImg`, `Buffer::host_write_referencing`, `Uploader::write_referencing`), which the buffer keeps alive (`KeepAlive`: its distinct children, four looked up branch-free and more through a hash index, and a child index per reference) and which commands that name the buffer reach for barriers
 use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
@@ -8,9 +8,12 @@ use std::{
 
 use smallvec::SmallVec;
 
+#[cfg(feature = "acceleration-structure")]
+use crate::vkobjects::acceleration_structure::{StructureInternal, Tlas};
 use crate::{
+    bindless::{ImageHandle, Sampler, SamplerInternal},
     buffer::{BufferInternal, slice::BufferSlice},
-    image::{Dim, ImageInternal, format::Format, slice::ImageView, usage::ImageUsage},
+    image::{Dim, ImageInternal, ImageRef, format::Format, slice::ImageView, usage::ImageUsage},
     object::{Object, Strong, mark_writes_below},
     queue::lock,
 };
@@ -18,7 +21,7 @@ use crate::{
 /// An element type whose handles and addresses reference other GPU objects, written into a
 /// buffer only together with its references ([`ReferenceInfo`]), which the buffer keeps alive
 /// and which commands that name the buffer reach for barriers. lava-build-slang implements it
-/// for every Slang struct with `Buf`, `MutBuf`, image, `DynImg` or `Accel` fields.
+/// for every Slang struct with `Buf`, `MutBuf`, image, `DynImg`, `Accel` or `Sampler` fields.
 ///
 /// It is `AnyBitPattern` (buffers of it can be read back) but not `NoUninit`, so none of
 /// lava's plain writes (`host_write`, `host_mut`, `Uploader::write`, `cast`, ...) take it:
@@ -58,8 +61,20 @@ pub unsafe trait ReferencingData: bytemuck::AnyBitPattern {
 /// addresses from them.
 pub trait ReferenceInfo<'a> {
     type Data: ReferencingData;
-    /// Calls `f` with the element and its `Data::REFERENCES` references, in order.
-    fn with_output<R>(self, f: impl FnOnce(&Self::Data, &[Reference<'a>]) -> R) -> R;
+    /// Writes the element into `data` (zeroed) and its references into `references`, exactly
+    /// `Data::REFERENCES` of them (`Reference::NONE` until written), in order; nested structs
+    /// write theirs into the sub-slice their fields cover.
+    fn write(self, data: &mut Self::Data, references: &mut [Reference<'a>]);
+}
+
+/// `item`'s element and references.
+pub(crate) fn output<'a, T: ReferencingData>(
+    item: impl ReferenceInfo<'a, Data = T>,
+) -> (T, SmallVec<[Reference<'a>; 8]>) {
+    let mut data = T::zeroed();
+    let mut references = smallvec::smallvec![Reference::NONE; T::REFERENCES];
+    item.write(&mut data, &mut references);
+    (data, references)
 }
 
 /// A borrowed reference to an object an element's handle or address names, and the byte range
@@ -72,11 +87,41 @@ pub struct Reference<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Referenced<'a> {
+    /// Nothing: a reference not written yet.
+    None,
     Buffer(&'a Arc<BufferInternal>),
     Image(&'a Arc<ImageInternal>),
+    Sampler(&'a Arc<SamplerInternal>),
+    #[cfg(feature = "acceleration-structure")]
+    Structure(&'a Arc<StructureInternal>),
 }
 
 impl<'a> Reference<'a> {
+    /// No reference, what a slice of them starts as.
+    pub const NONE: Self = Reference {
+        object: Referenced::None,
+        range: Range { start: 0, end: 0 },
+    };
+
+    /// The sampler a `Sampler` field's handle names.
+    #[doc(hidden)]
+    pub fn sampler(sampler: &'a Sampler) -> Self {
+        Reference {
+            object: Referenced::Sampler(&sampler.internal),
+            range: (0..0).into(),
+        }
+    }
+
+    /// The TLAS an `Accel` field's address names.
+    #[doc(hidden)]
+    #[cfg(feature = "acceleration-structure")]
+    pub fn tlas(tlas: &'a Tlas) -> Self {
+        Reference {
+            object: Referenced::Structure(&tlas.internal),
+            range: tlas.internal.range,
+        }
+    }
+
     /// The slice a `Buf`/`MutBuf` field's address points at.
     #[doc(hidden)]
     pub fn buffer<T: Copy + 'static>(slice: BufferSlice<'a, T>) -> Self {
@@ -95,18 +140,62 @@ impl<'a> Reference<'a> {
         }
     }
 
-    fn strong(&self) -> Strong {
-        match self.object {
+    /// `None` for `NONE`.
+    fn strong(&self) -> Option<Strong> {
+        Some(match self.object {
+            Referenced::None => return None,
             Referenced::Buffer(buffer) => Strong::Buffer(buffer.clone()),
             Referenced::Image(image) => Strong::Image(image.clone()),
-        }
+            Referenced::Sampler(sampler) => Strong::Sampler(sampler.clone()),
+            #[cfg(feature = "acceleration-structure")]
+            Referenced::Structure(structure) => Strong::Structure(structure.clone()),
+        })
     }
 
     fn key(&self) -> usize {
-        match self.object {
-            Referenced::Buffer(buffer) => Arc::as_ptr(buffer) as *const () as usize,
-            Referenced::Image(image) => Arc::as_ptr(image) as *const () as usize,
+        self.strong().map_or(0, |strong| strong.key())
+    }
+}
+
+/// What a `DynImg` field names: a view of any kind its image is bound with, or nothing
+/// ([`Self::NULL`], the null handle, which shaders read as zero).
+#[derive(Clone, Copy, Debug)]
+pub struct DynImage<'a> {
+    handle: ImageHandle,
+    reference: Reference<'a>,
+}
+
+impl<'a> DynImage<'a> {
+    pub const NULL: Self = DynImage {
+        handle: ImageHandle::NULL,
+        reference: Reference::NONE,
+    };
+
+    /// `view`, through its image's handle (`ImageView::dynamic_handle`; panics unless it is
+    /// bound).
+    #[track_caller]
+    pub fn new(view: impl ImageRef + 'a) -> Self {
+        let view = view.view();
+        DynImage {
+            handle: view.dynamic_handle(),
+            reference: Reference::image(view),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn handle(&self) -> ImageHandle {
+        self.handle
+    }
+
+    #[doc(hidden)]
+    pub fn reference(&self) -> Reference<'a> {
+        self.reference
+    }
+}
+
+impl Default for DynImage<'_> {
+    fn default() -> Self {
+        Self::NULL
     }
 }
 
@@ -200,9 +289,10 @@ impl KeepAlive {
                 _ => Some(Order::Unordered),
             };
             let own = matches!(reference.object, Referenced::Buffer(b) if Arc::ptr_eq(b, parent));
-            // A reference to the buffer itself: it is alive whenever it is read, and an `Arc`
-            // would leak it.
-            let index = match own {
+            // None, or the buffer itself: it is alive whenever it is read, and an `Arc` would
+            // leak it.
+            let none = matches!(reference.object, Referenced::None);
+            let index = match own || none {
                 true => NONE,
                 false => self.insert(parent, reference, write),
             };
@@ -256,7 +346,7 @@ impl KeepAlive {
                 i
             }
             None => {
-                let object = reference.strong();
+                let object = reference.strong().expect("a reference to something");
                 debug_assert!(
                     !reaches(object.object(), parent),
                     "a reference cycle between two buffers: both would stay alive for good"

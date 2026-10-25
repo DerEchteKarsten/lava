@@ -1,4 +1,4 @@
-//! GPU tests under GPU-assisted validation (`Config::gpu_assisted_validation`, its own context, so its own binary): representative passes (buffers through device addresses, a storage image, a bindless texture in a draw, a ray query) whose bindless indices, layouts and address bounds the layer checks on the GPU
+//! GPU tests under GPU-assisted validation (`Config::gpu_assisted_validation`, its own context, so its own binary): representative passes (buffers through device addresses, a storage image, a bindless texture in a draw, a ray query, images reached through a referencing buffer) whose bindless indices, layouts and address bounds the layer checks on the GPU
 mod common;
 
 use common::render::*;
@@ -195,37 +195,6 @@ fn reads_past_a_buffer_are_reported() {
     );
 }
 
-/// `TestImagePair` as a referencing type: its storage and sampled handles are references.
-#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
-#[repr(transparent)]
-struct Pair(TestImagePair);
-
-// SAFETY: its two handles, in field order, come with their references from `pair`'s info,
-// and the pass only reads through them.
-unsafe impl lava::reference::ReferencingData for Pair {
-    const REFERENCES: usize = 2;
-    const WRITES: u64 = 0;
-    const UNORDERED: u64 = 0;
-}
-
-struct PairInfo<'a>(&'a Target, &'a Target);
-
-impl<'a> lava::reference::ReferenceInfo<'a> for PairInfo<'a> {
-    type Data = Pair;
-    fn with_output<R>(self, f: impl FnOnce(&Pair, &[lava::reference::Reference<'a>]) -> R) -> R {
-        let (storage, sampled) = (self.0.whole_view(), self.1.whole_view());
-        let pair = Pair(TestImagePair {
-            storage: storage.handle(),
-            sampled: sampled.handle(),
-        });
-        use lava::reference::Reference;
-        f(
-            &pair,
-            &[Reference::image(storage), Reference::image(sampled)],
-        )
-    }
-}
-
 type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Sampled, Storage]>;
 
 /// Images rendered right before a pass reads them through a referencing buffer, without
@@ -242,8 +211,14 @@ fn images_reached_through_a_buffer_are_read_in_general() {
             .unwrap()
     };
     let (top, storage, sampled) = (make(), make(), make());
-    let mut pairs = lava::Buffer::<Pair, lava::buffer::Upload>::upload(1).unwrap();
-    pairs.host_write_referencing(0, [PairInfo(&storage, &sampled)]);
+    let mut pairs = lava::Buffer::<TestImagePair, lava::buffer::Upload>::upload(1).unwrap();
+    pairs.host_write_referencing(
+        0,
+        [TestImagePairReferenceInfo {
+            storage: storage.whole_view(),
+            sampled: sampled.whole_view(),
+        }],
+    );
     let mut out = common::zeroed_buffer::<Vec4>(12);
     gpu.submit(|cmd| {
         for image in [&top, &storage, &sampled] {
@@ -259,7 +234,7 @@ fn images_reached_through_a_buffer_are_read_in_general() {
         let bindings = TestImage2d::push_bindings(
             TestImage2dArgs {
                 image: top.whole_view(),
-                images: pairs.range(..).cast::<TestImagePair>(),
+                images: pairs.range(..),
                 sampler: nearest(),
                 out: out.range(..),
             },

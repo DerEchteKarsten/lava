@@ -1,4 +1,4 @@
-//! The plain-data description of a compiled pass that the codegen and the hot reload read from Slang's reflection: its kind and entry points (workgroup and subgroup sizes), push constants and specialization constants as type trees with lava's handle types, its exported constants, and the layout hash of everything its generated bindings depend on
+//! The plain-data description of a compiled pass that the codegen and the hot reload read from Slang's reflection: its kind and entry points (workgroup and subgroup sizes), push constants and specialization constants as type trees with lava's handle types (and `[Unordered]` fields), its exported constants, and the layout hash of everything its generated bindings depend on
 use shader_slang::{
     self as slang, MatrixLayoutMode, ParameterCategory as Cat, ScalarType, TypeKind,
     reflection::{Shader, TypeLayout, VariableLayout},
@@ -128,6 +128,9 @@ pub struct Field {
     pub offset: u32,
     pub size: u32,
     pub ty: Ty,
+    /// `[Unordered]` (`bindless.slang`): draws of one rendering may write through it in any
+    /// order.
+    pub unordered: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,18 +139,6 @@ pub struct Struct {
     pub name: String,
     pub fields: Vec<Field>,
     pub size: u32,
-}
-
-impl Ty {
-    /// Whether it holds an `ImageHandle` (which isn't `Zeroable`), directly or in a field.
-    pub fn holds_handles(&self) -> bool {
-        match self {
-            Ty::Image(_) | Ty::DynImg => true,
-            Ty::Array { element, .. } => element.holds_handles(),
-            Ty::Struct(s) => s.fields.iter().any(|f| f.ty.holds_handles()),
-            _ => false,
-        }
-    }
 }
 
 /// (Slang name, Rust path) of the Slang structs that mirror a lava type.
@@ -307,6 +298,7 @@ impl Struct {
             h.u32(f.offset);
             h.u32(f.size);
             f.ty.hash_into(h);
+            h.u32(f.unordered as u32);
         }
     }
 }
@@ -527,11 +519,16 @@ fn describe_fields(t: &TypeLayout, outer: &mut Vec<String>) -> Result<Vec<Field>
                 .checked_type_layout()
                 .ok_or(format!("`{name}`: Slang doesn't lay it out"))?;
             let ty = describe_ty(layout, outer).map_err(|e| prefix(name, e))?;
+            let unordered = f.variable().is_some_and(|v| {
+                v.checked_user_attributes()
+                    .any(|a| a.checked_name() == Some("Unordered"))
+            });
             Ok(Field {
                 name: name.to_string(),
                 offset: f.offset(Cat::Uniform) as u32,
                 size: layout.size(Cat::Uniform) as u32,
                 ty,
+                unordered,
             })
         })
         .collect()
@@ -1148,6 +1145,27 @@ pub(crate) mod tests {
             nested.contains("push constant `inner.t` is a handle inside a struct"),
             "{nested}"
         );
+    }
+
+    #[test]
+    fn unordered_fields_are_reflected() {
+        let desc = describe_fields(
+            "unordered",
+            "struct C { [Unordered] MutBuf<uint> hits; MutBuf<uint> slots; }",
+            "Buf<C> c;",
+        )
+        .unwrap();
+        let field = &desc.push_constants.unwrap().fields[0];
+        let Ty::Buffer { pointee, .. } = &field.ty else {
+            panic!("{field:?}")
+        };
+        let Ty::Struct(c) = &pointee.ty else {
+            panic!("{pointee:?}")
+        };
+        let flags: Vec<(&str, bool)> = (c.fields.iter())
+            .map(|f| (f.name.as_str(), f.unordered))
+            .collect();
+        assert_eq!(flags, [("hits", true), ("slots", false)]);
     }
 
     #[test]
