@@ -30,6 +30,10 @@ hashbrown.workspace = true
 # refuse devices without it and drops the checks. Without either, its API isn't compiled.
 # `dynamic-*` decide whether a draw's state is dynamic state or part of the pipeline key.
 # See `lava::features`.
+# `command-spans` (no device feature, not a default) opens an info-level `tracing` span per
+# dispatch, trace and rendering (`compute`/`raytrace`/`draw` with the pass's name), which the
+# engine's profiler reads; off, a recording creates no spans.
+command-spans = []
 default = [
     "host-image-copy",
     "mesh-shader",

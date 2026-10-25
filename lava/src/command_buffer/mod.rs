@@ -41,6 +41,22 @@ use crate::buffer::staging::Staging;
 #[cfg(feature = "ray-tracing-pipeline")]
 use crate::vkobjects::rt_pipeline::BoundRayTracing;
 
+/// The `tracing` span of a dispatch, trace or rendering: an entered info span with the
+/// `command-spans` feature, nothing without (a span costs a registry slot per command, which a
+/// subscriber at info level pays even where nothing reads it).
+#[cfg(feature = "command-spans")]
+macro_rules! command_span {
+    ($name:literal, pass = $pass:expr) => {
+        tracing::info_span!($name, pass = $pass).entered()
+    };
+}
+#[cfg(not(feature = "command-spans"))]
+macro_rules! command_span {
+    ($name:literal, pass = $pass:expr) => {
+        ()
+    };
+}
+
 pub(crate) mod access_state;
 mod binding_output;
 pub(crate) mod image_state;
@@ -1487,7 +1503,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     /// depth writes and blending see earlier draws, so no draw may read what an earlier one writes.
     #[validation_trace]
     pub fn record(&mut self, name: &str) {
-        let _span = tracing::trace_span!("draw", pass = name).entered();
+        let _span = command_span!("draw", pass = name);
         self.check_layers();
         self.check_blends();
         // Draws reach objects through the referencing buffers they name: walked first, with
@@ -1814,7 +1830,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     fn compute_private(&mut self, bindings: &BindingOutput<'_, kind::Compute>, dispatch: Dispatch) {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
-        let _span = tracing::trace_span!("compute", pass = pass.name).entered();
+        let _span = command_span!("compute", pass = pass.name);
         let indirect = match &dispatch {
             Dispatch::Indirect(_, access) => Some(*access),
             _ => None,
@@ -1903,7 +1919,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     ) {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
-        let _span = tracing::trace_span!("raytrace", pass = pass.name).entered();
+        let _span = command_span!("raytrace", pass = pass.name);
         let rec = &mut self.rec;
         rec.flush_pending(
             sections.images(),
