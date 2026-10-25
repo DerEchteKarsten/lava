@@ -26,8 +26,3 @@ lava-build-slang = { path = "../lava-build-slang" }
 [[test]]
 name = "gpu_window"
 harness = false
-
-# Recording generated passes into real command buffers, headless.
-[[bench]]
-name = "recording"
-harness = false

@@ -77,7 +77,9 @@ more directly, which may point to an API gap rather than overhead).
 - **friction, annoying** (mip generation): lava records blits in program order, and each blit
   of a chain depends on the one before it, so the natural per-texture loop serialises the GPU:
   **+32% GPU time** against the baseline, which batches the 8 textures per mip level. With
-  the same level-major loop lava is +6%. Lava can't reorder. *Fix:* say so in the docs, or a
+  the same level-major loop lava is +6%, probably because it still places a barrier before
+  each blit, where the baseline merges a level's eight into one call (not traced). Lava can't
+  reorder or batch. *Fix:* say so in the docs, or a
   `cmd.generate_mips(&[&image])` that batches by level.
 - **friction, annoying** (inputs buffer): the frame rewrites a referencing buffer (57
   references), one per frame slot. `PerFrame::get_mut(&submission)` isn't reachable inside the

@@ -1,4 +1,4 @@
-//! The baseline's thin, non-tracking ash layer: per queue a command pool and buffer per frame slot, a timeline semaphore and a timestamp pool, and a command buffer wrapper whose methods map one-to-one to Vulkan calls
+//! The baseline's thin, non-tracking ash layer: per queue a command pool and buffer per frame slot, a timeline semaphore and a timestamp pool; a command buffer wrapper whose methods map one-to-one to Vulkan calls; barrier shorthands; and a device-local buffer of its own for what lava's buffers lack the usage for
 
 use std::ops::Range;
 use std::time::Instant;

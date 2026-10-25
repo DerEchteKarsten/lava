@@ -46,7 +46,7 @@ The engine's are in `../GameEngine/STATE.md`. Same conventions: `--- fix ---` en
 - Baked draw state can make many pipelines per pass on devices without the dynamic state (the 16-pipeline warning then names the pass); `dynamic-*` without `assert-` keeps that possible.
 ----fix----
 - `ray-traversal-primitive-culling` compiled without `ray-query` and `ray-tracing-pipeline` can never be on (`Features::consistent` drops it), so `assert-ray-traversal-primitive-culling` alone makes `init` refuse every device; its `Cargo.toml` entry implies only `acceleration-structure` (2026-10-24, found by `lava/src/tests.rs`, whose consistency tests skip that combination).
-- Release builds of lava warn that `CallsiteGuard` and its `enter` are unused (`state.rs`, the `#[validation_trace]` callsite helper; `cargo bench` shows it).
+- Release builds of lava warn that `CallsiteGuard` and its `enter` are unused (`state.rs`, the `#[validation_trace]` callsite helper; a release build of lava-bench shows it).
 
 ## lava: renderings and draws (2026-10-21)
 ----find solutions----
@@ -152,6 +152,22 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 - `Buffer::reserve` always copies the old contents; scratch buffers want a grow without contents.
 - Generated code names `::core::` paths, which break in doc tests of a crate itself named `core` (the engine's).
 
+## lava-bench: lava against hand-written Vulkan (2026-10-25)
+The figures above that name the `lava-tests` recording bench come from the bench lava-bench replaced (2026-10-25; older commits have it). The friction log is `lava-bench/API_NOTES.md`; what of it is worth keeping is here.
+----find solutions----
+- Results on the Arc B390 (Mesa 26.2.5, no `VK_KHR_unified_image_layouts`; two full runs pinned to core 2, 500 frames each): lava's recording costs 1.5 to 7 times the baseline's (`ml_train` +630%, `forward` +375%, `ml` +300 to 360%, `ray_tracing` +270%, `deferred` +200 to 290%); per command about 0.55 µs against 0.12 µs for an indexed draw (`forward`) and 2.5 µs against 0.35 to 0.6 µs for a dispatch (`ml`, `particles`). The small scenarios' CPU medians are bimodal between runs (`gpu_driven`'s raw recording 34 or 94 µs); their 10th percentiles are steady. GPU time is at par (within ±3.6%) in 9 of 11 scenarios, so lava's barriers and `GENERAL` layouts cost nothing measurable here. `streaming` is +6 to 7% (probably one barrier per blit where the baseline merges a mip level's eight into one: lava places barriers per command and has no way to batch those of independent commands; not traced), `ml_train` +2.5% (not traced), and `forward` is 3 to 7% *faster* with lava than with the optimal-layout baseline (not profiled; its depth images go through `SHADER_READ_ONLY_OPTIMAL` and `UNDEFINED` transitions there).
+- Lava rediscovers every hazard per command per frame; a fixed command sequence (`ml`'s 145 dispatches, the same every frame) costs it 4 to 5 times the baseline's CPU time, which plans its barriers once at setup. See the recorded-plan idea below.
+- Lava records in program order and can't reorder: a per-texture mip-generation loop (each blit depends on the one before) cost `streaming` +32% GPU time against the baseline's level-major batching, +6% with the same loop order. Worth a doc line or a batched `cmd.generate_mips(&[..])`.
+- `Scratch::for_any` holds one build, so `update_all` of many structures with it records one batch per structure with a barrier between each (`ray_tracing`: +8% GPU on its 64 refits, at par with a scratch for all). A `Scratch::for_all(&structures)` and a doc line on `build_all`/`update_all` would fix the trap.
+- A submission's `wait_for(w.at(stage))` covers only `stage`; an access of what the waited-for timeline wrote at another stage of the same submission (a compute pass after the raster stage it waited at) is unsynchronised, and lava, which tracks that write, says nothing. A debug check could panic there.
+- `Uploader::image` errors on every `rebar` device (all integrated GPUs), since they have no staging ring: streaming textures needs a second path through `HostCopy`. lava-bench disables `rebar` to upload everywhere. A small image-only ring there, or a fallback to host copies for `HostCopy` images, would make one path work everywhere.
+- `BufferAccess::unordered()` is documented for draws of one rendering only; whether compute dispatches with commuting atomics (`image_processing`'s histogram bands) skip their barriers isn't said.
+- There is no way to see the barriers a recording made (counts, or the barrier log in debug builds), so a GPU-time gap can't be traced to them.
+- Fresh buffers and images hold whatever the memory held; lava-bench's checksums caught two reads of never-written memory that agreed between the modes only while the memory happened to be alike. A debug `Config` option filling new memory with a pattern would show them at once.
+- `PerFrame::get_mut(&submission)` isn't reachable inside the `submit` closure, which consumes the submission; a closure that rewrites a per-slot buffer keeps its own slot counter (`cmd.slot()` would do).
+- lava-build-slang: a file of several compute entry points shares one push struct but gets an argument type (and `C{Pass}Bindings`) per pass, so one set of arguments can't serve several dispatches; push-constant structs keep private `_pad`s (structs behind pointers have `pub #[doc(hidden)]` ones and a `Default`); a pointee whose size isn't a multiple of its alignment is refused rather than padded to its stride; Slang's indirect command structs aren't mirrored to lava's (`DrawIndexedIndirectCommand` and kin), so their buffers need a `.cast()`.
+- Views of differently typed images are different types, so a step whose source is one image or another (Hi-Z mip 0 from depth, later mips from the chain) needs a generic helper spelling out the generated bound; an `ImageView::erase()` would let one call site take either. `SamplerHandle` has `DEFAULT` but no `Default`.
+
 ## Performance
 --- find solutions ---
 - Specialized and raster pipelines are created synchronously on the recording thread at first use (outside the pass's map lock, through the `VkPipelineCache`). (Ideas: a warm-up list, `FAIL_ON_PIPELINE_COMPILE_REQUIRED` for async compiles.)
@@ -163,6 +179,9 @@ Found in a read-only review; details, line numbers and the lower-severity rest (
 (hot reload is a debug feature anyways)
 
 ## Ideas
+
+### Recorded plans (2026-10-25, from lava-bench)
+Workloads whose command sequence doesn't change between frames (an ML graph, a post-processing chain) pay lava's hazard tracking anew for every command every frame, while a hand-written recording plans its barriers once. A plan could record a sequence once, keep the barriers it computed and the accesses they came from (a hash of every command's ranges, images and layouts), and replay it with new push data, checking the hash instead of walking the accesses. The open questions are what invalidates a plan (a resized image, a rebound handle, a referencing buffer gone dirty) and how replays interleave with tracked commands on the same objects.
 
 ### Transient attachments (2026-10-19)
 Image memory is always `GpuOnly`; images have no memory type parameter. Their only other useful memory is lazily allocated memory for attachments that never leave a rendering (depth of a single pass, MSAA targets once lava has them), which tilers never back with memory. It belongs in the usage set: a `Transient` flag of `Usage` (`TRANSIENT_ATTACHMENT`, allowed only with attachment flags and without sampled, storage or transfer ones), whose images allocate from `LAZILY_ALLOCATED` memory where the device has it.

@@ -1,4 +1,4 @@
-//! The workloads, from an everyday game frame to specialised compute, and what both modes of them share: setup submissions and the image helpers of the baseline
+//! The workloads, from an everyday game frame to specialised compute, which of them the device can run, and the setup submissions both modes of a scenario record once
 
 use lava::queue::Graphics;
 
