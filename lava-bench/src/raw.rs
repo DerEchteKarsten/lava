@@ -51,10 +51,6 @@ pub const INDIRECT_READ: Access = (
     vk::PipelineStageFlags2::DRAW_INDIRECT,
     vk::AccessFlags2::INDIRECT_COMMAND_READ,
 );
-pub const INDEX_READ: Access = (
-    vk::PipelineStageFlags2::INDEX_INPUT,
-    vk::AccessFlags2::INDEX_READ,
-);
 pub const COLOR_WRITE: Access = (
     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
     vk::AccessFlags2::from_raw(
@@ -85,11 +81,12 @@ pub const BUILD_WRITE: Access = (
     vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
     vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
 );
+/// What builds read: structures, and geometry and instances as shader reads.
 pub const BUILD_READ: Access = (
     vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
     vk::AccessFlags2::from_raw(
         vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR.as_raw()
-            | vk::AccessFlags2::SHADER_STORAGE_READ.as_raw(),
+            | vk::AccessFlags2::SHADER_READ.as_raw(),
     ),
 );
 
@@ -432,16 +429,6 @@ impl RawCmd {
         unsafe { device().cmd_dispatch(self.cmd, x, y, z) };
     }
 
-    /// A dispatch of the command at `address`.
-    pub fn dispatch_indirect(&mut self, address: u64) {
-        let info = vk::DispatchIndirect2InfoKHR::default()
-            .address_range(range(address, 12))
-            .address_flags(ADDRESS_FLAGS);
-        unsafe {
-            lava::raw::device_address_commands().cmd_dispatch_indirect2(self.cmd, &info)
-        };
-    }
-
     pub fn begin_rendering(
         &mut self,
         extent: [u32; 2],
@@ -673,5 +660,67 @@ impl RawCmd {
                 &[range],
             )
         };
+    }
+}
+
+/// A buffer of the baseline's own, device-local, for what lava's buffers lack the usage for
+/// (acceleration structure storage).
+pub struct RawBuffer {
+    pub buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    pub address: u64,
+}
+
+impl RawBuffer {
+    pub fn new(size: u64, usage: vk::BufferUsageFlags) -> Self {
+        let device = device();
+        let usage = usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        let buffer = unsafe {
+            device
+                .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None)
+                .unwrap()
+        };
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let properties = unsafe {
+            lava::raw::instance().get_physical_device_memory_properties(lava::raw::physical_device())
+        };
+        let memory_type = (0..properties.memory_type_count)
+            .find(|&i| {
+                requirements.memory_type_bits & (1 << i) != 0
+                    && (properties.memory_types[i as usize].property_flags)
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
+            .expect("a device-local memory type");
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let memory = unsafe {
+            device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(memory_type)
+                        .push_next(&mut flags),
+                    None,
+                )
+                .unwrap()
+        };
+        unsafe { device.bind_buffer_memory(buffer, memory, 0).unwrap() };
+        let address = unsafe {
+            device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        };
+        Self {
+            buffer,
+            memory,
+            address,
+        }
+    }
+}
+
+impl Drop for RawBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            device().destroy_buffer(self.buffer, None);
+            device().free_memory(self.memory, None);
+        }
     }
 }

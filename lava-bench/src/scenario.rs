@@ -25,10 +25,6 @@ pub trait Scenario {
     fn block_extra(&mut self, _lava: bool) {}
     /// After a `--check` frame of both modes completed: lava's and the baseline's checksums.
     fn checksums(&mut self) -> (Vec<u32>, Vec<u32>);
-    /// Checksums the modes may disagree on (order-dependent float atomics), by index.
-    fn loose_checksums(&self) -> &'static [usize] {
-        &[]
-    }
 }
 
 /// What a lava frame records with: the harness's graphics timeline, and the frame's timings.

@@ -5,15 +5,19 @@ use lava::queue::Graphics;
 use crate::raw::{RawCmd, RawQueue};
 use crate::scenario::{Scenario, Stamped};
 
+mod async_compute;
 mod deferred;
+mod fluid;
 mod forward;
 mod gpu_driven;
+mod image_processing;
 mod ml;
 mod particles;
+mod ray_tracing;
 mod streaming;
 
 /// Every scenario, in the order they run.
-pub const NAMES: &[&str] = &["forward", "deferred", "gpu_driven", "streaming", "particles", "ml", "ml_train"];
+pub const NAMES: &[&str] = &["forward", "deferred", "gpu_driven", "streaming", "particles", "ml", "ml_train", "image_processing", "fluid", "ray_tracing", "async_compute"];
 
 /// The scenario `name`, or `None` where the device lacks what it needs.
 pub fn make(
@@ -30,13 +34,21 @@ pub fn make(
         "particles" => Box::new(particles::Particles::new(&mut setup)),
         "ml" => Box::new(ml::Ml::new(&mut setup, false)),
         "ml_train" => Box::new(ml::Ml::new(&mut setup, true)),
+        "image_processing" => Box::new(image_processing::ImageProcessing::new(&mut setup)),
+        "fluid" => Box::new(fluid::Fluid::new(&mut setup)),
+        "ray_tracing" => Box::new(ray_tracing::RayTracing::new(&mut setup)?),
+        "async_compute" => Box::new(async_compute::AsyncCompute::new(&mut setup)?),
         _ => unreachable!("{name} is checked by `args`"),
     })
 }
 
 /// Why `make` skipped `name`.
-pub fn skip_reason(_name: &str) -> &'static str {
-    "the device lacks a feature it needs"
+pub fn skip_reason(name: &str) -> &'static str {
+    match name {
+        "ray_tracing" => "the device has no ray queries",
+        "async_compute" => "the device has no compute family without graphics",
+        _ => "the device lacks a feature it needs",
+    }
 }
 
 /// Whether the device has `VK_KHR_unified_image_layouts`, where `GENERAL` costs nothing.

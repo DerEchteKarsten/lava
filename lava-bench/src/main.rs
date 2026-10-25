@@ -225,10 +225,7 @@ std::env::set_var("VK_LAYER_VALIDATE_SYNC", "1")
         if args.check {
             let messages = std::mem::take(&mut *MESSAGES.lock().unwrap());
             let (lava, raw) = scenario.checksums();
-            let loose = scenario.loose_checksums();
-            let mismatches: Vec<_> = (0..lava.len())
-                .filter(|i| lava[*i] != raw[*i] && !loose.contains(i))
-                .collect();
+            let mismatches: Vec<_> = (0..lava.len()).filter(|i| lava[*i] != raw[*i]).collect();
             let ok = messages.is_empty() && mismatches.is_empty() && !lava.contains(&0);
             failed |= !ok;
             println!(
