@@ -772,6 +772,16 @@ pub(crate) fn write_descriptors(
     images: impl IntoIterator<Item = ShaderImage>,
     handles: impl IntoIterator<Item = ImageHandle>,
 ) -> Result<()> {
+    write_descriptors_in(images, handles, vk::ImageLayout::GENERAL)
+}
+
+/// `write_descriptors` with the sampled descriptors in `sampled_layout` (storage ones are always
+/// `GENERAL`): lava's own are `GENERAL`, `raw::write_descriptors` writes others.
+pub(crate) fn write_descriptors_in(
+    images: impl IntoIterator<Item = ShaderImage>,
+    handles: impl IntoIterator<Item = ImageHandle>,
+    sampled_layout: vk::ImageLayout,
+) -> Result<()> {
     let bindless = Bindless::get();
     let layout = &bindless.images;
     let mut targets: SmallVec<[(ShaderImage, vk::DescriptorType, u32); 8]> = SmallVec::new();
@@ -836,12 +846,13 @@ pub(crate) fn write_descriptors(
                 })
         })
         .collect();
-    let infos: SmallVec<[_; 8]> = views
-        .iter()
-        .map(|view| {
-            vk::ImageDescriptorInfoEXT::default()
-                .p_view(view)
-                .layout(vk::ImageLayout::GENERAL)
+    let infos: SmallVec<[_; 8]> = (views.iter().zip(&targets))
+        .map(|(view, &(_, ty, _))| {
+            let layout = match ty {
+                vk::DescriptorType::SAMPLED_IMAGE => sampled_layout,
+                _ => vk::ImageLayout::GENERAL,
+            };
+            vk::ImageDescriptorInfoEXT::default().p_view(view).layout(layout)
         })
         .collect();
     let resources: SmallVec<[_; 8]> = targets
