@@ -218,8 +218,8 @@ fn images_reached_through_a_buffer_are_read_in_general() {
     pairs.host_write_referencing(
         0,
         [TestImagePairReferenceInfo {
-            storage: storage.whole_view(),
-            sampled: sampled.whole_view(),
+            storage: Some(storage.whole_view()),
+            sampled: Some(sampled.whole_view()),
         }],
     );
     let mut out = common::zeroed_buffer::<Vec4>(12);

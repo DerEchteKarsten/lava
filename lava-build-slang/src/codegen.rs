@@ -802,16 +802,19 @@ fn reference_info(
                 let kind = handle_kind(image);
                 let g = generic_of("View");
                 let (texels, flags) = (view.texels.clone(), view.flags);
+                // `None` is the null handle, which shaders test with `IsNull()`.
                 (
-                    g.clone(),
+                    format!("::core::option::Option<{g}>"),
                     Some((g, format!("{} + 'a", view.traits))),
                     Box::new(move |source: &str, target: &str, index: &str| {
                         format!(
-                            "let __view = ::lava::image::ImageRef::view({source});\n            \
+                            "if let ::core::option::Option::Some(__image) = {source} {{\n            \
+                             let __view = ::lava::image::ImageRef::view(__image);\n            \
                              __view.texel_check::<{texels}>();\n            \
                              __view.usage_check(::lava::vk::ImageUsageFlags::{flags});\n            \
                              {target} = __view.handle::<::lava::bindless::{kind}>();\n            \
-                             references[{index}] = ::lava::reference::Reference::image(__view);"
+                             references[{index}] = ::lava::reference::Reference::image(__view);\n            \
+                             }}"
                         )
                     }),
                 )
@@ -2189,6 +2192,10 @@ mod tests {
         assert!(
             text.contains("pub r#dyn: ::lava::reference::DynImage<'a>,"),
             "{text}"
+        );
+        assert!(
+            text.contains("pub color: ::core::option::Option<ColorView>,"),
+            "an image of a struct may be null: {text}"
         );
         assert!(
             text.contains("pub sampler: &'a ::lava::bindless::Sampler,"),

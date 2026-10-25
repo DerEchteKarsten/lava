@@ -75,8 +75,8 @@ fn what_a_buffer_references_gets_its_barriers() {
     pairs.host_write_referencing(
         0,
         [TestImagePairReferenceInfo {
-            storage: storage.whole_view(),
-            sampled: sampled.whole_view(),
+            storage: Some(storage.whole_view()),
+            sampled: Some(sampled.whole_view()),
         }],
     );
     let mut out = zeroed_buffer::<Vec4>(12);
@@ -115,8 +115,8 @@ fn what_a_buffer_references_lives_with_it() {
             &pairs,
             0,
             [TestImagePairReferenceInfo {
-                storage: storage.whole_view(),
-                sampled: sampled.whole_view(),
+                storage: Some(storage.whole_view()),
+                sampled: Some(sampled.whole_view()),
             }],
         )
         .unwrap();
@@ -147,8 +147,8 @@ fn referencing_buffers_refuse_command_writes() {
     pairs.host_write_referencing(
         0,
         [TestImagePairReferenceInfo {
-            storage: storage.whole_view(),
-            sampled: sampled.whole_view(),
+            storage: Some(storage.whole_view()),
+            sampled: Some(sampled.whole_view()),
         }],
     );
     let message = panic_message(|| gpu.submit(|cmd| cmd.fill_buffer(pairs.range(..), 0)));
@@ -184,11 +184,11 @@ fn nested_references_are_reached_and_kept() {
         [RefNodeReferenceInfo {
             materials: [
                 RefMaterialReferenceInfo {
-                    color: red.whole_view(),
+                    color: Some(red.whole_view()),
                     sampler: &samplers[0],
                 },
                 RefMaterialReferenceInfo {
-                    color: green.whole_view(),
+                    color: Some(green.whole_view()),
                     sampler: &samplers[1],
                 },
             ],
@@ -247,7 +247,7 @@ fn nested_references_are_reached_and_kept() {
     let samplers = [Sampler::new(&SamplerDesc::new()).unwrap()];
     let weights = common::buffer_with(&[1.0f32, 2.0]);
     let material = |view| RefMaterialReferenceInfo {
-        color: view,
+        color: Some(view),
         sampler: &samplers[0],
     };
     nodes.host_write_referencing(

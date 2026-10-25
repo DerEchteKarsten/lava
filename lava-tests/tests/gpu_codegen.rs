@@ -333,7 +333,7 @@ fn layouts(
         m33: Mat3::from_cols_array(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]),
         m34,
         arr,
-        tex: tex.whole_view(),
+        tex: Some(tex.whole_view()),
         r#dyn: DynImage::NULL,
         r#type: 5,
         inner: Inner {
@@ -471,8 +471,8 @@ fn storage_images_and_handles_behind_pointers_are_read() {
     images.host_write_referencing(
         0,
         [TestImagePairReferenceInfo {
-            storage: storage.whole_view(),
-            sampled: sampled.whole_view(),
+            storage: Some(storage.whole_view()),
+            sampled: Some(sampled.whole_view()),
         }],
     );
     let mut out = zeroed_buffer::<Vec4>(12);
