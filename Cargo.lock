@@ -752,6 +752,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lava-bench"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "glam",
+ "lava",
+ "lava-build-slang",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lava-build-slang"
 version = "0.1.0"
 dependencies = [

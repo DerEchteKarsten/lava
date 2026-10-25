@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["lava", "lava-build-slang", "lava-macros", "lava-tests"]
+members = ["lava", "lava-bench", "lava-build-slang", "lava-macros", "lava-tests"]
 
 [workspace.package]
 version = "0.1.0"

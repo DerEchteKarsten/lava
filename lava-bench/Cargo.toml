@@ -1,0 +1,16 @@
+[package]
+name = "lava-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+lava = { path = "../lava" }
+ash = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+lava-build-slang = { path = "../lava-build-slang" }
