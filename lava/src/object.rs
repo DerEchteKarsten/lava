@@ -6,11 +6,17 @@ use std::sync::{
 
 use smallvec::SmallVec;
 
+use crate::vk::{AccessFlags2 as A, PipelineStageFlags2 as S2};
 #[cfg(feature = "acceleration-structure")]
 use crate::vkobjects::acceleration_structure::StructureInternal;
 use crate::{
-    bindless::SamplerInternal, buffer::BufferInternal, global::Live, image::ImageInternal,
-    queue::lock, reference::KeepAlive,
+    bindless::SamplerInternal,
+    buffer::BufferInternal,
+    command_buffer::{Barriers, access_state::Tracker},
+    global::Live,
+    image::ImageInternal,
+    queue::lock,
+    reference::KeepAlive,
 };
 
 /// The dirty bit of a layout: an image of the object or below it may be outside `GENERAL`.
@@ -58,6 +64,43 @@ pub(crate) trait Object: Send + Sync + 'static {
     fn keep_alive(&self) -> Option<&Mutex<KeepAlive>> {
         None
     }
+    /// What a write (`stage`, `access`) of an object it references waits for of its own
+    /// tracked accesses: the commands that read the object through it recorded only reads of
+    /// it (a walk of a clean buffer reaches nothing). None for objects that reference nothing.
+    fn reference_hazards(&self, t: &Tracker, log: &[Barriers], stage: S2, access: A) -> Hazard {
+        let _ = (t, log, stage, access);
+        None
+    }
+}
+
+/// The stages and accesses a barrier waits for, if any.
+pub(crate) type Hazard = Option<(S2, A)>;
+
+/// What a write (`stage`, `access`) of `object` waits for of the objects above it, which
+/// commands read it through (`Object::reference_hazards` of every ancestor).
+pub(crate) fn ancestor_hazards(
+    object: &dyn Object,
+    t: &Tracker,
+    log: &[Barriers],
+    stage: S2,
+    access: A,
+) -> Hazard {
+    if !object.header().has_parents() {
+        return None;
+    }
+    let mut found: Hazard = None;
+    let mut add = |hazard: Hazard| {
+        if let Some((s, a)) = hazard {
+            let (stages, accesses) = found.get_or_insert((S2::NONE, A::NONE));
+            *stages |= s;
+            *accesses |= a;
+        }
+    };
+    for parent in parents(object) {
+        add(parent.reference_hazards(t, log, stage, access));
+        add(ancestor_hazards(&*parent, t, log, stage, access));
+    }
+    found
 }
 
 /// A strong reference to an object a referencing buffer holds, typed, since a walk turns it

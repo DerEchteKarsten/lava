@@ -2612,3 +2612,80 @@ fn reached_images_are_transitioned_and_transitions_mark_their_buffers() {
         "clean again"
     );
 }
+
+/// A command that reads a child through a clean referencing buffer records only its read of
+/// the buffer: a later write of the child waits for that read, and a transition of a referenced
+/// image too.
+#[test]
+fn writes_of_referenced_objects_wait_for_reads_through_their_buffers() {
+    let child = fake_buffer(60 << 40);
+    let parent = fake_buffer(61 << 40);
+    let image = tracked(60, [state(L::GENERAL, Some(Kind::Graphics))]);
+    let mut released = Vec::new();
+    let to_image = Reference {
+        object: Referenced::Image(image),
+        range: (0..1).into(),
+    };
+    keep_alive_of(parent).replace(
+        parent,
+        1,
+        0,
+        &[to_buffer(child, 0..4), to_buffer(parent, 0..4)],
+        &mut released,
+    );
+    let grandparent = fake_buffer(62 << 40);
+    let image_parent = fake_buffer(63 << 40);
+    keep_alive_of(image_parent).replace(
+        image_parent,
+        1,
+        0,
+        &[to_image, to_buffer(image_parent, 0..4)],
+        &mut released,
+    );
+    keep_alive_of(grandparent).replace(
+        grandparent,
+        1,
+        0,
+        &[to_buffer(parent, 0..4), to_buffer(grandparent, 0..4)],
+        &mut released,
+    );
+    let access = |b: &'static Arc<BufferInternal>, stage, access| BufferAccess {
+        unordered: false,
+        stage,
+        access,
+        range: (b.address..b.address + 4).into(),
+        buffer: Some(b),
+    };
+    let mut rec = Rec::new();
+    // A fragment shader reads the child through the grandparent, a vertex shader the image
+    // through its buffer: only the named buffers' reads are recorded.
+    let read = A::SHADER_STORAGE_READ;
+    rec.record(&[], &[access(grandparent, S::FRAGMENT_SHADER, read)]);
+    rec.record(&[], &[access(image_parent, S::VERTEX_SHADER, read)]);
+    let copy = access(child, S::TRANSFER, A::TRANSFER_WRITE);
+    assert_eq!(
+        flush(&mut rec, &[], &[copy]),
+        Some((S::FRAGMENT_SHADER, read, 0)),
+        "the write of the child waits for the read two buffers up"
+    );
+    let attachment = image_use(
+        60,
+        image,
+        S::COLOR_ATTACHMENT_OUTPUT,
+        A::COLOR_ATTACHMENT_WRITE,
+        L::ATTACHMENT_OPTIMAL,
+    );
+    let barriers = flush_barriers(&mut rec, &[attachment], &[]).unwrap();
+    let [transition] = barriers.images.as_slice() else {
+        panic!("one transition")
+    };
+    assert!(
+        transition.src_stage_mask.contains(S::VERTEX_SHADER),
+        "{:?}",
+        transition.src_stage_mask
+    );
+    // A child nothing references waits for nothing of the kind.
+    let alone = fake_buffer(64 << 40);
+    let copy = access(alone, S::TRANSFER, A::TRANSFER_WRITE);
+    assert_eq!(flush(&mut rec, &[], &[copy]), None);
+}

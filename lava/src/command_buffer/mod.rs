@@ -45,7 +45,7 @@ pub(crate) mod access_state;
 mod binding_output;
 pub(crate) mod image_state;
 mod raster_state;
-use crate::object::{DIRTY_LAYOUT, Object, Strong, mark_dirty};
+use crate::object::{DIRTY_LAYOUT, Object, Strong, ancestor_hazards, mark_dirty};
 use crate::reference::{Child, KeepAlive};
 use crate::unsized_struct::unsized_struct;
 use access_state::{READ_ACCESS, StructureAccesses, Tracker, WHOLE, WRITE_ACCESS};
@@ -2534,6 +2534,14 @@ pub(crate) fn compute_barriers<'a>(
             Some(buffer) => {
                 let found = lock(&buffer.state).hazards(t, log, b.range, stage, access);
                 hazard(found, stage, access);
+                // Commands that read it through references waited only for those buffers.
+                if access.intersects(WRITE_ACCESS) {
+                    hazard(
+                        ancestor_hazards(&**buffer, t, log, stage, access),
+                        stage,
+                        access,
+                    );
+                }
                 if access.contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
                     hazard(structures.write_hazards(t), stage, access);
                 }
@@ -2555,6 +2563,14 @@ pub(crate) fn compute_barriers<'a>(
         }
         let found = lock(&image.internal.access).hazards(t, log, WHOLE, stage, access);
         hazard(found, stage, access);
+        if access.intersects(WRITE_ACCESS) {
+            let internal = &**image.internal;
+            hazard(
+                ancestor_hazards(internal, t, log, stage, access),
+                stage,
+                access,
+            );
+        }
     }
 
     let kind = family.kind;
@@ -2629,6 +2645,14 @@ pub(crate) fn compute_barriers<'a>(
                     } else {
                         all
                     };
+                }
+                // And for the reads of the buffers that reference it: commands that read it
+                // through them recorded only those.
+                let write = vk::AccessFlags2::MEMORY_WRITE;
+                let internal = &**image.internal;
+                if let Some((s, a)) = ancestor_hazards(internal, t, log, to_stage, write) {
+                    src_stage |= s;
+                    src_access |= a;
                 }
                 // It comes after the acquire, a barrier call of its own, at its stages.
                 if acquire {

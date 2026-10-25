@@ -15,9 +15,13 @@ use lava_macros::validation_trace;
 use smallvec::SmallVec;
 
 use crate::{
-    command_buffer::access_state::AccessState,
+    command_buffer::{
+        Barriers,
+        access_state::{AccessState, Tracker},
+    },
     global::Live,
     lifetime,
+    object::Hazard,
     object::{Header, Object},
     queue::{lock, timeline::poll},
     reference::{KeepAlive, ReferenceInfo, ReferencingData},
@@ -168,6 +172,21 @@ impl Object for BufferInternal {
 
     fn keep_alive(&self) -> Option<&Mutex<KeepAlive>> {
         self.keep_alive.get()
+    }
+
+    fn reference_hazards(
+        &self,
+        t: &Tracker,
+        log: &[Barriers],
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> Hazard {
+        self.keep_alive.get()?;
+        let range = Range {
+            start: self.address,
+            end: self.address + self.num_bytes,
+        };
+        lock(&self.state).hazards(t, log, range, stage, access)
     }
 }
 
