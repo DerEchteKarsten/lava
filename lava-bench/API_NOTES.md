@@ -65,3 +65,55 @@ more directly, which may point to an API gap rather than overhead).
   (`impl SampledView<Dim = D2, Format: HasTexels<[f32; 1]>> + 'a`). Same fix as above.
 - **positive**: `Draw::indexed_indirect_count` takes the command and count slices; the baseline
   computes the strided range, the stride and the maximum by hand.
+
+## streaming
+
+- **surprise, annoying** (setup, `main.rs`): on a `rebar` device (every integrated GPU, this
+  one included) there is no staging ring and `Uploader::image` returns an error, so texture
+  streaming needs a second code path (`HostCopy` usage and `Image::copy_from`). The bench
+  disables `rebar` (`Config::disabled`) to run the discrete-GPU path everywhere. *Fix:* give
+  rebar devices a small ring for images only, or let `Uploader::image` fall back to a host
+  copy where the image has `HostCopy`.
+- **friction, annoying** (mip generation): lava records blits in program order, and each blit
+  of a chain depends on the one before it, so the natural per-texture loop serialises the GPU:
+  **+32% GPU time** against the baseline, which batches the 8 textures per mip level. With
+  the same level-major loop lava is +6%. Lava can't reorder. *Fix:* say so in the docs, or a
+  `cmd.generate_mips(&[&image])` that batches by level.
+- **friction, annoying** (inputs buffer): the frame rewrites a referencing buffer (57
+  references), one per frame slot. `PerFrame::get_mut(&submission)` isn't reachable inside the
+  `submit` closure, which consumes the submission, so the bench keeps its own slot counter.
+  *Fix:* hand the closure the slot (`cmd.slot()`), or let `PerFrame` take the command buffer.
+- **errors, minor** (`stream_consume.slang`): lava-build-slang refused `Buf<StreamInputs>` with
+  "elements 424 bytes apart that are 420 bytes long: pad the element type to its stride". A
+  clear message, but the generator pads every other gap itself. *Fix:* generate the tail
+  `_pad` up to the stride.
+- **raw view, minor**: transient buffers go through gpu-allocator on both sides (`Buffer::new`
+  per frame). A per-frame bump allocator is what an engine would use; lava has none (its
+  `StructureArena` is the only suballocator).
+
+## particles
+
+- **friction, annoying** (`particles.rs`): a file of several compute entry points shares one
+  push-constant struct, but lava-build-slang generates an argument type per pass
+  (`ParticlesEmitArgs`, `ParticlesSimulateArgs`, ...), so the same arguments can't be built once
+  for five dispatches; the bench uses a macro (`ml` does too, for eight kernels). *Fix:* one
+  `{File}Args` (and `C{File}Bindings`) for all passes of a multi-entry file.
+- **surprise, minor** (`radix.slang`): entry points named `radix_count` became `RadixRadixCount`
+  (stem + entry). Renamed to `count`, `scan`, `scatter`. Documented, but a `[Pass("Name")]`
+  override would be welcome (STATE.md lists it as not there).
+
+## ml, ml_train
+
+- **raw view, annoying** (`ml.rs`): the op list never changes, so the baseline plans its
+  barriers once at setup (an interval overlap pass, `plan_barriers`) and records only pushes,
+  dispatches and the precomputed barriers each frame. Lava recomputes every hazard for every
+  dispatch every frame: 145 dispatches cost 382 µs in lava against 88 µs by hand. *Fix idea:*
+  a recorded plan that caches the barrier decisions of a fixed command sequence and replays it
+  with new push data (validated by a hash of the accessed ranges).
+- **friction, minor**: activations as sub-ranges of one arena needed a `slice(span)` helper per
+  buffer; `BufferSlice` ranges composed well.
+- **missing, minor**: there is no way to see which barriers lava recorded (a count per recording,
+  or the barrier log in a debug build). Whether its per-range tracking kept the backward pass's
+  independent matmuls unordered, as the baseline's plan does, can only be guessed from GPU
+  time (`ml_train` is about 2% slower on the GPU). *Fix:* barrier statistics on `UploadStats`'s
+  model, `cmd.barrier_stats()`.

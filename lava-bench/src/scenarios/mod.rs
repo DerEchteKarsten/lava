@@ -8,9 +8,12 @@ use crate::scenario::{Scenario, Stamped};
 mod deferred;
 mod forward;
 mod gpu_driven;
+mod ml;
+mod particles;
+mod streaming;
 
 /// Every scenario, in the order they run.
-pub const NAMES: &[&str] = &["forward", "deferred", "gpu_driven"];
+pub const NAMES: &[&str] = &["forward", "deferred", "gpu_driven", "streaming", "particles", "ml", "ml_train"];
 
 /// The scenario `name`, or `None` where the device lacks what it needs.
 pub fn make(
@@ -23,6 +26,10 @@ pub fn make(
         "forward" => Box::new(forward::Forward::new(&mut setup)),
         "deferred" => Box::new(deferred::Deferred::new(&mut setup)),
         "gpu_driven" => Box::new(gpu_driven::GpuDriven::new(&mut setup)),
+        "streaming" => Box::new(streaming::Streaming::new(&mut setup)),
+        "particles" => Box::new(particles::Particles::new(&mut setup)),
+        "ml" => Box::new(ml::Ml::new(&mut setup, false)),
+        "ml_train" => Box::new(ml::Ml::new(&mut setup, true)),
         _ => unreachable!("{name} is checked by `args`"),
     })
 }
