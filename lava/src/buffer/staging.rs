@@ -696,7 +696,7 @@ fn image_copy<F: Format + ColorAspect, U: IsTransferDst, D: Dim, V: Views>(
 /// An image a drain copied into, the mips it copied (bit `i` for mip `i`) and the family it
 /// releases them to.
 struct Copied<'a> {
-    image: &'a ImageInternal,
+    image: &'a Arc<ImageInternal>,
     aspect: vk::ImageAspectFlags,
     mips: u64,
     to: Kind,
@@ -752,7 +752,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                     if staged.destination != K::KIND {
                         let mips = (copy.mips.start..copy.mips.end).fold(0, |m, i| m | 1 << i);
                         let same = |c: &&mut Copied| {
-                            std::ptr::eq(c.image, &*copy.image) && c.to == staged.destination
+                            Arc::ptr_eq(c.image, &copy.image) && c.to == staged.destination
                         };
                         match copied.iter_mut().find(same) {
                             Some(c) => c.mips |= mips,

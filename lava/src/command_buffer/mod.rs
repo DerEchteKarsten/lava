@@ -44,12 +44,14 @@ use crate::vkobjects::rt_pipeline::BoundRayTracing;
 pub(crate) mod access_state;
 mod binding_output;
 pub(crate) mod image_state;
+pub(crate) mod locals;
 mod raster_state;
 use crate::object::{DIRTY_LAYOUT, Keep, Object, Strong, ancestor_hazards, mark_dirty};
 use crate::reference::{Child, KeepAlive};
 use crate::unsized_struct::unsized_struct;
 use access_state::{READ_ACCESS, StructureAccesses, Tracker, WHOLE, WRITE_ACCESS};
 pub use binding_output::{BindingOutput, Bindings, Sections, kind};
+use locals::Locals;
 use image_state::{ImageState, check_states, release_states, released_by, take_checked_states};
 pub use raster_state::*;
 use std::sync::{Mutex, atomic::Ordering::Relaxed};
@@ -185,6 +187,8 @@ pub(crate) struct Recording<'p> {
     pub(crate) structures: &'p mut StructureAccesses,
     /// What its accesses are tagged with.
     pub(crate) tracker: Tracker,
+    /// Its working copies of the access states of the objects it touches.
+    pub(crate) locals: Locals,
     /// The objects its commands name, which its submission keeps alive.
     pub(crate) keep: Keep,
     pub(crate) timeline: usize,
@@ -513,13 +517,9 @@ impl<'a> DrawOutput<'a> {
 /// accesses, so they are left out, and so are pairs of [`BufferAccess::unordered`] accesses.
 /// `accesses(i)` is draw `i`'s image and buffer accesses (its bindings', its index and indirect
 /// buffers', and what it reaches through referencing buffers), of `count` draws.
-fn check_hazards<'a, I, B>(name: &str, count: usize, accesses: impl Fn(usize) -> (I, B))
-where
-    I: Iterator<Item = ImageUse<'a>>,
-    B: Iterator<Item = BufferAccess<'a>>,
-{
+fn check_hazards(name: &str, images: &[(u32, ImageUse)], buffers: &[(u32, BufferAccess)]) {
     let writes = |access: vk::AccessFlags2| access.intersects(WRITE_ACCESS);
-    let hazard = |i: usize, j: usize, what: std::fmt::Arguments| -> ! {
+    let hazard = |i: u32, j: u32, what: std::fmt::Arguments| -> ! {
         panic!(
             "draws {i} and {j} of the rendering `{name}` both access {what}, which draw {i} \
              writes: draws of one rendering are ordered only by depth tests and blending, so \
@@ -527,35 +527,79 @@ where
              `BufferAccess::unordered`)"
         )
     };
-    for i in 0..count {
-        let (images, buffers) = accesses(i);
-        for write in buffers.filter(|b| writes(b.access)) {
-            let mut others = (0..count).filter(|&j| j != i);
-            let conflicts =
-                |b: &BufferAccess| b.overlaps(&write) && !(b.unordered && write.unordered);
-            if let Some(j) = others.find(|&j| accesses(j).1.any(|b| conflicts(&b))) {
-                hazard(i, j, format_args!("the addresses {:?}", write.range));
-            }
+    for (i, write) in buffers.iter().filter(|(_, b)| writes(b.access)) {
+        let conflicts = |(j, b): &(u32, BufferAccess)| {
+            j != i && b.overlaps(write) && !(b.unordered && write.unordered)
+        };
+        if let Some((j, _)) = buffers.iter().find(|b| conflicts(b)) {
+            hazard(*i, *j, format_args!("the addresses {:?}", write.range));
         }
-        for write in images.filter(|image| writes(image.access.access)) {
-            let w = &write.access;
-            let overlaps = |image: &ImageUse| {
-                let mips = image.access.mip_range;
-                image.access.image == w.image
-                    && mips.start < w.mip_range.end
-                    && w.mip_range.start < mips.end
-            };
-            let mut others = (0..count).filter(|&j| j != i);
-            if let Some(j) = others.find(|&j| accesses(j).0.any(|i| overlaps(&i))) {
-                hazard(
-                    i,
-                    j,
-                    format_args!("mips {:?} of the image {:?}", w.mip_range, w.image),
-                );
-            }
+    }
+    for (i, write) in images.iter().filter(|(_, image)| writes(image.access.access)) {
+        let w = &write.access;
+        let overlaps = |(j, image): &(u32, ImageUse)| {
+            let mips = image.access.mip_range;
+            j != i
+                && image.access.image == w.image
+                && mips.start < w.mip_range.end
+                && w.mip_range.start < mips.end
+        };
+        if let Some((j, _)) = images.iter().find(|i| overlaps(i)) {
+            hazard(
+                *i,
+                *j,
+                format_args!("mips {:?} of the image {:?}", w.mip_range, w.image),
+            );
         }
     }
 }
+
+/// Drops repeated accesses (the same image, mips, stage, access and layout): barriers and
+/// tracking of one are those of all. Each is compared with the few before it, the common
+/// pattern of draws that bind the same resources.
+fn dedup_images(images: &mut Vec<(u32, ImageUse)>) {
+    let mut unique: usize = 0;
+    for i in 0..images.len() {
+        let (_, a) = &images[i];
+        let seen = images[unique.saturating_sub(DEDUP_WINDOW)..unique]
+            .iter()
+            .any(|(_, u)| u.access == a.access && Arc::ptr_eq(u.internal, a.internal));
+        if !seen {
+            images.swap(unique, i);
+            unique += 1;
+        }
+    }
+    images.truncate(unique);
+}
+
+/// Like `dedup_images`, for buffer accesses of the same buffer, range, stage and access.
+fn dedup_buffers(buffers: &mut Vec<(u32, BufferAccess)>) {
+    let same = |a: &BufferAccess, b: &BufferAccess| {
+        a.range == b.range
+            && a.stage == b.stage
+            && a.access == b.access
+            && a.unordered == b.unordered
+            && match (a.buffer, b.buffer) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    };
+    let mut unique: usize = 0;
+    for i in 0..buffers.len() {
+        let seen = buffers[unique.saturating_sub(DEDUP_WINDOW)..unique]
+            .iter()
+            .any(|(_, u)| same(u, &buffers[i].1));
+        if !seen {
+            buffers.swap(unique, i);
+            unique += 1;
+        }
+    }
+    buffers.truncate(unique);
+}
+
+/// How many earlier accesses of a rendering a repeated access is looked for among.
+const DEDUP_WINDOW: usize = 8;
 
 impl<'a, const N: usize, const E: usize> Draw<'a, N, E> {
     #[track_caller]
@@ -1440,7 +1484,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
     /// depth writes and blending see earlier draws, so no draw may read what an earlier one writes.
     #[validation_trace]
     pub fn record(&mut self, name: &str) {
-        let _span = tracing::info_span!("draw", pass = name).entered();
+        let _span = tracing::trace_span!("draw", pass = name).entered();
         self.check_layers();
         self.check_blends();
         // Draws reach objects through the referencing buffers they name: walked first, with
@@ -1479,35 +1523,31 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                 mark_dirty(&**access.internal, bit | DIRTY_LAYOUT);
             }
         }
-        // What each draw reaches, for the draws that reach something.
-        let mut reached: SmallVec<[(usize, SmallVec<[Reached; 4]>); 2]> = SmallVec::new();
+        // Every draw's accesses, and what it reaches, flattened once and tagged with the draw:
+        // the hazard check compares draws, and the barriers and tracking take each distinct
+        // access once (a rendering's draws mostly read the same buffers).
+        let mut reached: SmallVec<[(u32, Reached); 4]> = SmallVec::new();
         for (i, draw) in self.draws.iter().enumerate().filter(|_| references) {
             let mut found = SmallVec::new();
             self.cmd_buf.walk_roots(draw.buffer_accesses(), &mut found);
-            if !found.is_empty() {
-                reached.push((i, found));
-            }
+            reached.extend(found.into_iter().map(|r| (i as u32, r)));
         }
-        // Each draw's accesses, as iterators made once: nothing is copied.
-        let per_draw: SmallVec<[_; INLINE_DRAWS]> = (self.draws.iter().enumerate())
-            .map(|(i, draw)| {
-                let found = (reached.iter())
-                    .find(|(j, _)| *j == i)
-                    .map_or(&[][..], |(_, found)| found.as_slice())
-                    .iter();
-                let images = (draw.image_accesses().map(shorter_image))
-                    .chain(found.clone().filter_map(Reached::image_use));
-                let buffers = (draw.buffer_accesses().map(shorter_buffer))
-                    .chain(found.clone().filter_map(Reached::buffer_access))
-                    .chain(found.filter_map(Reached::structure_read));
-                (images, buffers)
-            })
-            .collect();
-        let count = per_draw.len();
-        let accesses = |i: usize| per_draw[i].clone();
+        let draws = self.draws.iter().count();
+        let mut images: Vec<(u32, ImageUse<'_>)> = Vec::with_capacity(draws * 2);
+        let mut buffers: Vec<(u32, BufferAccess<'_>)> = Vec::with_capacity(draws * 4);
+        for (i, draw) in self.draws.iter().enumerate() {
+            let i = i as u32;
+            images.extend(draw.image_accesses().map(|a| (i, shorter_image(a))));
+            buffers.extend(draw.buffer_accesses().map(|b| (i, shorter_buffer(b))));
+        }
+        for (i, r) in &reached {
+            images.extend(r.image_use().map(|a| (*i, a)));
+            buffers.extend(r.buffer_access().map(|b| (*i, b)));
+            buffers.extend(r.structure_read().map(|b| (*i, b)));
+        }
         // One mip can't be in two layouts in one rendering, so an attachment whose mip a draw
         // also accesses is rendered in `GENERAL`, its descriptor's layout.
-        let in_layout = |mut access: ImageUse<'a>| {
+        let in_layout = |mut access: ImageUse<'a>| -> ImageUse<'a> {
             let a = &access.access;
             let overlaps = |i: &ImageUse| {
                 let mips = i.access.mip_range;
@@ -1515,7 +1555,7 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
                     && mips.start < a.mip_range.end
                     && a.mip_range.start < mips.end
             };
-            if (0..count).any(|i| accesses(i).0.any(|i| overlaps(&i))) {
+            if images.iter().any(|(_, i)| overlaps(i)) {
                 access.access.layout = vk::ImageLayout::GENERAL;
             }
             access
@@ -1534,14 +1574,15 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             }
             in_layout(access)
         });
-        check_hazards(name, count, accesses);
+        check_hazards(name, &images, &buffers);
+        dedup_images(&mut images);
+        dedup_buffers(&mut buffers);
         self.cmd_buf.flush_accesses(
-            ((0..count).flat_map(|i| accesses(i).0))
+            (images.iter().map(|(_, i)| i.clone()))
                 .chain(color_accesses.iter().cloned().map(shorter_image))
                 .chain(ds_access.clone().map(shorter_image)),
-            (0..count).flat_map(|i| accesses(i).1),
+            buffers.iter().map(|(_, b)| *b),
         );
-        drop(per_draw);
 
         let mut color_layouts = color_accesses.iter().map(|access| access.access.layout);
         let color_attachments = self.color.each_ref().map(|color| {
@@ -1770,7 +1811,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     fn compute_private(&mut self, bindings: &BindingOutput<'_, kind::Compute>, dispatch: Dispatch) {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
-        let _span = tracing::info_span!("compute", pass = pass.name).entered();
+        let _span = tracing::trace_span!("compute", pass = pass.name).entered();
         let indirect = match &dispatch {
             Dispatch::Indirect(_, access) => Some(*access),
             _ => None,
@@ -1859,7 +1900,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
     ) {
         let sections = bindings.sections();
         let pass = &pass_map().passes[sections.pass];
-        let _span = tracing::info_span!("raytrace", pass = pass.name).entered();
+        let _span = tracing::trace_span!("raytrace", pass = pass.name).entered();
         let rec = &mut self.rec;
         rec.flush_pending(
             sections.images(),
@@ -2030,7 +2071,7 @@ impl Recording<'_> {
     /// nobody owns stay unowned. Panics unless this family owns them.
     pub(crate) fn release(
         &mut self,
-        internal: &ImageInternal,
+        internal: &Arc<ImageInternal>,
         mips: Range<u32>,
         aspect: vk::ImageAspectFlags,
         to: Kind,
@@ -2043,7 +2084,7 @@ impl Recording<'_> {
         let (from, to_index) = (self.family.index(self.family.kind), self.family.index(to));
         // It waits for this timeline's accesses of the image; the acquire waits for it through
         // the semaphore its submission signals.
-        let (mut stage, mut access) = lock(&internal.access).sources(&self.tracker);
+        let (mut stage, mut access) = self.locals.of(internal).sources(&self.tracker);
         if stage.is_empty() {
             stage = S2::ALL_COMMANDS;
             access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
@@ -2082,7 +2123,7 @@ impl Recording<'_> {
         // The family it goes to waits for this submission as a whole. Mips this family still
         // owns keep the image's accesses, which their later accesses wait for.
         if released_by(states, self.family.kind) {
-            lock(&internal.access).forget(&self.tracker);
+            self.locals.of(internal).forget(&self.tracker);
         }
     }
 }
@@ -2101,6 +2142,7 @@ impl<'p> Recording<'p> {
             handle,
             structures,
             keep: Keep::new(timeline, value),
+            locals: Locals::new(tracker),
             tracker,
             timeline,
             value,
@@ -2236,7 +2278,7 @@ impl<'p> Recording<'p> {
             }
         }
         let barriers = compute_barriers(
-            &self.tracker,
+            &mut self.locals,
             self.barrier_log,
             self.structures,
             &self.family,
@@ -2247,10 +2289,10 @@ impl<'p> Recording<'p> {
             self.acquired.extend_from_slice(&barriers.acquired);
             self.barrier_log.push(barriers);
             self.pipeline_barrier(self.barrier_log.last().expect("just pushed"));
-            made_visible(&self.tracker, self.barrier_log, image_accesses.clone());
+            made_visible(&mut self.locals, self.barrier_log, image_accesses.clone());
         }
         record(
-            &self.tracker,
+            &mut self.locals,
             self.barrier_log,
             self.structures,
             &mut self.keep,
@@ -2278,6 +2320,11 @@ impl<'p> Recording<'p> {
         };
         self.barrier_log.push(barriers);
         self.pipeline_barrier(self.barrier_log.last().expect("just pushed"));
+    }
+
+    /// Writes the recording's copies of the access states back into their objects.
+    pub(crate) fn publish_accesses(&mut self) {
+        self.locals.publish(self.barrier_log);
     }
 
     /// What its submission keeps alive until it completed.
@@ -2542,7 +2589,7 @@ impl<'a> BufferAccess<'a> {
 /// The barriers a command with these accesses needs after `pending`. It moves each image's
 /// tracked state, so call it once per command, when the command is recorded.
 pub(crate) fn compute_barriers<'a>(
-    t: &Tracker,
+    locals: &mut Locals,
     log: &[Barriers],
     structures: &mut StructureAccesses,
     family: &FamilyInfo,
@@ -2562,6 +2609,8 @@ pub(crate) fn compute_barriers<'a>(
         }
     };
 
+    let t = &*locals.tracker();
+    let t = &{ *t };
     for b in buffer_accesses {
         let (stage, access) = (b.stage, b.access);
         if !access.intersects(READ_ACCESS | WRITE_ACCESS) {
@@ -2575,18 +2624,18 @@ pub(crate) fn compute_barriers<'a>(
                 access,
             ),
             Some(buffer) => {
-                let found = lock(&buffer.state).hazards(t, log, b.range, stage, access);
+                let found = locals.of(buffer).hazards(t, log, b.range, stage, access);
                 hazard(found, stage, access);
                 // Commands that read it through references waited only for those buffers.
                 if access.intersects(WRITE_ACCESS) {
                     hazard(
-                        ancestor_hazards(&**buffer, t, log, stage, access),
+                        ancestor_hazards(&**buffer, locals, log, stage, access),
                         stage,
                         access,
                     );
                     #[cfg(feature = "acceleration-structure")]
                     if let Some(structure) = b.structure {
-                        let found = ancestor_hazards(&**structure, t, log, stage, access);
+                        let found = ancestor_hazards(&**structure, locals, log, stage, access);
                         hazard(found, stage, access);
                     }
                 }
@@ -2609,12 +2658,12 @@ pub(crate) fn compute_barriers<'a>(
         if !access.intersects(READ_ACCESS | WRITE_ACCESS) {
             continue;
         }
-        let found = lock(&image.internal.access).hazards(t, log, WHOLE, stage, access);
+        let found = (locals.of(image.internal)).hazards(t, log, WHOLE, stage, access);
         hazard(found, stage, access);
         if access.intersects(WRITE_ACCESS) {
             let internal = &**image.internal;
             hazard(
-                ancestor_hazards(internal, t, log, stage, access),
+                ancestor_hazards(internal, locals, log, stage, access),
                 stage,
                 access,
             );
@@ -2644,7 +2693,7 @@ pub(crate) fn compute_barriers<'a>(
             access.access
         };
         // What a transition waits for: the image's tracked accesses.
-        let tracked = lock(&image.internal.access).sources(t);
+        let tracked = locals.of(image.internal).sources(t);
         take_checked_states(
             image.states(),
             access.mip_range,
@@ -2698,7 +2747,7 @@ pub(crate) fn compute_barriers<'a>(
                 // through them recorded only those.
                 let write = vk::AccessFlags2::MEMORY_WRITE;
                 let internal = &**image.internal;
-                if let Some((s, a)) = ancestor_hazards(internal, t, log, to_stage, write) {
+                if let Some((s, a)) = ancestor_hazards(internal, locals, log, to_stage, write) {
                     src_stage |= s;
                     src_access |= a;
                 }
@@ -2767,7 +2816,7 @@ pub(crate) fn compute_barriers<'a>(
 /// is its image's latest write, at its barriers' destination stages and visible there
 /// (`AccessState::transition`). Memory barriers make writes visible through the log.
 pub(crate) fn made_visible<'a>(
-    t: &Tracker,
+    locals: &mut Locals,
     log: &[Barriers],
     image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
 ) {
@@ -2784,7 +2833,8 @@ pub(crate) fn made_visible<'a>(
             .collect();
         if let Some(access) = image_accesses.clone().find(|a| a.access.image == image) {
             let internal = &access.internal;
-            lock(&internal.access).transition(t, log, &scopes);
+            let t = *locals.tracker();
+            locals.of(internal).transition(&t, log, &scopes);
             // Out of `GENERAL`: the buffers that reference it need a transition back.
             let away = (moved.clone())
                 .any(|b| b.image == image && b.new_layout != vk::ImageLayout::GENERAL);
@@ -2798,13 +2848,15 @@ pub(crate) fn made_visible<'a>(
 /// Tracks the accesses of a command recorded after the barriers of `log`, in their buffers and
 /// images, and in `structures` for every acceleration structure read and structure write.
 pub(crate) fn record<'a>(
-    t: &Tracker,
+    locals: &mut Locals,
     log: &[Barriers],
     structures: &mut StructureAccesses,
     keep: &mut Keep,
     image_accesses: impl Iterator<Item = ImageUse<'a>>,
     buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
 ) {
+    let t = *locals.tracker();
+    let t = &t;
     for b in buffer_accesses {
         #[cfg(feature = "acceleration-structure")]
         if let Some(structure) = b.structure {
@@ -2818,7 +2870,7 @@ pub(crate) fn record<'a>(
             }
             Some(buffer) => {
                 keep.object(buffer);
-                lock(&buffer.state).record(t, log, b.range, b.stage, b.access);
+                locals.of(buffer).record(t, log, b.range, b.stage, b.access);
                 if (b.access).contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
                     structures.record_write(t, log, b.stage, b.access);
                 }
@@ -2839,7 +2891,7 @@ pub(crate) fn record<'a>(
     for image in image_accesses {
         keep.object(image.internal);
         let access = &image.access;
-        lock(&image.internal.access).record(t, log, WHOLE, access.stage, access.access);
+        (locals.of(image.internal)).record(t, log, WHOLE, access.stage, access.access);
         if access.access.intersects(WRITE_ACCESS) && image.internal.header.has_parents() {
             mark_dirty(&**image.internal, 1 << t.timeline);
         }

@@ -19,13 +19,13 @@ use crate::{
     bindless::Ranges,
     buffer::{Buffer, BufferInternal, Gpu, slice::BufferSlice},
     command_buffer::{
-        Barriers, BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE, Recording,
-        access_state::Tracker,
+        BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE, Recording,
+        access_state::AccessState,
     },
     error::{Error, Result},
     features::{Feature, gate},
     global::Live,
-    object::{Hazard, Header, Object, Strong},
+    object::{Header, Object, Strong},
     query::{CompactedSize, QueryKind, QueryPool, SerializedSize},
     queue::{HasCompute, lock},
     reference::KeepAlive,
@@ -412,15 +412,13 @@ impl Object for StructureInternal {
         self.keep_alive.get()
     }
 
-    fn reference_hazards(
-        &self,
-        t: &Tracker,
-        log: &[Barriers],
-        stage: vk::PipelineStageFlags2,
-        access: vk::AccessFlags2,
-    ) -> Hazard {
+    fn access_state(&self) -> Option<&Mutex<AccessState>> {
+        Some(&self.buffer().state)
+    }
+
+    fn referencing_range(&self) -> Option<Range<u64>> {
         self.keep_alive.get()?;
-        lock(&self.buffer().state).hazards(t, log, self.range, stage, access)
+        Some(self.range)
     }
 }
 

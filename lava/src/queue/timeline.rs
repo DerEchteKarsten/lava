@@ -836,6 +836,9 @@ impl<K: QueueKind> Submission<'_, K> {
         }
         #[cfg(feature = "acceleration-structure")]
         cmd.rec.finish_structure_builds(result.is_ok());
+        // Its tracked accesses go into their objects before its value counts as submitted,
+        // which host access checks against.
+        cmd.rec.publish_accesses();
         // Submitted, or replayed or signalled from the host: its value completes it.
         let kept = cmd.rec.take_kept();
         drop(cmd);

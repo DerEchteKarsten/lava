@@ -16,11 +16,9 @@ use smallvec::SmallVec;
 
 use crate::{
     command_buffer::{
-        Barriers,
-        access_state::{AccessState, Tracker},
+        access_state::AccessState,
     },
     global::Live,
-    object::Hazard,
     object::{Header, Object},
     queue::{lock, timeline::poll},
     reference::{KeepAlive, ReferenceInfo, ReferencingData},
@@ -173,19 +171,16 @@ impl Object for BufferInternal {
         self.keep_alive.get()
     }
 
-    fn reference_hazards(
-        &self,
-        t: &Tracker,
-        log: &[Barriers],
-        stage: vk::PipelineStageFlags2,
-        access: vk::AccessFlags2,
-    ) -> Hazard {
+    fn access_state(&self) -> Option<&Mutex<AccessState>> {
+        Some(&self.state)
+    }
+
+    fn referencing_range(&self) -> Option<Range<u64>> {
         self.keep_alive.get()?;
-        let range = Range {
+        Some(Range {
             start: self.address,
             end: self.address + self.num_bytes,
-        };
-        lock(&self.state).hazards(t, log, range, stage, access)
+        })
     }
 }
 

@@ -1,4 +1,5 @@
 //! GPU objects as lava owns them: each lives in an `Arc` of its internal (buffers, images, acceleration structures, samplers), whose `Header` counts it as a lava user until its drop finished and keeps what references between objects need (the buffers that reference it, and dirty bits a write marks them with), the typed strong references (`Strong`) a referencing buffer holds its children by, and the keep list (`Keep`) of what a recording names, which its submission holds until it completed
+use std::range::Range;
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
@@ -12,7 +13,7 @@ use crate::vkobjects::acceleration_structure::StructureInternal;
 use crate::{
     bindless::SamplerInternal,
     buffer::BufferInternal,
-    command_buffer::{Barriers, access_state::Tracker},
+    command_buffer::{Barriers, access_state::AccessState, locals::Locals},
     global::Live,
     image::ImageInternal,
     queue::lock,
@@ -67,11 +68,13 @@ pub(crate) trait Object: Send + Sync + 'static {
     fn keep_alive(&self) -> Option<&Mutex<KeepAlive>> {
         None
     }
-    /// What a write (`stage`, `access`) of an object it references waits for of its own
-    /// tracked accesses: the commands that read the object through it recorded only reads of
-    /// it (a walk of a clean buffer reaches nothing). None for objects that reference nothing.
-    fn reference_hazards(&self, t: &Tracker, log: &[Barriers], stage: S2, access: A) -> Hazard {
-        let _ = (t, log, stage, access);
+    /// Its tracked accesses (a structure's are its buffer's); none for a sampler.
+    fn access_state(&self) -> Option<&Mutex<AccessState>> {
+        None
+    }
+    /// The range of its state the commands that reach things through it access: the whole
+    /// buffer, or the structure's memory. None for objects that reference nothing.
+    fn referencing_range(&self) -> Option<Range<u64>> {
         None
     }
 }
@@ -81,9 +84,11 @@ pub(crate) type Hazard = Option<(S2, A)>;
 
 /// What a write (`stage`, `access`) of `object` waits for of the objects above it, which
 /// commands read it through (`Object::reference_hazards` of every ancestor).
+/// The commands that read the object through an ancestor recorded only reads of the ancestor
+/// (a walk of a clean buffer reaches nothing), so those are what the write waits for.
 pub(crate) fn ancestor_hazards(
     object: &dyn Object,
-    t: &Tracker,
+    locals: &mut Locals,
     log: &[Barriers],
     stage: S2,
     access: A,
@@ -100,8 +105,13 @@ pub(crate) fn ancestor_hazards(
         }
     };
     for parent in parents(object) {
-        add(parent.reference_hazards(t, log, stage, access));
-        add(ancestor_hazards(&*parent, t, log, stage, access));
+        let t = *locals.tracker();
+        if let Some(range) = parent.referencing_range()
+            && let Some(state) = locals.of_dyn(&parent)
+        {
+            add(state.hazards(&t, log, range, stage, access));
+        }
+        add(ancestor_hazards(&*parent, locals, log, stage, access));
     }
     found
 }
@@ -184,7 +194,10 @@ impl Keep {
     }
 
     pub(crate) fn object<T: Object>(&mut self, object: &Arc<T>) {
-        if object.header().last_kept.swap(self.tag, Relaxed) != self.tag {
+        // A load, so a kept object's repeated accesses never write its header.
+        let last_kept = &object.header().last_kept;
+        if last_kept.load(Relaxed) != self.tag {
+            last_kept.store(self.tag, Relaxed);
             let object: Arc<dyn Object> = object.clone();
             self.kept.push(crate::queue::timeline::Kept::Object(object));
         }

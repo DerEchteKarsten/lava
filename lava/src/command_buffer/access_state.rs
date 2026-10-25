@@ -1,4 +1,4 @@
-//! The accesses later commands may have to wait for, kept in each buffer and image (`AccessState`, one per buffer or image, entries tagged with their timeline) and, for the reads of every acceleration structure a TLAS build or trace makes, per timeline: what its submissions read and wrote (layout transitions and acquires count as writes), each write with what barriers already made it visible to (its own pairs, and the memory barriers its recording logged after it), how recording a command adds to them, how they shrink once the GPU finished them, and the host-access check of a buffer's incomplete writes
+//! The accesses later commands may have to wait for, kept in each buffer and image (`AccessState`, one per buffer or image, entries tagged with their timeline; a recording works on a copy of its timeline's share, `import`/`publish`, see `locals.rs`) and, for the reads of every acceleration structure a TLAS build or trace makes, per timeline: what its submissions read and wrote (layout transitions and acquires count as writes), each write with what barriers already made it visible to (its own pairs, and the memory barriers its recording logged after it), how recording a command adds to them, how they shrink once the GPU finished them, and the host-access check of a buffer's incomplete writes
 
 use std::range::Range;
 
@@ -149,14 +149,30 @@ pub(crate) struct AccessState {
 pub(crate) const WHOLE: Range<u64> = Range { start: 0, end: 1 };
 
 impl AccessState {
-    /// Drops the entries `t` no longer needs: its timeline's former owner's, and its reads that
-    /// completed.
-    fn prune(&mut self, t: &Tracker) {
-        let mine = |timeline: u8, value: u64| timeline == t.timeline && value <= t.base;
-        self.reads.retain(|r| {
-            !mine(r.timeline, r.value) && !(r.timeline == t.timeline && r.value <= t.completed)
-        });
-        self.writes.retain(|w| !mine(w.timeline, w.value));
+    /// The recording `t`'s working copy of its timeline's share: the entries of its timeline
+    /// but the former owner's of the index (at or below `t.base`) and the reads that
+    /// completed. A timeline has one recording at a time, so the copy is the recording's
+    /// alone (`Locals`).
+    pub(crate) fn import(&self, t: &Tracker) -> AccessState {
+        let mine = |timeline: u8, value: u64| timeline == t.timeline && value > t.base;
+        AccessState {
+            reads: (self.reads.iter())
+                .filter(|r| mine(r.timeline, r.value) && r.value > t.completed)
+                .cloned()
+                .collect(),
+            writes: (self.writes.iter())
+                .filter(|w| mine(w.timeline, w.value))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Replaces the share of `t`'s timeline with the recording's copy.
+    pub(crate) fn publish(&mut self, t: &Tracker, local: AccessState) {
+        self.reads.retain(|r| r.timeline != t.timeline);
+        self.writes.retain(|w| w.timeline != t.timeline);
+        self.reads.extend(local.reads);
+        self.writes.extend(local.writes);
     }
 
     /// What an access of `range` at `stage` with `access` waits for on `t`'s timeline: the
@@ -171,7 +187,6 @@ impl AccessState {
         stage: S2,
         access: A,
     ) -> Option<(S2, A)> {
-        self.prune(t);
         let mut hazard: Option<(S2, A)> = None;
         let mut add = |s: S2, a: A| {
             let (stages, accesses) = hazard.get_or_insert((S2::NONE, A::NONE));
@@ -200,7 +215,6 @@ impl AccessState {
     /// The stages and accesses of every access of `t`'s timeline: what a layout transition or
     /// a release waits for.
     pub(crate) fn sources(&mut self, t: &Tracker) -> (S2, A) {
-        self.prune(t);
         let (mut stage, mut access) = (S2::NONE, A::NONE);
         let reads = self.reads.iter().map(|r| (r.timeline, r.stage, r.access));
         let writes = self.writes.iter().map(|w| (w.timeline, w.stage, w.access));
@@ -224,18 +238,29 @@ impl AccessState {
         stage: S2,
         access: A,
     ) {
+        // Entries are unordered, so covered ones are swapped out. The command's barriers may
+        // have made earlier writes visible, which `hazards` takes in where it asks and
+        // `settle` before the recording's log goes.
         let mine = |timeline: u8| timeline == t.timeline;
-        // The command's barriers (the log's last) may have made its writes visible: taken in
-        // now, so the visibility outlives the recording's log.
-        for w in self.writes.iter_mut().filter(|w| mine(w.timeline)) {
-            w.apply(t, log);
-        }
         if access.intersects(WRITE_ACCESS) {
-            (self.writes).retain(|w| !(mine(w.timeline) && covers(range, w.range)));
+            let mut i = 0;
+            while i < self.writes.len() {
+                let w = &self.writes[i];
+                match mine(w.timeline) && covers(range, w.range) {
+                    true => drop(self.writes.swap_remove(i)),
+                    false => i += 1,
+                }
+            }
             let seq = log.len() as u32;
             self.writes.push(Write::new(t, seq, range, stage, access));
-            self.reads
-                .retain(|r| !(mine(r.timeline) && covers(range, r.range)));
+            let mut i = 0;
+            while i < self.reads.len() {
+                let r = &self.reads[i];
+                match mine(r.timeline) && covers(range, r.range) {
+                    true => drop(self.reads.swap_remove(i)),
+                    false => i += 1,
+                }
+            }
             self.fold(t, log);
         }
         if access.intersects(READ_ACCESS) {
@@ -246,15 +271,26 @@ impl AccessState {
                 stage,
                 access,
             };
-            self.reads.retain(|r| {
-                let covered = mine(r.timeline) && covers(range, r.range);
-                if covered {
+            let mut i = 0;
+            while i < self.reads.len() {
+                let r = &self.reads[i];
+                if mine(r.timeline) && covers(range, r.range) {
                     read.stage |= r.stage;
                     read.access |= r.access;
+                    self.reads.swap_remove(i);
+                } else {
+                    i += 1;
                 }
-                !covered
-            });
+            }
             self.reads.push(read);
+        }
+    }
+
+    /// Takes the barriers of `log` into every write of `t`'s recording, so their visibility
+    /// outlives the log: before the copy is published.
+    pub(crate) fn settle(&mut self, t: &Tracker, log: &[Barriers]) {
+        for w in self.writes.iter_mut().filter(|w| w.timeline == t.timeline) {
+            w.apply(t, log);
         }
     }
 
@@ -262,6 +298,9 @@ impl AccessState {
     /// into one over all their ranges, which keeps the visibility all of them had (their own
     /// pairs, with `log`'s barriers taken in first).
     fn fold(&mut self, t: &Tracker, log: &[Barriers]) {
+        if self.writes.len() <= MAX_WRITES {
+            return;
+        }
         let mine = (self.writes.iter())
             .filter(|w| w.timeline == t.timeline)
             .count();

@@ -14,6 +14,7 @@ use crate::{
         Barriers, BufferAccess, ImageAccess, ImageUse,
         access_state::{AccessState, MAX_WRITES, StructureAccesses, Tracker},
         compute_barriers,
+        locals::Locals,
         image_state::{ImageState, check_states, release_states, released_by, take_checked_states},
         made_visible, record, walk,
     },
@@ -163,6 +164,7 @@ struct Rec {
     tracker: Tracker,
     log: Vec<Barriers>,
     structures: StructureAccesses,
+    locals: Locals,
 }
 
 impl Rec {
@@ -175,19 +177,22 @@ impl Rec {
             tracker,
             log: Vec::new(),
             structures: StructureAccesses::default(),
+            locals: Locals::new(tracker),
         }
     }
 
-    /// Tracks `images` and `buffers` without their barriers.
+    /// Tracks `images` and `buffers` without their barriers, published to their objects, so
+    /// the tests read them there.
     fn record(&mut self, images: &[ImageUse], buffers: &[BufferAccess]) {
         record(
-            &self.tracker,
+            &mut self.locals,
             &self.log,
             &mut self.structures,
             &mut crate::object::Keep::new(0, self.tracker.value),
             images.iter().cloned(),
             buffers.iter().cloned(),
         );
+        self.locals.publish(&self.log);
     }
 }
 
@@ -198,7 +203,7 @@ fn flush_barriers(
     buffers: &[BufferAccess],
 ) -> Option<Barriers> {
     let barriers = compute_barriers(
-        &rec.tracker,
+        &mut rec.locals,
         &rec.log,
         &mut rec.structures,
         &GRAPHICS,
@@ -207,7 +212,7 @@ fn flush_barriers(
     );
     if let Some(barriers) = &barriers {
         rec.log.push(barriers.clone());
-        made_visible(&rec.tracker, &rec.log, images.iter().cloned());
+        made_visible(&mut rec.locals, &rec.log, images.iter().cloned());
     }
     rec.record(images, buffers);
     barriers
@@ -273,10 +278,9 @@ fn tracked_accesses_shrink_only_when_covered_or_completed() {
         S::VERTEX_SHADER,
         A::SHADER_STORAGE_READ,
     );
-    state.sources(&tracker(3, 1));
-    assert_eq!(state.reads.len(), 1);
-    state.sources(&tracker(3, 2));
-    assert!(state.reads.is_empty());
+    // A recording's copy leaves the completed reads out.
+    assert_eq!(state.import(&tracker(3, 1)).reads.len(), 1);
+    assert!(state.import(&tracker(3, 2)).reads.is_empty());
 }
 
 /// Each timeline sees only its own accesses, and a timeline that took an index over ignores
@@ -321,12 +325,14 @@ fn timelines_track_their_own_accesses() {
         timeline: 1,
         ..next_owner
     };
+    // The next owner's recording copies nothing of its former owner's.
+    let mut local = state.import(&next_owner);
     assert_eq!(
-        read_hazards(&next_owner, &mut state),
+        read_hazards(&next_owner, &mut local),
         None,
         "a former owner's"
     );
-    assert!(state.writes.is_empty());
+    assert!(local.writes.is_empty());
 }
 
 /// A barrier's visibility outlives its recording's log: a buffer written and read once in one
@@ -442,7 +448,7 @@ fn ownership_moves_through_release_and_acquire() {
         L::GENERAL,
     );
     let barriers = compute_barriers(
-        &tracker(1, 0),
+        &mut Locals::new(tracker(1, 0)),
         &[],
         &mut StructureAccesses::default(),
         &GRAPHICS,
@@ -729,11 +735,9 @@ fn completed_accesses_retire_and_folds_keep_their_visibility() {
         L::GENERAL,
     );
     Rec::at(tracker(3, 0)).record(&[sampled.clone()], &[]);
-    let mut access = sampled.internal.access.lock().unwrap();
-    access.sources(&tracker(4, 2));
-    assert_eq!(access.reads.len(), 1);
-    access.sources(&tracker(4, 3));
-    assert!(access.reads.is_empty());
+    let access = sampled.internal.access.lock().unwrap();
+    assert_eq!(access.import(&tracker(4, 2)).reads.len(), 1);
+    assert!(access.import(&tracker(4, 3)).reads.is_empty());
     drop(access);
 
     let mut pending = Rec::new();

@@ -363,6 +363,10 @@ impl crate::object::Object for ImageInternal {
     fn header(&self) -> &Header {
         &self.header
     }
+
+    fn access_state(&self) -> Option<&Mutex<AccessState>> {
+        Some(&self.access)
+    }
 }
 
 impl Drop for ImageInternal {
