@@ -733,6 +733,15 @@ impl DrawState<'_> {
         dynamic: &Dynamic,
         cmd: vk::CommandBuffer,
     ) {
+        // Draws of one rendering mostly share one state: the same as the last draw's sets
+        // nothing (the viewport and scissor are the same `Option`s, so the same values).
+        if let Some(last) = last
+            && *last.state == *self.state
+            && last.blends == self.blends
+            && last.write_masks == self.write_masks
+        {
+            return;
+        }
         let device = Ctx::device();
         let (d2, d3) = (Functions::dynamic_state2(), Functions::dynamic_state3());
         // Blends and write masks are slices of the rendering's attachment count.

@@ -181,29 +181,71 @@ fn parents(object: &dyn Object) -> SmallVec<[Arc<dyn Object>; 2]> {
 }
 
 /// The objects a recording names, which its submission keeps alive until it completed
-/// (`timeline::keep_until`): each once, by the recording's tag in the object's header.
+/// (`timeline::keep_until`): each once, by the recording's tag in the object's header. The
+/// tag is the timeline (bits 60 and up), the index of the recording's copy of the object's
+/// access state (`Locals`, bits 40 to 59; `NO_INDEX` for none, or one that doesn't fit) and
+/// the low 40 bits of the recording's value.
 pub(crate) struct Keep {
+    /// The recording's timeline and value bits; an object's tag matches with any index.
     tag: u64,
     pub(crate) kept: Vec<crate::queue::timeline::Kept>,
 }
+
+const INDEX_SHIFT: u32 = 40;
+const INDEX_MASK: u64 = 0xF_FFFF << INDEX_SHIFT;
+const NO_INDEX: u64 = INDEX_MASK;
 
 impl Keep {
     /// The keep list of the recording of `value` on timeline `timeline`.
     pub(crate) fn new(timeline: usize, value: u64) -> Self {
         Keep {
-            tag: (timeline as u64 + 1) << 56 | value,
+            tag: (timeline as u64 + 1) << 60 | (value & ((1 << INDEX_SHIFT) - 1)),
             kept: Vec::new(),
         }
     }
 
+    /// `header`'s tag if it is this recording's.
+    fn tag_of(&self, header: &Header) -> Option<u64> {
+        let tag = header.last_kept.load(Relaxed);
+        (tag & !INDEX_MASK == self.tag).then_some(tag)
+    }
+
+    /// The index of the recording's copy of the object's access state, if its header carries
+    /// it.
+    pub(crate) fn local_index(&self, header: &Header) -> Option<usize> {
+        let index = self.tag_of(header)? & INDEX_MASK;
+        (index != NO_INDEX).then_some((index >> INDEX_SHIFT) as usize)
+    }
+
     pub(crate) fn object<T: Object>(&mut self, object: &Arc<T>) {
         // A load, so a kept object's repeated accesses never write its header.
-        let last_kept = &object.header().last_kept;
-        if last_kept.load(Relaxed) != self.tag {
-            last_kept.store(self.tag, Relaxed);
+        if self.tag_of(object.header()).is_none() {
+            object.header().last_kept.store(self.tag | NO_INDEX, Relaxed);
             let object: Arc<dyn Object> = object.clone();
             self.kept.push(crate::queue::timeline::Kept::Object(object));
         }
+    }
+
+    /// Drops the index from `header`'s tag: the copy was published.
+    pub(crate) fn forget_index(&self, header: &Header) {
+        if self.tag_of(header).is_some() {
+            header.last_kept.store(self.tag | NO_INDEX, Relaxed);
+        }
+    }
+
+    /// Keeps `object`, whose access state the recording copied at `index`.
+    pub(crate) fn object_with_index(
+        &mut self,
+        header: &Header,
+        object: &Arc<dyn Object>,
+        index: usize,
+    ) {
+        let index = match index < (INDEX_MASK >> INDEX_SHIFT) as usize {
+            true => (index as u64) << INDEX_SHIFT,
+            false => NO_INDEX,
+        };
+        header.last_kept.store(self.tag | index, Relaxed);
+        (self.kept).push(crate::queue::timeline::Kept::Object(object.clone()));
     }
 
     /// Something else the submission needs alive, which its caller keeps once.

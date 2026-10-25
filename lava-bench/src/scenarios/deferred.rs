@@ -118,6 +118,10 @@ impl Deferred {
         // Both histories start black.
         let set = &deferred.lava;
         setup.lava(|cmd| {
+            cmd.freeze(&deferred.vertices);
+            cmd.freeze(&deferred.indices);
+            cmd.freeze(&deferred.instances);
+            cmd.freeze(&deferred.lights);
             for history in &set.history {
                 cmd.clear_image(history.whole_view(), [0.0; 4]);
             }

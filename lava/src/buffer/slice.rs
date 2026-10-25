@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::range::Range;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 use lava_macros::validation_trace;
 use smallvec::SmallVec;
@@ -144,6 +145,9 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
     ) -> BufferAccess<'a> {
+        if access.intersects(WRITE_ACCESS) {
+            self.buffer.check_not_frozen();
+        }
         assert!(
             !access.intersects(WRITE_ACCESS) || self.buffer.keep_alive.get().is_none(),
             "a buffer whose elements reference other objects is written with \
@@ -159,11 +163,19 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
     ) -> BufferAccess<'a> {
+        let frozen = self.buffer.frozen.load(Relaxed);
+        if frozen && access.intersects(WRITE_ACCESS) {
+            self.buffer.check_not_frozen();
+        }
         BufferAccess {
             unordered: false,
+            tracked: !frozen,
             stage,
             access,
-            range: self.get_range(),
+            range: match self.buffer.coarse.load(Relaxed) {
+                true => self.buffer.range(),
+                false => self.get_range(),
+            },
             buffer: Some(self.buffer),
             #[cfg(feature = "acceleration-structure")]
             structure: None,
@@ -269,6 +281,27 @@ fn check_words(address: u64, size: u64, what: &str) {
 pub(crate) const MAX_UPDATE: usize = 65536;
 
 impl<K: QueueKind> CommandBuffer<'_, K> {
+    /// Freezes `buffer`: after this command nothing writes it again (a later write, host or
+    /// GPU, panics), so its reads need no barriers and aren't tracked, which makes reads of
+    /// static data (meshes, index buffers, tables) free. Record it after the buffer's last
+    /// write, in that recording or a later one on the same timeline: the command waits for the
+    /// buffer's pending writes and makes them visible to every later command. Submissions on
+    /// other timelines still need their `wait_for`.
+    #[validation_trace]
+    pub fn freeze<T: Copy + 'static, M: Memory>(&mut self, buffer: &Buffer<T, M>) {
+        assert!(
+            buffer.internal.keep_alive.get().is_none(),
+            "a buffer whose elements reference other objects can't be frozen: writes of what it \
+             references wait for the reads through it, which a frozen buffer doesn't track"
+        );
+        let read = (buffer.range(..)).access_unchecked(
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ,
+        );
+        self.rec.flush_pending(iter::empty(), iter::once(read));
+        buffer.internal.frozen.store(true, Relaxed);
+    }
+
     /// Writes `data`, repeated, into every 4-byte word of `buffer`, whose address and size have
     /// to be multiples of 4. An empty slice records nothing.
     #[validation_trace]

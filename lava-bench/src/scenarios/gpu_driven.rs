@@ -118,7 +118,11 @@ impl GpuDriven {
                 pipelines::compute("Hiz"),
             ],
         };
-        setup.lava(|_| {});
+        setup.lava(|cmd| {
+            cmd.freeze(&driven.vertices);
+            cmd.freeze(&driven.indices);
+            cmd.freeze(&driven.instances);
+        });
         let set = &driven.raw;
         unsafe {
             let read_only = L::SHADER_READ_ONLY_OPTIMAL;

@@ -360,10 +360,12 @@ impl Ml {
             })
             .collect();
         let set = || Set {
-            acts: Buffer::new(((LAYERS + 1) * act::SIZE) as usize).unwrap(),
+            // Suballocated into one span per activation, every op depending on the one
+            // before: tracked as whole buffers.
+            acts: Buffer::new(((LAYERS + 1) * act::SIZE) as usize).unwrap().coarse(),
             weights: uploader.from_slice(&initial).unwrap(),
             grads: Buffer::new(WEIGHTS as usize).unwrap(),
-            scratch: Buffer::new(grad::SIZE as usize).unwrap(),
+            scratch: Buffer::new(grad::SIZE as usize).unwrap().coarse(),
             zeros: uploader.from_slice(&[0.0f32; 256]).unwrap(),
             moments: Buffer::new(WEIGHTS as usize).unwrap(),
             step: 0,

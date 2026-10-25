@@ -574,3 +574,35 @@ fn transfer_family_copies_follow_its_rules() {
         "{message}"
     );
 }
+
+/// A frozen buffer reads without tracking and refuses every write; a coarse buffer tracks
+/// every slice as the whole buffer.
+#[test]
+fn frozen_buffers_refuse_writes_and_coarse_buffers_track_whole() {
+    let mut gpu = gpu();
+    let data = [1u32, 2, 3, 4];
+    let frozen = gpu.buffer(&data);
+    let mut copy = zeroed_buffer::<u32>(4);
+    gpu.submit(|cmd| {
+        cmd.freeze(&frozen);
+        cmd.copy_buffer(frozen.range(..), copy.range(..));
+    });
+    assert_eq!(copy.host(), &data);
+    let message = panic_message(|| {
+        gpu.submit(|cmd| cmd.fill_buffer(frozen.range(..), 0));
+    });
+    assert!(message.contains("frozen"), "{message}");
+    let mut upload = buffer_with(&data);
+    gpu.submit(|cmd| cmd.freeze(&upload));
+    let message = panic_message(|| upload.host_write(0, &[9]));
+    assert!(message.contains("frozen"), "{message}");
+
+    let coarse = Buffer::<u32>::new(8).unwrap().coarse();
+    let mut out = zeroed_buffer::<u32>(8);
+    gpu.submit(|cmd| {
+        cmd.fill_buffer(coarse.range(..4), 7);
+        cmd.fill_buffer(coarse.range(4..), 9);
+        cmd.copy_buffer(coarse.range(..), out.range(..));
+    });
+    assert_eq!(out.host(), &[7, 7, 7, 7, 9, 9, 9, 9]);
+}

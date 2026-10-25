@@ -65,6 +65,8 @@ thread_local! {
         memory: BufferMemory::Allocation(Default::default()),
         state: Default::default(),
         keep_alive: Default::default(),
+        frozen: Default::default(),
+        coarse: Default::default(),
         header: Header::new(Live::internal()),
     })));
 }
@@ -76,6 +78,7 @@ fn test_buffer() -> &'static Arc<BufferInternal> {
 fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess<'static> {
     BufferAccess {
         unordered: false,
+        tracked: true,
         stage,
         access,
         range: range.into(),
@@ -189,7 +192,6 @@ impl Rec {
             &mut self.locals,
             &Visibility::of(&self.log),
             &mut self.structures,
-            &mut crate::object::Keep::new(0, self.tracker.value),
             images.iter().cloned(),
             buffers.iter().cloned(),
         );
@@ -2305,6 +2307,8 @@ fn fake_buffer(address: u64) -> &'static Arc<BufferInternal> {
         memory: BufferMemory::Allocation(Default::default()),
         state: Default::default(),
         keep_alive: Default::default(),
+        frozen: Default::default(),
+        coarse: Default::default(),
         header: Header::new(Live::internal()),
     })))
 }
@@ -2660,6 +2664,7 @@ fn writes_of_referenced_objects_wait_for_reads_through_their_buffers() {
     );
     let access = |b: &'static Arc<BufferInternal>, stage, access| BufferAccess {
         unordered: false,
+        tracked: true,
         stage,
         access,
         range: (b.address..b.address + 4).into(),

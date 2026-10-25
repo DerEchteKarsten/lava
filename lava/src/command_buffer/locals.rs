@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use hashbrown::HashMap;
 
 use crate::command_buffer::access_state::{AccessState, Tracker, Visibility};
-use crate::object::Object;
+use crate::object::{Header, Keep, Object};
 use crate::queue::lock;
 
 /// A copy of one object's share of its access state.
@@ -39,7 +39,12 @@ impl Hasher for PointerHasher {
 pub(crate) struct Locals {
     tracker: Tracker,
     entries: Vec<Local>,
+    /// Every copy by the address of its object's state: the fallback of the tag in the
+    /// object's header (`Keep::tag`, which carries the copy's index), which another timeline's
+    /// recording may overwrite.
     index: HashMap<usize, u32, BuildHasherDefault<PointerHasher>>,
+    /// The objects the recording names, kept until its submission completed.
+    pub(crate) keep: Keep,
 }
 
 impl Locals {
@@ -48,6 +53,7 @@ impl Locals {
             tracker,
             entries: Vec::new(),
             index: HashMap::default(),
+            keep: Keep::new(tracker.timeline as usize, tracker.value),
         }
     }
 
@@ -58,28 +64,36 @@ impl Locals {
     /// The recording's copy of `owner`'s state (an object that has one, else a panic).
     pub(crate) fn of<T: Object>(&mut self, owner: &Arc<T>) -> &mut AccessState {
         let state = owner.access_state().expect("an object with tracked accesses");
-        self.entry(state, || owner.clone())
+        self.entry(owner.header(), state, || owner.clone())
     }
 
     /// The recording's copy of `owner`'s state, or none for an object without one.
     pub(crate) fn of_dyn(&mut self, owner: &Arc<dyn Object>) -> Option<&mut AccessState> {
         let state = owner.access_state()?;
-        Some(self.entry(state, || owner.clone()))
+        Some(self.entry(owner.header(), state, || owner.clone()))
     }
 
+    /// The copy of `state`, by the index the recording's tag in `header` carries (one load for
+    /// the common case), else by the map; the first touch imports it and keeps the object.
     fn entry(
         &mut self,
+        header: &Header,
         state: &Mutex<AccessState>,
         owner: impl FnOnce() -> Arc<dyn Object>,
     ) -> &mut AccessState {
+        if let Some(i) = self.keep.local_index(header) {
+            return &mut self.entries[i].local;
+        }
         let key = state as *const Mutex<AccessState> as usize;
         let i = match self.index.get(&key) {
             Some(&i) => i as usize,
             None => {
                 let i = self.entries.len();
                 self.index.insert(key, i as u32);
+                let owner = owner();
+                self.keep.object_with_index(header, &owner, i);
                 self.entries.push(Local {
-                    owner: owner(),
+                    owner,
                     local: lock(state).import(&self.tracker),
                 });
                 i
@@ -95,6 +109,8 @@ impl Locals {
             entry.local.settle(&self.tracker, vis);
             let state = entry.owner.access_state().expect("imported from it");
             lock(state).publish(&self.tracker, entry.local);
+            // Kept still, but with no copy to find.
+            self.keep.forget_index(entry.owner.header());
         }
         self.index.clear();
     }

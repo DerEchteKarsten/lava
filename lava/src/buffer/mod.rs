@@ -1,4 +1,5 @@
 //! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones (writes of `NoUninit` elements, reads of `AnyBitPattern` ones), checked against GPU writes still in flight; growth that keeps the contents (`reserve`); the staging rings and uploaders (`staging`); casts; the internal its owners share (`BufferInternal`, also of sparse and external buffers, whose memory it frees), destroyed once its handle, the submissions that use it and the buffers that reference it all let it go
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -105,6 +106,11 @@ pub(crate) struct BufferInternal {
     /// What its elements reference, once one was written with references
     /// (`host_write_referencing`, `Uploader::write_referencing`).
     pub(crate) keep_alive: OnceLock<Mutex<KeepAlive>>,
+    /// Nothing writes it again (`CommandBuffer::freeze`): its reads aren't tracked.
+    pub(crate) frozen: AtomicBool,
+    /// Every access counts as one of the whole buffer (`Buffer::coarse`): one tracked range
+    /// however many slices of it commands take.
+    pub(crate) coarse: AtomicBool,
     /// Its lava user count and what references to it need.
     pub(crate) header: Header,
 }
@@ -184,6 +190,17 @@ impl Object for BufferInternal {
     }
 }
 
+impl BufferInternal {
+    /// Panics for a write of a frozen buffer.
+    #[track_caller]
+    pub(crate) fn check_not_frozen(&self) {
+        assert!(
+            !self.frozen.load(Relaxed),
+            "a frozen buffer (`cmd.freeze`) is never written again: its reads aren't tracked"
+        );
+    }
+}
+
 impl Drop for BufferInternal {
     /// Destroys the buffer and its memory, once no submission reaches it; its tracked accesses
     /// go with it, and it leaves its children's parents.
@@ -237,6 +254,8 @@ impl<T: Copy + 'static> Buffer<T, Gpu> {
                 memory: BufferMemory::External(memory),
                 state: Mutex::default(),
                 keep_alive: OnceLock::new(),
+                frozen: AtomicBool::new(false),
+                coarse: AtomicBool::new(false),
                 header: Header::new(live),
             },
             Gpu,
@@ -455,6 +474,8 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
                 memory: BufferMemory::Allocation(allocation),
                 state: Mutex::default(),
                 keep_alive: OnceLock::new(),
+                frozen: AtomicBool::new(false),
+                coarse: AtomicBool::new(false),
                 header: Header::new(live.clone()),
             },
             memory,
@@ -463,6 +484,17 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
 
     /// The same buffer named `name`, for debuggers, the validation layer (with debug utils,
     /// `Config::validation`) and allocator reports.
+    /// Tracks every access of the buffer as one of the whole buffer, however many slices of it
+    /// commands take: one pending write and one pending read instead of one per distinct range,
+    /// so barrier tracking stays O(1) for a buffer suballocated into many ranges whose commands
+    /// depend on each other anyway (an ML graph's activations). Commands that access disjoint
+    /// ranges get barriers between them that they wouldn't otherwise, and draws of one
+    /// rendering that write disjoint ranges are refused as a conflict.
+    pub fn coarse(self) -> Self {
+        self.internal.coarse.store(true, Relaxed);
+        self
+    }
+
     pub fn named(mut self, name: &str) -> Self {
         self.set_name(name);
         self
@@ -558,6 +590,7 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
         len: usize,
         cmd: &mut crate::command_buffer::CommandBuffer<'_, K>,
     ) -> Result<bool> {
+        self.internal.check_not_frozen();
         let old = self.len();
         if len <= old {
             return Ok(false);
@@ -624,6 +657,7 @@ impl<T: Copy + 'static, M: HostVisible> Buffer<T, M> {
     where
         T: NoUninit,
     {
+        self.internal.check_not_frozen();
         let end = first.checked_add(data.len());
         assert!(
             end.is_some_and(|end| end <= self.len()),
@@ -657,6 +691,7 @@ impl<T: ReferencingData, M: HostVisible> Buffer<T, M> {
         first: usize,
         items: impl IntoIterator<Item = impl ReferenceInfo<'a, Data = T>>,
     ) {
+        self.internal.check_not_frozen();
         let ptr = self.checked();
         let len = self.len();
         let keep_alive = self
@@ -711,6 +746,7 @@ impl<T: AnyBitPattern, M: HostVisible> Buffer<T, M> {
     where
         T: NoUninit,
     {
+        self.internal.check_not_frozen();
         unsafe { std::slice::from_raw_parts_mut(self.checked(), self.len()) }
     }
 

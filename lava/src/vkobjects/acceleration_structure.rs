@@ -90,6 +90,7 @@ pub(crate) fn every_structure_read<'a>(
 ) -> BufferAccess<'a> {
     BufferAccess {
         unordered: false,
+        tracked: true,
         stage,
         access,
         range: EVERY_ACCELERATION_STRUCTURE,
@@ -102,6 +103,7 @@ pub(crate) fn every_structure_read<'a>(
 fn no_access<'a>(stage: vk::PipelineStageFlags2) -> BufferAccess<'a> {
     BufferAccess {
         unordered: false,
+        tracked: true,
         stage,
         access: vk::AccessFlags2::NONE,
         range: (0..0).into(),
@@ -438,6 +440,7 @@ impl StructureInternal {
     ) -> BufferAccess<'_> {
         BufferAccess {
             unordered: false,
+            tracked: true,
             stage,
             access,
             range: self.range,

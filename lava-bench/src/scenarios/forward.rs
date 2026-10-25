@@ -161,6 +161,11 @@ impl Forward {
         };
         let set = &forward.lava;
         setup.lava(|cmd| {
+            // Static after their upload: their reads go untracked.
+            cmd.freeze(&forward.vertices);
+            cmd.freeze(&forward.indices);
+            cmd.freeze(&forward.instances);
+            cmd.freeze(&forward.quads);
             for (i, texture) in set.textures().enumerate() {
                 cmd.clear_image(texture.whole_view(), texture_color(i));
             }

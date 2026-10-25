@@ -251,6 +251,8 @@ impl RayTracing {
         // The first frame refits: build every BLAS once from the rest pose.
         let s = &rt.lava;
         setup.lava(|cmd| {
+            cmd.freeze(&rt.rest);
+            cmd.freeze(&rt.indices);
             rt.skin_lava(cmd, s);
             let geometry = rt.lava_geometry(s);
             let builds: Vec<_> = s.blases.iter().zip(&geometry).map(|(b, g)| (b, BlasGeometry::Triangles(g))).collect();

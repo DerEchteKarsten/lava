@@ -281,7 +281,7 @@ impl<K: QueryKind> QueryPool<K> {
             return;
         }
         // The submission keeps the pool until it completed.
-        rec.keep.other(self.owner.clone());
+        rec.locals.keep.other(self.owner.clone());
         for word in &self.used {
             word.store(0, Ordering::Relaxed);
         }

@@ -62,7 +62,7 @@ mod binding_output;
 pub(crate) mod image_state;
 pub(crate) mod locals;
 mod raster_state;
-use crate::object::{DIRTY_LAYOUT, Keep, Object, Strong, ancestor_hazards, mark_dirty};
+use crate::object::{DIRTY_LAYOUT, Object, Strong, ancestor_hazards, mark_dirty};
 use crate::reference::{Child, KeepAlive};
 use crate::unsized_struct::unsized_struct;
 use access_state::{READ_ACCESS, StructureAccesses, Tracker, Visibility, WHOLE, WRITE_ACCESS};
@@ -80,6 +80,9 @@ pub struct BufferAccess<'a> {
     pub range: Range<u64>,
     /// Draws of one rendering may make it alongside each other's (`unordered`).
     pub(crate) unordered: bool,
+    /// Whether barriers and tracking see it: false for a read of a frozen buffer
+    /// (`CommandBuffer::freeze`), which nothing writes again.
+    pub(crate) tracked: bool,
     /// The buffer the range lies in; none for `EVERY_ACCELERATION_STRUCTURE`.
     pub(crate) buffer: Option<&'a Arc<BufferInternal>>,
     /// The acceleration structure the range is the memory of: its writes mark what references
@@ -208,8 +211,6 @@ pub(crate) struct Recording<'p> {
     /// Its barrier log's memory barriers as the tracked writes read them, kept up with the
     /// log (`sync_visibility`) before any tracking uses it.
     pub(crate) vis: Visibility,
-    /// The objects its commands name, which its submission keeps alive.
-    pub(crate) keep: Keep,
     pub(crate) timeline: usize,
     pub(crate) value: u64,
     pub(crate) family: FamilyInfo,
@@ -2160,7 +2161,6 @@ impl<'p> Recording<'p> {
         Self {
             handle,
             structures,
-            keep: Keep::new(timeline, value),
             locals: Locals::new(tracker),
             vis: Visibility::default(),
             tracker,
@@ -2317,7 +2317,6 @@ impl<'p> Recording<'p> {
             &mut self.locals,
             &self.vis,
             self.structures,
-            &mut self.keep,
             image_accesses,
             buffer_accesses,
         );
@@ -2352,7 +2351,7 @@ impl<'p> Recording<'p> {
 
     /// What its submission keeps alive until it completed.
     pub(crate) fn take_kept(&mut self) -> Vec<crate::queue::timeline::Kept> {
-        std::mem::take(&mut self.keep.kept)
+        std::mem::take(&mut self.locals.keep.kept)
     }
 
     pub(crate) fn enter(&mut self, name: &str, pass: bool) {
@@ -2636,7 +2635,7 @@ pub(crate) fn compute_barriers<'a>(
     let t = &{ *t };
     for b in buffer_accesses {
         let (stage, access) = (b.stage, b.access);
-        if !access.intersects(READ_ACCESS | WRITE_ACCESS) {
+        if !b.tracked || !access.intersects(READ_ACCESS | WRITE_ACCESS) {
             continue;
         }
         match b.buffer {
@@ -2875,7 +2874,6 @@ pub(crate) fn record<'a>(
     locals: &mut Locals,
     vis: &Visibility,
     structures: &mut StructureAccesses,
-    keep: &mut Keep,
     image_accesses: impl Iterator<Item = ImageUse<'a>>,
     buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
 ) {
@@ -2884,7 +2882,7 @@ pub(crate) fn record<'a>(
     for b in buffer_accesses {
         #[cfg(feature = "acceleration-structure")]
         if let Some(structure) = b.structure {
-            keep.object(structure);
+            locals.keep.object(structure);
         }
         match b.buffer {
             None => {
@@ -2892,8 +2890,9 @@ pub(crate) fn record<'a>(
                     structures.record_read(t, b.stage, b.access);
                 }
             }
+            // A frozen buffer's read: kept, tracked by nothing.
+            Some(buffer) if !b.tracked => locals.keep.object(buffer),
             Some(buffer) => {
-                keep.object(buffer);
                 locals.of(buffer).record(t, vis, b.range, b.stage, b.access);
                 if (b.access).contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
                     structures.record_write(t, vis, b.stage, b.access);
@@ -2913,7 +2912,6 @@ pub(crate) fn record<'a>(
         }
     }
     for image in image_accesses {
-        keep.object(image.internal);
         let access = &image.access;
         (locals.of(image.internal)).record(t, vis, WHOLE, access.stage, access.access);
         if access.access.intersects(WRITE_ACCESS) && image.internal.header.has_parents() {
@@ -2961,6 +2959,7 @@ impl Reached {
                 access: self.access(),
                 range: self.range,
                 unordered: self.write && self.unordered,
+                tracked: true,
                 buffer: Some(buffer),
                 #[cfg(feature = "acceleration-structure")]
                 structure: None,
