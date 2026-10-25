@@ -704,7 +704,9 @@ struct Copied<'a> {
 
 impl<K: QueueKind> CommandBuffer<'_, K> {
     /// Records the copies of every write its timeline's uploaders published so far, here, in
-    /// publication order; barrier tracking orders them against the commands around them.
+    /// publication order; barrier tracking orders them against the commands around them, and
+    /// when it copied anything one barrier makes the copies visible to every later command, so
+    /// passes that read what was uploaded through raw addresses (`T*`) see it too.
     /// Every image an uploader for another family `D` copied into is released to `D` after
     /// the last copy, and `D`'s first access acquires it: the receiving submission has to
     /// wait for this one (`Submission::wait_for`), which lava doesn't check, and this
@@ -766,6 +768,9 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             }
             stats.copies += 1;
             stats.bytes += staged.size;
+        }
+        if stats.copies > 0 {
+            self.rec.make_transfers_visible();
         }
         for c in &copied {
             // One release per run of copied mips.

@@ -2259,6 +2259,27 @@ impl<'p> Recording<'p> {
         );
     }
 
+    /// A barrier from every transfer write so far to every later command, in the barrier log so
+    /// the tracking counts it.
+    pub(crate) fn make_transfers_visible(&mut self) {
+        let barriers = Barriers {
+            acquired: SmallVec::new(),
+            acquires: SmallVec::new(),
+            memory: Some(
+                vk::MemoryBarrier2::default()
+                    .src_stage_mask(S2::TRANSFER)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(S2::ALL_COMMANDS)
+                    .dst_access_mask(
+                        vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                    ),
+            ),
+            images: SmallVec::new(),
+        };
+        self.barrier_log.push(barriers);
+        self.pipeline_barrier(self.barrier_log.last().expect("just pushed"));
+    }
+
     /// What its submission keeps alive until it completed.
     pub(crate) fn take_kept(&mut self) -> Vec<crate::queue::timeline::Kept> {
         std::mem::take(&mut self.keep.kept)
