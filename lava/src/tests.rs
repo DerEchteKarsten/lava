@@ -14,6 +14,7 @@ use crate::{
         Barriers, BufferAccess, ImageAccess, ImageUse,
         access_state::{AccessState, MAX_WRITES, StructureAccesses, Tracker},
         compute_barriers,
+        access_state::Visibility,
         locals::Locals,
         image_state::{ImageState, check_states, release_states, released_by, take_checked_states},
         made_visible, record, walk,
@@ -186,13 +187,13 @@ impl Rec {
     fn record(&mut self, images: &[ImageUse], buffers: &[BufferAccess]) {
         record(
             &mut self.locals,
-            &self.log,
+            &Visibility::of(&self.log),
             &mut self.structures,
             &mut crate::object::Keep::new(0, self.tracker.value),
             images.iter().cloned(),
             buffers.iter().cloned(),
         );
-        self.locals.publish(&self.log);
+        self.locals.publish(&Visibility::of(&self.log));
     }
 }
 
@@ -204,7 +205,7 @@ fn flush_barriers(
 ) -> Option<Barriers> {
     let barriers = compute_barriers(
         &mut rec.locals,
-        &rec.log,
+        &Visibility::of(&rec.log),
         &mut rec.structures,
         &GRAPHICS,
         images.iter().cloned(),
@@ -212,7 +213,7 @@ fn flush_barriers(
     );
     if let Some(barriers) = &barriers {
         rec.log.push(barriers.clone());
-        made_visible(&mut rec.locals, &rec.log, images.iter().cloned());
+        made_visible(&mut rec.locals, &Visibility::of(&rec.log), &rec.log, images.iter().cloned());
     }
     rec.record(images, buffers);
     barriers
@@ -266,14 +267,14 @@ fn tracked_accesses_shrink_only_when_covered_or_completed() {
         (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
         (S::TRANSFER, A::TRANSFER_WRITE),
     );
-    state.record(&t, &[], (0..100).into(), write.0, write.1);
-    state.record(&t, &[], (50..60).into(), transfer.0, transfer.1);
+    state.record(&t, &Visibility::default(), (0..100).into(), write.0, write.1);
+    state.record(&t, &Visibility::default(), (50..60).into(), transfer.0, transfer.1);
     assert_eq!(state.writes.len(), 2);
-    state.record(&t, &[], (0..100).into(), write.0, write.1);
+    state.record(&t, &Visibility::default(), (0..100).into(), write.0, write.1);
     assert_eq!(state.writes.len(), 1, "a covering write replaces both");
     state.record(
         &tracker(2, 0),
-        &[],
+        &Visibility::default(),
         (0..10).into(),
         S::VERTEX_SHADER,
         A::SHADER_STORAGE_READ,
@@ -291,7 +292,7 @@ fn timelines_track_their_own_accesses() {
     let write = |t: &Tracker, state: &mut AccessState| {
         state.record(
             t,
-            &[],
+            &Visibility::default(),
             (0..16).into(),
             S::COMPUTE_SHADER,
             A::SHADER_STORAGE_WRITE,
@@ -300,7 +301,7 @@ fn timelines_track_their_own_accesses() {
     let read_hazards = |t: &Tracker, state: &mut AccessState| {
         state.hazards(
             t,
-            &[],
+            &Visibility::default(),
             (0..16).into(),
             S::COMPUTE_SHADER,
             A::SHADER_STORAGE_READ,
@@ -449,7 +450,7 @@ fn ownership_moves_through_release_and_acquire() {
     );
     let barriers = compute_barriers(
         &mut Locals::new(tracker(1, 0)),
-        &[],
+        &Visibility::default(),
         &mut StructureAccesses::default(),
         &GRAPHICS,
         iter::once(access.clone()),
@@ -751,8 +752,8 @@ fn completed_accesses_retire_and_folds_keep_their_visibility() {
     flush(&mut next, &[], &[write(end..end + 16)]);
     {
         let state = test_buffer().state.lock().unwrap();
-        let [_, folded] = state.writes.as_slice() else {
-            panic!("the new write and the folded one")
+        let [folded, _] = state.writes.as_slice() else {
+            panic!("the folded write and the new one")
         };
         assert_eq!((folded.range.start, folded.range.end), (0, end));
         assert!(folded.visible_to(S::VERTEX_SHADER, A::SHADER_STORAGE_READ));
@@ -1320,12 +1321,12 @@ fn locations_allocate_from_their_memory_types() {
 fn host_access_waits_for_overlapping_incomplete_writes() {
     let mut state = AccessState::default();
     let write = (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE);
-    state.record(&tracker(3, 0), &[], (0..16).into(), write.0, write.1);
-    state.record(&tracker(5, 0), &[], (16..32).into(), write.0, write.1);
-    state.record(&tracker(9, 0), &[], (32..48).into(), write.0, write.1);
+    state.record(&tracker(3, 0), &Visibility::default(), (0..16).into(), write.0, write.1);
+    state.record(&tracker(5, 0), &Visibility::default(), (16..32).into(), write.0, write.1);
+    state.record(&tracker(9, 0), &Visibility::default(), (32..48).into(), write.0, write.1);
     state.record(
         &tracker(9, 0),
-        &[],
+        &Visibility::default(),
         (64..80).into(),
         S::COMPUTE_SHADER,
         A::SHADER_STORAGE_READ,

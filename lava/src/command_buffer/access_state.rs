@@ -27,6 +27,54 @@ pub(crate) struct Tracker {
     pub(crate) completed: u64,
 }
 
+/// A recording's barrier log as the writes read it: its distinct memory barrier scopes (source
+/// and destination stages and accesses), each with the position of the last barrier that had
+/// it, so taking the log into a write costs the few distinct scopes, not the barriers.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Visibility {
+    /// Barriers of the log taken in.
+    pub(crate) len: u32,
+    scopes: SmallVec<[Scope; 4]>,
+}
+
+#[derive(Clone, Debug)]
+struct Scope {
+    src: (S2, A),
+    dst: (S2, A),
+    /// The position in the log of the last barrier with this scope.
+    last: u32,
+}
+
+impl Visibility {
+    /// Takes in the barriers of `log` past those taken in before.
+    pub(crate) fn extend(&mut self, log: &[Barriers]) {
+        for (i, barriers) in log.iter().enumerate().skip(self.len as usize) {
+            if let Some(m) = barriers.memory {
+                let src = (m.src_stage_mask, m.src_access_mask);
+                let dst = (m.dst_stage_mask, m.dst_access_mask);
+                match (self.scopes.iter_mut()).find(|s| s.src == src && s.dst == dst) {
+                    Some(scope) => scope.last = i as u32,
+                    None => self.scopes.push(Scope {
+                        src,
+                        dst,
+                        last: i as u32,
+                    }),
+                }
+            }
+        }
+        self.len = log.len() as u32;
+    }
+
+    /// All of `log`.
+    #[cfg(test)]
+    pub(crate) fn of(log: &[Barriers]) -> Self {
+        let mut vis = Self::default();
+        vis.extend(log);
+        vis
+    }
+
+}
+
 /// A read, with the timeline value of the latest submission it stands for.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Read {
@@ -47,7 +95,7 @@ pub(crate) struct Write {
     /// The destination scopes of the barriers recorded since, each visible to its own pairs.
     pub(crate) visible: SmallVec<[(S2, A); 2]>,
     /// The recording (its value) and the length of its barrier log when `visible` last took
-    /// that log's memory barriers in: later ones may make it visible too.
+    /// that log's memory barriers in (`Visibility::len`): later ones may make it visible too.
     pub(crate) applied: (u64, u32),
 }
 
@@ -92,24 +140,26 @@ impl Write {
         self.visible.push((stage, access));
     }
 
-    /// Takes in the memory barriers of the recording `t` logged since it last looked (`log`,
-    /// this recording's barriers in order): a barrier makes every write in its source scope
+    /// Takes in the memory barriers of the recording `t` logged since it last looked (`vis`,
+    /// this recording's barriers so far): a barrier makes every write in its source scope
     /// visible to its destination, also writes it wasn't recorded for. A write of an earlier
     /// recording comes before all of this one's barriers.
-    fn apply(&mut self, t: &Tracker, log: &[Barriers]) {
+    fn apply(&mut self, t: &Tracker, vis: &Visibility) {
         let from = match self.applied {
-            (value, seq) if value == t.value => seq as usize,
+            (value, seq) if value == t.value => seq,
             _ => 0,
         };
-        for barriers in log.iter().skip(from) {
-            if let Some(m) = barriers.memory
-                && m.src_stage_mask.contains(self.stage)
-                && m.src_access_mask.contains(self.access)
-            {
-                self.make_visible(m.dst_stage_mask, m.dst_access_mask);
+        if from < vis.len {
+            for scope in &vis.scopes {
+                if scope.last >= from
+                    && scope.src.0.contains(self.stage)
+                    && scope.src.1.contains(self.access)
+                {
+                    self.make_visible(scope.dst.0, scope.dst.1);
+                }
             }
         }
-        self.applied = (t.value, log.len() as u32);
+        self.applied = (t.value, vis.len);
     }
 
     /// Keeps only the pairs `other` is visible to as well (each scope is a box of stages and
@@ -155,7 +205,7 @@ impl AccessState {
     /// alone (`Locals`).
     pub(crate) fn import(&self, t: &Tracker) -> AccessState {
         let mine = |timeline: u8, value: u64| timeline == t.timeline && value > t.base;
-        AccessState {
+        let mut local = AccessState {
             reads: (self.reads.iter())
                 .filter(|r| mine(r.timeline, r.value) && r.value > t.completed)
                 .cloned()
@@ -164,7 +214,11 @@ impl AccessState {
                 .filter(|w| mine(w.timeline, w.value))
                 .cloned()
                 .collect(),
-        }
+        };
+        // Only imported writes can have completed, so the copy is folded once, here; the
+        // recording's own writes never fold (their visibility is settled at `publish`).
+        local.fold(t);
+        local
     }
 
     /// Replaces the share of `t`'s timeline with the recording's copy.
@@ -182,7 +236,7 @@ impl AccessState {
     pub(crate) fn hazards(
         &mut self,
         t: &Tracker,
-        log: &[Barriers],
+        vis: &Visibility,
         range: Range<u64>,
         stage: S2,
         access: A,
@@ -204,7 +258,7 @@ impl AccessState {
             if !overlap(w.range, range) {
                 continue;
             }
-            w.apply(t, log);
+            w.apply(t, vis);
             if !w.visible_to(stage, access) {
                 add(w.stage, w.access);
             }
@@ -227,13 +281,13 @@ impl AccessState {
         (stage, access)
     }
 
-    /// Tracks an access of a command `t` recorded after the barriers of `log`, its own
+    /// Tracks an access of a command `t` recorded after the barriers of `vis`, its own
     /// included. An older access is only forgotten once a newer write covers its whole range; a
     /// newer read doesn't wait for older reads, so it takes over those it covers.
     pub(crate) fn record(
         &mut self,
         t: &Tracker,
-        log: &[Barriers],
+        vis: &Visibility,
         range: Range<u64>,
         stage: S2,
         access: A,
@@ -251,7 +305,7 @@ impl AccessState {
                     false => i += 1,
                 }
             }
-            let seq = log.len() as u32;
+            let seq = vis.len;
             self.writes.push(Write::new(t, seq, range, stage, access));
             let mut i = 0;
             while i < self.reads.len() {
@@ -261,7 +315,6 @@ impl AccessState {
                     false => i += 1,
                 }
             }
-            self.fold(t, log);
         }
         if access.intersects(READ_ACCESS) {
             let mut read = Read {
@@ -286,32 +339,25 @@ impl AccessState {
         }
     }
 
-    /// Takes the barriers of `log` into every write of `t`'s recording, so their visibility
-    /// outlives the log: before the copy is published.
-    pub(crate) fn settle(&mut self, t: &Tracker, log: &[Barriers]) {
+    /// Takes the recording's barriers (`vis`) into every write of `t`'s recording, so their
+    /// visibility outlives the log: before the copy is published.
+    pub(crate) fn settle(&mut self, t: &Tracker, vis: &Visibility) {
         for w in self.writes.iter_mut().filter(|w| w.timeline == t.timeline) {
-            w.apply(t, log);
+            w.apply(t, vis);
         }
     }
 
-    /// Once `t`'s timeline has more than `MAX_WRITES` writes here, folds the completed ones
+    /// Once a recording's copy holds more than `MAX_WRITES` writes, folds the completed ones
     /// into one over all their ranges, which keeps the visibility all of them had (their own
-    /// pairs, with `log`'s barriers taken in first).
-    fn fold(&mut self, t: &Tracker, log: &[Barriers]) {
+    /// pairs; an imported write's were settled by its recording).
+    fn fold(&mut self, t: &Tracker) {
         if self.writes.len() <= MAX_WRITES {
-            return;
-        }
-        let mine = (self.writes.iter())
-            .filter(|w| w.timeline == t.timeline)
-            .count();
-        if mine <= MAX_WRITES {
             return;
         }
         let mut folded: Option<Write> = None;
         self.writes.retain_mut(|w| {
-            let fold = w.timeline == t.timeline && w.value <= t.completed;
+            let fold = w.value <= t.completed;
             if fold {
-                w.apply(t, log);
                 match &mut folded {
                     None => folded = Some(w.clone()),
                     Some(f) => {
@@ -334,14 +380,14 @@ impl AccessState {
     }
 
     /// A layout transition or queue family acquire of the image by `t`, after the barriers of
-    /// `log` (its own included): it is the image's latest write, at the destination stages of
+    /// `vis` (its own included): it is the image's latest write, at the destination stages of
     /// its barriers and visible there (`scopes`). Every earlier access of `t`'s timeline happens
     /// before it (the barrier waited for them, or for a semaphore that did), so they are
     /// dropped.
-    pub(crate) fn transition(&mut self, t: &Tracker, log: &[Barriers], scopes: &[(S2, A)]) {
+    pub(crate) fn transition(&mut self, t: &Tracker, vis: &Visibility, scopes: &[(S2, A)]) {
         self.forget(t);
         let stage = scopes.iter().fold(S2::NONE, |stage, &(s, _)| stage | s);
-        let mut write = Write::new(t, log.len() as u32, WHOLE, stage, A::NONE);
+        let mut write = Write::new(t, vis.len, WHOLE, stage, A::NONE);
         for &(stage, access) in scopes {
             write.make_visible(stage, access);
         }
@@ -398,12 +444,12 @@ impl StructureAccesses {
     pub(crate) fn read_hazards(
         &mut self,
         t: &Tracker,
-        log: &[Barriers],
+        vis: &Visibility,
         stage: S2,
         access: A,
     ) -> Option<(S2, A)> {
         let w = self.writes.as_mut()?;
-        w.apply(t, log);
+        w.apply(t, vis);
         (!w.visible_to(stage, access)).then_some((w.stage, w.access))
     }
 
@@ -436,9 +482,9 @@ impl StructureAccesses {
     /// the build stage after it.
     /// The merged write is visible to nothing yet: the pairs both see, of which the new write
     /// has none.
-    pub(crate) fn record_write(&mut self, t: &Tracker, log: &[Barriers], stage: S2, access: A) {
+    pub(crate) fn record_write(&mut self, t: &Tracker, vis: &Visibility, stage: S2, access: A) {
         self.reads = None;
-        let mut write = Write::new(t, log.len() as u32, WHOLE, stage, access);
+        let mut write = Write::new(t, vis.len, WHOLE, stage, access);
         if let Some(old) = self.writes.take()
             && old.timeline == t.timeline
             && old.value > t.base

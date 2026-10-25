@@ -49,7 +49,7 @@ mod raster_state;
 use crate::object::{DIRTY_LAYOUT, Keep, Object, Strong, ancestor_hazards, mark_dirty};
 use crate::reference::{Child, KeepAlive};
 use crate::unsized_struct::unsized_struct;
-use access_state::{READ_ACCESS, StructureAccesses, Tracker, WHOLE, WRITE_ACCESS};
+use access_state::{READ_ACCESS, StructureAccesses, Tracker, Visibility, WHOLE, WRITE_ACCESS};
 pub use binding_output::{BindingOutput, Bindings, Sections, kind};
 use locals::Locals;
 use image_state::{ImageState, check_states, release_states, released_by, take_checked_states};
@@ -189,6 +189,9 @@ pub(crate) struct Recording<'p> {
     pub(crate) tracker: Tracker,
     /// Its working copies of the access states of the objects it touches.
     pub(crate) locals: Locals,
+    /// Its barrier log's memory barriers as the tracked writes read them, kept up with the
+    /// log (`sync_visibility`) before any tracking uses it.
+    pub(crate) vis: Visibility,
     /// The objects its commands name, which its submission keeps alive.
     pub(crate) keep: Keep,
     pub(crate) timeline: usize,
@@ -2143,6 +2146,7 @@ impl<'p> Recording<'p> {
             structures,
             keep: Keep::new(timeline, value),
             locals: Locals::new(tracker),
+            vis: Visibility::default(),
             tracker,
             timeline,
             value,
@@ -2277,9 +2281,10 @@ impl<'p> Recording<'p> {
                 self.check_unpresented(access.access.image);
             }
         }
+        self.vis.extend(self.barrier_log);
         let barriers = compute_barriers(
             &mut self.locals,
-            self.barrier_log,
+            &self.vis,
             self.structures,
             &self.family,
             image_accesses.clone(),
@@ -2289,11 +2294,12 @@ impl<'p> Recording<'p> {
             self.acquired.extend_from_slice(&barriers.acquired);
             self.barrier_log.push(barriers);
             self.pipeline_barrier(self.barrier_log.last().expect("just pushed"));
-            made_visible(&mut self.locals, self.barrier_log, image_accesses.clone());
+            self.vis.extend(self.barrier_log);
+            made_visible(&mut self.locals, &self.vis, self.barrier_log, image_accesses.clone());
         }
         record(
             &mut self.locals,
-            self.barrier_log,
+            &self.vis,
             self.structures,
             &mut self.keep,
             image_accesses,
@@ -2324,7 +2330,8 @@ impl<'p> Recording<'p> {
 
     /// Writes the recording's copies of the access states back into their objects.
     pub(crate) fn publish_accesses(&mut self) {
-        self.locals.publish(self.barrier_log);
+        self.vis.extend(self.barrier_log);
+        self.locals.publish(&self.vis);
     }
 
     /// What its submission keeps alive until it completed.
@@ -2590,7 +2597,7 @@ impl<'a> BufferAccess<'a> {
 /// tracked state, so call it once per command, when the command is recorded.
 pub(crate) fn compute_barriers<'a>(
     locals: &mut Locals,
-    log: &[Barriers],
+    vis: &Visibility,
     structures: &mut StructureAccesses,
     family: &FamilyInfo,
     image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
@@ -2619,23 +2626,23 @@ pub(crate) fn compute_barriers<'a>(
         match b.buffer {
             // A read of every acceleration structure.
             None => hazard(
-                structures.read_hazards(t, log, stage, access),
+                structures.read_hazards(t, vis, stage, access),
                 stage,
                 access,
             ),
             Some(buffer) => {
-                let found = locals.of(buffer).hazards(t, log, b.range, stage, access);
+                let found = locals.of(buffer).hazards(t, vis, b.range, stage, access);
                 hazard(found, stage, access);
                 // Commands that read it through references waited only for those buffers.
                 if access.intersects(WRITE_ACCESS) {
                     hazard(
-                        ancestor_hazards(&**buffer, locals, log, stage, access),
+                        ancestor_hazards(&**buffer, locals, vis, stage, access),
                         stage,
                         access,
                     );
                     #[cfg(feature = "acceleration-structure")]
                     if let Some(structure) = b.structure {
-                        let found = ancestor_hazards(&**structure, locals, log, stage, access);
+                        let found = ancestor_hazards(&**structure, locals, vis, stage, access);
                         hazard(found, stage, access);
                     }
                 }
@@ -2658,12 +2665,12 @@ pub(crate) fn compute_barriers<'a>(
         if !access.intersects(READ_ACCESS | WRITE_ACCESS) {
             continue;
         }
-        let found = (locals.of(image.internal)).hazards(t, log, WHOLE, stage, access);
+        let found = (locals.of(image.internal)).hazards(t, vis, WHOLE, stage, access);
         hazard(found, stage, access);
         if access.intersects(WRITE_ACCESS) {
             let internal = &**image.internal;
             hazard(
-                ancestor_hazards(internal, locals, log, stage, access),
+                ancestor_hazards(internal, locals, vis, stage, access),
                 stage,
                 access,
             );
@@ -2747,7 +2754,7 @@ pub(crate) fn compute_barriers<'a>(
                 // through them recorded only those.
                 let write = vk::AccessFlags2::MEMORY_WRITE;
                 let internal = &**image.internal;
-                if let Some((s, a)) = ancestor_hazards(internal, locals, log, to_stage, write) {
+                if let Some((s, a)) = ancestor_hazards(internal, locals, vis, to_stage, write) {
                     src_stage |= s;
                     src_access |= a;
                 }
@@ -2817,6 +2824,7 @@ pub(crate) fn compute_barriers<'a>(
 /// (`AccessState::transition`). Memory barriers make writes visible through the log.
 pub(crate) fn made_visible<'a>(
     locals: &mut Locals,
+    vis: &Visibility,
     log: &[Barriers],
     image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
 ) {
@@ -2834,7 +2842,7 @@ pub(crate) fn made_visible<'a>(
         if let Some(access) = image_accesses.clone().find(|a| a.access.image == image) {
             let internal = &access.internal;
             let t = *locals.tracker();
-            locals.of(internal).transition(&t, log, &scopes);
+            locals.of(internal).transition(&t, vis, &scopes);
             // Out of `GENERAL`: the buffers that reference it need a transition back.
             let away = (moved.clone())
                 .any(|b| b.image == image && b.new_layout != vk::ImageLayout::GENERAL);
@@ -2849,7 +2857,7 @@ pub(crate) fn made_visible<'a>(
 /// images, and in `structures` for every acceleration structure read and structure write.
 pub(crate) fn record<'a>(
     locals: &mut Locals,
-    log: &[Barriers],
+    vis: &Visibility,
     structures: &mut StructureAccesses,
     keep: &mut Keep,
     image_accesses: impl Iterator<Item = ImageUse<'a>>,
@@ -2870,9 +2878,9 @@ pub(crate) fn record<'a>(
             }
             Some(buffer) => {
                 keep.object(buffer);
-                locals.of(buffer).record(t, log, b.range, b.stage, b.access);
+                locals.of(buffer).record(t, vis, b.range, b.stage, b.access);
                 if (b.access).contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
-                    structures.record_write(t, log, b.stage, b.access);
+                    structures.record_write(t, vis, b.stage, b.access);
                 }
                 // The buffers that reference it reach the write.
                 if b.access.intersects(WRITE_ACCESS) && buffer.header.has_parents() {
@@ -2891,7 +2899,7 @@ pub(crate) fn record<'a>(
     for image in image_accesses {
         keep.object(image.internal);
         let access = &image.access;
-        (locals.of(image.internal)).record(t, log, WHOLE, access.stage, access.access);
+        (locals.of(image.internal)).record(t, vis, WHOLE, access.stage, access.access);
         if access.access.intersects(WRITE_ACCESS) && image.internal.header.has_parents() {
             mark_dirty(&**image.internal, 1 << t.timeline);
         }

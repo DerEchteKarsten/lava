@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
 
-use crate::command_buffer::Barriers;
-use crate::command_buffer::access_state::{AccessState, Tracker};
+use crate::command_buffer::access_state::{AccessState, Tracker, Visibility};
 use crate::object::Object;
 use crate::queue::lock;
 
@@ -90,10 +89,10 @@ impl Locals {
     }
 
     /// Writes every copy back into its object, replacing the timeline's share, with the
-    /// barriers of the recording's `log` taken into its writes, and forgets them.
-    pub(crate) fn publish(&mut self, log: &[Barriers]) {
+    /// recording's barriers (`vis`) taken into its writes, and forgets them.
+    pub(crate) fn publish(&mut self, vis: &Visibility) {
         for mut entry in self.entries.drain(..) {
-            entry.local.settle(&self.tracker, log);
+            entry.local.settle(&self.tracker, vis);
             let state = entry.owner.access_state().expect("imported from it");
             lock(state).publish(&self.tracker, entry.local);
         }

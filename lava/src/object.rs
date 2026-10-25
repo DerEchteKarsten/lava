@@ -13,7 +13,10 @@ use crate::vkobjects::acceleration_structure::StructureInternal;
 use crate::{
     bindless::SamplerInternal,
     buffer::BufferInternal,
-    command_buffer::{Barriers, access_state::AccessState, locals::Locals},
+    command_buffer::{
+        access_state::{AccessState, Visibility},
+        locals::Locals,
+    },
     global::Live,
     image::ImageInternal,
     queue::lock,
@@ -89,7 +92,7 @@ pub(crate) type Hazard = Option<(S2, A)>;
 pub(crate) fn ancestor_hazards(
     object: &dyn Object,
     locals: &mut Locals,
-    log: &[Barriers],
+    vis: &Visibility,
     stage: S2,
     access: A,
 ) -> Hazard {
@@ -109,9 +112,9 @@ pub(crate) fn ancestor_hazards(
         if let Some(range) = parent.referencing_range()
             && let Some(state) = locals.of_dyn(&parent)
         {
-            add(state.hazards(&t, log, range, stage, access));
+            add(state.hazards(&t, vis, range, stage, access));
         }
-        add(ancestor_hazards(&*parent, locals, log, stage, access));
+        add(ancestor_hazards(&*parent, locals, vis, stage, access));
     }
     found
 }
