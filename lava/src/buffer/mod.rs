@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     mem,
     range::Range,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crate::error::{Error, Result};
@@ -18,8 +18,9 @@ use crate::{
     command_buffer::access_state::AccessState,
     global::Live,
     lifetime,
-    object::Header,
+    object::{Header, Object},
     queue::{lock, timeline::poll},
+    reference::{KeepAlive, ReferenceInfo, ReferencingData},
     state::Ctx,
 };
 
@@ -100,8 +101,10 @@ pub(crate) struct BufferInternal {
     pub(crate) memory: BufferMemory,
     /// What the timelines' submissions read and wrote of it, which later commands wait for.
     pub(crate) state: Mutex<AccessState>,
-    /// Counts it as a lava user until its drop finished.
-    #[allow(dead_code, reason = "held for its count")]
+    /// What its elements reference, once one was written with references
+    /// (`host_write_referencing`, `Uploader::write_referencing`).
+    pub(crate) keep_alive: OnceLock<Mutex<KeepAlive>>,
+    /// Its lava user count and what references to it need.
     pub(crate) header: Header,
 }
 
@@ -158,10 +161,23 @@ impl BufferInternal {
     }
 }
 
+impl Object for BufferInternal {
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn keep_alive(&self) -> Option<&Mutex<KeepAlive>> {
+        self.keep_alive.get()
+    }
+}
+
 impl Drop for BufferInternal {
     /// Destroys the buffer and its memory, once no submission reaches it; its tracked accesses
-    /// go with it.
+    /// go with it, and it leaves its children's parents.
     fn drop(&mut self) {
+        if let Some(keep_alive) = self.keep_alive.get() {
+            lock(keep_alive).unregister_all();
+        }
         let handle = self.handle;
         let memory = mem::replace(
             &mut self.memory,
@@ -208,6 +224,7 @@ impl<T: Copy + 'static> Buffer<T, Gpu> {
                 num_bytes,
                 memory: BufferMemory::External(memory),
                 state: Mutex::default(),
+                keep_alive: OnceLock::new(),
                 header: Header::new(live),
             },
             Gpu,
@@ -425,6 +442,7 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
                 num_bytes,
                 memory: BufferMemory::Allocation(allocation),
                 state: Mutex::default(),
+                keep_alive: OnceLock::new(),
                 header: Header::new(live.clone()),
             },
             memory,
@@ -498,8 +516,12 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     }
 
     /// The same buffer of `B`s; panics unless its size is a multiple of `B`'s and its address
-    /// aligned to `B`.
-    pub fn cast<B: Copy + 'static>(self) -> Buffer<B, M> {
+    /// aligned to `B`. Plain data only (`NoUninit` both ways): a cast to a [`ReferencingData`]
+    /// type would forge references, one from it would write them without.
+    pub fn cast<B: NoUninit>(self) -> Buffer<B, M>
+    where
+        T: NoUninit,
+    {
         slice::cast_check::<B>(self.address(), self.size());
         Buffer {
             internal: self.internal,
@@ -516,7 +538,8 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
     /// Only the old buffer's addresses can outlive this call (the `&mut` borrow ends its
     /// slices): addresses stored in other buffers or push constants stay valid until the old
     /// buffer is destroyed, once no frame reaches it, but point to the old memory, so rewrite
-    /// them. Host writes to the old mapping after the copy is recorded are lost.
+    /// them. Host writes to the old mapping after the copy is recorded are lost. A buffer of a
+    /// [`ReferencingData`] type references what the old one did.
     #[validation_trace]
     pub fn reserve<K: crate::queue::QueueKind>(
         &mut self,
@@ -532,6 +555,12 @@ impl<T: Copy + 'static, M: Memory> Buffer<T, M> {
             self.byte_range(..),
             grown.byte_range(..self.size() as usize),
         );
+        // The copy's references: the old buffer keeps its own for frames in flight that read
+        // it.
+        if let Some(keep_alive) = self.internal.keep_alive.get() {
+            let copy = lock(keep_alive).clone_for(&grown.internal);
+            let _ = grown.internal.keep_alive.set(Mutex::new(copy));
+        }
         // Retired, so destroyed once this recording's submission (and every other in flight)
         // completed.
         drop(mem::replace(self, grown));
@@ -603,6 +632,40 @@ impl<T: Copy + 'static, M: HostVisible> Buffer<T, M> {
     }
 }
 
+impl<T: ReferencingData, M: HostVisible> Buffer<T, M> {
+    /// Writes the elements of `items` (each its data and references, a generated
+    /// `{Name}ReferenceInfo`) from element `first` on, checked like [`Self::host_mut`]: the only
+    /// host write of a referencing type. The buffer keeps what they reference alive and names
+    /// it to the commands that read the buffer, for barriers; what the elements it overwrites
+    /// referenced and nothing else does any more is let go right away (a frame in flight that
+    /// still reads those elements races with this write anyway: one range per frame slot).
+    #[track_caller]
+    pub fn host_write_referencing<'a>(
+        &mut self,
+        first: usize,
+        items: impl IntoIterator<Item = impl ReferenceInfo<'a, Data = T>>,
+    ) {
+        let ptr = self.checked();
+        let len = self.len();
+        let keep_alive = self
+            .internal
+            .keep_alive
+            .get_or_init(|| Mutex::new(KeepAlive::new::<T>()));
+        let mut keep_alive = lock(keep_alive);
+        let mut released = Vec::new();
+        for (i, item) in (first..).zip(items) {
+            assert!(i < len, "writing element {i} into a buffer of {len}");
+            item.with_output(|data, references| {
+                // SAFETY: inside the mapping, which no reference covers while `self` is borrowed.
+                unsafe { ptr.add(i).write(*data) };
+                keep_alive.replace(&self.internal, len, i, references, &mut released);
+            });
+        }
+        drop(keep_alive);
+        drop(released);
+    }
+}
+
 /// Host reads see whatever bytes the GPU (or nothing) wrote, so they take elements of any bit
 /// pattern.
 impl<T: AnyBitPattern, M: HostVisible> Buffer<T, M> {
@@ -626,9 +689,14 @@ impl<T: AnyBitPattern, M: HostVisible> Buffer<T, M> {
 
     /// The mapping as a mutable slice, checked like [`Self::host`]. A frame in flight may
     /// still read it: per-frame data goes into one range per frame slot, or one buffer per slot
-    /// ([`crate::queue::PerFrame`]). Elements that aren't `AnyBitPattern` use [`Self::host_write`].
+    /// ([`crate::queue::PerFrame`]). Elements that aren't `AnyBitPattern` use [`Self::host_write`];
+    /// it writes elements too, so they are `NoUninit` (a [`ReferencingData`] type isn't: it is
+    /// written with [`Self::host_write_referencing`]).
     #[track_caller]
-    pub fn host_mut(&mut self) -> &mut [T] {
+    pub fn host_mut(&mut self) -> &mut [T]
+    where
+        T: NoUninit,
+    {
         unsafe { std::slice::from_raw_parts_mut(self.checked(), self.len()) }
     }
 

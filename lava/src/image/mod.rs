@@ -291,8 +291,7 @@ pub(crate) struct ImageInternal {
     pub(crate) states: Box<[AtomicU64]>,
     /// What the timelines' submissions read and wrote of it, which later commands wait for.
     pub(crate) access: Mutex<AccessState>,
-    /// Counts it as a lava user until its drop finished.
-    #[allow(dead_code, reason = "held for its count")]
+    /// Its lava user count and what references to it need.
     pub(crate) header: Header,
 }
 
@@ -358,6 +357,12 @@ impl ImageInternal {
             access: Mutex::default(),
             header: Header::new(Live::internal()),
         }
+    }
+}
+
+impl crate::object::Object for ImageInternal {
+    fn header(&self) -> &Header {
+        &self.header
     }
 }
 

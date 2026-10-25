@@ -124,6 +124,7 @@ pub mod pipeline;
 pub mod present;
 pub mod query;
 pub mod queue;
+pub mod reference;
 #[cfg(feature = "sparse-binding")]
 pub mod sparse;
 mod state;

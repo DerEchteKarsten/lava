@@ -26,7 +26,9 @@ use crate::{
         slice::{copy_block_of, rows_len},
         usage::IsTransferDst,
     },
+    object::Strong,
     queue::{Kind, QueueKind, lock, timeline},
+    reference::{KeepAlive, Reference, ReferenceInfo, ReferencingData},
     state::Functions,
     vk,
 };
@@ -194,6 +196,10 @@ pub(crate) struct Staged {
     /// The family that uses the data, which its image is released to when it is drained on
     /// another.
     destination: Kind,
+    /// What the elements it overwrites referenced that nothing references any more: alive
+    /// until the copy completed, since submissions before it read the old elements.
+    #[allow(dead_code, reason = "held until the copy completed")]
+    released: Vec<Strong>,
 }
 
 /// A timeline's staging ring: `Upload` memory that `Uploader`s fill and `drain_uploads`
@@ -417,11 +423,13 @@ impl Uploader {
     }
 
     /// Stages `len` `T`s written by `fill`, for `target`.
-    fn stage<T: NoUninit>(
+    /// Stages `len` `T`s that `fill` writes (returning what the staged copy keeps alive) for
+    /// `target`.
+    fn stage<T: Copy>(
         &self,
         len: usize,
         target: Target,
-        fill: impl FnOnce(&mut [MaybeUninit<T>]),
+        fill: impl FnOnce(&mut [MaybeUninit<T>]) -> Vec<Strong>,
     ) -> Result<()> {
         let staging = self.ring()?;
         let size = (len * size_of::<T>()) as u64;
@@ -440,13 +448,14 @@ impl Uploader {
             );
             std::slice::from_raw_parts_mut(ptr, len)
         };
-        fill(data);
+        let released = fill(data);
         staging.publish(Staged {
             reserved: reservation.range,
             offset: reservation.offset,
             size,
             target,
             destination: self.destination,
+            released,
         });
         drop(counted);
         Ok(())
@@ -485,7 +494,10 @@ impl Uploader {
             }),
             None => {
                 let target = Target::Buffer(buffer.internal.clone(), buffer.address());
-                self.stage(len, target, |data| fill(buffer.address(), data))?
+                self.stage(len, target, |data| {
+                    fill(buffer.address(), data);
+                    Vec::new()
+                })?
             }
         }
         Ok(buffer)
@@ -525,7 +537,10 @@ impl Uploader {
         if self.staging.is_some() {
             let address = buffer.address() + (offset * size_of::<T>()) as u64;
             let target = Target::Buffer(buffer.internal.clone(), address);
-            return self.stage(data.len(), target, |out| write_slice(out, data));
+            return self.stage(data.len(), target, |out| {
+                write_slice(out, data);
+                Vec::new()
+            });
         }
         let Some(ptr) = buffer.coherent_mapping() else {
             return Err(Error::other(
@@ -554,8 +569,74 @@ impl Uploader {
         self.ring()?;
         let copy = image_copy(image, level, data.len())?;
         self.stage(data.len(), Target::Image(copy), |out| {
-            write_slice(out, data)
+            write_slice(out, data);
+            Vec::new()
         })
+    }
+
+    /// Writes the elements of `items` (each its data and references, a generated
+    /// `{Name}ReferenceInfo`) from element `first` on into `buffer`, staged like
+    /// [`Self::write`] (or in place without a ring): the only uploader write of a referencing
+    /// type. The buffer keeps what they reference alive from now on; what the elements it
+    /// overwrites referenced and nothing else does any more stays alive until the copy
+    /// completed (in place: is let go right away). Panics unless the elements fit.
+    #[validation_trace]
+    pub fn write_referencing<'a, T: ReferencingData, M: Memory>(
+        &self,
+        buffer: &Buffer<T, M>,
+        first: usize,
+        items: impl IntoIterator<Item = impl ReferenceInfo<'a, Data = T>>,
+    ) -> Result<()> {
+        let len = buffer.len();
+        let elements: Vec<(T, SmallVec<[Reference<'a>; 4]>)> = items
+            .into_iter()
+            .map(|item| item.with_output(|data, references| (*data, references.into())))
+            .collect();
+        assert!(
+            first
+                .checked_add(elements.len())
+                .is_some_and(|end| end <= len),
+            "writing {} elements at {first} into a buffer of {len}",
+            elements.len()
+        );
+        if elements.is_empty() {
+            return Ok(());
+        }
+        let internal = &buffer.internal;
+        let replace = || {
+            let keep_alive = internal
+                .keep_alive
+                .get_or_init(|| Mutex::new(KeepAlive::new::<T>()));
+            let mut keep_alive = lock(keep_alive);
+            let mut released = Vec::new();
+            for (i, (_, references)) in (first..).zip(&elements) {
+                keep_alive.replace(internal, len, i, references, &mut released);
+            }
+            released
+        };
+        if self.staging.is_some() {
+            let address = buffer.address() + (first * size_of::<T>()) as u64;
+            let target = Target::Buffer(internal.clone(), address);
+            return self.stage(elements.len(), target, |out| {
+                for (slot, (data, _)) in out.iter_mut().zip(&elements) {
+                    slot.write(*data);
+                }
+                replace()
+            });
+        }
+        let Some(ptr) = buffer.coherent_mapping() else {
+            return Err(Error::other(
+                "the buffer's memory isn't mapped and the uploader's timeline has no staging \
+                 ring: give `Timeline::new` a staging size",
+            ));
+        };
+        for (i, (data, _)) in (first..).zip(&elements) {
+            // SAFETY: inside the mapping, which holds `len` elements; a frame in flight
+            // reading it is the documented race.
+            unsafe { ptr.add(i).write(*data) };
+        }
+        drop(replace());
+        Ok(())
     }
 }
 
@@ -664,7 +745,7 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
             let src = BufferSlice::<u8>::new(ring, ring.address + staged.offset, staged.size);
             match &staged.target {
                 Target::Buffer(buffer, address) => {
-                    self.copy_buffer(src, BufferSlice::<u8>::new(buffer, *address, staged.size))
+                    self.copy_staged(src, BufferSlice::<u8>::new(buffer, *address, staged.size))
                 }
                 Target::Image(copy) => {
                     record_image_copy(self, src, copy);

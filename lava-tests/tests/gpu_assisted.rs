@@ -194,3 +194,82 @@ fn reads_past_a_buffer_are_reported() {
         "GPU-AV reports the reads past `src`: {errors:#?}"
     );
 }
+
+/// `TestImagePair` as a referencing type: its storage and sampled handles are references.
+#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
+#[repr(transparent)]
+struct Pair(TestImagePair);
+
+// SAFETY: its two handles, in field order, come with their references from `pair`'s info,
+// and the pass only reads through them.
+unsafe impl lava::reference::ReferencingData for Pair {
+    const REFERENCES: usize = 2;
+    const WRITES: u64 = 0;
+    const UNORDERED: u64 = 0;
+}
+
+struct PairInfo<'a>(&'a Target, &'a Target);
+
+impl<'a> lava::reference::ReferenceInfo<'a> for PairInfo<'a> {
+    type Data = Pair;
+    fn with_output<R>(self, f: impl FnOnce(&Pair, &[lava::reference::Reference<'a>]) -> R) -> R {
+        let (storage, sampled) = (self.0.whole_view(), self.1.whole_view());
+        let pair = Pair(TestImagePair {
+            storage: storage.handle(),
+            sampled: sampled.handle(),
+        });
+        use lava::reference::Reference;
+        f(
+            &pair,
+            &[Reference::image(storage), Reference::image(sampled)],
+        )
+    }
+}
+
+type Target = Image<R8G8B8A8Unorm, usage![ColorAttachment, Sampled, Storage]>;
+
+/// Images rendered right before a pass reads them through a referencing buffer, without
+/// `Accesses`: the pass names the buffer, which reaches them (their transitions back to
+/// `GENERAL` are checked in lava's unit tests; the layer doesn't see layouts through the
+/// descriptor heaps).
+#[test]
+fn images_reached_through_a_buffer_are_read_in_general() {
+    let mut gpu = gpu();
+    let make = || {
+        Target::new(UVec2::splat(2))
+            .unwrap()
+            .bind_combined()
+            .unwrap()
+    };
+    let (top, storage, sampled) = (make(), make(), make());
+    let mut pairs = lava::Buffer::<Pair, lava::buffer::Upload>::upload(1).unwrap();
+    pairs.host_write_referencing(0, [PairInfo(&storage, &sampled)]);
+    let mut out = common::zeroed_buffer::<Vec4>(12);
+    gpu.submit(|cmd| {
+        for image in [&top, &storage, &sampled] {
+            cmd.raster(
+                UVec2::splat(2),
+                [Attachment::color(
+                    image.whole_view(),
+                    Some([0.0, 1.0, 0.0, 1.0]),
+                )],
+            )
+            .record("clear");
+        }
+        let bindings = TestImage2d::push_bindings(
+            TestImage2dArgs {
+                image: top.whole_view(),
+                images: pairs.range(..).cast::<TestImagePair>(),
+                sampler: nearest(),
+                out: out.range(..),
+            },
+            None,
+        );
+        cmd.compute(&bindings, [1, 1, 1]);
+    });
+    assert!(
+        out.host()
+            .iter()
+            .all(|t| *t == Vec4::new(0.0, 1.0, 0.0, 1.0))
+    );
+}

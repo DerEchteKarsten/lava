@@ -13,7 +13,7 @@ use std::iter;
 use crate::{
     Error, Result,
     buffer::{Buffer, BufferInternal, Memory},
-    command_buffer::{BufferAccess, CommandBuffer},
+    command_buffer::{BufferAccess, CommandBuffer, access_state::WRITE_ACCESS},
     queue::QueueKind,
     state::Functions,
 };
@@ -132,8 +132,29 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
     pub fn bytes(self) -> BufferSlice<'a, u8> {
         BufferSlice::new(self.buffer, self.address, self.size)
     }
-    /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`].
+    /// A pass's access of the slice, for [`crate::command_buffer::Bindings::new`]. Panics for
+    /// a write of a buffer whose elements reference other objects ([`ReferencingData`]): lava
+    /// keeps what they reference only for the writes that name it
+    /// (`host_write_referencing`, `Uploader::write_referencing`).
+    ///
+    /// [`ReferencingData`]: crate::reference::ReferencingData
+    #[track_caller]
     pub fn access(
+        &self,
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> BufferAccess<'a> {
+        assert!(
+            !access.intersects(WRITE_ACCESS) || self.buffer.keep_alive.get().is_none(),
+            "a buffer whose elements reference other objects is written with \
+             `host_write_referencing` or `Uploader::write_referencing`, not by commands or \
+             passes, whose writes lava can't follow"
+        );
+        self.access_unchecked(stage, access)
+    }
+
+    /// `access` without its check: for lava's own writes of what it follows.
+    pub(crate) fn access_unchecked(
         &self,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
@@ -322,6 +343,21 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
         &mut self,
         regions: &[(BufferSlice<'a, T>, BufferSlice<'a, T>)],
     ) {
+        self.copy_regions(regions, true);
+    }
+
+    /// The copy of staged bytes into a buffer, which may be one of referencing elements: their
+    /// references are the uploader's to follow (`Uploader::write_referencing`).
+    pub(crate) fn copy_staged(&mut self, src: BufferSlice<'_, u8>, dst: BufferSlice<'_, u8>) {
+        self.copy_regions(&[(src, dst)], false);
+    }
+
+    #[track_caller]
+    fn copy_regions<'a, T: Copy + 'static>(
+        &mut self,
+        regions: &[(BufferSlice<'a, T>, BufferSlice<'a, T>)],
+        checked: bool,
+    ) {
         // Every region as the bytes it reads and writes.
         let regions: SmallVec<[_; 4]> = regions
             .iter()
@@ -350,10 +386,16 @@ impl<K: QueueKind> CommandBuffer<'_, K> {
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_READ,
                 ),
-                dst.access(
-                    vk::PipelineStageFlags2::TRANSFER,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                ),
+                match checked {
+                    true => dst.access(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
+                    false => dst.access_unchecked(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
+                },
             ]
         });
         self.rec.flush_pending(iter::empty(), accesses);

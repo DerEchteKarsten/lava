@@ -15,7 +15,7 @@ use crate::{
         access_state::{AccessState, MAX_WRITES, StructureAccesses, Tracker},
         compute_barriers,
         image_state::{ImageState, check_states, release_states, released_by, take_checked_states},
-        made_visible, record,
+        made_visible, record, walk,
     },
     features::{DeviceFacts, FeatureChain, Features, Needs},
     global::Live,
@@ -25,8 +25,9 @@ use crate::{
         slice::rows_len,
         usage::{ImageUsage, StaticUsage, Usage, usage},
     },
-    object::Header,
+    object::{DIRTY_LAYOUT, Header, Object, Strong, mark_dirty},
     queue::{FamilyInfo, Kind},
+    reference::{KeepAlive, Reference, Referenced, ReferencingData},
     vkobjects::physical_device::{QueueFamily, pick_queue_families},
 };
 
@@ -61,6 +62,7 @@ thread_local! {
         num_bytes: 1 << 40,
         memory: BufferMemory::Allocation(Default::default()),
         state: Default::default(),
+        keep_alive: Default::default(),
         header: Header::new(Live::internal()),
     })));
 }
@@ -2281,4 +2283,332 @@ fn the_format_table_has_the_spec_texel_sizes() {
     // Compressed formats have no texel size: their blocks have the bytes.
     #[cfg(feature = "bc-compression")]
     assert_eq!(format::info(F::BC7_UNORM_BLOCK).unwrap().texel_size, 0);
+}
+
+// ---- referencing buffers ----------------------------------------------------------------------
+
+/// A buffer of 1 TiB of addresses at `address`, never dropped (its `Drop` needs a context).
+fn fake_buffer(address: u64) -> &'static Arc<BufferInternal> {
+    Box::leak(Box::new(Arc::new(BufferInternal {
+        handle: vk::Buffer::null(),
+        address,
+        num_bytes: 1 << 40,
+        memory: BufferMemory::Allocation(Default::default()),
+        state: Default::default(),
+        keep_alive: Default::default(),
+        header: Header::new(Live::internal()),
+    })))
+}
+
+fn to_buffer(
+    buffer: &'static Arc<BufferInternal>,
+    range: std::ops::Range<u64>,
+) -> Reference<'static> {
+    Reference {
+        object: Referenced::Buffer(buffer),
+        range: range.into(),
+    }
+}
+
+/// An element with two references, the second a write reference.
+#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
+#[repr(C)]
+struct TwoReferences([u64; 2]);
+
+unsafe impl ReferencingData for TwoReferences {
+    const REFERENCES: usize = 2;
+    const WRITES: u64 = 0b10;
+    const UNORDERED: u64 = 0;
+}
+
+fn keep_alive_of(
+    parent: &'static Arc<BufferInternal>,
+) -> std::sync::MutexGuard<'static, KeepAlive> {
+    let keep_alive = parent
+        .keep_alive
+        .get_or_init(|| std::sync::Mutex::new(KeepAlive::new::<TwoReferences>()));
+    keep_alive.lock().unwrap()
+}
+
+/// A referencing buffer keeps each distinct child once, counted per reference, registers itself
+/// as the child's parent, and lets a child go when no element references it any more; write
+/// references make the child a writer and the buffer `writes_below`.
+#[test]
+fn referencing_buffers_count_their_children() {
+    let parent = fake_buffer(1 << 40);
+    let (a, b) = (fake_buffer(2 << 40), fake_buffer(3 << 40));
+    let mut released = Vec::new();
+    {
+        let mut keep_alive = keep_alive_of(parent);
+        keep_alive.replace(
+            parent,
+            4,
+            0,
+            &[to_buffer(a, 0..16), to_buffer(b, 0..16)],
+            &mut released,
+        );
+        keep_alive.replace(
+            parent,
+            4,
+            1,
+            &[to_buffer(a, 16..32), to_buffer(a, 32..48)],
+            &mut released,
+        );
+        assert_eq!(keep_alive.children.iter().count(), 2);
+        let child_a = keep_alive
+            .children
+            .iter()
+            .find(|c| c.object.key() == Strong::Buffer(a.clone()).key())
+            .unwrap();
+        assert_eq!(
+            (child_a.range.start, child_a.range.end),
+            (0, 48),
+            "the referenced ranges' union"
+        );
+        assert_eq!(child_a.writes, 1);
+        assert_eq!(
+            keep_alive.writers.len(),
+            2,
+            "a and b are both written through"
+        );
+    }
+    assert!(released.is_empty());
+    assert_eq!(
+        a.header
+            .parent_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(
+        parent
+            .header
+            .writes_below
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    // Element 0 references b alone, element 1 too: a is let go.
+    {
+        let mut keep_alive = keep_alive_of(parent);
+        keep_alive.replace(
+            parent,
+            4,
+            0,
+            &[to_buffer(b, 0..16), to_buffer(b, 0..16)],
+            &mut released,
+        );
+        assert!(released.is_empty(), "element 1 still references a");
+        keep_alive.replace(
+            parent,
+            4,
+            1,
+            &[to_buffer(b, 0..16), to_buffer(b, 0..16)],
+            &mut released,
+        );
+        assert_eq!(keep_alive.children.iter().count(), 1);
+        assert_eq!(keep_alive.writers.len(), 1);
+    }
+    assert_eq!(released.len(), 1);
+    assert_eq!(
+        a.header
+            .parent_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    // A reference to the buffer itself keeps nothing alive.
+    let mut keep_alive = keep_alive_of(parent);
+    keep_alive.replace(
+        parent,
+        4,
+        2,
+        &[to_buffer(parent, 0..8), to_buffer(b, 0..8)],
+        &mut released,
+    );
+    assert_eq!(keep_alive.children.iter().count(), 1);
+}
+
+/// Children past the fourth are found through a hash index, and freed entries are reused.
+#[test]
+fn children_past_four_are_hashed() {
+    let parent = fake_buffer(10 << 40);
+    let children: Vec<_> = (0..7).map(|i| fake_buffer((11 + i) << 40)).collect();
+    let mut keep_alive = keep_alive_of(parent);
+    let mut released = Vec::new();
+    for (i, pair) in children.chunks(2).enumerate() {
+        let second = pair.get(1).unwrap_or(&pair[0]);
+        keep_alive.replace(
+            parent,
+            8,
+            i,
+            &[to_buffer(pair[0], 0..4), to_buffer(second, 0..4)],
+            &mut released,
+        );
+    }
+    assert_eq!(keep_alive.children.iter().count(), 7);
+    // Every one found again: each element written again keeps the same children.
+    for (i, pair) in children.chunks(2).enumerate() {
+        let second = pair.get(1).unwrap_or(&pair[0]);
+        keep_alive.replace(
+            parent,
+            8,
+            i,
+            &[to_buffer(pair[0], 0..4), to_buffer(second, 0..4)],
+            &mut released,
+        );
+    }
+    assert_eq!(keep_alive.children.iter().count(), 7);
+    assert!(released.is_empty());
+    // One let go, a new one takes its entry.
+    keep_alive.replace(
+        parent,
+        8,
+        0,
+        &[to_buffer(children[1], 0..4), to_buffer(children[1], 0..4)],
+        &mut released,
+    );
+    assert_eq!(released.len(), 1);
+    let newcomer = fake_buffer(30 << 40);
+    keep_alive.replace(
+        parent,
+        8,
+        4,
+        &[to_buffer(newcomer, 0..4), to_buffer(newcomer, 0..4)],
+        &mut released,
+    );
+    assert_eq!(keep_alive.children.iter().count(), 7);
+}
+
+/// A write marks the object's ancestors, stopping at one that has the bits already; a walk of a
+/// dirty buffer reaches its dirty children and its writers and leaves it clean.
+#[test]
+fn dirty_bits_climb_and_walks_clear_them() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (outer, inner) = (fake_buffer(40 << 40), fake_buffer(41 << 40));
+    let (read, written) = (fake_buffer(42 << 40), fake_buffer(43 << 40));
+    let mut released = Vec::new();
+    keep_alive_of(inner).replace(
+        inner,
+        1,
+        0,
+        &[to_buffer(read, 0..4), to_buffer(written, 0..4)],
+        &mut released,
+    );
+    // The outer buffer's write reference is to itself, which keeps nothing alive.
+    keep_alive_of(outer).replace(
+        outer,
+        1,
+        0,
+        &[to_buffer(inner, 0..4), to_buffer(outer, 0..4)],
+        &mut released,
+    );
+    assert!(
+        outer.header.writes_below.load(Relaxed),
+        "a writer below, in the inner buffer"
+    );
+    mark_dirty(&**read, 1 << 3);
+    assert_eq!(inner.header.dirty.load(Relaxed), 1 << 3);
+    assert_eq!(outer.header.dirty.load(Relaxed), 1 << 3);
+    mark_dirty(&**written, DIRTY_LAYOUT);
+    assert_eq!(outer.header.dirty.load(Relaxed), 1 << 3 | DIRTY_LAYOUT);
+
+    let mut reached = smallvec::SmallVec::new();
+    let mask = 1 << 3 | DIRTY_LAYOUT;
+    walk(
+        &**outer,
+        outer.keep_alive().unwrap(),
+        true,
+        mask,
+        &mut reached,
+    );
+    let keys: Vec<usize> = reached.iter().map(|r| r.object.key()).collect();
+    for child in [inner, read, written] {
+        assert!(keys.contains(&Strong::Buffer(child.clone()).key()));
+    }
+    let is = |r: &&crate::command_buffer::Reached, b: &'static Arc<BufferInternal>| {
+        r.object.key() == Strong::Buffer(b.clone()).key()
+    };
+    assert!(
+        reached.iter().find(|r| is(r, written)).unwrap().write,
+        "a write reference"
+    );
+    assert!(!reached.iter().find(|r| is(r, read)).unwrap().write);
+    for object in [outer, inner, read, written] {
+        assert_eq!(
+            object.header.dirty.load(Relaxed) & mask,
+            0,
+            "clean after the walk"
+        );
+    }
+    // Clean, but a writer below: a walk still reaches the writer.
+    let mut reached = smallvec::SmallVec::new();
+    walk(
+        &**outer,
+        outer.keep_alive().unwrap(),
+        false,
+        mask,
+        &mut reached,
+    );
+    assert_eq!(reached.len(), 1);
+    assert_eq!(
+        reached[0].object.key(),
+        Strong::Buffer(written.clone()).key()
+    );
+}
+
+/// What a walk reaches goes through the barrier computation like a named access: an image
+/// outside `GENERAL` is transitioned back. And a transition away from `GENERAL` marks the
+/// buffers that reference the image, whose next walk reaches it.
+#[test]
+fn reached_images_are_transitioned_and_transitions_mark_their_buffers() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let image = tracked(50, [state(L::GENERAL, Some(Kind::Graphics))]);
+    let parent = fake_buffer(50 << 40);
+    let mut released = Vec::new();
+    let to_image = Reference {
+        object: Referenced::Image(image),
+        range: (0..1).into(),
+    };
+    keep_alive_of(parent).replace(
+        parent,
+        1,
+        0,
+        &[to_image, to_buffer(parent, 0..4)],
+        &mut released,
+    );
+    // Rendered into: the transition to the attachment layout marks the buffer.
+    let mut rec = Rec::new();
+    let attachment = image_use(
+        50,
+        image,
+        S::COLOR_ATTACHMENT_OUTPUT,
+        A::COLOR_ATTACHMENT_WRITE,
+        L::ATTACHMENT_OPTIMAL,
+    );
+    flush_barriers(&mut rec, &[attachment], &[]).unwrap();
+    assert_ne!(parent.header.dirty.load(Relaxed) & DIRTY_LAYOUT, 0);
+    // A command that names the buffer reaches the image, which goes back to `GENERAL`.
+    let mut reached = smallvec::SmallVec::new();
+    walk(
+        &**parent,
+        parent.keep_alive().unwrap(),
+        true,
+        1 | DIRTY_LAYOUT,
+        &mut reached,
+    );
+    let images: Vec<ImageUse> = reached
+        .iter()
+        .filter_map(crate::command_buffer::Reached::image_use)
+        .collect();
+    assert_eq!(images.len(), 1);
+    let barriers = flush_barriers(&mut rec, &images, &[]).unwrap();
+    let [transition] = barriers.images.as_slice() else {
+        panic!("one transition")
+    };
+    assert_eq!(
+        (transition.old_layout, transition.new_layout),
+        (L::ATTACHMENT_OPTIMAL, L::GENERAL)
+    );
+    assert_eq!(
+        parent.header.dirty.load(Relaxed) & (1 | DIRTY_LAYOUT),
+        0,
+        "clean again"
+    );
 }

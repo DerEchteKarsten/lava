@@ -45,11 +45,14 @@ pub(crate) mod access_state;
 mod binding_output;
 pub(crate) mod image_state;
 mod raster_state;
+use crate::object::{DIRTY_LAYOUT, Object, Strong, mark_dirty};
+use crate::reference::{Child, KeepAlive};
 use crate::unsized_struct::unsized_struct;
 use access_state::{READ_ACCESS, StructureAccesses, Tracker, WHOLE, WRITE_ACCESS};
 pub use binding_output::{BindingOutput, Bindings, Sections, kind};
 use image_state::{ImageState, check_states, release_states, released_by, take_checked_states};
 pub use raster_state::*;
+use std::sync::{Mutex, atomic::Ordering::Relaxed};
 
 /// A pass's access of a buffer range, made by `BufferSlice::access`.
 #[derive(Clone, Copy)]
@@ -502,7 +505,13 @@ impl<'a> DrawOutput<'a> {
 /// Panics if a draw accesses what another draw of the rendering writes: draws are ordered only
 /// by depth tests and blending, and nothing else passes between them. Attachments aren't draws'
 /// accesses, so they are left out, and so are pairs of [`BufferAccess::unordered`] accesses.
-fn check_hazards<'a>(name: &str, draws: impl Iterator<Item = &'a DrawOutput<'a>> + Clone) {
+/// `accesses(i)` is draw `i`'s image and buffer accesses (its bindings', its index and indirect
+/// buffers', and what it reaches through referencing buffers), of `count` draws.
+fn check_hazards<'a, I, B>(name: &str, count: usize, accesses: impl Fn(usize) -> (I, B))
+where
+    I: Iterator<Item = ImageUse<'a>>,
+    B: Iterator<Item = BufferAccess<'a>>,
+{
     let writes = |access: vk::AccessFlags2| access.intersects(WRITE_ACCESS);
     let hazard = |i: usize, j: usize, what: std::fmt::Arguments| -> ! {
         panic!(
@@ -512,28 +521,26 @@ fn check_hazards<'a>(name: &str, draws: impl Iterator<Item = &'a DrawOutput<'a>>
              `BufferAccess::unordered`)"
         )
     };
-    for (i, draw) in draws.clone().enumerate() {
-        for write in draw.buffer_accesses().filter(|b| writes(b.access)) {
-            let mut others = draws.clone().enumerate().filter(|&(j, _)| j != i);
+    for i in 0..count {
+        let (images, buffers) = accesses(i);
+        for write in buffers.filter(|b| writes(b.access)) {
+            let mut others = (0..count).filter(|&j| j != i);
             let conflicts =
                 |b: &BufferAccess| b.overlaps(&write) && !(b.unordered && write.unordered);
-            if let Some((j, _)) = others.find(|(_, d)| d.buffer_accesses().any(|b| conflicts(&b))) {
+            if let Some(j) = others.find(|&j| accesses(j).1.any(|b| conflicts(&b))) {
                 hazard(i, j, format_args!("the addresses {:?}", write.range));
             }
         }
-        for write in draw
-            .image_accesses()
-            .filter(|image| writes(image.access.access))
-        {
+        for write in images.filter(|image| writes(image.access.access)) {
             let w = &write.access;
-            let overlaps = |image: ImageUse| {
+            let overlaps = |image: &ImageUse| {
                 let mips = image.access.mip_range;
                 image.access.image == w.image
                     && mips.start < w.mip_range.end
                     && w.mip_range.start < mips.end
             };
-            let mut others = draws.clone().enumerate().filter(|&(j, _)| j != i);
-            if let Some((j, _)) = others.find(|(_, d)| d.image_accesses().any(overlaps)) {
+            let mut others = (0..count).filter(|&j| j != i);
+            if let Some(j) = others.find(|&j| accesses(j).0.any(|i| overlaps(&i))) {
                 hazard(
                     i,
                     j,
@@ -1430,21 +1437,78 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
         let _span = tracing::info_span!("draw", pass = name).entered();
         self.check_layers();
         self.check_blends();
+        // Draws reach objects through the referencing buffers they name: walked first, with
+        // what the rendering writes marked, so a draw that writes what another reaches is
+        // refused below and an attachment a draw reaches is rendered in `GENERAL`.
+        let bit = 1u32 << self.cmd_buf.timeline;
+        // Without a referencing buffer among the draws' nothing is reached; recording marks
+        // what they write for later commands.
+        let references = (self.draws.iter()).any(|draw| {
+            (draw.buffer_accesses()).any(|b| {
+                b.buffer
+                    .is_some_and(|buffer| buffer.keep_alive.get().is_some())
+            })
+        });
+        for draw in self.draws.iter().filter(|_| references) {
+            for b in draw.buffer_accesses() {
+                if let Some(buffer) = b.buffer
+                    && b.access.intersects(WRITE_ACCESS)
+                    && buffer.header.has_parents()
+                {
+                    mark_dirty(&**buffer, bit);
+                }
+            }
+            for image in draw.image_accesses() {
+                if image.access.access.intersects(WRITE_ACCESS)
+                    && image.internal.header.has_parents()
+                {
+                    mark_dirty(&**image.internal, bit);
+                }
+            }
+        }
+        let attachments = (self.color.iter().map(|c| &c.access))
+            .chain(self.depth_stencil.iter().map(|ds| &ds.access));
+        for access in attachments.filter(|_| references) {
+            if access.internal.header.has_parents() {
+                mark_dirty(&**access.internal, bit | DIRTY_LAYOUT);
+            }
+        }
+        // What each draw reaches, for the draws that reach something.
+        let mut reached: SmallVec<[(usize, SmallVec<[Reached; 4]>); 2]> = SmallVec::new();
+        for (i, draw) in self.draws.iter().enumerate().filter(|_| references) {
+            let mut found = SmallVec::new();
+            self.cmd_buf.walk_roots(draw.buffer_accesses(), &mut found);
+            if !found.is_empty() {
+                reached.push((i, found));
+            }
+        }
+        // Each draw's accesses, as iterators made once: nothing is copied.
+        let per_draw: SmallVec<[_; INLINE_DRAWS]> = (self.draws.iter().enumerate())
+            .map(|(i, draw)| {
+                let found = (reached.iter())
+                    .find(|(j, _)| *j == i)
+                    .map_or(&[][..], |(_, found)| found.as_slice())
+                    .iter();
+                let images = (draw.image_accesses().map(shorter_image))
+                    .chain(found.clone().filter_map(Reached::image_use));
+                let buffers = (draw.buffer_accesses().map(shorter_buffer))
+                    .chain(found.filter_map(Reached::buffer_access));
+                (images, buffers)
+            })
+            .collect();
+        let count = per_draw.len();
+        let accesses = |i: usize| per_draw[i].clone();
         // One mip can't be in two layouts in one rendering, so an attachment whose mip a draw
         // also accesses is rendered in `GENERAL`, its descriptor's layout.
         let in_layout = |mut access: ImageUse<'a>| {
             let a = &access.access;
-            let overlaps = |i: ImageUse| {
+            let overlaps = |i: &ImageUse| {
                 let mips = i.access.mip_range;
                 i.access.image == a.image
                     && mips.start < a.mip_range.end
                     && a.mip_range.start < mips.end
             };
-            if self
-                .draws
-                .iter()
-                .any(|draw| draw.image_accesses().any(overlaps))
-            {
+            if (0..count).any(|i| accesses(i).0.any(|i| overlaps(&i))) {
                 access.access.layout = vk::ImageLayout::GENERAL;
             }
             access
@@ -1463,16 +1527,14 @@ impl<'a, const N: usize> RasterBuilder<'a, '_, N> {
             }
             in_layout(access)
         });
-        let draws = self.draws.iter();
-        check_hazards(name, draws.clone());
-        self.cmd_buf.flush_pending(
-            draws
-                .clone()
-                .flat_map(|draw| draw.image_accesses())
-                .chain(color_accesses.iter().cloned())
-                .chain(ds_access.clone()),
-            draws.flat_map(|draw| draw.buffer_accesses()),
+        check_hazards(name, count, accesses);
+        self.cmd_buf.flush_accesses(
+            ((0..count).flat_map(|i| accesses(i).0))
+                .chain(color_accesses.iter().cloned().map(shorter_image))
+                .chain(ds_access.clone().map(shorter_image)),
+            (0..count).flat_map(|i| accesses(i).1),
         );
+        drop(per_draw);
 
         let mut color_layouts = color_accesses.iter().map(|access| access.access.layout);
         let color_attachments = self.color.each_ref().map(|color| {
@@ -2098,6 +2160,58 @@ impl<'p> Recording<'p> {
         image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
         buffer_accesses: impl Iterator<Item = BufferAccess<'a>> + Clone,
     ) {
+        let mut reached = SmallVec::new();
+        self.walk_roots(buffer_accesses.clone(), &mut reached);
+        if reached.is_empty() {
+            return self.flush_accesses(image_accesses, buffer_accesses);
+        }
+        let images = (image_accesses.map(shorter_image))
+            .chain(reached.iter().filter_map(Reached::image_use));
+        let buffers = (buffer_accesses.map(shorter_buffer))
+            .chain(reached.iter().filter_map(Reached::buffer_access));
+        self.flush_accesses(images, buffers);
+    }
+
+    /// The bit of this recording's timeline among objects' dirty bits, and the layout bit.
+    fn dirty_mask(&self) -> u32 {
+        1 << self.timeline | DIRTY_LAYOUT
+    }
+
+    /// Walks down from the referencing buffers among `buffer_accesses` (a command's) to the
+    /// children it may reach that need a barrier, into `reached`: the dirty ones (written on
+    /// this timeline, or an image outside `GENERAL`) where a buffer is dirty, and the ones it
+    /// may write through a write reference always. A transfer family runs no shaders.
+    pub(crate) fn walk_roots<'a>(
+        &self,
+        buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
+        reached: &mut SmallVec<[Reached; 4]>,
+    ) {
+        if self.family.kind == Kind::Transfer {
+            return;
+        }
+        let mask = self.dirty_mask();
+        for access in buffer_accesses {
+            let Some(buffer) = access.buffer else {
+                continue;
+            };
+            let Some(keep_alive) = buffer.keep_alive.get() else {
+                continue;
+            };
+            let header = &buffer.header;
+            let dirty = header.dirty.load(Relaxed) & mask != 0;
+            if dirty || header.writes_below.load(Relaxed) {
+                walk(&**buffer, keep_alive, dirty, mask, reached);
+            }
+        }
+    }
+
+    /// Records the barriers a command with these accesses needs and tracks its accesses,
+    /// without walking down from them (`flush_pending` does).
+    pub(crate) fn flush_accesses<'a>(
+        &mut self,
+        image_accesses: impl Iterator<Item = ImageUse<'a>> + Clone,
+        buffer_accesses: impl Iterator<Item = BufferAccess<'a>> + Clone,
+    ) {
         if !self.presents.is_empty() {
             for access in image_accesses.clone() {
                 self.check_unpresented(access.access.image);
@@ -2595,7 +2709,14 @@ pub(crate) fn made_visible<'a>(
             .map(|b| (b.dst_stage_mask, b.dst_access_mask))
             .collect();
         if let Some(access) = image_accesses.clone().find(|a| a.access.image == image) {
-            lock(&access.internal.access).transition(t, log, &scopes);
+            let internal = &access.internal;
+            lock(&internal.access).transition(t, log, &scopes);
+            // Out of `GENERAL`: the buffers that reference it need a transition back.
+            let away = (moved.clone())
+                .any(|b| b.image == image && b.new_layout != vk::ImageLayout::GENERAL);
+            if away && internal.header.has_parents() {
+                mark_dirty(&***internal, DIRTY_LAYOUT);
+            }
         }
     }
 }
@@ -2621,13 +2742,137 @@ pub(crate) fn record<'a>(
                 if (b.access).contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
                     structures.record_write(t, log, b.stage, b.access);
                 }
+                // The buffers that reference it reach the write.
+                if b.access.intersects(WRITE_ACCESS) && buffer.header.has_parents() {
+                    mark_dirty(&**buffer, 1 << t.timeline);
+                }
             }
         }
     }
     for image in image_accesses {
         let access = &image.access;
         lock(&image.internal.access).record(t, log, WHOLE, access.stage, access.access);
+        if access.access.intersects(WRITE_ACCESS) && image.internal.header.has_parents() {
+            mark_dirty(&**image.internal, 1 << t.timeline);
+        }
     }
+}
+
+/// A child a walk reached: what it is, the range of it its parent references, and how the
+/// command accesses it through the parent.
+pub(crate) struct Reached {
+    pub(crate) object: Strong,
+    pub(crate) range: Range<u64>,
+    pub(crate) write: bool,
+    pub(crate) unordered: bool,
+}
+
+/// The access of a child reached through a reference: at every stage, so the walk can leave
+/// it clean for every later command, read or written.
+const INDIRECT_STAGES: S2 = S2::ALL_COMMANDS;
+
+impl Reached {
+    fn of(child: &Child, write: bool) -> Self {
+        Reached {
+            object: child.object.clone(),
+            range: child.range,
+            write,
+            unordered: child.ordered_writes == 0,
+        }
+    }
+
+    fn access(&self) -> vk::AccessFlags2 {
+        match self.write {
+            true => vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+            false => vk::AccessFlags2::SHADER_READ,
+        }
+    }
+
+    pub(crate) fn buffer_access(&self) -> Option<BufferAccess<'_>> {
+        let Strong::Buffer(buffer) = &self.object else {
+            return None;
+        };
+        Some(BufferAccess {
+            stage: INDIRECT_STAGES,
+            access: self.access(),
+            range: self.range,
+            unordered: self.write && self.unordered,
+            buffer: Some(buffer),
+        })
+    }
+
+    pub(crate) fn image_use(&self) -> Option<ImageUse<'_>> {
+        let Strong::Image(image) = &self.object else {
+            return None;
+        };
+        Some(ImageUse {
+            access: ImageAccess {
+                stage: INDIRECT_STAGES,
+                access: self.access(),
+                image: image.image,
+                layout: vk::ImageLayout::GENERAL,
+                aspect: image.aspects,
+                mip_range: (0..image.mip_levels).into(),
+            },
+            internal: image,
+        })
+    }
+}
+
+/// Down from `parent` (whose references `keep_alive` holds, dirty or not) into `reached`: its
+/// dirty children when it is dirty (cleared, nested buffers walked too), its writers always,
+/// and the nested buffers with writers below.
+pub(crate) fn walk(
+    parent: &dyn Object,
+    keep_alive: &Mutex<KeepAlive>,
+    dirty: bool,
+    mask: u32,
+    reached: &mut SmallVec<[Reached; 4]>,
+) {
+    let keep_alive = lock(keep_alive);
+    let seen = |reached: &SmallVec<[Reached; 4]>, child: &Child| {
+        let key = child.object.key();
+        reached.iter().any(|r| r.object.key() == key)
+    };
+    if dirty {
+        for child in keep_alive.children.iter() {
+            let object = child.object.object();
+            if object.header().dirty.load(Relaxed) & mask == 0 {
+                continue;
+            }
+            if !seen(reached, child) {
+                reached.push(Reached::of(child, child.writes > 0));
+            }
+            if let Some(nested) = object.keep_alive() {
+                walk(object, nested, true, mask, reached);
+            }
+            object.header().dirty.fetch_and(!mask, Relaxed);
+        }
+        parent.header().dirty.fetch_and(!mask, Relaxed);
+    }
+    for &w in &keep_alive.writers {
+        let child = keep_alive.children.get(w);
+        if !seen(reached, child) {
+            reached.push(Reached::of(child, true));
+        }
+    }
+    for &c in &keep_alive.containers {
+        let child = keep_alive.children.get(c);
+        let object = child.object.object();
+        if object.header().writes_below.load(Relaxed)
+            && let Some(nested) = object.keep_alive()
+        {
+            walk(object, nested, false, mask, reached);
+        }
+    }
+}
+
+fn shorter_image<'s: 'l, 'l>(image: ImageUse<'s>) -> ImageUse<'l> {
+    image
+}
+
+fn shorter_buffer<'s: 'l, 'l>(buffer: BufferAccess<'s>) -> BufferAccess<'l> {
+    buffer
 }
 
 /// Every layer of `mips`: an image's tracked states cover all its layers.
