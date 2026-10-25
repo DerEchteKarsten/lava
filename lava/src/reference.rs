@@ -116,9 +116,17 @@ impl<'a> Reference<'a> {
     #[doc(hidden)]
     #[cfg(feature = "acceleration-structure")]
     pub fn tlas(tlas: &'a Tlas) -> Self {
+        Self::structure(tlas)
+    }
+
+    /// The structure an address names (an instance's BLAS, an `Accel`'s TLAS).
+    #[cfg(feature = "acceleration-structure")]
+    pub(crate) fn structure<L: crate::vkobjects::acceleration_structure::Level>(
+        structure: &'a crate::vkobjects::acceleration_structure::AccelerationStructure<L>,
+    ) -> Self {
         Reference {
-            object: Referenced::Structure(&tlas.internal),
-            range: tlas.internal.range,
+            object: Referenced::Structure(&structure.internal),
+            range: structure.internal.range,
         }
     }
 
@@ -305,11 +313,15 @@ impl KeepAlive {
 
     /// Takes over `other`'s children and elements: a buffer that grew (`Buffer::reserve`)
     /// references what the old one did, which keeps its own.
-    pub(crate) fn clone_for(&self, parent: &Arc<BufferInternal>) -> Self {
+    /// A copy whose children `parent` references (a grown buffer, a TLAS built from
+    /// instances), dirty where they are.
+    pub(crate) fn clone_for<P: Object>(&self, parent: &Arc<P>) -> Self {
         let mut children = Children::default();
         for (i, child) in self.children.entries.iter().enumerate() {
             if let Some(child) = child {
                 register(parent, &child.object);
+                let dirty = child.object.object().header().dirty.load(RELAXED);
+                parent.header().dirty.fetch_or(dirty, RELAXED);
                 let copy = Child {
                     object: child.object.clone(),
                     ..*child
@@ -409,6 +421,14 @@ impl KeepAlive {
         Some(child.object)
     }
 
+    /// Forgets `parent`, which these were the children of, in its children's parents.
+    #[cfg(feature = "acceleration-structure")]
+    pub(crate) fn unregister<P: Object>(&self, parent: &Arc<P>) {
+        for child in self.children.iter() {
+            unregister(parent, &child.object);
+        }
+    }
+
     /// Forgets the buffer in its children's parents as it is destroyed.
     pub(crate) fn unregister_all(&self) {
         for child in self.children.iter() {
@@ -420,14 +440,14 @@ impl KeepAlive {
 const RELAXED: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
 
 /// `parent` references `child` now.
-fn register(parent: &Arc<BufferInternal>, child: &Strong) {
+fn register<P: Object>(parent: &Arc<P>, child: &Strong) {
     let header = child.object().header();
     lock(&header.parents).push(Arc::downgrade(parent) as Weak<dyn Object>);
     header.parent_count.fetch_add(1, RELAXED);
 }
 
 /// `parent` no longer references `child`.
-fn unregister(parent: &Arc<BufferInternal>, child: &Strong) {
+fn unregister<P: Object>(parent: &Arc<P>, child: &Strong) {
     let header = child.object().header();
     let parent = Arc::downgrade(parent) as Weak<dyn Object>;
     let mut parents = lock(&header.parents);

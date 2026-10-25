@@ -145,7 +145,7 @@ pub struct Struct {
 pub const MIRRORED_TYPES: [(&str, &str); 2] = [
     (
         "AccelerationStructureInstance",
-        "::lava::acceleration_structure::Instance",
+        "::lava::acceleration_structure::RawInstance",
     ),
     ("Sampler", "::lava::bindless::SamplerHandle"),
 ];

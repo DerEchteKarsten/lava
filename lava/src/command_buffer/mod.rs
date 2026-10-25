@@ -13,7 +13,7 @@ use std::{
 use crate::features::{Gated, gate};
 use crate::vk::{self, PipelineStageFlags2 as S2};
 #[cfg(feature = "acceleration-structure")]
-use crate::vkobjects::acceleration_structure::Tlas;
+use crate::vkobjects::acceleration_structure::{StructureInternal, Tlas};
 use crate::{
     buffer::{BufferInternal, slice::BufferSlice},
     image::{
@@ -64,6 +64,10 @@ pub struct BufferAccess<'a> {
     pub(crate) unordered: bool,
     /// The buffer the range lies in; none for `EVERY_ACCELERATION_STRUCTURE`.
     pub(crate) buffer: Option<&'a Arc<BufferInternal>>,
+    /// The acceleration structure the range is the memory of: its writes mark what references
+    /// it, and a command that names a TLAS reaches the BLASes it references.
+    #[cfg(feature = "acceleration-structure")]
+    pub(crate) structure: Option<&'a Arc<StructureInternal>>,
 }
 
 impl Debug for BufferAccess<'_> {
@@ -2193,16 +2197,25 @@ impl<'p> Recording<'p> {
         }
         let mask = self.dirty_mask();
         for access in buffer_accesses {
-            let Some(buffer) = access.buffer else {
+            // A TLAS references its BLASes, the buffer it lies in nothing.
+            #[cfg(feature = "acceleration-structure")]
+            let root: &dyn Object = match (access.structure, access.buffer) {
+                (Some(structure), _) => &**structure,
+                (None, Some(buffer)) => &**buffer,
+                (None, None) => continue,
+            };
+            #[cfg(not(feature = "acceleration-structure"))]
+            let root: &dyn Object = match access.buffer {
+                Some(buffer) => &**buffer,
+                None => continue,
+            };
+            let Some(keep_alive) = root.keep_alive() else {
                 continue;
             };
-            let Some(keep_alive) = buffer.keep_alive.get() else {
-                continue;
-            };
-            let header = &buffer.header;
+            let header = root.header();
             let dirty = header.dirty.load(Relaxed) & mask != 0;
             if dirty || header.writes_below.load(Relaxed) {
-                walk(&**buffer, keep_alive, dirty, mask, reached);
+                walk(root, keep_alive, dirty, mask, reached);
             }
         }
     }
@@ -2541,6 +2554,11 @@ pub(crate) fn compute_barriers<'a>(
                         stage,
                         access,
                     );
+                    #[cfg(feature = "acceleration-structure")]
+                    if let Some(structure) = b.structure {
+                        let found = ancestor_hazards(&**structure, t, log, stage, access);
+                        hazard(found, stage, access);
+                    }
                 }
                 if access.contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
                     hazard(structures.write_hazards(t), stage, access);
@@ -2772,6 +2790,13 @@ pub(crate) fn record<'a>(
                 if b.access.intersects(WRITE_ACCESS) && buffer.header.has_parents() {
                     mark_dirty(&**buffer, 1 << t.timeline);
                 }
+                #[cfg(feature = "acceleration-structure")]
+                if let Some(structure) = b.structure
+                    && b.access.intersects(WRITE_ACCESS)
+                    && structure.header().has_parents()
+                {
+                    mark_dirty(&**structure, 1 << t.timeline);
+                }
             }
         }
     }
@@ -2824,6 +2849,8 @@ impl Reached {
                 range: self.range,
                 unordered: self.write && self.unordered,
                 buffer: Some(buffer),
+                #[cfg(feature = "acceleration-structure")]
+                structure: None,
             }),
             #[cfg(feature = "acceleration-structure")]
             Strong::Structure(structure) => Some(structure.access(
@@ -2834,11 +2861,12 @@ impl Reached {
         }
     }
 
-    /// A TLAS's read of the BLASes it names, which lava can't list.
+    /// A read of every structure by a TLAS built from raw instances, whose BLASes lava can't
+    /// list (it reaches the others' through their references).
     pub(crate) fn structure_read(&self) -> Option<BufferAccess<'_>> {
         match &self.object {
             #[cfg(feature = "acceleration-structure")]
-            Strong::Structure(_) => Some(
+            Strong::Structure(structure) if structure.from_raw_instances() => Some(
                 crate::vkobjects::acceleration_structure::every_structure_read(
                     INDIRECT_STAGES,
                     crate::vkobjects::acceleration_structure::trace_read(),

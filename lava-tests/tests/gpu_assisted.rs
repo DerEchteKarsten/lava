@@ -121,7 +121,7 @@ fn a_draw_samples_a_bindless_texture() {
 #[test]
 fn a_ray_query_traces_a_tlas() {
     use lava::acceleration_structure::{
-        BlasGeometry, BuildFlags, Instance, Instances, Scratch, Triangles,
+        BlasGeometry, BuildFlags, InstanceInfo, Instances, Scratch, Triangles,
     };
     let mut gpu = gpu();
     if !Ctx::features().ray_query {
@@ -135,7 +135,11 @@ fn a_ray_query_traces_a_tlas() {
     ]);
     let geometry = [Triangles::new(vertices.range(..))];
     let blas = lava::Blas::new(&BlasGeometry::Triangles(&geometry), BuildFlags::default()).unwrap();
-    let instances = gpu.buffer(&[Instance::new(&blas, Affine3A::IDENTITY)]);
+    let instances = {
+        let mut instances = lava::Buffer::upload(1).unwrap();
+        instances.host_write_referencing(0, [InstanceInfo::new(&blas, Affine3A::IDENTITY)]);
+        instances
+    };
     let tlas = lava::Tlas::new(1, BuildFlags::default()).unwrap();
     let (scratch, tlas_scratch) = (
         Scratch::for_any(&[&blas]).unwrap(),
@@ -143,9 +147,8 @@ fn a_ray_query_traces_a_tlas() {
     );
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
-        // SAFETY: the BLAS is built before it and outlives the trace.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             &tlas_scratch,
         );
         cmd.compute(

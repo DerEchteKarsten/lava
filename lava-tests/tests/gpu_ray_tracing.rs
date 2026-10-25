@@ -1,4 +1,4 @@
-//! GPU ray tracing tests: acceleration structure builds (checked against their creation's shapes, batched to fit a scratch, empty ones skipped), refits, compaction by hand and with a `Compactor`, copies, serialization, arenas, `with_capacity`, half, snorm and `Vec3A` positions, geometry transforms (part of the shape), instance flags, the built state traces check (applied only once a recording reaches the GPU), the device limits (per axis and in total), ray queries (also through a TLAS named in a struct behind a pointer) and ray tracing pipelines (also with specialization constants) on a small scene, position fetch and shader execution reordering
+//! GPU ray tracing tests: acceleration structure builds (checked against their creation's shapes, batched to fit a scratch, empty ones skipped), refits, compaction by hand and with a `Compactor`, copies, serialization, arenas, `with_capacity`, half, snorm and `Vec3A` positions, geometry transforms (part of the shape), instance flags, the built state traces check (applied only once a recording reaches the GPU), the device limits (per axis and in total), TLASes that keep and wait for the BLASes of their instances, ray queries (also through a TLAS named in a struct behind a pointer) and ray tracing pipelines (also with specialization constants) on a small scene, position fetch and shader execution reordering
 mod common;
 
 use common::{
@@ -11,8 +11,9 @@ use lava::{
     Ctx, Error,
     acceleration_structure::{
         Aabb, Aabbs, AabbsDesc, Blas, BlasDesc, BlasGeometry, Bottom, BuildFlags, BuildPreference,
-        Compactor, Half4, Instance, InstanceFlags, Instances, Scratch, Snorm16x4, StructureArena,
-        Tlas, TransformMatrix, Triangles, TrianglesDesc, VertexPosition, scratch_alignment,
+        Compactor, Half4, Instance, InstanceFlags, InstanceInfo, Instances, RawInstance, Scratch,
+        Snorm16x4, StructureArena, Tlas, TransformMatrix, Triangles, TrianglesDesc, VertexPosition,
+        scratch_alignment,
     },
     buffer::{Buffer, Gpu, Readback, Upload},
     command_buffer::TraceRaysIndirectCommand,
@@ -140,18 +141,40 @@ fn place(scale: f32, position: Vec3) -> Affine3A {
 }
 
 /// The scene's instances, as `test_write_instances.slang` writes them.
-fn instances(wall: u64, triangle: u64, sphere: u64) -> [Instance; 4] {
+fn instances(wall: u64, triangle: u64, sphere: u64) -> [RawInstance; 4] {
     [
-        Instance::from_address(wall, place(1.0, Vec3::ZERO)),
-        Instance::from_address(triangle, place(1.0, Vec3::new(-0.4, -0.3, -0.5)))
-            .with_custom_index(1),
-        Instance::from_address(sphere, place(0.25, Vec3::new(0.35, 0.35, -0.5)))
+        RawInstance::new(wall, place(1.0, Vec3::ZERO)),
+        RawInstance::new(triangle, place(1.0, Vec3::new(-0.4, -0.3, -0.5))).with_custom_index(1),
+        RawInstance::new(sphere, place(0.25, Vec3::new(0.35, 0.35, -0.5)))
             .with_custom_index(2)
             .with_sbt_offset(1),
-        Instance::from_address(triangle, place(1.0, Vec3::new(0.45, -0.45, -0.5)))
+        RawInstance::new(triangle, place(1.0, Vec3::new(0.45, -0.45, -0.5)))
             .with_custom_index(3)
             .with_mask(0x02),
     ]
+}
+
+/// `raw`'s instances written with their BLASes (found among `blases` by address) as
+/// references.
+fn referenced(raw: &[RawInstance], blases: &[&Blas]) -> Buffer<Instance, Upload> {
+    let mut buffer = Buffer::upload(raw.len()).unwrap();
+    buffer.host_write_referencing(
+        0,
+        raw.iter().map(|raw| {
+            let blas = (blases.iter())
+                .find(|b| b.address() == raw.blas)
+                .expect("a BLAS of the instance");
+            InstanceInfo::new(blas, raw.transform()).with(|_| *raw)
+        }),
+    );
+    buffer
+}
+
+/// One instance per info, written with its BLAS.
+fn instance_buffer(infos: &[InstanceInfo]) -> Buffer<Instance, Upload> {
+    let mut buffer = Buffer::upload(infos.len()).unwrap();
+    buffer.host_write_referencing(0, infos.iter().copied());
+    buffer
 }
 
 fn scratch(size: u64) -> Buffer<u8> {
@@ -187,11 +210,14 @@ fn scene(gpu: &mut common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) 
         Blas::new(&triangle, blas_flags).unwrap(),
         Blas::new(&sphere, blas_flags).unwrap(),
     );
-    let instances = buffer_with::<Instance>(&instances(
-        wall_blas.address(),
-        triangle_blas.address(),
-        sphere_blas.address(),
-    ));
+    let instances = referenced(
+        &instances(
+            wall_blas.address(),
+            triangle_blas.address(),
+            sphere_blas.address(),
+        ),
+        &[&wall_blas, &triangle_blas, &sphere_blas],
+    );
     let tlas = Tlas::new(4, tlas_flags).unwrap();
 
     // Room for the largest build alone, so `build_all` builds one BLAS per batch.
@@ -206,9 +232,8 @@ fn scene(gpu: &mut common::Gpu, blas_flags: BuildFlags, tlas_flags: BuildFlags) 
             ],
             &scratch,
         );
-        // SAFETY: the BLASes it names are built before it and outlive the traces of this test.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             &tlas_scratch,
         );
     });
@@ -324,7 +349,7 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
         return;
     }
     let mut scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
-    let mut written = zeroed_buffer::<Instance>(4);
+    let mut written = zeroed_buffer::<RawInstance>(4);
     let tlas = Tlas::new(4, BuildFlags::default()).unwrap();
     let scratch = scratch(tlas.build_scratch_size());
     let pixels = render(&mut gpu, |cmd, target| {
@@ -342,12 +367,13 @@ fn instances_written_by_a_pass_build_a_tlas_in_the_same_submission() {
         );
         // SAFETY: the BLASes it names outlive the traces of this test.
         cmd.build(
-            &[(&tlas, unsafe { Instances::new(written.range(..)) })],
+            &[(&tlas, unsafe { Instances::from_raw(written.range(..)) })],
             scratch.range(..),
         );
         trace_query(cmd, target, &tlas);
     });
-    assert_eq!(written.host(), scene.instances.host());
+    let expected: Vec<RawInstance> = scene.instances.host().iter().map(|i| **i).collect();
+    assert_eq!(written.host(), expected);
     assert_query_image(&pixels);
 }
 
@@ -372,7 +398,7 @@ fn updates_follow_moved_vertices() {
     let blas = Blas::new(&BlasGeometry::Triangles(&geometry(&vertices)), updatable).unwrap();
     assert!(blas.update_scratch_size() > 0);
     let instances =
-        buffer_with::<Instance>(&[Instance::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
+        instance_buffer(&[InstanceInfo::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
     let tlas = Tlas::new(1, updatable).unwrap();
     let scratch = scratch(
         [
@@ -391,9 +417,8 @@ fn updates_follow_moved_vertices() {
             &[(&blas, BlasGeometry::Triangles(&geometry(&vertices)))],
             scratch.range(..),
         );
-        // SAFETY: the BLASes it names outlive the traces of this test.
         cmd.build(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             scratch.range(..),
         );
         trace_query(cmd, target, &tlas);
@@ -409,9 +434,8 @@ fn updates_follow_moved_vertices() {
             &[(&blas, BlasGeometry::Triangles(&geometry(&vertices)))],
             scratch.range(..),
         );
-        // SAFETY: the BLASes it names outlive the traces of this test.
         cmd.update(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             scratch.range(..),
         );
         trace_query(cmd, target, &tlas);
@@ -430,7 +454,7 @@ fn a_tlas_rebuilt_between_two_traces_waits_for_the_first() {
         return;
     }
     let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
-    let wall_only = buffer_with::<Instance>(
+    let wall_only = buffer_with::<RawInstance>(
         &instances(
             scene.wall.address(),
             scene.triangle.address(),
@@ -442,7 +466,9 @@ fn a_tlas_rebuilt_between_two_traces_waits_for_the_first() {
         trace_query(cmd, first, &scene.tlas);
         // SAFETY: the BLASes it names outlive the traces of this test.
         cmd.build(
-            &[(&scene.tlas, unsafe { Instances::new(wall_only.range(..)) })],
+            &[(&scene.tlas, unsafe {
+                Instances::from_raw(wall_only.range(..))
+            })],
             scratch.range(..),
         );
         trace_query(cmd, second, &scene.tlas);
@@ -495,7 +521,7 @@ fn compacted_structures_trace_the_same_image() {
         sphere.compacted(sizes[2]).unwrap(),
     ];
     let [c_wall, c_triangle, c_sphere] = &compacted;
-    let moved = buffer_with::<Instance>(&instances(
+    let moved = buffer_with::<RawInstance>(&instances(
         c_wall.address(),
         c_triangle.address(),
         c_sphere.address(),
@@ -507,7 +533,7 @@ fn compacted_structures_trace_the_same_image() {
         }
         // SAFETY: the BLASes it names outlive the traces of this test.
         cmd.build(
-            &[(&tlas, unsafe { Instances::new(moved.range(..)) })],
+            &[(&tlas, unsafe { Instances::from_raw(moved.range(..)) })],
             scratch.range(..),
         );
         // Nothing reaches the originals any more; they go once this frame is done.
@@ -673,15 +699,14 @@ fn trace_triangle_of<V: VertexPosition + bytemuck::Pod>(
     let geometry = [Triangles::new(vertices.range(..))];
     let blas = Blas::new(&BlasGeometry::Triangles(&geometry), BuildFlags::default()).unwrap();
     let instances =
-        buffer_with::<Instance>(&[Instance::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
+        instance_buffer(&[InstanceInfo::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
     let tlas = Tlas::new(1, BuildFlags::default()).unwrap();
     let scratch = Scratch::for_any(&[&blas]).unwrap();
     let tlas_scratch = Scratch::for_any(&[&tlas]).unwrap();
     render(gpu, |cmd, target| {
         cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
-        // SAFETY: the BLAS is built before it and outlives the trace.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             &tlas_scratch,
         );
         trace_query(cmd, target, &tlas);
@@ -716,7 +741,7 @@ fn half_snorm_and_padded_positions_build_the_same_triangle() {
     let geometry = [Triangles::new(padded.range(..))];
     let blas = Blas::new(&BlasGeometry::Triangles(&geometry), BuildFlags::default()).unwrap();
     let instances =
-        buffer_with::<Instance>(&[Instance::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
+        instance_buffer(&[InstanceInfo::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
     let tlas = Tlas::new(1, BuildFlags::default()).unwrap();
     let scratch = Scratch::new(blas.build_scratch_size().max(tlas.build_scratch_size())).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
@@ -724,9 +749,8 @@ fn half_snorm_and_padded_positions_build_the_same_triangle() {
             &[(&blas, BlasGeometry::Triangles(&geometry))],
             scratch.slice(),
         );
-        // SAFETY: the BLAS is built before it and outlives the trace.
         cmd.build(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             scratch.slice(),
         );
         trace_query(cmd, target, &tlas);
@@ -826,7 +850,7 @@ fn a_structure_counts_as_built_only_once_its_build_reaches_the_gpu() {
         return;
     }
     let scene = scene(&mut gpu, BuildFlags::default(), BuildFlags::default());
-    let instances = buffer_with::<Instance>(&instances(
+    let instances = buffer_with::<RawInstance>(&instances(
         scene.wall.address(),
         scene.triangle.address(),
         scene.sphere.address(),
@@ -851,7 +875,7 @@ fn a_structure_counts_as_built_only_once_its_build_reaches_the_gpu() {
         gpu.submit(|cmd| {
             // SAFETY: the BLASes it names are built and outlive this test's traces.
             cmd.build_all(
-                &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+                &[(&tlas, unsafe { Instances::from_raw(instances.range(..)) })],
                 &scratch,
             );
             assert!(tlas.is_built(), "built by this recording");
@@ -863,7 +887,7 @@ fn a_structure_counts_as_built_only_once_its_build_reaches_the_gpu() {
     let message = panic_message(|| {
         gpu.submit(|cmd| {
             cmd.update(
-                &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+                &[(&tlas, unsafe { Instances::from_raw(instances.range(..)) })],
                 scratch.slice(),
             )
         })
@@ -872,7 +896,7 @@ fn a_structure_counts_as_built_only_once_its_build_reaches_the_gpu() {
     let pixels = render(&mut gpu, |cmd, target| {
         // SAFETY: as above.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, unsafe { Instances::from_raw(instances.range(..)) })],
             &scratch,
         );
         trace_query(cmd, target, &tlas);
@@ -1027,7 +1051,7 @@ fn compactors_compact_over_a_few_frames_and_hand_back_traceable_structures() {
     for (blas, size) in compacted.iter().zip(sizes) {
         assert!(blas.is_compacted() && blas.is_built() && blas.size() <= size);
     }
-    let moved = buffer_with::<Instance>(&instances(
+    let moved = buffer_with::<RawInstance>(&instances(
         compacted[0].address(),
         compacted[1].address(),
         compacted[2].address(),
@@ -1036,7 +1060,7 @@ fn compactors_compact_over_a_few_frames_and_hand_back_traceable_structures() {
     let pixels = render(&mut gpu, |cmd, target| {
         // SAFETY: the compacted BLASes outlive the trace.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(moved.range(..)) })],
+            &[(&tlas, unsafe { Instances::from_raw(moved.range(..)) })],
             &scratch,
         );
         trace_query(cmd, target, &tlas);
@@ -1068,16 +1092,15 @@ fn arenas_hold_structures_and_take_their_ranges_back() {
         Err(Error::ArenaFull { .. })
     ));
     let instances =
-        buffer_with::<Instance>(&[Instance::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
+        instance_buffer(&[InstanceInfo::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
     let scratch = Scratch::for_any(&[&blas]).unwrap();
     let tlas_scratch = Scratch::for_any(&[&tlas]).unwrap();
     // The arena can go before its structures, which keep its memory.
     drop(arena);
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
-        // SAFETY: the BLAS is built before it and outlives the trace.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             &tlas_scratch,
         );
         trace_query(cmd, target, &tlas);
@@ -1178,7 +1201,7 @@ fn copies_and_serialized_structures_trace_like_their_sources() {
 
     let scratch = Scratch::for_any(&[&scene.tlas]).unwrap();
     for blases in [&clones, &deserialized] {
-        let moved = buffer_with::<Instance>(&instances(
+        let moved = buffer_with::<RawInstance>(&instances(
             blases[0].address(),
             blases[1].address(),
             blases[2].address(),
@@ -1186,7 +1209,7 @@ fn copies_and_serialized_structures_trace_like_their_sources() {
         let pixels = render(&mut gpu, |cmd, target| {
             // SAFETY: the BLASes outlive the trace.
             cmd.build_all(
-                &[(&scene.tlas, unsafe { Instances::new(moved.range(..)) })],
+                &[(&scene.tlas, unsafe { Instances::from_raw(moved.range(..)) })],
                 &scratch,
             );
             trace_query(cmd, target, &scene.tlas);
@@ -1212,12 +1235,14 @@ fn instance_flags_force_opaque_geometry() {
     );
     forced[0] = forced[0].with_flags(InstanceFlags::FORCE_OPAQUE);
     assert_eq!(forced[0].flags(), InstanceFlags::FORCE_OPAQUE);
-    let forced = buffer_with::<Instance>(&forced);
+    let forced = buffer_with::<RawInstance>(&forced);
     let scratch = Scratch::for_any(&[&scene.tlas]).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
         // SAFETY: the scene's BLASes outlive the trace.
         cmd.build_all(
-            &[(&scene.tlas, unsafe { Instances::new(forced.range(..)) })],
+            &[(&scene.tlas, unsafe {
+                Instances::from_raw(forced.range(..))
+            })],
             &scratch,
         );
         trace_pipeline(cmd, target, &scene.tlas);
@@ -1240,15 +1265,14 @@ fn wall_scene(
     let indices = buffer_with::<u16>(&[0, 1, 2, 0, 2, 3]);
     let geometry = [Triangles::indexed(vertices.range(..), indices.range(..))];
     let blas = Blas::new(&BlasGeometry::Triangles(&geometry), flags).unwrap();
-    let instances = buffer_with::<Instance>(&[Instance::new(&blas, Affine3A::IDENTITY)]);
+    let instances = instance_buffer(&[InstanceInfo::new(&blas, Affine3A::IDENTITY)]);
     let tlas = Tlas::new(1, BuildFlags::default()).unwrap();
     let scratch = Scratch::for_any(&[&blas]).unwrap();
     let tlas_scratch = Scratch::for_any(&[&tlas]).unwrap();
     gpu.submit(|cmd| {
         cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
-        // SAFETY: the BLAS is built before it and outlives the traces.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             &tlas_scratch,
         );
     });
@@ -1362,7 +1386,7 @@ fn geometry_transforms_move_their_triangles_and_are_part_of_the_shape() {
     let geometry = [Triangles::new(vertices.range(..)).transform(transform.range(..))];
     let blas = Blas::new(&BlasGeometry::Triangles(&geometry), BuildFlags::default()).unwrap();
     let instances =
-        buffer_with::<Instance>(&[Instance::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
+        instance_buffer(&[InstanceInfo::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
     let tlas = Tlas::new(1, BuildFlags::default()).unwrap();
     let scratch = Scratch::for_any(&[&blas]).unwrap();
     let tlas_scratch = Scratch::for_any(&[&tlas]).unwrap();
@@ -1379,9 +1403,8 @@ fn geometry_transforms_move_their_triangles_and_are_part_of_the_shape() {
     assert!(message.contains("doesn't fit"), "{message}");
     let pixels = render(&mut gpu, |cmd, target| {
         cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
-        // SAFETY: the BLAS is built before it and outlives the trace.
         cmd.build_all(
-            &[(&tlas, unsafe { Instances::new(instances.range(..)) })],
+            &[(&tlas, Instances::new(instances.range(..)))],
             &tlas_scratch,
         );
         trace_query(cmd, target, &tlas);
@@ -1405,7 +1428,7 @@ fn instance_flags_disable_culling_and_force_non_opaque() {
     ];
     for (bit, flag) in all.into_iter().enumerate() {
         assert_eq!(flag.bits(), 1 << bit, "{flag:?}");
-        let instance = Instance::from_address(1, Affine3A::IDENTITY)
+        let instance = RawInstance::new(1, Affine3A::IDENTITY)
             .with_sbt_offset(7)
             .with_flags(flag);
         assert_eq!(instance.sbt_offset_and_flags >> 24, 1 << bit);
@@ -1427,12 +1450,14 @@ fn instance_flags_disable_culling_and_force_non_opaque() {
     );
     flagged[1] = flagged[1]
         .with_flags(InstanceFlags::FORCE_NO_OPAQUE | InstanceFlags::TRIANGLE_FACING_CULL_DISABLE);
-    let flagged = buffer_with::<Instance>(&flagged);
+    let flagged = buffer_with::<RawInstance>(&flagged);
     let scratch = Scratch::for_any(&[&scene.tlas]).unwrap();
     let pixels = render(&mut gpu, |cmd, target| {
         // SAFETY: the scene's BLASes outlive the trace.
         cmd.build_all(
-            &[(&scene.tlas, unsafe { Instances::new(flagged.range(..)) })],
+            &[(&scene.tlas, unsafe {
+                Instances::from_raw(flagged.range(..))
+            })],
             &scratch,
         );
         trace_query(cmd, target, &scene.tlas);
@@ -1508,4 +1533,47 @@ fn ray_tracing_passes_take_specialization_constants() {
         assert_pixel(&pixels, BACKGROUND.0, BACKGROUND.1, [0, sky as u8, 0]);
         assert_pixel(&pixels, WALL.0, WALL.1, [204, 204, 204]);
     }
+}
+
+/// A TLAS built from instances written with their BLASes keeps the BLASes: it is traced after
+/// their handles and the instance buffer are dropped. A BLAS built in the submission that
+/// builds the TLAS is waited for through the instance buffer that references it, and a TLAS
+/// isn't built from instances of a BLAS that never was.
+#[test]
+fn tlases_keep_and_wait_for_the_blases_of_their_instances() {
+    let mut gpu = gpu();
+    if !supported("tlases_keep_their_blases", Ctx::features().ray_query) {
+        return;
+    }
+    let reference = trace_triangle_of(&mut gpu, &TRIANGLE_VERTICES);
+    let moved = TRIANGLE_VERTICES.map(|v| v + Vec3::new(0.4, 0.0, 0.0));
+    let moved_reference = trace_triangle_of(&mut gpu, &moved);
+    assert_ne!(reference, moved_reference);
+    let tlas = Tlas::new(1, BuildFlags::default()).unwrap();
+    let tlas_scratch = Scratch::for_any(&[&tlas]).unwrap();
+    let triangle = |gpu: &mut common::Gpu, vertices: &[Vec3], build_blas: bool| {
+        let vertices = buffer_with::<Vec3>(vertices);
+        let geometry = [Triangles::new(vertices.range(..))];
+        let blas = Blas::new(&BlasGeometry::Triangles(&geometry), BuildFlags::default()).unwrap();
+        let instances =
+            instance_buffer(&[InstanceInfo::new(&blas, Affine3A::IDENTITY).with_custom_index(1)]);
+        let scratch = Scratch::for_any(&[&blas]).unwrap();
+        render(gpu, |cmd, target| {
+            if build_blas {
+                cmd.build_all(&[(&blas, BlasGeometry::Triangles(&geometry))], &scratch);
+            }
+            cmd.build_all(
+                &[(&tlas, Instances::new(instances.range(..)))],
+                &tlas_scratch,
+            );
+            trace_query(cmd, target, &tlas);
+        })
+        // The BLAS, its vertices and the instances go here; the TLAS keeps the BLAS.
+    };
+    assert_eq!(triangle(&mut gpu, &TRIANGLE_VERTICES, true), reference);
+    let pixels = render(&mut gpu, |cmd, target| trace_query(cmd, target, &tlas));
+    assert_eq!(pixels, reference, "the TLAS kept its dropped BLAS");
+    assert_eq!(triangle(&mut gpu, &moved, true), moved_reference);
+    let message = panic_message(|| triangle(&mut gpu, &moved, false));
+    assert!(message.contains("a BLAS that was never built"), "{message}");
 }

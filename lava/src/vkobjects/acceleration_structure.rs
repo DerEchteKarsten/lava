@@ -1,9 +1,9 @@
-//! Ray tracing acceleration structures: `Blas`/`Tlas` in their own memory or an arena's, the shapes they were created for (from geometry or counts), their geometry (triangles of sealed vertex formats, AABBs, instances), builds and refits (batched to fit a `Scratch`), copies, serialization and compaction with automatic barriers and debug scopes, and the built state (applied once a recording reaches the GPU) that traces check
+//! Ray tracing acceleration structures: `Blas`/`Tlas` in their own memory or an arena's, the shapes they were created for (from geometry or counts), their geometry (triangles of sealed vertex formats, AABBs, and instances: written with their BLASes as references (`InstanceInfo`), which a TLAS build takes for the TLAS so traces keep and wait for them, or raw (`RawInstance`, `unsafe Instances::from_raw`), which waits for every structure), builds and refits (batched to fit a `Scratch`), copies, serialization and compaction with automatic barriers and debug scopes, and the built state (applied once a recording reaches the GPU) that traces check
 use std::{
     marker::PhantomData,
     range::Range,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -18,14 +18,18 @@ use smallvec::SmallVec;
 use crate::{
     bindless::Ranges,
     buffer::{Buffer, BufferInternal, Gpu, slice::BufferSlice},
-    command_buffer::{BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE, Recording},
+    command_buffer::{
+        Barriers, BufferAccess, CommandBuffer, EVERY_ACCELERATION_STRUCTURE, Recording,
+        access_state::Tracker,
+    },
     error::{Error, Result},
     features::{Feature, gate},
     global::Live,
     lifetime,
-    object::{Header, Object},
+    object::{Hazard, Header, Object, Strong},
     query::{CompactedSize, QueryKind, QueryPool, SerializedSize},
     queue::{HasCompute, lock},
+    reference::KeepAlive,
     state::{Ctx, Functions},
 };
 
@@ -91,6 +95,19 @@ pub(crate) fn every_structure_read<'a>(
         access,
         range: EVERY_ACCELERATION_STRUCTURE,
         buffer: None,
+        structure: None,
+    }
+}
+
+/// An access that is none: what a trace of a TLAS whose BLASes it references adds.
+fn no_access<'a>(stage: vk::PipelineStageFlags2) -> BufferAccess<'a> {
+    BufferAccess {
+        unordered: false,
+        stage,
+        access: vk::AccessFlags2::NONE,
+        range: (0..0).into(),
+        buffer: None,
+        structure: None,
     }
 }
 
@@ -108,9 +125,20 @@ mod describe {
     /// The geometries of a build ([`Level::Geometry`]).
     pub trait Describe<'a> {
         fn describe(&self, out: &mut SmallVec<[Described<'a>; 1]>);
+        /// Where a TLAS build's instances come from; none for a BLAS's geometry.
+        fn instance_source(&self) -> Option<InstanceSource<'a>> {
+            None
+        }
+    }
+
+    /// The instances of a TLAS build: the buffer they were written to with their BLASes as
+    /// references, or none for raw instances.
+    #[derive(Clone, Copy)]
+    pub struct InstanceSource<'a> {
+        pub(crate) referenced: Option<&'a std::sync::Arc<crate::buffer::BufferInternal>>,
     }
 }
-use describe::{Describe, Described};
+use describe::{Describe, Described, InstanceSource};
 
 /// One geometry as Vulkan sizes and builds it: everything but its addresses. A structure keeps
 /// its creation's shapes, with the counts as maxima, and its last build's, which an update keeps.
@@ -360,6 +388,10 @@ pub(crate) struct StructureInternal {
     /// The device addresses of its memory, which barriers track.
     pub(crate) range: Range<u64>,
     memory: Memory,
+    /// A TLAS's BLASes: what its last recorded build's instances referenced.
+    keep_alive: OnceLock<Mutex<KeepAlive>>,
+    /// Its last recorded build was from raw instances, whose BLASes lava doesn't know.
+    raw_instances: AtomicBool,
     header: Header,
 }
 
@@ -376,6 +408,21 @@ impl Object for StructureInternal {
     fn header(&self) -> &Header {
         &self.header
     }
+
+    fn keep_alive(&self) -> Option<&Mutex<KeepAlive>> {
+        self.keep_alive.get()
+    }
+
+    fn reference_hazards(
+        &self,
+        t: &Tracker,
+        log: &[Barriers],
+        stage: vk::PipelineStageFlags2,
+        access: vk::AccessFlags2,
+    ) -> Hazard {
+        self.keep_alive.get()?;
+        lock(&self.buffer().state).hazards(t, log, self.range, stage, access)
+    }
 }
 
 impl StructureInternal {
@@ -388,7 +435,7 @@ impl StructureInternal {
     }
 
     pub(crate) fn access(
-        &self,
+        self: &Arc<Self>,
         stage: vk::PipelineStageFlags2,
         access: vk::AccessFlags2,
     ) -> BufferAccess<'_> {
@@ -398,7 +445,59 @@ impl StructureInternal {
             access,
             range: self.range,
             buffer: Some(self.buffer()),
+            structure: Some(self),
         }
+    }
+
+    /// Whether its last recorded build was from raw instances.
+    pub(crate) fn from_raw_instances(&self) -> bool {
+        self.raw_instances.load(Ordering::Relaxed)
+    }
+
+    /// Takes the BLASes `instances` references (none for raw instances) for its own, as a
+    /// build from them is recorded.
+    #[track_caller]
+    fn take_instances(self: &Arc<Self>, source: InstanceSource<'_>) {
+        let new = match source.referenced {
+            Some(buffer) => {
+                let Some(instances) = buffer.keep_alive.get() else {
+                    panic!("a TLAS is built from instances that were never written")
+                };
+                let instances = lock(instances);
+                for blas in instances.children.iter() {
+                    if let Strong::Structure(blas) = &blas.object {
+                        assert!(
+                            blas.state.recorded.load(Ordering::Acquire),
+                            "a TLAS is built from an instance of a BLAS that was never built: \
+                             record its build first"
+                        );
+                    }
+                }
+                instances.clone_for(self)
+            }
+            None => KeepAlive::new::<Instance>(),
+        };
+        self.replace_instances(new, source.referenced.is_none());
+    }
+
+    /// Takes `src`'s BLASes, as a copy or compaction of it into this TLAS is recorded.
+    fn copy_instances(self: &Arc<Self>, src: &StructureInternal) {
+        if let Some(instances) = src.keep_alive.get() {
+            let new = lock(instances).clone_for(self);
+            self.replace_instances(new, src.from_raw_instances());
+        }
+    }
+
+    /// Its BLASes are `new` from now on, or unknown (`raw`).
+    fn replace_instances(self: &Arc<Self>, new: KeepAlive, raw: bool) {
+        let keep_alive = self
+            .keep_alive
+            .get_or_init(|| Mutex::new(KeepAlive::new::<Instance>()));
+        self.raw_instances.store(raw, Ordering::Relaxed);
+        // The BLASes of the last build go once nothing references them (a recording that
+        // traces this TLAS keeps them through its submission).
+        let old = std::mem::replace(&mut *lock(keep_alive), new);
+        old.unregister(self);
     }
 }
 
@@ -557,6 +656,8 @@ impl<L: Level> AccelerationStructure<L> {
                 state: BuildState::new(),
                 range,
                 memory,
+                keep_alive: OnceLock::new(),
+                raw_instances: AtomicBool::new(false),
                 header: Header::new(live),
             }),
             _level: PhantomData,
@@ -760,9 +861,10 @@ impl Tlas {
         )
     }
 
-    /// The accesses of a pass that traces it: its memory and the BLASes it names. Panics
-    /// unless a build of it was recorded ([`AccelerationStructure::is_built`]): a trace of an
-    /// unbuilt TLAS reads uninitialised memory.
+    /// The accesses of a pass that traces it: its memory (through which a command reaches the
+    /// BLASes its instances referenced), and for a TLAS built from raw instances a read of every
+    /// structure. Panics unless a build of it was recorded ([`AccelerationStructure::is_built`]):
+    /// a trace of an unbuilt TLAS reads uninitialised memory.
     #[track_caller]
     pub fn trace_accesses(&self, stage: vk::PipelineStageFlags2) -> [BufferAccess<'_>; 2] {
         assert!(
@@ -770,12 +872,19 @@ impl Tlas {
             "a trace of a TLAS that was never built: record its build first"
         );
         let read = trace_read();
-        [self.access(stage, read), every_structure_read(stage, read)]
+        let blases = match self.internal.from_raw_instances() {
+            true => every_structure_read(stage, read),
+            false => no_access(stage),
+        };
+        [self.access(stage, read), blases]
     }
 }
 
 impl Drop for StructureInternal {
     fn drop(&mut self) {
+        if let Some(keep_alive) = self.keep_alive.get() {
+            lock(keep_alive).unregister_all();
+        }
         let handle = self.handle;
         let arena = match &self.memory {
             Memory::Own(_) => None,
@@ -1458,12 +1567,95 @@ impl std::ops::BitOrAssign for InstanceFlags {
     }
 }
 
-/// An instance of a BLAS in a TLAS (`VkAccelerationStructureInstanceKHR`, a layout of the
-/// shader contract, so passes can write them). Its fields are public for that layout; read them
+/// An instance of a BLAS in a TLAS as lava writes it (`VkAccelerationStructureInstanceKHR`):
+/// a [`RawInstance`] whose BLAS the buffer it is in keeps alive, written only with it by an
+/// [`InstanceInfo`] (`host_write_referencing`, `Uploader::write_referencing`). A TLAS built
+/// from such instances keeps their BLASes, and commands that trace it wait for their builds.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::AnyBitPattern)]
+pub struct Instance(RawInstance);
+
+// SAFETY: one reference, the BLAS `InstanceInfo` writes with its address.
+unsafe impl crate::reference::ReferencingData for Instance {
+    const REFERENCES: usize = 1;
+    const WRITES: u64 = 0;
+    const UNORDERED: u64 = 0;
+}
+
+impl std::ops::Deref for Instance {
+    type Target = RawInstance;
+    fn deref(&self) -> &RawInstance {
+        &self.0
+    }
+}
+
+/// An [`Instance`] as what it references: its BLAS, placed and flagged by the `with_` methods
+/// of a [`RawInstance`].
+#[derive(Clone, Copy)]
+pub struct InstanceInfo<'a> {
+    blas: &'a Blas,
+    raw: RawInstance,
+}
+
+impl<'a> InstanceInfo<'a> {
+    /// `blas` placed by `transform`, seen by every ray mask, with custom index, hit group
+    /// offset and flags 0.
+    pub fn new(blas: &'a Blas, transform: Affine3A) -> Self {
+        InstanceInfo {
+            blas,
+            raw: RawInstance::new(blas.address(), transform),
+        }
+    }
+
+    /// The instance with `f` applied to its raw fields ([`RawInstance::with_mask`], ...); its
+    /// BLAS stays.
+    pub fn with(mut self, f: impl FnOnce(RawInstance) -> RawInstance) -> Self {
+        self.raw = f(self.raw);
+        self.raw.blas = self.blas.address();
+        self
+    }
+
+    /// See [`RawInstance::with_custom_index`].
+    #[track_caller]
+    pub fn with_custom_index(self, index: u32) -> Self {
+        self.with(|raw| raw.with_custom_index(index))
+    }
+
+    /// See [`RawInstance::with_mask`].
+    pub fn with_mask(self, mask: u8) -> Self {
+        self.with(|raw| raw.with_mask(mask))
+    }
+
+    /// See [`RawInstance::with_sbt_offset`].
+    #[track_caller]
+    pub fn with_sbt_offset(self, offset: u32) -> Self {
+        self.with(|raw| raw.with_sbt_offset(offset))
+    }
+
+    pub fn with_flags(self, flags: InstanceFlags) -> Self {
+        self.with(|raw| raw.with_flags(flags))
+    }
+
+    pub fn with_transform(self, transform: Affine3A) -> Self {
+        self.with(|raw| raw.with_transform(transform))
+    }
+}
+
+impl<'a> crate::reference::ReferenceInfo<'a> for InstanceInfo<'a> {
+    type Data = Instance;
+    fn write(self, data: &mut Instance, references: &mut [crate::reference::Reference<'a>]) {
+        *data = Instance(self.raw);
+        references[0] = crate::reference::Reference::structure(self.blas);
+    }
+}
+
+/// `VkAccelerationStructureInstanceKHR` as plain data, a layout of the shader contract (Slang's
+/// `AccelerationStructureInstance`), so passes can write them: TLASes are built from them only
+/// through `unsafe` [`Instances::from_raw`]. Its fields are public for that layout; read them
 /// through the getters and set them with the `with_` methods.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
-pub struct Instance {
+pub struct RawInstance {
     pub transform: TransformMatrix,
     /// The custom index in bits 0..24, the mask in 24..32.
     pub custom_index_and_mask: u32,
@@ -1474,15 +1666,11 @@ pub struct Instance {
 
 const LOW_24: u32 = (1 << 24) - 1;
 
-impl Instance {
-    /// `blas` placed by `transform`, seen by every ray mask, with custom index, hit group
-    /// offset and flags 0. It keeps nothing alive: see [`Instances::new`].
-    pub fn new(blas: &Blas, transform: Affine3A) -> Self {
-        Self::from_address(blas.address(), transform)
-    }
-
-    /// Like [`Self::new`] for the BLAS at `address` ([`AccelerationStructure::address`]).
-    pub fn from_address(address: u64, transform: Affine3A) -> Self {
+impl RawInstance {
+    /// The BLAS at `address` ([`AccelerationStructure::address`]; 0 for an inactive instance)
+    /// placed by `transform`, seen by every ray mask, with custom index, hit group offset and
+    /// flags 0. It keeps nothing alive: see [`Instances::from_raw`].
+    pub fn new(address: u64, transform: Affine3A) -> Self {
         Self {
             transform: transform.into(),
             custom_index_and_mask: 0xFF << 24,
@@ -1565,31 +1753,46 @@ fn instances_described(address: u64, count: u32) -> Described<'static> {
     }
 }
 
-/// What a TLAS is built from: a slice of [`Instance`]s, which the host or a pass may write.
+/// What a TLAS is built from: a slice of [`Instance`]s, whose BLASes the TLAS keeps, or of
+/// [`RawInstance`]s a pass may write.
 #[derive(Clone, Copy)]
 pub struct Instances<'a> {
     instances: BufferSlice<'a, u8>,
     count: u32,
+    raw: bool,
 }
 
 impl<'a> Instances<'a> {
-    /// The build input of a TLAS: `instances`, written by the host or a pass.
+    /// The build input of a TLAS: `instances`, written with their BLASes, which a build keeps
+    /// for the TLAS. Panics unless every BLAS they name has a build recorded.
+    #[track_caller]
+    pub fn new(instances: BufferSlice<'a, Instance>) -> Self {
+        Self::of(instances.bytes(), instances.len(), false)
+    }
+
+    /// The build input of a TLAS from instances a pass may have written.
     ///
     /// # Safety
     /// Every BLAS the instances name (by address; 0 is an inactive instance) must be built and
     /// alive when a build from them executes on the GPU, which reads them, and stay alive while
-    /// a TLAS built from them is traced. lava doesn't track them: a dropped BLAS is destroyed
+    /// a TLAS built from them is traced. lava doesn't know them: a dropped BLAS is destroyed
     /// once the submissions in flight at its drop are done, so rebuild the TLAS without it
-    /// before tracing again.
+    /// before tracing again. (Builds and traces of such TLASes wait for every structure build.)
     #[track_caller]
-    pub unsafe fn new(instances: BufferSlice<'a, Instance>) -> Self {
+    pub unsafe fn from_raw(instances: BufferSlice<'a, RawInstance>) -> Self {
+        Self::of(instances.bytes(), instances.len(), true)
+    }
+
+    #[track_caller]
+    fn of(instances: BufferSlice<'a, u8>, count: usize, raw: bool) -> Self {
         assert!(
             instances.address().is_multiple_of(16),
             "an instance buffer's address has to be a multiple of 16"
         );
         Self {
-            count: instances.len() as u32,
-            instances: instances.bytes(),
+            count: count as u32,
+            instances,
+            raw,
         }
     }
 }
@@ -1599,6 +1802,12 @@ impl<'a> Describe<'a> for Instances<'a> {
         let mut described = instances_described(self.instances.address(), self.count);
         described.inputs[0] = Some(self.instances);
         out.push(described);
+    }
+
+    fn instance_source(&self) -> Option<InstanceSource<'a>> {
+        Some(InstanceSource {
+            referenced: (!self.raw).then_some(self.instances.buffer),
+        })
     }
 }
 
@@ -1794,8 +2003,16 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             "the builds need {offset} scratch bytes, the slice has {}",
             scratch.size()
         );
-        if L::TY == vk::AccelerationStructureTypeKHR::TOP_LEVEL {
+        // A TLAS build reaches the BLASes its instances reference through their buffer; raw
+        // instances name BLASes lava doesn't know.
+        let sources: SmallVec<[_; 1]> = (builds.iter())
+            .filter_map(|(structure, geometry)| Some((structure, geometry.instance_source()?)))
+            .collect();
+        if sources.iter().any(|(_, s)| s.referenced.is_none()) {
             accesses.push(every_structure_read(BUILD, READ));
+        }
+        for (structure, source) in sources {
+            structure.internal.take_instances(source);
         }
         let name = match update {
             true => "update acceleration structures",
@@ -1987,6 +2204,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         self.rec
             .flush_pending(std::iter::empty(), accesses.iter().cloned());
         self.rec.structure_built(&dst.internal.state, shapes);
+        dst.internal.copy_instances(&src.internal);
         unsafe {
             command_functions().cmd_copy_acceleration_structure(
                 self.rec.handle,
@@ -2066,6 +2284,11 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
             .flush_pending(std::iter::empty(), accesses.iter().cloned());
         self.rec
             .structure_built(&dst.internal.state, SmallVec::new());
+        // Its instances name BLASes lava doesn't know.
+        if L::TY == vk::AccelerationStructureTypeKHR::TOP_LEVEL {
+            dst.internal
+                .replace_instances(KeepAlive::new::<Instance>(), true);
+        }
         unsafe {
             command_functions().cmd_copy_memory_to_acceleration_structure(
                 self.rec.handle,

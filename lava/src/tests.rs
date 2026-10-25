@@ -78,6 +78,8 @@ fn buffer(stage: S, access: A, range: std::ops::Range<u64>) -> BufferAccess<'sta
         access,
         range: range.into(),
         buffer: Some(test_buffer()),
+        #[cfg(feature = "acceleration-structure")]
+        structure: None,
     }
 }
 
@@ -1074,32 +1076,33 @@ fn binding_table_regions_are_aligned_and_empty_ones_have_no_size() {
 #[cfg(feature = "acceleration-structure")]
 #[test]
 fn instances_have_the_layout_of_the_vulkan_struct() {
-    use crate::vkobjects::acceleration_structure::{Instance, InstanceFlags};
+    use crate::vkobjects::acceleration_structure::{Instance, InstanceFlags, RawInstance};
     use std::mem::offset_of;
     assert_eq!(
         size_of::<Instance>(),
         size_of::<vk::AccelerationStructureInstanceKHR>()
     );
+    assert_eq!(size_of::<RawInstance>(), size_of::<Instance>());
     assert_eq!(
-        offset_of!(Instance, transform),
+        offset_of!(RawInstance, transform),
         offset_of!(vk::AccelerationStructureInstanceKHR, transform)
     );
     assert_eq!(
-        offset_of!(Instance, custom_index_and_mask),
+        offset_of!(RawInstance, custom_index_and_mask),
         offset_of!(
             vk::AccelerationStructureInstanceKHR,
             instance_custom_index_and_mask
         )
     );
     assert_eq!(
-        offset_of!(Instance, sbt_offset_and_flags),
+        offset_of!(RawInstance, sbt_offset_and_flags),
         offset_of!(
             vk::AccelerationStructureInstanceKHR,
             instance_shader_binding_table_record_offset_and_flags
         )
     );
     assert_eq!(
-        offset_of!(Instance, blas),
+        offset_of!(RawInstance, blas),
         offset_of!(
             vk::AccelerationStructureInstanceKHR,
             acceleration_structure_reference
@@ -1107,7 +1110,7 @@ fn instances_have_the_layout_of_the_vulkan_struct() {
     );
     let transform = glam::Affine3A::from_translation(glam::Vec3::new(1.0, 2.0, 3.0));
     let flags = InstanceFlags::FORCE_OPAQUE | InstanceFlags::TRIANGLE_FLIP_FACING;
-    let instance = Instance::from_address(0xABC, transform)
+    let instance = RawInstance::new(0xABC, transform)
         .with_custom_index(5)
         .with_mask(0x0F)
         .with_sbt_offset(7)
@@ -2655,6 +2658,8 @@ fn writes_of_referenced_objects_wait_for_reads_through_their_buffers() {
         access,
         range: (b.address..b.address + 4).into(),
         buffer: Some(b),
+        #[cfg(feature = "acceleration-structure")]
+        structure: None,
     };
     let mut rec = Rec::new();
     // A fragment shader reads the child through the grandparent, a vertex shader the image

@@ -165,6 +165,8 @@ impl<'a, T: Copy + 'static> BufferSlice<'a, T> {
             access,
             range: self.get_range(),
             buffer: Some(self.buffer),
+            #[cfg(feature = "acceleration-structure")]
+            structure: None,
         }
     }
     /// The addresses the slice covers.
