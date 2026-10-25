@@ -1,4 +1,4 @@
-//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups, compute passes with a required subgroup size), each pass's pipelines per specialization and raster key (attachment formats, view mask and the draw state the device can't set dynamically, the topology class among it), raster passes with or without a fragment shader behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), `reload_pass`, which replaces a pass's pipelines and retires the old ones (or skips a pass the device can't run), and their destruction at `shutdown`
+//! Pass pipelines: the pass map a frontend generates and `init` takes (refused if a pass needs a feature lava was compiled without), its entries (ray tracing passes with their shader groups, compute passes with a required subgroup size), each pass's pipelines per specialization and raster key (attachment formats, view mask and the draw state the device can't set dynamically, the topology class among it), raster passes with or without a fragment shader behind a lock of their own and made outside it, their creation through one `VkPipelineCache` (loaded from and saved to `Config::pipeline_cache`; batched at init; none for passes the device can't run), `reload_pass`, which replaces a pass's pipelines and destroys the old ones once nothing in flight can use them (or skips a pass the device can't run), and their destruction at `shutdown`
 use std::{
     ffi::CStr,
     hash::Hash,
@@ -475,7 +475,8 @@ pub enum Reload {
 
 /// Replaces the SPIR-V of pass `pass_index` and every pipeline made from it, which must keep
 /// the layout the bindings were generated from; if the driver rejects it, nothing is replaced.
-/// Recordings that looked up a pipeline before keep using it; it is retired like any object.
+/// Recordings that looked up a pipeline before keep using it: the replaced ones are destroyed
+/// once every recording in progress and submission in flight completed.
 pub fn reload_pass(pass_index: usize, spirv: &[u8]) -> Result<Reload> {
     let _call = crate::state::call();
     let manager = pipelines();
@@ -755,7 +756,8 @@ fn retire<P: Into<vk::Pipeline> + Send + 'static>(pipelines: Vec<P>) {
     if pipelines.is_empty() {
         return;
     }
-    crate::lifetime::retire(move || {
+    // Recordings in progress may have looked them up.
+    crate::queue::timeline::destroy_when_idle(move || {
         pipelines
             .into_iter()
             .for_each(|p| destroy_pipeline(p.into()))

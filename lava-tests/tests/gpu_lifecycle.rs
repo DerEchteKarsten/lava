@@ -1,4 +1,4 @@
-//! GPU tests of lava's lifecycle in one process: a failed init destroys what it made and can be retried, `shutdown` refuses while objects live and then destroys everything, every call panics after it, and `init` works again; within each context, what dropped timelines and `reclaim` do to destruction, host waits with timeouts and on several submissions, and typed errors
+//! GPU tests of lava's lifecycle in one process: a failed init destroys what it made and can be retried, `shutdown` refuses while objects live and then destroys everything, every call panics after it, and `init` works again; within each context, how submissions keep what they use until `reclaim` or a dropped timeline lets it go, host waits with timeouts and on several submissions, and typed errors
 mod common;
 
 use std::time::Duration;
@@ -36,10 +36,6 @@ fn no_validation_errors() {
 
 type Texture = Image<R8G8B8A8Unorm, usage![Sampled]>;
 
-fn sampled_slot(image: &Texture) -> u32 {
-    image.handle::<Sampled>().sampled_slot().expect("bound")
-}
-
 /// What one context does: typed errors, timelines and destruction, waits, and a refused
 /// shutdown.
 fn exercise() {
@@ -54,42 +50,52 @@ fn exercise() {
             .named("named texture"),
     );
 
-    // `reclaim` polls: an image dropped while a submission runs is destroyed by it alone once
-    // the GPU finished, and its slot is the first free one again.
-    let image = Texture::new(UVec2::splat(4))
-        .unwrap()
-        .bind_sampled()
-        .unwrap();
-    let slot = sampled_slot(&image);
+    // An image a submission uses lives until that submission completed and something let it
+    // go: `reclaim` polls and does, and its slot is the first free one again.
+    type Cleared = Image<R8G8B8A8Unorm, usage![Sampled, TransferDst]>;
+    let cleared = || {
+        Cleared::new(UVec2::splat(4))
+            .unwrap()
+            .bind_sampled()
+            .unwrap()
+    };
+    let image = cleared();
+    let slot = image.handle::<Sampled>().sampled_slot().unwrap();
     let filled = (timeline.begin().unwrap())
-        .submit(|cmd| cmd.fill_buffer(readback.range(..), 7))
+        .submit(|cmd| {
+            cmd.clear_image(image.whole_view(), [0.0; 4]);
+            cmd.fill_buffer(readback.range(..), 7);
+        })
         .unwrap();
     drop(image);
+    let other_slot = |image: &Cleared| image.handle::<Sampled>().sampled_slot().unwrap();
+    let kept = cleared();
+    assert_ne!(other_slot(&kept), slot, "the submission keeps the image");
+    drop(kept);
     std::thread::sleep(Duration::from_millis(200));
     lava::reclaim();
-    let again = Texture::new(UVec2::splat(4))
-        .unwrap()
-        .bind_sampled()
-        .unwrap();
-    assert_eq!(sampled_slot(&again), slot, "reclaim freed the slot");
+    assert_eq!(other_slot(&cleared()), slot, "reclaim freed the slot");
     filled.block_timeout(Duration::ZERO).unwrap();
     assert!(filled.block_timeout(Duration::from_secs(5)).unwrap());
     assert_eq!(readback.host(), [7; 4]);
 
-    // A timeline dropped with its stamp ahead of its last submission (`reserve`, or a `begin`
-    // never submitted) signals it, so what was dropped meanwhile doesn't wait forever.
-    let reserved = Timeline::<Graphics>::new(1, 0).unwrap();
-    reserved.reserve();
-    drop(Texture::new(UVec2::splat(4)).unwrap());
-    drop(reserved);
-    assert!(
-        lava::latest_stamp().is_done(),
-        "the dropped timeline's stamp is signalled"
+    // A dropped timeline lets go of what its submissions kept; one never submitted holds none.
+    let mut dropped = Timeline::<Graphics>::new(1, 0).unwrap();
+    let image = cleared();
+    let slot = other_slot(&image);
+    (dropped.begin().unwrap())
+        .submit(|cmd| cmd.clear_image(image.whole_view(), [0.0; 4]))
+        .unwrap();
+    drop(image);
+    drop(dropped);
+    assert_eq!(
+        other_slot(&cleared()),
+        slot,
+        "the timeline's drop freed the slot"
     );
     let mut begun = Timeline::<Graphics>::new(2, 0).unwrap();
     drop(begun.begin().unwrap());
     drop(begun);
-    assert!(lava::latest_stamp().is_done());
 
     // Several submissions at once, and none.
     let mut other = Timeline::<Graphics>::new(1, 0).unwrap();

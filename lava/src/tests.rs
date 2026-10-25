@@ -184,6 +184,7 @@ impl Rec {
             &self.tracker,
             &self.log,
             &mut self.structures,
+            &mut crate::object::Keep::new(0, self.tracker.value),
             images.iter().cloned(),
             buffers.iter().cloned(),
         );

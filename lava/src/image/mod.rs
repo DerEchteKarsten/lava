@@ -32,7 +32,6 @@ use crate::{
         format::{Format, StaticFormat},
         usage::{ImageUsage, StaticUsage},
     },
-    lifetime,
     object::Header,
     state::{Ctx, Functions, ImageFormatKey},
 };
@@ -400,10 +399,7 @@ impl Drop for ImageInternal {
             }
             memory.free();
         };
-        match swapchain {
-            true => destroy(),
-            false => lifetime::retire(destroy),
-        }
+        destroy();
     }
 }
 

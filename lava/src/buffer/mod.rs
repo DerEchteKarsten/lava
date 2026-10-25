@@ -1,4 +1,4 @@
-//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones (writes of `NoUninit` elements, reads of `AnyBitPattern` ones), checked against GPU writes still in flight; growth that keeps the contents (`reserve`); the staging rings and uploaders (`staging`); casts; the internal its owners share (`BufferInternal`, also of sparse and external buffers, whose memory it frees), destroyed once the last owner dropped it and no frame can reach it
+//! Typed GPU buffers backed by gpu-allocator memory in a location their type names (`memory`; `Gpu` from `Shared`'s memory types on `rebar` devices, so uploaders write it in place), each with every usage lava's commands need; host access to host-visible ones (writes of `NoUninit` elements, reads of `AnyBitPattern` ones), checked against GPU writes still in flight; growth that keeps the contents (`reserve`); the staging rings and uploaders (`staging`); casts; the internal its owners share (`BufferInternal`, also of sparse and external buffers, whose memory it frees), destroyed once its handle, the submissions that use it and the buffers that reference it all let it go
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -20,7 +20,6 @@ use crate::{
         access_state::{AccessState, Tracker},
     },
     global::Live,
-    lifetime,
     object::Hazard,
     object::{Header, Object},
     queue::{lock, timeline::poll},
@@ -202,10 +201,9 @@ impl Drop for BufferInternal {
             &mut self.memory,
             BufferMemory::Allocation(Allocation::default()),
         );
-        lifetime::retire(move || {
-            unsafe { Ctx::device().destroy_buffer(handle, None) };
-            memory.free();
-        });
+        // Nothing in flight uses it: submissions keep what they use.
+        unsafe { Ctx::device().destroy_buffer(handle, None) };
+        memory.free();
     }
 }
 
@@ -680,7 +678,10 @@ impl<T: ReferencingData, M: HostVisible> Buffer<T, M> {
             keep_alive.replace(&self.internal, len, i, &references, &mut released);
         }
         drop(keep_alive);
-        drop(released);
+        // Submissions in flight may still read what the old elements referenced.
+        if !released.is_empty() {
+            crate::queue::timeline::keep_until_idle(std::sync::Arc::new(released));
+        }
     }
 }
 

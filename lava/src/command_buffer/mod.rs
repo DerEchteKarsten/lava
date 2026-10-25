@@ -45,7 +45,7 @@ pub(crate) mod access_state;
 mod binding_output;
 pub(crate) mod image_state;
 mod raster_state;
-use crate::object::{DIRTY_LAYOUT, Object, Strong, ancestor_hazards, mark_dirty};
+use crate::object::{DIRTY_LAYOUT, Keep, Object, Strong, ancestor_hazards, mark_dirty};
 use crate::reference::{Child, KeepAlive};
 use crate::unsized_struct::unsized_struct;
 use access_state::{READ_ACCESS, StructureAccesses, Tracker, WHOLE, WRITE_ACCESS};
@@ -185,6 +185,8 @@ pub(crate) struct Recording<'p> {
     pub(crate) structures: &'p mut StructureAccesses,
     /// What its accesses are tagged with.
     pub(crate) tracker: Tracker,
+    /// The objects its commands name, which its submission keeps alive.
+    pub(crate) keep: Keep,
     pub(crate) timeline: usize,
     pub(crate) value: u64,
     pub(crate) family: FamilyInfo,
@@ -2098,6 +2100,7 @@ impl<'p> Recording<'p> {
         Self {
             handle,
             structures,
+            keep: Keep::new(timeline, value),
             tracker,
             timeline,
             value,
@@ -2250,9 +2253,15 @@ impl<'p> Recording<'p> {
             &self.tracker,
             self.barrier_log,
             self.structures,
+            &mut self.keep,
             image_accesses,
             buffer_accesses,
         );
+    }
+
+    /// What its submission keeps alive until it completed.
+    pub(crate) fn take_kept(&mut self) -> Vec<crate::queue::timeline::Kept> {
+        std::mem::take(&mut self.keep.kept)
     }
 
     pub(crate) fn enter(&mut self, name: &str, pass: bool) {
@@ -2771,10 +2780,15 @@ pub(crate) fn record<'a>(
     t: &Tracker,
     log: &[Barriers],
     structures: &mut StructureAccesses,
+    keep: &mut Keep,
     image_accesses: impl Iterator<Item = ImageUse<'a>>,
     buffer_accesses: impl Iterator<Item = BufferAccess<'a>>,
 ) {
     for b in buffer_accesses {
+        #[cfg(feature = "acceleration-structure")]
+        if let Some(structure) = b.structure {
+            keep.object(structure);
+        }
         match b.buffer {
             None => {
                 if b.access.intersects(READ_ACCESS) {
@@ -2782,6 +2796,7 @@ pub(crate) fn record<'a>(
                 }
             }
             Some(buffer) => {
+                keep.object(buffer);
                 lock(&buffer.state).record(t, log, b.range, b.stage, b.access);
                 if (b.access).contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR) {
                     structures.record_write(t, log, b.stage, b.access);
@@ -2801,6 +2816,7 @@ pub(crate) fn record<'a>(
         }
     }
     for image in image_accesses {
+        keep.object(image.internal);
         let access = &image.access;
         lock(&image.internal.access).record(t, log, WHOLE, access.stage, access.access);
         if access.access.intersects(WRITE_ACCESS) && image.internal.header.has_parents() {

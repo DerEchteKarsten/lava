@@ -1,4 +1,4 @@
-//! Headless GPU tests: buffers (memory locations, host access and pointers, uploads), images, sync (threads recording at once, waits per stage and per timeline, stamps), command recording, extra accesses of what passes reach through pointers, queries (pool reuse, recorder misuse, host instants, memory reports), full bindless heaps, and golden images per pass type
+//! Headless GPU tests: buffers (memory locations, host access and pointers, uploads), images, sync (threads recording at once, waits per stage and per timeline, objects kept by the submissions that use them), command recording, extra accesses of what passes reach through pointers, queries (pool reuse, recorder misuse, host instants, memory reports), full bindless heaps, and golden images per pass type
 mod common;
 
 use common::render::*;
@@ -445,20 +445,21 @@ fn a_panicking_recording_still_makes_its_layout_transitions() {
     gpu.submit(|cmd| cmd.fill_buffer(readback.range(..), 0));
 }
 
-/// A thread that records runs no destructors: `reclaim` inside a submission leaves them for later.
+/// What a recording names lives until its submission completed, also when it is dropped
+/// inside the recording (the layer would report a destroyed buffer in the command buffer).
 #[test]
-fn a_recording_thread_runs_no_destructors() {
+fn objects_dropped_while_recorded_live_until_their_submission_completed() {
     let mut gpu = gpu();
-    let image =
-        Image::<R8G8B8A8Unorm, usage![Storage, TransferSrc, TransferDst]>::new(UVec2::new(8, 8))
-            .unwrap();
-    drop(image);
-    let mut buffer = zeroed_buffer::<u32>(4);
-    gpu.submit(|cmd| {
-        lava::reclaim();
+    let buffer = zeroed_buffer::<u32>(1 << 20);
+    let mut read = zeroed_buffer::<u32>(4);
+    let target = read.range(..);
+    gpu.submit(move |cmd| {
         cmd.fill_buffer(buffer.range(..), 1);
+        cmd.copy_buffer(buffer.range(..4), target);
+        drop(buffer);
+        lava::reclaim();
     });
-    assert_eq!(buffer.host(), [1; 4]);
+    assert_eq!(read.host(), [1; 4]);
 }
 
 #[test]
@@ -483,36 +484,34 @@ fn a_submission_waits_for_another_timelines() {
     assert_eq!(dst.host(), [9; 4]);
 }
 
-/// What is dropped after another timeline reserved lives until that one submitted and finished.
+/// What another timeline's submission uses lives until that submission completed, whatever
+/// this timeline submits meanwhile.
 #[test]
-fn deletions_wait_for_every_timeline() {
+fn deletions_wait_for_the_submissions_that_use_them() {
     let mut gpu = gpu();
     let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
     lava::wait_idle().unwrap();
     let bind = || {
-        Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::new(4, 4))
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::new(4, 4))
             .unwrap()
             .bind_sampled()
             .unwrap()
     };
-    other.reserve();
     let image = bind();
     let slot = image.handle::<bindless::Sampled>();
+    let cleared = (other.begin().unwrap())
+        .submit(|cmd| cmd.clear_image(image.whole_view(), [0.0; 4]))
+        .unwrap();
     drop(image);
     gpu.submit(|_| {});
     let unrelated = bind();
     assert_ne!(
         unrelated.handle::<bindless::Sampled>(),
         slot,
-        "the other timeline may still read it"
+        "the other timeline may still use it"
     );
-    other
-        .begin()
-        .unwrap()
-        .submit(|_| {})
-        .unwrap()
-        .block()
-        .unwrap();
+    drop(unrelated);
+    cleared.block().unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 }
 
@@ -541,47 +540,6 @@ fn timelines_are_limited_and_reused() {
         .unwrap()
         .block()
         .unwrap();
-}
-
-/// An application's own slot reuse (core's materials): an index freed with `latest_stamp()` is
-/// reused once that stamp is done, which takes every timeline.
-#[test]
-fn stamps_are_done_once_every_timeline_completed_them() {
-    let mut gpu = gpu();
-    let mut other = Timeline::<Graphics>::new(2, 0).unwrap();
-    assert!(lava::Stamp::default().is_done());
-    // Whatever an earlier test left reserved is signalled now.
-    gpu.submit(|_| {});
-    let idle = lava::latest_stamp();
-    assert!(idle.is_done(), "nothing is in flight");
-    let reusable = |free: &[(u32, lava::Stamp)]| -> Vec<u32> {
-        (free.iter())
-            .filter(|(_, stamp)| stamp.is_done())
-            .map(|&(index, _)| index)
-            .collect()
-    };
-    let frame = gpu.timeline.begin().unwrap();
-    let free = [(0, lava::latest_stamp())];
-    assert_ne!(free[0].1, idle, "`begin` raised the stamp");
-    assert!(
-        reusable(&free).is_empty(),
-        "the frame being recorded may still read index 0"
-    );
-    frame.submit(|_| {}).unwrap().block().unwrap();
-    assert_eq!(reusable(&free), [0]);
-
-    // Another timeline's reserved stamp holds a stamp back too.
-    other.reserve();
-    let stamp = lava::latest_stamp();
-    assert!(!stamp.is_done());
-    gpu.submit(|_| {});
-    assert!(!stamp.is_done(), "the other timeline hasn't submitted");
-    (other.begin().unwrap())
-        .submit(|_| {})
-        .unwrap()
-        .block()
-        .unwrap();
-    assert!(stamp.is_done());
 }
 
 /// Records eight fills of 64 MiB on `timeline`, then copies `data` into `target`: a submission
@@ -2251,30 +2209,35 @@ fn pairs_skip_single_holes() {
     drop(kept);
 }
 
-/// A dropped image's slots are free again once no submission reaches it.
+/// A dropped image's slots are free again once no submission uses it.
 #[test]
 fn slots_are_free_again_once_their_image_is_destroyed() {
     let mut gpu = gpu();
     // Destroys what earlier tests dropped, so the lowest free slots are the first ones.
     lava::wait_idle().unwrap();
     let bind = || {
-        Image::<R8G8B8A8Unorm, usage![Sampled]>::new(UVec2::new(4, 4))
+        Image::<R8G8B8A8Unorm, usage![Sampled, TransferDst]>::new(UVec2::new(4, 4))
             .unwrap()
             .bind_sampled()
             .unwrap()
     };
     let image = bind();
     let slot = image.handle::<bindless::Sampled>();
-    // A frame being recorded may reach it: even a poll leaves its slot taken.
-    let frame = gpu.timeline.begin().unwrap();
+    // Unused, it goes right away.
     drop(image);
-    lava::reclaim();
+    let image = bind();
+    assert_eq!(image.handle::<bindless::Sampled>(), slot);
+    // A submission that uses it keeps it until it completed and something let it go.
+    let frame = (gpu.timeline.begin().unwrap())
+        .submit(|cmd| cmd.clear_image(image.whole_view(), [0.0; 4]))
+        .unwrap();
+    drop(image);
     assert_ne!(
         bind().handle::<bindless::Sampled>(),
         slot,
-        "taken until no frame reaches it"
+        "taken until no submission uses it"
     );
-    frame.submit(|_| {}).unwrap().block().unwrap();
+    frame.block().unwrap();
     assert_eq!(bind().handle::<bindless::Sampled>(), slot);
 
     // A mip chain frees its whole view's slot and each mip's, erased or not, and so does a
@@ -2295,8 +2258,9 @@ fn slots_are_free_again_once_their_image_is_destroyed() {
         bound.mip_view(0).handle::<bindless::Storage>(),
     );
     drop(bound);
-    lava::wait_idle().unwrap();
-    assert_eq!(bind().handle::<bindless::Sampled>(), whole);
+    // Held, so the next binds take other slots.
+    let first = bind();
+    assert_eq!(first.handle::<bindless::Sampled>(), whole);
     let again = chain().bind_mips_storage().unwrap();
     assert_eq!(
         again.mip_view(0).handle::<bindless::Storage>(),
@@ -2411,13 +2375,14 @@ fn samplers_filter_by_their_description_and_free_their_slots() {
     let desc = SamplerDesc::new();
     let dropped = Sampler::new(&desc).unwrap();
     let index = dropped.handle();
-    // A frame being recorded may reach it: even a poll leaves its slot taken.
-    let frame = gpu.timeline.begin().unwrap();
+    // A push constant names a sampler without keeping it: its slot waits for every submission
+    // in flight at its drop.
+    let frame = gpu.timeline.begin().unwrap().submit(|_| {}).unwrap();
     drop(dropped);
     lava::reclaim();
     let next = Sampler::new(&desc).unwrap();
     assert_ne!(next.handle(), index, "taken until no frame reaches it");
-    frame.submit(|_| {}).unwrap().block().unwrap();
+    frame.block().unwrap();
     assert_eq!(Sampler::new(&desc).unwrap().handle(), index);
     drop(next);
 }
@@ -2478,12 +2443,13 @@ fn full_bindless_heaps_are_errors() {
         let array =
             Image::<R8G8B8A8Unorm, usage![Sampled], D2Array>::with_layers(UVec2::ONE, 1, layers)
                 .unwrap();
+        taken.push(array);
+        let array = taken.last().unwrap();
         for layer in 0..layers {
             if let Err(error) = array.whole_view().layer(layer).bind::<bindless::Sampled>() {
                 break 'fill error;
             }
         }
-        taken.push(array);
     };
     assert!(
         matches!(

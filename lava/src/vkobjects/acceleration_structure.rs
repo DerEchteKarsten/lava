@@ -25,7 +25,6 @@ use crate::{
     error::{Error, Result},
     features::{Feature, gate},
     global::Live,
-    lifetime,
     object::{Hazard, Header, Object, Strong},
     query::{CompactedSize, QueryKind, QueryPool, SerializedSize},
     queue::{HasCompute, lock},
@@ -890,12 +889,10 @@ impl Drop for StructureInternal {
             Memory::Own(_) => None,
             Memory::Arena { arena, units } => Some((arena.clone(), units.clone())),
         };
-        lifetime::retire(move || {
-            unsafe { command_functions().destroy_acceleration_structure(handle, None) };
-            if let Some((arena, units)) = arena {
-                lock(&arena.free).give(units);
-            }
-        });
+        unsafe { command_functions().destroy_acceleration_structure(handle, None) };
+        if let Some((arena, units)) = arena {
+            lock(&arena.free).give(units);
+        }
     }
 }
 
@@ -2123,7 +2120,7 @@ impl<K: HasCompute> CommandBuffer<'_, K> {
         self.rec.enter(name, false);
         self.rec
             .flush_pending(std::iter::empty(), accesses.iter().cloned());
-        sizes.take(&self.rec, first, count);
+        sizes.take(&mut self.rec, first, count);
         let handles: SmallVec<[_; 8]> = structures.iter().map(|s| s.internal.handle).collect();
         unsafe {
             command_functions().cmd_write_acceleration_structures_properties(

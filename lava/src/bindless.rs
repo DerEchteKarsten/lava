@@ -21,7 +21,6 @@ use crate::{
         slice::{ImageView, single_aspect},
         usage::ImageUsage,
     },
-    lifetime,
     object::{Header, Object},
     queue::{Kind, lock},
     state::{Ctx, Functions},
@@ -417,7 +416,10 @@ impl Sampler {
 impl Drop for SamplerInternal {
     fn drop(&mut self) {
         let index = self.index;
-        lifetime::retire(move || lock(&Bindless::get().free_samplers).give(index..index + 1));
+        // A push constant may name it without keeping it: its slot waits for what is in flight.
+        crate::queue::timeline::destroy_when_idle(move || {
+            lock(&Bindless::get().free_samplers).give(index..index + 1)
+        });
     }
 }
 
@@ -919,7 +921,7 @@ impl Bindless {
         }
     }
 
-    /// Unsets the heaps and hands their buffers to [`lifetime`], at `shutdown`.
+    /// Unsets the heaps and destroys their buffers, at `shutdown`.
     ///
     /// # Safety
     /// Nothing records or binds (lava is closed), and every image and sampler was destroyed.

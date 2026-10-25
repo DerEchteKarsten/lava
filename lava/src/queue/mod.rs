@@ -273,7 +273,7 @@ impl<S: StageSet> Wait<S> {
             *value = (*value).max(wait.value);
         }
         let done = timeline::wait_values(&values, timeout)?;
-        crate::lifetime::run_ready();
+        timeline::release_completed();
         Ok(done)
     }
 }

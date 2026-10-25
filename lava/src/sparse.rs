@@ -32,7 +32,6 @@ use crate::{
         format::{ColorAspect, Format, StaticFormat},
         usage::{ImageUsage, StaticUsage},
     },
-    lifetime,
     object::Header,
     queue::{Graphics, Timeline, Wait, lock},
     state::Ctx,
@@ -714,7 +713,7 @@ impl<'a> Batch<'a> {
             .filter_map(|(pages, page)| lock(&pages.resident).remove(&page))
             .collect();
         if !freed.is_empty() {
-            lifetime::retire(move || {
+            crate::queue::timeline::destroy_when_idle(move || {
                 let mut allocator = Ctx::allocator();
                 for allocation in freed {
                     if let Err(err) = allocator.free(allocation) {

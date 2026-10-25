@@ -1,7 +1,7 @@
-//! GPU objects as lava owns them: each lives in an `Arc` of its internal (buffers, images, acceleration structures, samplers), whose `Header` counts it as a lava user until its drop finished and keeps what references between objects need (the buffers that reference it, and dirty bits a write marks them with), and the typed strong references (`Strong`) a referencing buffer holds its children by
+//! GPU objects as lava owns them: each lives in an `Arc` of its internal (buffers, images, acceleration structures, samplers), whose `Header` counts it as a lava user until its drop finished and keeps what references between objects need (the buffers that reference it, and dirty bits a write marks them with), the typed strong references (`Strong`) a referencing buffer holds its children by, and the keep list (`Keep`) of what a recording names, which its submission holds until it completed
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
 };
 
 use smallvec::SmallVec;
@@ -33,6 +33,8 @@ pub(crate) struct Header {
     pub(crate) parents: Mutex<SmallVec<[Weak<dyn Object>; 2]>>,
     /// `parents`' length, so writes of objects nothing references skip the lock.
     pub(crate) parent_count: AtomicU32,
+    /// The recording that kept it last (`Keep::tag`), so a recording keeps it once.
+    pub(crate) last_kept: AtomicU64,
     /// Somewhere below this object is a write reference: a command that reaches it may write
     /// through it, so it walks to the writers even when nothing is dirty. Never cleared while
     /// the object lives.
@@ -47,6 +49,7 @@ impl Header {
             dirty: AtomicU32::new(0),
             parents: Mutex::default(),
             parent_count: AtomicU32::new(0),
+            last_kept: AtomicU64::new(0),
             writes_below: AtomicBool::new(false),
             _live: live,
         }
@@ -162,4 +165,33 @@ fn parents(object: &dyn Object) -> SmallVec<[Arc<dyn Object>; 2]> {
     (lock(&object.header().parents).iter())
         .filter_map(Weak::upgrade)
         .collect()
+}
+
+/// The objects a recording names, which its submission keeps alive until it completed
+/// (`timeline::keep_until`): each once, by the recording's tag in the object's header.
+pub(crate) struct Keep {
+    tag: u64,
+    pub(crate) kept: Vec<crate::queue::timeline::Kept>,
+}
+
+impl Keep {
+    /// The keep list of the recording of `value` on timeline `timeline`.
+    pub(crate) fn new(timeline: usize, value: u64) -> Self {
+        Keep {
+            tag: (timeline as u64 + 1) << 56 | value,
+            kept: Vec::new(),
+        }
+    }
+
+    pub(crate) fn object<T: Object>(&mut self, object: &Arc<T>) {
+        if object.header().last_kept.swap(self.tag, Relaxed) != self.tag {
+            let object: Arc<dyn Object> = object.clone();
+            self.kept.push(crate::queue::timeline::Kept::Object(object));
+        }
+    }
+
+    /// Something else the submission needs alive, which its caller keeps once.
+    pub(crate) fn other(&mut self, other: Arc<dyn std::any::Any + Send + Sync>) {
+        self.kept.push(crate::queue::timeline::Kept::Other(other));
+    }
 }

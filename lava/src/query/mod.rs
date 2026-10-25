@@ -1,4 +1,4 @@
-//! GPU queries: user-owned pools of one kind each (timestamps, and with their features pipeline and compute statistics, occlusion, hardware counters, compacted sizes), the kinds each queue family records as a type (`RecordedOn`), each query taken once per recording and the pool reset on the host when a recording first touches it, read without waiting, calibrated against the host's clock (cached), and destroyed once no submission can reach them
+//! GPU queries: user-owned pools of one kind each (timestamps, and with their features pipeline and compute statistics, occlusion, hardware counters, compacted sizes), the kinds each queue family records as a type (`RecordedOn`), each query taken once per recording and the pool reset on the host when a recording first touches it, read without waiting, calibrated against the host's clock (cached), and destroyed once the pool and every submission that used it are gone (`PoolOwner`)
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "calibrated-timestamps")]
 use std::{
@@ -13,7 +13,6 @@ use crate::{
     command_buffer::Recording,
     error::{Error, Result},
     features::{Feature, Gated, gate},
-    lifetime,
     queue::{HasCompute, HasGraphics, QueueKind, timeline::poll},
     sealed::Sealed,
     state::{Ctx, Functions},
@@ -219,8 +218,29 @@ pub struct QueryPool<K: QueryKind> {
     /// One bit per query that recording used.
     used: Box<[AtomicU64]>,
     pub(crate) kind: K,
+    /// What destroys the pool, which recordings keep until their submissions completed.
+    owner: std::sync::Arc<PoolOwner>,
+}
+
+/// A query pool's `VkQueryPool`, destroyed once the pool and every submission that used it are
+/// gone.
+struct PoolOwner {
+    handle: vk::QueryPool,
+    /// A performance pool holds the profiling lock.
+    #[cfg(feature = "performance-query")]
+    locked: bool,
     /// Last, so it counts the pool until its drop finished.
     _live: crate::global::Live,
+}
+
+impl Drop for PoolOwner {
+    fn drop(&mut self) {
+        unsafe { Ctx::device().destroy_query_pool(self.handle, None) };
+        #[cfg(feature = "performance-query")]
+        if self.locked {
+            counters::release_lock();
+        }
+    }
 }
 
 impl<K: QueryKind> QueryPool<K> {
@@ -237,7 +257,12 @@ impl<K: QueryKind> QueryPool<K> {
             last: AtomicU64::new(0),
             used: (0..count.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
             kind,
-            _live: live,
+            owner: std::sync::Arc::new(PoolOwner {
+                handle,
+                #[cfg(feature = "performance-query")]
+                locked: K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR,
+                _live: live,
+            }),
         })
     }
 
@@ -248,13 +273,15 @@ impl<K: QueryKind> QueryPool<K> {
     /// Called by every command that touches the pool: resets it on the host the first time a
     /// recording does, except in a later pass of the capture that profiles it, which keeps the
     /// earlier passes' counters.
-    fn record(&self, rec: &Recording) {
+    fn record(&self, rec: &mut Recording) {
         const _: () = assert!(crate::queue::MAX_TIMELINES <= 8);
         let packed = rec.value << 3 | rec.timeline as u64;
         let last = self.last.swap(packed, Ordering::Relaxed);
         if last == packed {
             return;
         }
+        // The submission keeps the pool until it completed.
+        rec.keep.other(self.owner.clone());
         for word in &self.used {
             word.store(0, Ordering::Relaxed);
         }
@@ -277,7 +304,7 @@ impl<K: QueryKind> QueryPool<K> {
     /// `rec` is the first to touch it. Panics if they aren't in the pool or `rec` took one of
     /// them already.
     #[track_caller]
-    pub(crate) fn take(&self, rec: &Recording, first: u32, count: u32) {
+    pub(crate) fn take(&self, rec: &mut Recording, first: u32, count: u32) {
         let end = first.checked_add(count).filter(|&end| end <= self.count);
         let Some(end) = end else {
             panic!(
@@ -666,20 +693,5 @@ impl QueryPool<SerializedSize> {
     pub fn serialized_sizes(count: u32) -> Result<Self> {
         crate::vkobjects::acceleration_structure::functions()?;
         Self::create(count, vk::QueryPoolCreateInfo::default(), SerializedSize)
-    }
-}
-
-impl<K: QueryKind> Drop for QueryPool<K> {
-    fn drop(&mut self) {
-        let pool = self.handle;
-        #[cfg(feature = "performance-query")]
-        let locked = K::TYPE == vk::QueryType::PERFORMANCE_QUERY_KHR;
-        lifetime::retire(move || {
-            unsafe { Ctx::device().destroy_query_pool(pool, None) };
-            #[cfg(feature = "performance-query")]
-            if locked {
-                counters::release_lock();
-            }
-        });
     }
 }

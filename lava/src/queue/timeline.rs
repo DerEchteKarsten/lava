@@ -1,4 +1,4 @@
-//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (after the last sparse binding; with `submit_profiled` inside a hardware counter query, and `capture` once per counter pass) and sparse bindings (`submit_sparse`, ordered with them by the semaphore), the base value below which a new timeline of an index ignores its former owners' tracked accesses, and the reads of every acceleration structure; values no submission signals (a dropped timeline's stamp, a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
+//! Timelines: up to `MAX_TIMELINES` timeline semaphores, each owned by one `Timeline` at a time and pinned to one queue with a command pool per frame in flight and an optional staging ring (`uploader()`), and the submission of their recordings (after the last sparse binding; with `submit_profiled` inside a hardware counter query, and `capture` once per counter pass) and sparse bindings (`submit_sparse`, ordered with them by the semaphore), the base value below which a new timeline of an index ignores its former owners' tracked accesses, and the reads of every acceleration structure; what each submission keeps alive until it completed (`keep_until`, and `keep_until_idle` for what no recording tracks), released by `begin`, waits, `reclaim` and `wait_idle`; values no submission signals (a failed replay) are signalled from the host, device loss comes out of polls and waits, and `shutdown` destroys the semaphores
 use std::{
     fmt,
     marker::PhantomData,
@@ -23,7 +23,7 @@ use crate::{
     },
     error::{Error, Result},
     global::Live,
-    lifetime,
+    object::Object,
     queue::{FamilyInfo, FamilyQueues, Kind, MAX_TIMELINES, QueueKind, StageOf, Wait, lock},
     state::{CALLSITE, Ctx, vk_error},
 };
@@ -40,8 +40,9 @@ pub(crate) struct Index {
     /// Its timeline semaphore's raw handle, 0 before the first timeline of the index (and
     /// after `shutdown`).
     semaphore: AtomicU64,
-    /// What drops are stamped with: `Timeline::reserve` counts it up, a submission signals it.
-    pub(crate) stamp: AtomicU64,
+    /// The value of the recording in progress, 0 for none: what lava keeps objects no
+    /// recording tracks alive for (`keep_until_idle`) besides the submitted values.
+    recording: AtomicU64,
     completed: AtomicU64,
     /// The last value of the timelines that owned the index before its current one: accesses
     /// objects keep of it up to there are theirs, on another queue maybe, so its current
@@ -51,6 +52,89 @@ pub(crate) struct Index {
     /// submission, which host access checks writes against.
     submitted: AtomicU64,
     pub(crate) state: Mutex<IndexState>,
+    /// What its submissions keep alive, by the value that completes them (`keep_until`).
+    kept: Mutex<Vec<(u64, Vec<Kept>)>>,
+}
+
+/// What a submission keeps alive until it completed: the objects its recording named, and
+/// what lava destroys only once nothing in flight can use it.
+#[allow(dead_code, reason = "held until the submission completed")]
+pub(crate) enum Kept {
+    Object(Arc<dyn Object>),
+    Other(Arc<dyn std::any::Any + Send + Sync>),
+}
+
+/// Keeps `kept` until timeline `i` completed `value`.
+pub(crate) fn keep_until(i: usize, value: u64, kept: Vec<Kept>) {
+    if kept.is_empty() {
+        return;
+    }
+    lock(&INDICES[i].kept).push((value, kept));
+}
+
+/// Keeps `object` until every recording in progress and every submission so far completed:
+/// what no recording tracks (a reloaded pass's pipelines, a freed sampler slot, unbound sparse
+/// pages). Dropped right away when nothing is in flight.
+pub(crate) fn keep_until_idle(object: Arc<dyn std::any::Any + Send + Sync>) {
+    for (i, index) in INDICES.iter().enumerate() {
+        let latest = (index.recording.load(Ordering::SeqCst)).max(index.submitted());
+        if latest > completed(i) {
+            keep_until(i, latest, vec![Kept::Other(object.clone())]);
+        }
+    }
+}
+
+/// Runs `destroy` once nothing in flight can use what it destroys (`keep_until_idle`).
+pub(crate) fn destroy_when_idle(destroy: impl FnOnce() + Send + 'static) {
+    struct OnDrop(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            if let Some(destroy) = lock(&self.0).take() {
+                destroy();
+            }
+        }
+    }
+    keep_until_idle(Arc::new(OnDrop(Mutex::new(Some(Box::new(destroy))))));
+}
+
+/// Drops what timeline `i`'s completed submissions kept, as far as the last poll knows; outside
+/// the lock, since destructors keep things too.
+pub(crate) fn release(i: usize) {
+    let done = completed(i);
+    let released: Vec<(u64, Vec<Kept>)> = lock(&INDICES[i].kept)
+        .extract_if(.., |(value, _)| *value <= done)
+        .collect();
+    drop(released);
+}
+
+/// `release` on every timeline.
+pub(crate) fn release_completed() {
+    for i in 0..MAX_TIMELINES {
+        release(i);
+    }
+}
+
+/// Drops everything every timeline keeps: `shutdown`, once the device is idle (or lost).
+pub(crate) fn release_all() {
+    for index in INDICES.iter() {
+        let released = std::mem::take(&mut *lock(&index.kept));
+        drop(released);
+    }
+}
+
+/// Polls every timeline and drops what their completed submissions kept alive: objects the
+/// application dropped while submissions used them are destroyed then. `begin`, `Wait::block`
+/// and [`wait_idle`](crate::wait_idle) do it too.
+pub fn reclaim() {
+    let _call = crate::state::call();
+    let _ = poll_all();
+    release_completed();
+}
+
+thread_local! {
+    /// The thread records a submission: presents and acquires, whose semaphores its own
+    /// submission would signal, panic there.
+    pub(crate) static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Index {
@@ -80,11 +164,12 @@ pub(crate) struct IndexState {
 pub(crate) static INDICES: LazyLock<[Index; MAX_TIMELINES]> = LazyLock::new(|| {
     std::array::from_fn(|_| Index {
         semaphore: AtomicU64::new(0),
-        stamp: AtomicU64::new(0),
+        recording: AtomicU64::new(0),
         completed: AtomicU64::new(0),
         base: AtomicU64::new(0),
         submitted: AtomicU64::new(0),
         state: Mutex::default(),
+        kept: Mutex::new(Vec::new()),
     })
 });
 
@@ -173,8 +258,8 @@ pub(crate) fn wait_values(values: &[u64; MAX_TIMELINES], timeout: Duration) -> R
 }
 
 /// Signals `value` of timeline `i` from the host, for a value no submission will signal (a
-/// timeline dropped with its stamp ahead, a recording that never reached the GPU), so what
-/// waits for it goes on. Waits for its earlier submissions (up to `submitted`) first, which a
+/// recording that never reached the GPU, whose barrier-only replay failed too), so what waits
+/// for it goes on. Waits for its earlier submissions (up to `submitted`) first, which a
 /// host signal must not overtake. Leaves the values alone once the device is lost.
 fn host_signal(i: usize, submitted: u64, value: u64) {
     let signalled = (|| -> Result<()> {
@@ -198,8 +283,8 @@ fn host_signal(i: usize, submitted: u64, value: u64) {
 }
 
 /// Destroys every timeline semaphore at `shutdown`, once no timeline exists. Their values go
-/// on in the next context, which starts each semaphore at its index's stamp, so `Wait`s and
-/// `Stamp`s of this one count as done there.
+/// on in the next context, which starts each semaphore at its index's last submitted value, so
+/// `Wait`s of this one count as done there.
 ///
 /// # Safety
 /// No timeline exists and nothing polls (lava is closed).
@@ -209,12 +294,10 @@ pub(crate) unsafe fn destroy() {
             unsafe { Ctx::device().destroy_semaphore(semaphore, None) };
             index.semaphore.store(0, Ordering::Release);
         }
-        let stamp = index.stamp.load(Ordering::SeqCst);
-        index.completed.fetch_max(stamp, Ordering::AcqRel);
         let mut state = lock(&index.state);
         state.structures = StructureAccesses::default();
-        let submitted = state.submitted.max(stamp);
-        state.set_submitted(index, submitted);
+        let submitted = state.submitted;
+        index.completed.fetch_max(submitted, Ordering::AcqRel);
         index.base.fetch_max(submitted, Ordering::AcqRel);
     }
     *lock(&LIVE) = [false; MAX_TIMELINES];
@@ -267,14 +350,6 @@ impl Drop for Inner {
                 tracing::error!(%err, "failed to wait for a dropped timeline's submissions")
             }
         }
-        // A stamp `reserve` or an unsubmitted `begin` raised past the last submission: no
-        // submission will signal it, and what was dropped meanwhile waits for it.
-        let stamp = index.stamp.load(Ordering::SeqCst);
-        if stamp > submitted {
-            host_signal(self.index, submitted, stamp);
-            // Signalled, so the next timeline of the index submits past it.
-            lock(&index.state).set_submitted(index, stamp);
-        }
         for slot in &self.slots {
             unsafe { Ctx::device().destroy_command_pool(slot.pool, None) };
         }
@@ -289,7 +364,9 @@ impl Drop for Inner {
         }
         lock(&self.family.timelines)[self.queue] -= 1;
         lock(&LIVE)[self.index] = false;
-        lifetime::run_ready();
+        // Its submissions completed: what they kept goes (on a lost device too).
+        let released = std::mem::take(&mut *lock(&index.kept));
+        drop(released);
     }
 }
 
@@ -328,10 +405,7 @@ impl<K: QueueKind> Timeline<K> {
                 .ok_or(Error::OutOfTimelines)?;
             if semaphore_of(index).is_none() {
                 // Values go on from what the index's earlier semaphores reached.
-                let start = INDICES[index]
-                    .stamp
-                    .load(Ordering::SeqCst)
-                    .max(completed(index));
+                let start = INDICES[index].submitted().max(completed(index));
                 let mut timeline = vk::SemaphoreTypeCreateInfo::default()
                     .semaphore_type(vk::SemaphoreType::TIMELINE)
                     .initial_value(start);
@@ -443,14 +517,6 @@ impl<K: QueueKind> Timeline<K> {
         Ok(Uploader::new(self.inner.staging.clone(), D::KIND))
     }
 
-    /// Counts the stamp up: call it before reading anything the next submission will reach, so
-    /// what is dropped after it lives until that submission finished.
-    pub fn reserve(&self) {
-        INDICES[self.inner.index]
-            .stamp
-            .fetch_add(1, Ordering::SeqCst);
-    }
-
     /// Submits a sparse binding through `bind` on the timeline's queue, after every earlier
     /// submission of the timeline (its wait, the timeline's last value) and signalling its
     /// next value, which the next submission waits for. `bind` gets the queue, the wait (none
@@ -464,8 +530,7 @@ impl<K: QueueKind> Timeline<K> {
         let i = inner.index;
         let index = &INDICES[i];
         let mut state = lock(&index.state);
-        index.stamp.fetch_max(state.submitted + 1, Ordering::SeqCst);
-        let value = index.stamp.load(Ordering::SeqCst);
+        let value = state.submitted + 1;
         let wait = (state.submitted > 0).then_some((semaphore(i), state.submitted));
         let queue = &inner.family.queues[inner.queue];
         bind(*lock(queue), wait, (semaphore(i), value))?;
@@ -488,17 +553,14 @@ impl<K: QueueKind> Timeline<K> {
         self.inner.index
     }
 
-    /// Waits until the next frame slot's last submission finished and destroys what that frees.
-    /// The submission borrows the timeline, so it has one at a time.
+    /// Waits until the next frame slot's last submission finished and destroys what the
+    /// completed submissions kept alive and nothing else holds. The submission borrows the
+    /// timeline, so it has one at a time.
     #[validation_trace]
     pub fn begin(&mut self) -> Result<Submission<'_, K>> {
         let inner = &mut self.inner;
-        let index = &INDICES[inner.index];
         let slot = (inner.begun % inner.slots.len() as u64) as usize;
         inner.begun += 1;
-        index
-            .stamp
-            .fetch_max(lock(&index.state).submitted + 1, Ordering::SeqCst);
         // One poll of every timeline, this one's slot included, then a wait only if it is behind.
         poll_all()?;
         let signalled = inner.slots[slot].signalled;
@@ -506,7 +568,7 @@ impl<K: QueueKind> Timeline<K> {
             let _span = tracing::info_span!("wait for frame slot").entered();
             wait_value(inner.index, signalled)?;
         }
-        lifetime::run_ready();
+        release_completed();
         let pool = inner.slots[slot].pool;
         unsafe { Ctx::device().reset_command_pool(pool, vk::CommandPoolResetFlags::empty()) }
             .map_err(vk_error)?;
@@ -568,9 +630,10 @@ impl<K: QueueKind> Submission<'_, K> {
         self
     }
 
-    /// Records `record` and submits it after its waits, signalling the timeline's stamp. A
-    /// recording that doesn't reach the GPU is replaced by a submission of just its barriers,
-    /// then its panic continues or its error is returned.
+    /// Records `record` and submits it after its waits, signalling the timeline's next value;
+    /// the objects its commands name live until it completed. A recording that doesn't reach
+    /// the GPU is replaced by a submission of just its barriers, then its panic continues or
+    /// its error is returned.
     #[validation_trace]
     pub fn submit(self, record: impl FnOnce(&mut CommandBuffer<K>)) -> Result<Wait> {
         self.submit_inner(None, record)
@@ -591,9 +654,9 @@ impl<K: QueueKind> Submission<'_, K> {
         let slot = &mut inner.slots[self.slot];
         let mut state = lock(&index.state);
         let state = &mut *state;
-        // `begin` raised the stamp past the last submission's value.
-        let value = index.stamp.load(Ordering::SeqCst);
-        debug_assert!(value > state.submitted);
+        let value = state.submitted + 1;
+        // Before any lookup the recording makes: what lava retires meanwhile waits for it.
+        index.recording.store(value, Ordering::SeqCst);
         let tracker = Tracker {
             timeline: i as u8,
             value,
@@ -612,7 +675,7 @@ impl<K: QueueKind> Submission<'_, K> {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(slot.cmd, &begin_info)? };
         let prev = CALLSITE.replace(None);
-        let was_recording = lifetime::RECORDING.replace(true);
+        let was_recording = RECORDING.replace(true);
         // Counters of command-buffer scope need their query's begin as the first command.
         let begun = std::panic::catch_unwind(AssertUnwindSafe(|| {
             #[cfg(feature = "performance-query")]
@@ -629,7 +692,7 @@ impl<K: QueueKind> Submission<'_, K> {
         Bindless::bind(slot.cmd, K::KIND);
         let recorded =
             begun.and_then(|()| std::panic::catch_unwind(AssertUnwindSafe(|| record(&mut cmd))));
-        lifetime::RECORDING.set(was_recording);
+        RECORDING.set(was_recording);
         CALLSITE.set(prev);
 
         let rec = &mut cmd.rec;
@@ -773,10 +836,14 @@ impl<K: QueueKind> Submission<'_, K> {
         }
         #[cfg(feature = "acceleration-structure")]
         cmd.rec.finish_structure_builds(result.is_ok());
+        // Submitted, or replayed or signalled from the host: its value completes it.
+        let kept = cmd.rec.take_kept();
         drop(cmd);
         slot.barrier_log.clear();
         slot.signalled = value;
         state.set_submitted(index, value);
+        index.recording.store(0, Ordering::SeqCst);
+        keep_until(i, value, kept);
         match result {
             Ok(()) => Ok(Wait {
                 timeline: i as u8,

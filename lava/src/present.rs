@@ -35,7 +35,6 @@ use crate::{
         slice::ImageView,
         usage::{StaticUsage, usage},
     },
-    lifetime::{self, Stamp, latest_stamp},
     queue::{
         HasGraphics, lock,
         timeline::{completed, poll},
@@ -330,8 +329,8 @@ pub struct PresentSurface<U: StaticUsage = usage![ColorAttachment, TransferDst]>
     /// out-of-date result and when the swapchain is made.
     capabilities: Option<(UVec2, vk::SurfaceCapabilitiesKHR)>,
     swapchain: Option<Swapchain>,
-    /// Replaced swapchains, with what they wait for.
-    old: Vec<(Swapchain, Stamp)>,
+    /// Replaced swapchains, which wait for their presents.
+    old: Vec<Swapchain>,
     recreate: bool,
     /// Acquire semaphores nothing uses.
     free: Vec<vk::Semaphore>,
@@ -390,11 +389,11 @@ fn present_fences() -> Result<()> {
 }
 
 /// Panics on a thread that records a submission: a present or acquire there would use a
-/// semaphore its own submission signals, and destroying a swapchain locks the recording's state.
+/// semaphore its own submission signals.
 #[track_caller]
 fn not_recording(what: &str, when: &str) {
     assert!(
-        !lifetime::RECORDING.get(),
+        !crate::queue::timeline::RECORDING.get(),
         "`{what}` is called while a submission records: call it {when} `submit`"
     );
 }
@@ -674,11 +673,11 @@ impl<U: StaticUsage> PresentSurface<U> {
                 self.fences.push(fence);
             }
         }
-        // A replaced swapchain goes once no frame reaches it and its presents are done.
-        for (swapchain, _) in (self.old).extract_if(.., |(swapchain, stamp)| {
-            swapchain.fences.iter().all(signalled) && stamp.is_done()
-        }) {
-            swapchain.destroy();
+        // A replaced swapchain goes once its presents are done and nothing in flight uses it.
+        for swapchain in
+            (self.old).extract_if(.., |swapchain| swapchain.fences.iter().all(signalled))
+        {
+            crate::queue::timeline::destroy_when_idle(move || swapchain.destroy());
         }
         if size.x == 0 || size.y == 0 {
             return Ok(false);
@@ -763,7 +762,7 @@ impl<U: StaticUsage> PresentSurface<U> {
             .as_ref()
             .map_or_else(vk::SwapchainKHR::null, |s| s.handle);
         if let Some(old) = old {
-            self.old.push((old, latest_stamp()));
+            self.old.push(old);
         }
         self.capabilities = None;
         let mode = self.present_mode.vk();
@@ -1092,7 +1091,7 @@ impl<U: StaticUsage> Drop for PresentSurface<U> {
             }
             self.free.push(current.acquire);
         }
-        let mut swapchains: Vec<Swapchain> = self.old.drain(..).map(|(s, _)| s).collect();
+        let mut swapchains: Vec<Swapchain> = self.old.drain(..).collect();
         swapchains.extend(self.swapchain.take());
         let fences: Vec<vk::Fence> = swapchains
             .iter()
@@ -1108,7 +1107,8 @@ impl<U: StaticUsage> Drop for PresentSurface<U> {
         semaphores.extend(self.waited.drain(..).map(|(semaphore, ..)| semaphore));
         let fences = std::mem::take(&mut self.fences);
         let surface = self.surface;
-        lifetime::retire(move || {
+        // After the submissions in flight, which may still keep its images.
+        crate::queue::timeline::destroy_when_idle(move || {
             for swapchain in swapchains {
                 swapchain.destroy();
             }

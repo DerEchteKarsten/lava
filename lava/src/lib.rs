@@ -6,12 +6,14 @@
 //!
 //! # Submission and lifetimes
 //! Work goes to a [`queue::Timeline`] (graphics, and with `async-compute`/`async-transfer` the
-//! dedicated compute and transfer families): `reserve()` counts its stamp up before reading
-//! anything the next submission reaches, `begin()` waits for a free frame slot, and `submit`
-//! records, submits and returns a [`queue::Wait`] for other timelines and the host. Barriers
-//! within a timeline are automatic; images move between families with
-//! [`command_buffer::CommandBuffer::release`]. Dropped objects are destroyed once every timeline
-//! finished its stamp at the drop ([`Stamp`]). Windows present through a [`present::PresentSurface`] and its current
+//! dedicated compute and transfer families): `begin()` waits for a free frame slot, and
+//! `submit` records, submits and returns a [`queue::Wait`] for other timelines and the host.
+//! Barriers within a timeline are automatic; images move between families with
+//! [`command_buffer::CommandBuffer::release`]. Every object lives in an `Arc` that its handle,
+//! the submissions in flight that name it and the referencing buffers that hold it share: a
+//! dropped object is destroyed once the last of them lets it go (`begin`, the waits of a
+//! [`queue::Wait`], [`reclaim`] and [`wait_idle`] release what completed submissions kept).
+//! Windows present through a [`present::PresentSurface`] and its current
 //! image, whose acquire and present follow from what the submission does with it. A submission
 //! waits for another timeline's [`queue::Wait`] at a stage of its own family's set
 //! ([`queue::GraphicsStage`], [`queue::ComputeStage`], [`queue::TransferStage`]).
@@ -84,9 +86,9 @@ pub use crate::command_buffer::{
 pub use crate::error::{Error, Result};
 pub use crate::features::{Features, Gated, MissingFeature};
 pub use crate::image::{DynamicImage, Image, ImageSlice, ImageView, MipChain};
-pub use crate::lifetime::{Stamp, latest_stamp, reclaim};
 pub use crate::present::PresentSurface;
 pub use crate::query::QueryPool;
+pub use crate::queue::timeline::reclaim;
 pub use crate::queue::{PerFrame, Submission, Timeline, Wait};
 pub use crate::state::{Ctx, FormatProperties};
 /// The stages timestamps and accesses name.
@@ -117,7 +119,6 @@ pub mod features;
 mod global;
 pub mod half;
 pub mod image;
-mod lifetime;
 pub mod memory;
 mod object;
 pub mod pipeline;
@@ -321,7 +322,7 @@ pub fn init(config: &Config) -> Result<()> {
 pub fn wait_idle() -> Result<()> {
     let _call = state::call();
     device_idle()?;
-    lifetime::run_ready();
+    queue::timeline::release_completed();
     Ok(())
 }
 
@@ -345,7 +346,7 @@ fn device_idle() -> Result<()> {
 /// uploaders, surfaces, samplers, query pools). While one is alive, or another
 /// thread is inside a lava call, it destroys nothing, lava stays initialised, and it returns
 /// `Error::ObjectsAlive`. A lost device is no error here: what is left is destroyed anyway.
-/// [`Wait`]s and [`Stamp`]s of the old context count as done in the next one; counters of
+/// [`Wait`]s of the old context count as done in the next one; counters of
 /// `query::counters` (`performance-query`) stay valid memory (they are leaked) but can't be queried.
 #[validation_trace]
 pub fn shutdown() -> Result<()> {
@@ -353,6 +354,14 @@ pub fn shutdown() -> Result<()> {
     if !global::is_open() {
         return Ok(());
     }
+    // What submissions kept of what the application dropped goes first, so it isn't counted.
+    match device_idle() {
+        Ok(()) | Err(Error::DeviceLost) => {}
+        Err(err) => {
+            tracing::error!(%err, "failed to wait for the device before shutting lava down")
+        }
+    }
+    queue::timeline::release_all();
     global::close().map_err(|count| Error::ObjectsAlive { count })?;
     // SAFETY: closed: no object and no call reads lava's state any more.
     unsafe { teardown() };
@@ -377,14 +386,14 @@ unsafe fn teardown() {
     if let Err(err) = pipeline::save_cache_now() {
         tracing::error!(%err, "failed to save the pipeline cache");
     }
-    // What the application dropped, then lava's own objects, whose destructors need nothing
-    // the earlier ones free.
-    lifetime::run_all();
+    // What submissions kept, then lava's own objects, whose destructors need nothing the
+    // earlier ones free.
+    queue::timeline::release_all();
     unsafe {
         pipeline::destroy();
         Bindless::destroy();
     }
-    lifetime::run_all();
+    queue::timeline::release_all();
     unsafe {
         queue::timeline::destroy();
         #[cfg(feature = "performance-query")]
